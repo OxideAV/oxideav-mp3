@@ -1,9 +1,11 @@
-//! Minimum-viable CBR MPEG-1 Layer III encoder.
+//! Minimum-viable CBR MPEG-1 / MPEG-2 LSF Layer III encoder.
 //!
 //! Scope (deliberately narrow):
-//! - MPEG-1 Layer III, 44.1 kHz or 48 kHz, mono or "dual-channel" stereo
-//!   (no joint stereo / no MS / no IS).
-//! - One CBR bitrate per encoder instance: 128 / 192 / 256 / 320 kbps.
+//! - MPEG-1 Layer III (32 / 44.1 / 48 kHz, 2 granules/frame) and
+//!   MPEG-2 LSF Layer III (16 / 22.05 / 24 kHz, 1 granule/frame),
+//!   mono or "dual-channel" stereo (no joint stereo / MS / IS).
+//! - One CBR bitrate per encoder instance, picked from the version's
+//!   standard bitrate table.
 //! - Long blocks only (block_type = 0). No window switching.
 //! - No CRC. No psychoacoustic model. No rate-distortion: a simple
 //!   global-gain bisection sets the quantisation step so the Huffman bit
@@ -13,7 +15,9 @@
 //!   degenerate (region0 spans everything, region1 / region2 empty).
 //! - count1 region uses table A.
 //! - Bit reservoir on the encode side: any unused bits roll forward via
-//!   the next frame's `main_data_begin`.
+//!   the next frame's `main_data_begin`. MPEG-1's `main_data_begin` is
+//!   9 bits wide (reservoir cap 511 bytes); MPEG-2 LSF's field is only
+//!   8 bits wide, so the reservoir is capped at 255 bytes.
 //!
 //! The pipeline is the mirror of the decoder:
 //!   PCM → polyphase analysis → forward MDCT → quantise →
@@ -33,8 +37,10 @@ use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A};
 use crate::mdct::{mdct_granule, MdctState};
 use crate::CODEC_ID_STR;
 
-/// Maximum reservoir lookback per the spec (MPEG-1).
-const MAX_LOOKBACK: usize = 511;
+/// Max reservoir lookback (bytes) for MPEG-1 — `main_data_begin` is 9 bits.
+const MAX_LOOKBACK_MPEG1: usize = 511;
+/// Max reservoir lookback (bytes) for MPEG-2 LSF — `main_data_begin` is 8 bits.
+const MAX_LOOKBACK_MPEG2: usize = 255;
 
 /// Candidate big-value tables, in priority order. We try the lowest-cost
 /// table first — values bounded by 15 use table 13 (no linbits); larger
@@ -53,38 +59,75 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| Error::invalid("MP3 encoder: missing sample_rate"))?;
-    let sr_index = match sample_rate {
-        44_100 => 0u8,
-        48_000 => 1u8,
-        32_000 => 2u8,
+    // Pick version based on sample rate.
+    // MPEG-1:    32 / 44.1 / 48 kHz.
+    // MPEG-2 LSF: 16 / 22.05 / 24 kHz. MPEG-2.5 is out of scope.
+    let (is_mpeg2, sr_index) = match sample_rate {
+        44_100 => (false, 0u8),
+        48_000 => (false, 1u8),
+        32_000 => (false, 2u8),
+        22_050 => (true, 0u8),
+        24_000 => (true, 1u8),
+        16_000 => (true, 2u8),
         _ => {
             return Err(Error::unsupported(format!(
-                "MP3 encoder: unsupported sample rate {sample_rate} (need 32000/44100/48000)"
+                "MP3 encoder: unsupported sample rate {sample_rate} (need 16000/22050/24000/32000/44100/48000)"
             )));
         }
     };
 
-    // Bit rate: default 128 kbps; accept other CBRs from a fixed list.
-    let bitrate_kbps = params.bit_rate.map(|b| (b / 1000) as u32).unwrap_or(128);
-    let br_index = match bitrate_kbps {
-        32 => 1u8,
-        40 => 2,
-        48 => 3,
-        56 => 4,
-        64 => 5,
-        80 => 6,
-        96 => 7,
-        112 => 8,
-        128 => 9,
-        160 => 10,
-        192 => 11,
-        224 => 12,
-        256 => 13,
-        320 => 14,
-        _ => {
-            return Err(Error::unsupported(format!(
-                "MP3 encoder: unsupported bitrate {bitrate_kbps} kbps"
-            )));
+    // Bit rate: default 128 kbps (MPEG-1) or 64 kbps (MPEG-2 LSF).
+    let default_kbps = if is_mpeg2 { 64 } else { 128 };
+    let bitrate_kbps = params
+        .bit_rate
+        .map(|b| (b / 1000) as u32)
+        .unwrap_or(default_kbps);
+    let br_index = if is_mpeg2 {
+        // MPEG-2 LSF Layer III bitrate table (ISO 13818-3 Table 2.4.2.3):
+        // [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, free].
+        match bitrate_kbps {
+            8 => 1u8,
+            16 => 2,
+            24 => 3,
+            32 => 4,
+            40 => 5,
+            48 => 6,
+            56 => 7,
+            64 => 8,
+            80 => 9,
+            96 => 10,
+            112 => 11,
+            128 => 12,
+            144 => 13,
+            160 => 14,
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "MP3 encoder: unsupported MPEG-2 LSF bitrate {bitrate_kbps} kbps"
+                )));
+            }
+        }
+    } else {
+        // MPEG-1 Layer III bitrate table.
+        match bitrate_kbps {
+            32 => 1u8,
+            40 => 2,
+            48 => 3,
+            56 => 4,
+            64 => 5,
+            80 => 6,
+            96 => 7,
+            112 => 8,
+            128 => 9,
+            160 => 10,
+            192 => 11,
+            224 => 12,
+            256 => 13,
+            320 => 14,
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "MP3 encoder: unsupported MPEG-1 bitrate {bitrate_kbps} kbps"
+                )));
+            }
         }
     };
 
@@ -110,6 +153,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         bitrate_kbps,
         sr_index,
         br_index,
+        is_mpeg2,
         time_base: TimeBase::new(1, sample_rate as i64),
         analysis_state: [AnalysisState::new(), AnalysisState::new()],
         mdct_state: [MdctState::new(), MdctState::new()],
@@ -129,6 +173,9 @@ struct Mp3Encoder {
     bitrate_kbps: u32,
     sr_index: u8,
     br_index: u8,
+    /// `true` for MPEG-2 LSF (16/22.05/24 kHz, 1 granule/frame);
+    /// `false` for MPEG-1 (32/44.1/48 kHz, 2 granules/frame).
+    is_mpeg2: bool,
     time_base: TimeBase,
     analysis_state: [AnalysisState; 2],
     mdct_state: [MdctState; 2],
@@ -136,7 +183,8 @@ struct Mp3Encoder {
     pcm_queue: Vec<Vec<f32>>,
     /// Pending main-data bytes that have not yet been written to a frame
     /// slot. The next frame's `main_data_begin` is exactly this length
-    /// (capped at MAX_LOOKBACK) BEFORE the new main_data gets appended.
+    /// (capped at the version's max lookback) BEFORE the new main_data
+    /// gets appended.
     main_data_queue: Vec<u8>,
     pending_packets: VecDeque<Packet>,
     frame_index: u64,
@@ -149,23 +197,60 @@ struct Mp3Encoder {
 
 impl Mp3Encoder {
     /// Bytes per CBR frame for given padding.
+    /// MPEG-1:  `144 * br / sr + pad`.
+    /// MPEG-2:  `72  * br / sr + pad` (one granule per frame = half the
+    ///           samples, so half the numerator).
     fn frame_bytes(&self, padding: bool) -> usize {
-        let base = (144 * self.bitrate_kbps * 1000 / self.sample_rate) as usize;
+        let num = if self.is_mpeg2 { 72 } else { 144 };
+        let base = (num * self.bitrate_kbps * 1000 / self.sample_rate) as usize;
         base + if padding { 1 } else { 0 }
+    }
+
+    /// Number of granules per frame: 2 for MPEG-1, 1 for MPEG-2 LSF.
+    fn num_granules(&self) -> usize {
+        if self.is_mpeg2 {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// PCM samples per channel per frame (576 × num_granules).
+    fn samples_per_frame(&self) -> usize {
+        576 * self.num_granules()
+    }
+
+    /// Reservoir-lookback ceiling: 511 (MPEG-1) or 255 (MPEG-2 LSF).
+    fn max_lookback(&self) -> usize {
+        if self.is_mpeg2 {
+            MAX_LOOKBACK_MPEG2
+        } else {
+            MAX_LOOKBACK_MPEG1
+        }
+    }
+
+    /// Side-info block length in bytes.
+    /// MPEG-1:  32 (stereo) / 17 (mono).
+    /// MPEG-2:  17 (stereo) / 9  (mono).
+    fn side_info_bytes(&self) -> usize {
+        match (self.is_mpeg2, self.channels) {
+            (false, 1) => 17,
+            (false, _) => 32,
+            (true, 1) => 9,
+            (true, _) => 17,
+        }
     }
 
     /// Decide whether this frame should set the padding bit, using the
     /// classic accumulator-style scheme (LAME-equivalent for CBR).
+    ///
+    /// Frame size in bits = `samples_per_frame * br / sr` — for MPEG-1
+    /// that's `1152*br/sr` = `144_000*br_kbps/sr`, and for MPEG-2 LSF
+    /// half of that.
     fn next_padding(&mut self) -> bool {
-        // Numerator/denominator of "extra bits per frame" * 8.
-        // Frame size in bits = 144_000 * br / sr; integer part is the
-        // base; fractional part accumulates and is paid off by inserting
-        // a padding byte (8 bits).
-        let num = 144_000u64 * self.bitrate_kbps as u64;
+        let num_k = if self.is_mpeg2 { 72_000 } else { 144_000 };
+        let num = num_k as u64 * self.bitrate_kbps as u64;
         let sr = self.sample_rate as u64;
-        // Bits per frame * sr = num. Integer bits = num / sr. Remainder
-        // accumulates.
-        let _whole = num / sr;
         let rem = num - (num / sr) * sr;
         self.cumulative_padded_bits += rem;
         let pad = self.cumulative_padded_bits >= sr * 8;
@@ -204,14 +289,16 @@ impl Mp3Encoder {
 
     fn flush_ready_frames(&mut self, drain: bool) -> Result<()> {
         // MPEG-1: 1152 samples per frame (2 granules of 576).
+        // MPEG-2 LSF: 576 samples per frame (1 granule of 576).
         let n_ch = self.channels as usize;
+        let spf = self.samples_per_frame();
         loop {
             let avail = self.pcm_queue[0].len();
-            if avail < 1152 {
+            if avail < spf {
                 if drain && avail > 0 {
-                    // Pad with zeros to 1152 to flush the tail.
+                    // Pad with zeros up to spf to flush the tail.
                     for ch in 0..n_ch {
-                        self.pcm_queue[ch].resize(1152, 0.0);
+                        self.pcm_queue[ch].resize(spf, 0.0);
                     }
                 } else {
                     return Ok(());
@@ -227,21 +314,21 @@ impl Mp3Encoder {
 
     fn encode_one_frame(&mut self) -> Result<Packet> {
         let n_ch = self.channels as usize;
+        let n_gr = self.num_granules();
+        let spf = self.samples_per_frame();
 
-        // Pull 1152 samples per channel into local buffers, drain queue.
-        let mut pcm_in: Vec<[f32; 1152]> = vec![[0.0f32; 1152]; n_ch];
+        // Pull `spf` samples per channel into local buffers, drain queue.
+        let mut pcm_in: Vec<Vec<f32>> = vec![vec![0.0f32; spf]; n_ch];
         for ch in 0..n_ch {
-            for i in 0..1152 {
-                pcm_in[ch][i] = self.pcm_queue[ch][i];
-            }
-            self.pcm_queue[ch].drain(..1152);
+            pcm_in[ch].copy_from_slice(&self.pcm_queue[ch][..spf]);
+            self.pcm_queue[ch].drain(..spf);
         }
 
         // Analysis + MDCT per granule per channel.
-        let mut xr: Vec<Vec<[f32; 576]>> = (0..2)
+        let mut xr: Vec<Vec<[f32; 576]>> = (0..n_gr)
             .map(|_| (0..n_ch).map(|_| [0.0f32; 576]).collect())
             .collect();
-        for gr in 0..2 {
+        for gr in 0..n_gr {
             for ch in 0..n_ch {
                 let mut pcm_gr = [0.0f32; 576];
                 pcm_gr.copy_from_slice(&pcm_in[ch][gr * 576..gr * 576 + 576]);
@@ -255,24 +342,22 @@ impl Mp3Encoder {
         let padding = self.next_padding();
         let frame_bytes = self.frame_bytes(padding);
         let header_bytes = 4usize;
-        let si_bytes = if n_ch == 1 { 17 } else { 32 };
+        let si_bytes = self.side_info_bytes();
         let main_data_slot_bytes = frame_bytes - header_bytes - si_bytes;
+        let max_lookback = self.max_lookback();
 
         // The encoder maintains a single byte stream of main_data
         // (`self.main_data_queue`). For this frame:
-        //   1. main_data_begin = current queue length (capped at MAX_LOOKBACK).
+        //   1. main_data_begin = current queue length (capped at max_lookback).
         //   2. Generate this frame's main_data bytes from Huffman.
         //   3. Append to queue.
         //   4. Pop the first `main_data_slot_bytes` from the queue into the
         //      on-wire slot. Pad with zeros if the queue is short.
         //
         // For the budget we target this frame's main_data_bytes length so
-        // that the queue stays within MAX_LOOKBACK after popping the slot.
+        // that the queue stays within max_lookback after popping the slot.
         let pre_queue = self.main_data_queue.len();
-        // pre_queue should already satisfy pre_queue <= MAX_LOOKBACK and
-        // <= cumulative slots written so far (the budget logic below
-        // enforces both invariants).
-        debug_assert!(pre_queue <= MAX_LOOKBACK);
+        debug_assert!(pre_queue <= max_lookback);
         let main_data_begin = pre_queue as u16;
 
         // Constraints on the size of THIS frame's main_data, in bytes:
@@ -282,26 +367,25 @@ impl Mp3Encoder {
         // (B) Lookback constraint for FUTURE frames: queue after this
         //     frame (= pre_queue + M_N - main_data_slot_bytes, clamped at
         //     0) must be reachable as a lookback in frame N+1:
-        //       queue_after <= MAX_LOOKBACK   (decoder reservoir cap)
-        // Combining: M_N <= main_data_slot_bytes + MAX_LOOKBACK - pre_queue
+        //       queue_after <= max_lookback   (decoder reservoir cap)
+        // Combining: M_N <= main_data_slot_bytes + max_lookback - pre_queue
         //                  AND M_N <= pre_queue + main_data_slot_bytes.
-        // (A) is the tighter constraint while pre_queue < MAX_LOOKBACK / 2.
+        // (A) is the tighter constraint while pre_queue < max_lookback / 2.
         let max_main_bytes_a = pre_queue + main_data_slot_bytes;
-        let max_main_bytes_b = main_data_slot_bytes + MAX_LOOKBACK - pre_queue;
+        let max_main_bytes_b = main_data_slot_bytes + max_lookback - pre_queue;
         let max_main_bytes = max_main_bytes_a.min(max_main_bytes_b);
         let max_main_bits = max_main_bytes * 8;
-        // Per-unit (granule × channel) budget. Allow some slack so the
-        // bisection has room to find a good gain.
-        let per_unit_budget = max_main_bits / (2 * n_ch);
+        let unit_count = n_gr * n_ch;
+        let per_unit_budget = max_main_bits / unit_count.max(1);
 
         // Encode each granule/channel.
         let mut granule_data: Vec<Vec<GranuleEncoded>> =
-            (0..2).map(|_| Vec::with_capacity(n_ch)).collect();
+            (0..n_gr).map(|_| Vec::with_capacity(n_ch)).collect();
         let mut bits_used_total: usize = 0;
-        for gr in 0..2 {
+        for gr in 0..n_gr {
             for ch in 0..n_ch {
                 let remaining = max_main_bits.saturating_sub(bits_used_total);
-                let units_left = (2 - gr) * n_ch - ch;
+                let units_left = (n_gr - gr) * n_ch - ch;
                 let target = remaining / units_left.max(1);
                 let target = target.min(per_unit_budget * 2).max(64);
                 let g = encode_granule(&xr[gr][ch], target);
@@ -312,9 +396,9 @@ impl Mp3Encoder {
 
         // Compose this frame's main-data bytes.
         let mut main_w = BitWriter::with_capacity(max_main_bits / 8 + 4);
-        for gr in 0..2 {
-            for ch in 0..n_ch {
-                granule_data[gr][ch].emit_main_data(&mut main_w);
+        for gr_data in granule_data.iter() {
+            for g in gr_data.iter() {
+                g.emit_main_data(&mut main_w);
             }
         }
         main_w.align_to_byte();
@@ -328,8 +412,8 @@ impl Mp3Encoder {
             slot_payload.resize(main_data_slot_bytes, 0);
         }
         // Re-cap queue (should already hold).
-        if self.main_data_queue.len() > MAX_LOOKBACK {
-            let drop = self.main_data_queue.len() - MAX_LOOKBACK;
+        if self.main_data_queue.len() > max_lookback {
+            let drop = self.main_data_queue.len() - max_lookback;
             self.main_data_queue.drain(..drop);
         }
 
@@ -340,7 +424,8 @@ impl Mp3Encoder {
         let mut hw = BitWriter::with_capacity(4);
         // Sync 11 bits + version(2) + layer(2) + protection(1)
         hw.write_u32(0x7FF, 11); // sync
-        hw.write_u32(0b11, 2); // MPEG-1
+        let version_bits: u32 = if self.is_mpeg2 { 0b10 } else { 0b11 };
+        hw.write_u32(version_bits, 2);
         hw.write_u32(0b01, 2); // Layer III
         hw.write_u32(1, 1); // protection bit (1 = no CRC)
         hw.write_u32(self.br_index as u32, 4);
@@ -360,36 +445,10 @@ impl Mp3Encoder {
 
         // Side info.
         let mut si_w = BitWriter::with_capacity(si_bytes);
-        si_w.write_u32(main_data_begin as u32, 9);
-        // private bits: 5 mono / 3 stereo
-        si_w.write_u32(0, if n_ch == 1 { 5 } else { 3 });
-        // scfsi: ch * 4 bits
-        for _ in 0..n_ch {
-            si_w.write_u32(0, 4); // never reuse
-        }
-        for gr in 0..2 {
-            for ch in 0..n_ch {
-                let g = &granule_data[gr][ch];
-                si_w.write_u32(g.part2_3_length as u32, 12);
-                si_w.write_u32(g.big_values as u32, 9);
-                si_w.write_u32(g.global_gain as u32, 8);
-                si_w.write_u32(0, 4); // scalefac_compress = 0 (slen1=0,slen2=0)
-                si_w.write_u32(0, 1); // window_switching_flag = 0 (long blocks)
-                                      // table_select[0..3] — all the same table so region splits
-                                      // don't matter; whichever region a coefficient lands in,
-                                      // the decoder reaches for the same Huffman table.
-                si_w.write_u32(g.table_select as u32, 5);
-                si_w.write_u32(g.table_select as u32, 5);
-                si_w.write_u32(g.table_select as u32, 5);
-                // region0_count=15, region1_count=7 → r0_end=bounds[16],
-                // r1_end=bounds[24]→clamped to bounds[22]=576. Ensures
-                // every coefficient in the big-values run gets decoded.
-                si_w.write_u32(15, 4); // region0_count
-                si_w.write_u32(7, 3); // region1_count
-                si_w.write_u32(0, 1); // preflag
-                si_w.write_u32(0, 1); // scalefac_scale
-                si_w.write_u32(0, 1); // count1table_select = 0 (table A)
-            }
+        if self.is_mpeg2 {
+            self.emit_side_info_mpeg2(&mut si_w, main_data_begin, n_ch, &granule_data);
+        } else {
+            self.emit_side_info_mpeg1(&mut si_w, main_data_begin, n_ch, &granule_data);
         }
         si_w.align_to_byte();
         let side = si_w.into_bytes();
@@ -401,14 +460,88 @@ impl Mp3Encoder {
 
         debug_assert_eq!(frame_buf.len(), frame_bytes);
 
-        let pts = (self.frame_index as i64) * 1152;
+        let pts = (self.frame_index as i64) * spf as i64;
         let mut pkt = Packet::new(0, self.time_base, frame_buf);
         pkt.pts = Some(pts);
         pkt.dts = Some(pts);
-        pkt.duration = Some(1152);
+        pkt.duration = Some(spf as i64);
         pkt.flags.keyframe = true;
         self.frame_index += 1;
         Ok(pkt)
+    }
+
+    /// Emit MPEG-1 Layer III side-information block.
+    fn emit_side_info_mpeg1(
+        &self,
+        si_w: &mut BitWriter,
+        main_data_begin: u16,
+        n_ch: usize,
+        granule_data: &[Vec<GranuleEncoded>],
+    ) {
+        si_w.write_u32(main_data_begin as u32, 9);
+        // private bits: 5 mono / 3 stereo
+        si_w.write_u32(0, if n_ch == 1 { 5 } else { 3 });
+        // scfsi: ch * 4 bits
+        for _ in 0..n_ch {
+            si_w.write_u32(0, 4); // never reuse
+        }
+        for gr_data in granule_data.iter() {
+            for g in gr_data.iter() {
+                si_w.write_u32(g.part2_3_length as u32, 12);
+                si_w.write_u32(g.big_values as u32, 9);
+                si_w.write_u32(g.global_gain as u32, 8);
+                si_w.write_u32(0, 4); // scalefac_compress = 0 (slen1=0, slen2=0)
+                si_w.write_u32(0, 1); // window_switching_flag = 0 (long blocks)
+                si_w.write_u32(g.table_select as u32, 5);
+                si_w.write_u32(g.table_select as u32, 5);
+                si_w.write_u32(g.table_select as u32, 5);
+                si_w.write_u32(15, 4); // region0_count
+                si_w.write_u32(7, 3); // region1_count
+                si_w.write_u32(0, 1); // preflag
+                si_w.write_u32(0, 1); // scalefac_scale
+                si_w.write_u32(0, 1); // count1table_select = 0 (table A)
+            }
+        }
+    }
+
+    /// Emit MPEG-2 LSF Layer III side-information block.
+    ///
+    /// Differences from MPEG-1 (see `sideinfo::parse_mpeg2`):
+    /// - `main_data_begin` is 8 bits (not 9).
+    /// - `private_bits` is 1 (mono) / 2 (stereo).
+    /// - No `scfsi` (single granule per frame).
+    /// - Exactly one granule per channel.
+    /// - `scalefac_compress` is 9 bits — we emit 0, which decomposes via
+    ///   `SCF_MOD_MPEG2` to `slen = [0, 0, 0, 0]` (long-block row, all
+    ///   scalefactor widths zero, so no scalefactor bits in main_data).
+    /// - No transmitted `preflag` bit (derived by the decoder from
+    ///   `scalefac_compress >= 500`; with 0 this is false).
+    fn emit_side_info_mpeg2(
+        &self,
+        si_w: &mut BitWriter,
+        main_data_begin: u16,
+        n_ch: usize,
+        granule_data: &[Vec<GranuleEncoded>],
+    ) {
+        si_w.write_u32(main_data_begin as u32, 8);
+        // private bits: 1 mono / 2 stereo
+        si_w.write_u32(0, if n_ch == 1 { 1 } else { 2 });
+        // Single granule only (granule_data.len() == 1 for MPEG-2 LSF).
+        for g in granule_data[0].iter() {
+            si_w.write_u32(g.part2_3_length as u32, 12);
+            si_w.write_u32(g.big_values as u32, 9);
+            si_w.write_u32(g.global_gain as u32, 8);
+            si_w.write_u32(0, 9); // scalefac_compress = 0 → slen=[0,0,0,0]
+            si_w.write_u32(0, 1); // window_switching_flag = 0 (long blocks)
+            si_w.write_u32(g.table_select as u32, 5);
+            si_w.write_u32(g.table_select as u32, 5);
+            si_w.write_u32(g.table_select as u32, 5);
+            si_w.write_u32(15, 4); // region0_count
+            si_w.write_u32(7, 3); // region1_count
+                                  // MPEG-2 has NO preflag bit in the bitstream.
+            si_w.write_u32(0, 1); // scalefac_scale
+            si_w.write_u32(0, 1); // count1table_select = 0 (table A)
+        }
     }
 }
 
