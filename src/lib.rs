@@ -1,14 +1,20 @@
-//! MPEG-1/2 Audio Layer III (MP3) codec — scaffold.
+//! MPEG-1 / MPEG-2 Audio Layer III (MP3) pure-Rust decoder + CBR encoder.
 //!
-//! What's landed: MSB-first bit reader and a frame-header parser that
-//! handles all MPEG-1/2/2.5 version/layer/bitrate/samplerate/channel-mode
-//! combinations. The full decoder (side info, bit reservoir, Huffman
-//! tables, scalefactor decode, requantisation, stereo processing,
-//! antialias, IMDCT, hybrid filterbank, polyphase synthesis) is a
-//! multi-session follow-up.
+//! Decoder covers MPEG-1 (32 / 44.1 / 48 kHz) and MPEG-2 LSF
+//! (16 / 22.05 / 24 kHz) Layer III, mono / stereo / joint-stereo M/S /
+//! dual-channel, all block types, bit reservoir, and scfsi reuse.
+//! MPEG-2.5 and intensity-stereo are not implemented; CRC bytes are
+//! consumed but not verified.
 //!
-//! The decoder is registered so the framework can probe/remux MP3
-//! streams today; `make_decoder` currently returns `Unsupported`.
+//! Encoder is a minimum-viable CBR MPEG-1 / MPEG-2 LSF Layer III encoder:
+//! long blocks only, no joint-stereo, no psychoacoustic model, global-gain
+//! bisection to fit a per-frame bit budget, with the bit reservoir rolled
+//! forward so `main_data_begin` carries across frames within the per-
+//! version lookback cap (511 bytes MPEG-1 / 255 bytes MPEG-2).
+//!
+//! The container demuxer at [`container`] accepts `.mp1` / `.mp2` / `.mp3`
+//! raw streams (with ID3v2 prefix + ID3v1 trailer) and routes packets to
+//! the matching `mp1`/`mp2`/`mp3` codec.
 
 #![allow(
     dead_code,

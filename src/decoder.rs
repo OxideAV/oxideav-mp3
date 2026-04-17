@@ -5,13 +5,21 @@
 //! IMDCT overlap state and a per-channel synthesis FIFO across frames,
 //! plus a 4 KiB bit reservoir.
 //!
-//! **Limitations** (this session):
-//! - MPEG-1 Layer III only. MPEG-2 LSF / MPEG-2.5 packets return
-//!   `Error::Unsupported`.
-//! - Intensity-stereo (mode_extension bit 0) is not implemented; pure-IS
-//!   joint-stereo frames will sound off but won't fail to decode. M/S
-//!   joint-stereo (the dominant case) is supported.
-//! - No CRC verification.
+//! **Coverage**:
+//! - MPEG-1 Layer III: 32 / 44.1 / 48 kHz, mono / stereo / joint-stereo
+//!   M/S / dual-channel. Two granules per frame.
+//! - MPEG-2 LSF Layer III: 16 / 22.05 / 24 kHz, mono / stereo /
+//!   joint-stereo M/S / dual-channel. One granule per frame.
+//! - Long / short / start / stop / mixed block types. scfsi reuse.
+//!   Bit reservoir look-back up to the per-version cap.
+//!
+//! **Not implemented**:
+//! - MPEG-2.5 (unofficial Fraunhofer extension, 8 / 11.025 / 12 kHz) —
+//!   returns `Error::Unsupported`.
+//! - Intensity-stereo (mode_extension bit 0). Pure-IS joint-stereo frames
+//!   still decode to PCM but the stereo field is wrong; M/S joint-stereo
+//!   (the dominant case) is fully supported.
+//! - CRC-16 verification — the CRC bytes are consumed but not checked.
 
 use oxideav_codec::Decoder;
 use oxideav_core::{
@@ -115,8 +123,7 @@ impl Mp3Decoder {
         let data = &pkt.data;
         let hdr = parse_frame_header(data)?;
         // MPEG-1 and MPEG-2 LSF are both supported. MPEG-2.5 (an
-        // unofficial Fraunhofer extension for 8/11.025/12 kHz) is out of
-        // scope for this session.
+        // unofficial Fraunhofer extension for 8 / 11.025 / 12 kHz) is not.
         if hdr.version == MpegVersion::Mpeg25 {
             return Err(Error::unsupported(
                 "MP3 decoder: MPEG-2.5 not yet supported",
