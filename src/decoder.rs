@@ -24,7 +24,9 @@ use crate::huffman::{decode_count1, decode_pair};
 use crate::imdct::{imdct_granule, ImdctState};
 use crate::requantize::{antialias, ms_stereo, reorder_short, requantize_granule};
 use crate::reservoir::Reservoir;
-use crate::scalefactor::{decode_mpeg1 as decode_sf_mpeg1, ScaleFactors};
+use crate::scalefactor::{
+    decode_mpeg1 as decode_sf_mpeg1, decode_mpeg2 as decode_sf_mpeg2, ScaleFactors,
+};
 use crate::sfband::sfband_long;
 use crate::sideinfo::SideInfo;
 use crate::synthesis::{synthesize_granule, SynthesisState};
@@ -112,11 +114,15 @@ impl Mp3Decoder {
     fn decode_packet(&mut self, pkt: &Packet) -> Result<Frame> {
         let data = &pkt.data;
         let hdr = parse_frame_header(data)?;
-        if hdr.version != MpegVersion::Mpeg1 {
+        // MPEG-1 and MPEG-2 LSF are both supported. MPEG-2.5 (an
+        // unofficial Fraunhofer extension for 8/11.025/12 kHz) is out of
+        // scope for this session.
+        if hdr.version == MpegVersion::Mpeg25 {
             return Err(Error::unsupported(
-                "MP3 decoder: MPEG-2 LSF / MPEG-2.5 not yet supported",
+                "MP3 decoder: MPEG-2.5 not yet supported",
             ));
         }
+        let is_mpeg2 = hdr.version == MpegVersion::Mpeg2;
         let channels = hdr.channels() as usize;
         let crc_bytes = if hdr.no_crc { 0 } else { 2 };
         let header_len = 4 + crc_bytes;
@@ -124,7 +130,11 @@ impl Mp3Decoder {
         if data.len() < header_len + si_bytes {
             return Err(Error::NeedMore);
         }
-        let si = SideInfo::parse_mpeg1(&hdr, &data[header_len..])?;
+        let si = if is_mpeg2 {
+            SideInfo::parse_mpeg2(&hdr, &data[header_len..])?
+        } else {
+            SideInfo::parse_mpeg1(&hdr, &data[header_len..])?
+        };
 
         // Update time base on first frame.
         self.time_base = TimeBase::new(1, hdr.sample_rate as i64);
@@ -158,6 +168,7 @@ impl Mp3Decoder {
         combined.extend_from_slice(main_data);
 
         // Decode all granules.
+        let num_granules = si.num_granules as usize;
         let mut pcm = vec![[[0.0f32; 576]; 2]; 2]; // pcm[gr][ch][i]
 
         // scfsi reuse for granule 1 must read from gr=0 of the CURRENT
@@ -169,7 +180,7 @@ impl Mp3Decoder {
         // this lets each granule start cleanly at part2_3_length boundary
         // even when the previous one over- or under-read by a few bits.
         let mut next_granule_bit: u64 = 0;
-        for gr in 0..2 {
+        for gr in 0..num_granules {
             for ch in 0..channels {
                 let gc = si.granules[gr][ch];
 
@@ -190,10 +201,14 @@ impl Mp3Decoder {
                 let part_start = br.bit_position();
                 let part_end_bit = part_start + gc.part2_3_length as u64;
 
-                // Scalefactors first. For gr=1, reuse from gr=0 of the
-                // SAME frame (per ISO 11172-3 §2.4.2.7), not the previous
-                // frame's gr=1.
-                let sf = decode_sf_mpeg1(&mut br, &gc, &si.scfsi[ch], gr, &frame_gr0_sf[ch])?;
+                // Scalefactors. MPEG-1: scfsi-based reuse across the two
+                // granules of one frame. MPEG-2: one granule per frame, no
+                // scfsi; slens come from a 9-bit scalefac_compress.
+                let sf = if is_mpeg2 {
+                    decode_sf_mpeg2(&mut br, &gc, false)?
+                } else {
+                    decode_sf_mpeg1(&mut br, &gc, &si.scfsi[ch], gr, &frame_gr0_sf[ch])?
+                };
                 if gr == 0 {
                     frame_gr0_sf[ch] = sf;
                 }
@@ -294,13 +309,15 @@ impl Mp3Decoder {
         }
 
         // IMDCT + polyphase synthesis per granule per channel.
-        let total_samples = 1152u32; // MPEG-1
+        // MPEG-1: 2 granules × 576 = 1152 samples/channel/frame.
+        // MPEG-2 LSF: 1 granule × 576 = 576 samples/channel/frame.
+        let total_samples = 576u32 * num_granules as u32;
         let bytes_per_sample = SampleFormat::S16.bytes_per_sample();
         let mut out_bytes =
             Vec::with_capacity(total_samples as usize * channels * bytes_per_sample);
 
         let mut pcm_per_gr = [[0.0f32; 576]; 2]; // [ch][i] for current granule
-        for gr in 0..2 {
+        for gr in 0..num_granules {
             for ch in 0..channels {
                 let mut sb = [[0.0f32; 18]; 32];
                 let gc = si.granules[gr][ch];
