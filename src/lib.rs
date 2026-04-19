@@ -45,7 +45,7 @@ pub mod window;
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};
 use oxideav_container::ContainerRegistry;
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
+use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 
 pub const CODEC_ID_STR: &str = "mp3";
 
@@ -61,14 +61,20 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         .with_intra_only(false) // MP3 uses a bit reservoir — not intra-only
         .with_max_channels(2)
         .with_max_sample_rate(48_000);
-    reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), dec_caps, make_decoder);
+    let cid = CodecId::new(CODEC_ID_STR);
+    reg.register_decoder_impl(cid.clone(), dec_caps, make_decoder);
 
     let enc_caps = CodecCapabilities::audio("mp3_sw_enc")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_channels(2)
         .with_max_sample_rate(48_000);
-    reg.register_encoder_impl(CodecId::new(CODEC_ID_STR), enc_caps, make_encoder);
+    reg.register_encoder_impl(cid.clone(), enc_caps, make_encoder);
+
+    // AVI / WAVEFORMATEX tag: WAVE_FORMAT_MPEGLAYER3 = 0x0055. The
+    // generic MPEG audio tag 0x0050 is owned by oxideav-mp2 (Layers
+    // I + II). Priority 10, no probe.
+    reg.claim_tag(cid, CodecTag::wave_format(0x0055), 10, None);
 }
 
 pub fn register_containers(reg: &mut ContainerRegistry) {
