@@ -32,10 +32,10 @@ use oxideav_core::{
 };
 
 use crate::analysis::{analyze_granule, AnalysisState};
-use crate::bitwriter::BitWriter;
 use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A};
 use crate::mdct::{mdct_granule, MdctState};
 use crate::CODEC_ID_STR;
+use oxideav_core::bits::BitWriter;
 
 /// Max reservoir lookback (bytes) for MPEG-1 — `main_data_begin` is 9 bits.
 const MAX_LOOKBACK_MPEG1: usize = 511;

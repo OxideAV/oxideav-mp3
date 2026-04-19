@@ -26,7 +26,6 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::bitreader::BitReader;
 use crate::frame::{parse_frame_header, ChannelMode, MpegVersion};
 use crate::huffman::{decode_count1, decode_pair};
 use crate::imdct::{imdct_granule, ImdctState};
@@ -38,6 +37,7 @@ use crate::scalefactor::{
 use crate::sfband::sfband_long;
 use crate::sideinfo::SideInfo;
 use crate::synthesis::{synthesize_granule, SynthesisState};
+use oxideav_core::bits::BitReader;
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Mp3Decoder {

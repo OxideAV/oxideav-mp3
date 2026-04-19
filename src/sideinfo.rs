@@ -56,8 +56,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::frame::{ChannelMode, FrameHeader, MpegVersion};
+use oxideav_core::bits::BitReader;
 
 /// Per-granule, per-channel side info.
 #[derive(Clone, Copy, Debug, Default)]

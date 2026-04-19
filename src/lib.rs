@@ -28,8 +28,6 @@
 )]
 
 pub mod analysis;
-pub mod bitreader;
-pub mod bitwriter;
 pub mod container;
 pub mod decoder;
 pub mod encoder;

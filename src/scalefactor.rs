@@ -17,8 +17,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::sideinfo::{GranuleChannel, SideInfo};
+use oxideav_core::bits::BitReader;
 
 /// (slen1, slen2) pair by scalefac_compress (MPEG-1, Table 3-B.32).
 pub const SLEN_TABLE: [(u8, u8); 16] = [

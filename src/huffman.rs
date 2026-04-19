@@ -21,7 +21,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use oxideav_core::bits::BitReader;
 
 /// Entry: (code_value, code_length_bits, x, y).
 pub type HTab = &'static [(u32, u8, u8, u8)];
