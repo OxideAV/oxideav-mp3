@@ -128,7 +128,9 @@ fn decode_with_ours(mp3: &[u8], _sample_rate: u32) -> Vec<i16> {
     let mut reg = oxideav_container::ContainerRegistry::new();
     oxideav_mp3::register_containers(&mut reg);
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(mp3.to_vec()));
-    let mut demuxer = reg.open_demuxer("mp3", input).expect("open mp3 container");
+    let mut demuxer = reg
+        .open_demuxer("mp3", input, &oxideav_core::NullCodecResolver)
+        .expect("open mp3 container");
 
     let params = demuxer.streams()[0].params.clone();
     let mut dec = oxideav_mp3::decoder::make_decoder(&params).expect("make decoder");

@@ -22,9 +22,9 @@ dependencies = [
 
 [[package]]
 name = "oxideav-container"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9449043b8904a4856ebb25657b915ba85cd832d2903cacb9349564d04e6a82f8"
+checksum = "117a8109cf684621db8c47d0934f8d0173ca02b46c457b1d8ba883eb0b68bc92"
 dependencies = [
  "oxideav-core 0.0.6",
 ]
@@ -40,9 +40,9 @@ dependencies = [
 
 [[package]]
 name = "oxideav-core"
-version = "0.0.6"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "558dd9aef4e71a01d521a205fb7a1e3c13289b3b0148fcf6aff2fc12e99e0fc1"
+checksum = "825dd21cc044ebb4a09d89054764c0ab8b7ae19bbcda268b9abfdfdcd78f483f"
 dependencies = [
  "thiserror",
 ]
