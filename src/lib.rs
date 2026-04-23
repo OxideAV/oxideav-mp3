@@ -1,10 +1,10 @@
 //! MPEG-1 / MPEG-2 Audio Layer III (MP3) pure-Rust decoder + CBR encoder.
 //!
-//! Decoder covers MPEG-1 (32 / 44.1 / 48 kHz) and MPEG-2 LSF
-//! (16 / 22.05 / 24 kHz) Layer III, mono / stereo / joint-stereo M/S /
-//! dual-channel, all block types, bit reservoir, and scfsi reuse.
-//! MPEG-2.5 and intensity-stereo are not implemented; CRC bytes are
-//! consumed but not verified.
+//! Decoder covers MPEG-1 (32 / 44.1 / 48 kHz), MPEG-2 LSF
+//! (16 / 22.05 / 24 kHz), and MPEG-2.5 (unofficial Fraunhofer extension
+//! at 8 / 11.025 / 12 kHz) Layer III — mono / stereo / joint-stereo
+//! (M/S and intensity) / dual-channel, all block types, bit reservoir,
+//! and scfsi reuse. CRC bytes are consumed but not verified.
 //!
 //! Encoder is a minimum-viable CBR MPEG-1 / MPEG-2 LSF Layer III encoder:
 //! long blocks only, no joint-stereo, no psychoacoustic model, global-gain

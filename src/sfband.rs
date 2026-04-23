@@ -34,6 +34,11 @@ pub fn sfband_short(sample_rate: u32) -> &'static [u16] {
         22_050 => &SFB_SHORT_22050,
         24_000 => &SFB_SHORT_24000,
         16_000 => &SFB_SHORT_16000,
+        // MPEG-2.5 reuses the 22.05 / 24 kHz tables at 11.025 / 12 kHz.
+        // 8 kHz has its own distinct short partition.
+        11_025 => &SFB_SHORT_22050,
+        12_000 => &SFB_SHORT_24000,
+        8_000 => &SFB_SHORT_8000,
         _ => &SFB_SHORT_44100,
     }
 }
@@ -85,3 +90,10 @@ pub const SFB_SHORT_32000: [u16; 14] = [0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104
 pub const SFB_SHORT_22050: [u16; 14] = [0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192];
 pub const SFB_SHORT_24000: [u16; 14] = [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192];
 pub const SFB_SHORT_16000: [u16; 14] = [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192];
+// MPEG-2.5 8 kHz short sfb widths (from libmad sfbwidth_table, also matches
+// ISO 13818-3 low-sample-rate annex):
+// widths:  8, 8, 8, 12, 16, 20, 24, 28, 36, 2, 2, 2, 26  (sum = 192)
+// offsets: 0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192
+pub const SFB_SHORT_8000: [u16; 14] = [
+    0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192,
+];

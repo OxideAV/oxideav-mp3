@@ -242,3 +242,105 @@ fn mpeg2_lsf_decode_silent_frame_mono_22050() {
         .unwrap_or(0);
     assert_eq!(max_abs, 0);
 }
+
+/// MPEG-2.5 (unofficial Fraunhofer low-sample-rate extension) header +
+/// silent-frame smoke test at 12 kHz / 32 kbps / stereo.
+///
+/// Header:
+/// byte 0 = 0xFF
+/// byte 1 = sync(111) ver(00 = MPEG-2.5) layer(01 = L3) noCRC(1) = 0xE3
+/// byte 2 = bitrate(0100 = 32 kbps idx 4) sr(01 = 12000) pad(0) priv(0) = 0x44
+/// byte 3 = mode(00 stereo) modext(00) copy(0) orig(0) emph(00) = 0x00
+///
+/// Frame length = 72 * 32 / 12 = 192 bytes. Header(4) + side-info(17) = 21. Main data = 171.
+#[test]
+fn mpeg25_header_parses_and_decode_silent_frame_12k_stereo() {
+    let mut frame = vec![0u8; 192];
+    frame[0] = 0xFF;
+    frame[1] = 0xE3;
+    frame[2] = 0x44;
+    frame[3] = 0x00;
+
+    let hdr = parse_frame_header(&frame[..4]).expect("parse");
+    assert_eq!(hdr.version, MpegVersion::Mpeg25);
+    assert_eq!(hdr.layer, Layer::Layer3);
+    assert_eq!(hdr.sample_rate, 12_000);
+    assert_eq!(hdr.bitrate_kbps, 32);
+    assert_eq!(hdr.channel_mode, ChannelMode::Stereo);
+    // MPEG-2.5 inherits MPEG-2 LSF side-info shape (single granule,
+    // 17 stereo / 9 mono bytes).
+    assert_eq!(hdr.side_info_bytes(), 17);
+    assert_eq!(hdr.samples_per_frame(), 576);
+    assert_eq!(hdr.frame_bytes(), Some(192));
+
+    let params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+    let mut dec = make_decoder(&params).expect("decoder");
+    let tb = TimeBase::new(1, 12_000);
+    let pkt = Packet::new(0, tb, frame);
+    dec.send_packet(&pkt).expect("send_packet");
+    let out = dec.receive_frame().expect("receive_frame");
+    let audio = match out {
+        Frame::Audio(a) => a,
+        _ => panic!("expected AudioFrame"),
+    };
+    assert_eq!(audio.sample_rate, 12_000);
+    assert_eq!(audio.channels, 2);
+    assert_eq!(audio.samples, 576);
+    assert_eq!(audio.data[0].len(), 576 * 2 * 2);
+    let max_abs = audio.data[0]
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        max_abs, 0,
+        "expected pure silence from MPEG-2.5 silent frame, got max_abs={max_abs}"
+    );
+}
+
+/// MPEG-2.5 8 kHz mono silent-frame smoke test. Exercises the distinct
+/// 8 kHz sfband partition added by the MPEG-2.5 low-sample-rate annex.
+///
+/// Header:
+/// byte 1 = sync(111) ver(00) layer(01) noCRC(1) = 0xE3
+/// byte 2 = bitrate(0010 = 16 kbps idx 2) sr(10 = 8000) pad(0) priv(0) = 0x28
+/// byte 3 = mode(11 mono) modext(00) copy(0) orig(0) emph(00) = 0xC0
+///
+/// Frame length = 72 * 16 / 8 = 144 bytes. Header(4) + side-info(9 mono) = 13. Main data = 131.
+#[test]
+fn mpeg25_decode_silent_frame_8k_mono() {
+    let mut frame = vec![0u8; 144];
+    frame[0] = 0xFF;
+    frame[1] = 0xE3;
+    frame[2] = 0x28;
+    frame[3] = 0xC0;
+
+    let hdr = parse_frame_header(&frame[..4]).expect("parse");
+    assert_eq!(hdr.version, MpegVersion::Mpeg25);
+    assert_eq!(hdr.sample_rate, 8_000);
+    assert_eq!(hdr.bitrate_kbps, 16);
+    assert_eq!(hdr.channel_mode, ChannelMode::Mono);
+    assert_eq!(hdr.side_info_bytes(), 9);
+    assert_eq!(hdr.frame_bytes(), Some(144));
+
+    let params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+    let mut dec = make_decoder(&params).expect("decoder");
+    let tb = TimeBase::new(1, 8_000);
+    let pkt = Packet::new(0, tb, frame);
+    dec.send_packet(&pkt).expect("send_packet");
+    let out = dec.receive_frame().expect("receive_frame");
+    let audio = match out {
+        Frame::Audio(a) => a,
+        _ => panic!("expected AudioFrame"),
+    };
+    assert_eq!(audio.sample_rate, 8_000);
+    assert_eq!(audio.channels, 1);
+    assert_eq!(audio.samples, 576);
+    assert_eq!(audio.data[0].len(), 576 * 2);
+    let max_abs = audio.data[0]
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(max_abs, 0);
+}

@@ -872,14 +872,11 @@ mod tests {
 
     #[test]
     fn header_is_four_bytes() {
-        let p = CodecParameters {
-            codec_id: CodecId::new("mp3"),
-            channels: Some(1),
-            sample_rate: Some(44_100),
-            sample_format: Some(SampleFormat::S16),
-            bit_rate: Some(128_000),
-            ..CodecParameters::audio(CodecId::new("mp3"))
-        };
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.channels = Some(1);
+        p.sample_rate = Some(44_100);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(128_000);
         let enc = make_encoder(&p).unwrap();
         assert_eq!(enc.codec_id().as_str(), "mp3");
     }

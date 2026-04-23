@@ -122,14 +122,14 @@ impl Mp3Decoder {
     fn decode_packet(&mut self, pkt: &Packet) -> Result<Frame> {
         let data = &pkt.data;
         let hdr = parse_frame_header(data)?;
-        // MPEG-1 and MPEG-2 LSF are both supported. MPEG-2.5 (an
-        // unofficial Fraunhofer extension for 8 / 11.025 / 12 kHz) is not.
-        if hdr.version == MpegVersion::Mpeg25 {
-            return Err(Error::unsupported(
-                "MP3 decoder: MPEG-2.5 not yet supported",
-            ));
-        }
-        let is_mpeg2 = hdr.version == MpegVersion::Mpeg2;
+        // MPEG-1, MPEG-2 LSF, and MPEG-2.5 (unofficial Fraunhofer
+        // low-sample-rate extension for 8 / 11.025 / 12 kHz) are all
+        // supported. MPEG-2.5 shares the side-info shape, scalefactor
+        // compressor, and single-granule layout of MPEG-2 LSF — only the
+        // sample-rate tables (already in `frame.rs`) and sfb partitions
+        // (see `sfband::sfband_{long,short}`) differ.
+        let is_mpeg2_or_25 = matches!(hdr.version, MpegVersion::Mpeg2 | MpegVersion::Mpeg25);
+        let is_mpeg2 = is_mpeg2_or_25;
         let channels = hdr.channels() as usize;
         let crc_bytes = if hdr.no_crc { 0 } else { 2 };
         let header_len = 4 + crc_bytes;
