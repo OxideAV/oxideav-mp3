@@ -6,19 +6,20 @@
 //! plus a 4 KiB bit reservoir.
 //!
 //! **Coverage**:
-//! - MPEG-1 Layer III: 32 / 44.1 / 48 kHz, mono / stereo / joint-stereo
-//!   M/S / dual-channel. Two granules per frame.
-//! - MPEG-2 LSF Layer III: 16 / 22.05 / 24 kHz, mono / stereo /
-//!   joint-stereo M/S / dual-channel. One granule per frame.
+//! - MPEG-1 Layer III: 32 / 44.1 / 48 kHz. Two granules per frame.
+//! - MPEG-2 LSF Layer III: 16 / 22.05 / 24 kHz. One granule per frame.
+//! - MPEG-2.5 Layer III: 8 / 11.025 / 12 kHz (unofficial Fraunhofer
+//!   low-sample-rate extension). One granule per frame.
+//! - mono / stereo / joint-stereo (M/S and intensity) / dual-channel.
 //! - Long / short / start / stop / mixed block types. scfsi reuse.
 //!   Bit reservoir look-back up to the per-version cap.
 //!
 //! **Not implemented**:
-//! - MPEG-2.5 (unofficial Fraunhofer extension, 8 / 11.025 / 12 kHz) —
-//!   returns `Error::Unsupported`.
-//! - Intensity-stereo (mode_extension bit 0). Pure-IS joint-stereo frames
-//!   still decode to PCM but the stereo field is wrong; M/S joint-stereo
-//!   (the dominant case) is fully supported.
+//! - MPEG-2 / MPEG-2.5 intensity stereo (the finer-grained `is_pos`
+//!   table and selectable `intensity_scale` of ISO 13818-3 §2.4.3.2).
+//!   For those frames M/S applies but the IS path is a no-op; R
+//!   remains the M/S-residual representation above the IS bound.
+//!   MPEG-1 intensity stereo (the dominant IS variant) IS supported.
 //! - CRC-16 verification — the CRC bytes are consumed but not checked.
 
 use oxideav_codec::Decoder;
@@ -29,7 +30,10 @@ use oxideav_core::{
 use crate::frame::{parse_frame_header, ChannelMode, MpegVersion};
 use crate::huffman::{decode_count1, decode_pair};
 use crate::imdct::{imdct_granule, ImdctState};
-use crate::requantize::{antialias, ms_stereo, reorder_short, requantize_granule};
+use crate::requantize::{
+    antialias, find_is_bound_sfb, intensity_stereo_mpeg1, ms_boundary_sample, ms_stereo,
+    ms_stereo_range, reorder_short, requantize_granule,
+};
 use crate::reservoir::Reservoir;
 use crate::scalefactor::{
     decode_mpeg1 as decode_sf_mpeg1, decode_mpeg2 as decode_sf_mpeg2, ScaleFactors,
@@ -188,6 +192,13 @@ impl Mp3Decoder {
         // even when the previous one over- or under-read by a few bits.
         let mut next_granule_bit: u64 = 0;
         for gr in 0..num_granules {
+            // Per-channel raw-integer coefficients and scalefactors from this
+            // granule — kept in full resolution until after stereo decoupling
+            // so intensity-stereo has the information it needs (R-channel
+            // scalefactors are reused as `is_pos`, and the IS bound is the
+            // lowest sfb at which R's raw coefficients are all zero upward).
+            let mut is_ch = [[0i32; 576]; 2];
+            let mut sf_ch: [ScaleFactors; 2] = Default::default();
             for ch in 0..channels {
                 let gc = si.granules[gr][ch];
 
@@ -209,8 +220,8 @@ impl Mp3Decoder {
                 let part_end_bit = part_start + gc.part2_3_length as u64;
 
                 // Scalefactors. MPEG-1: scfsi-based reuse across the two
-                // granules of one frame. MPEG-2: one granule per frame, no
-                // scfsi; slens come from a 9-bit scalefac_compress.
+                // granules of one frame. MPEG-2 / MPEG-2.5: one granule per
+                // frame, no scfsi; slens come from a 9-bit scalefac_compress.
                 let sf = if is_mpeg2 {
                     decode_sf_mpeg2(&mut br, &gc, false)?
                 } else {
@@ -291,20 +302,74 @@ impl Mp3Decoder {
                 // expected layout. No-op for long blocks.
                 reorder_short(&mut xr, &gc, hdr.sample_rate);
                 pcm[gr][ch] = xr;
+                is_ch[ch] = is_;
+                sf_ch[ch] = sf;
             }
 
             // Stereo processing on the granule (after both channels) —
             // applied to requantised (NOT yet antialiased) coefficients.
             if channels == 2 && hdr.channel_mode == ChannelMode::JointStereo {
                 let ms_on = (hdr.mode_extension & 0x2) != 0;
-                if ms_on {
-                    // Borrow split.
+                let is_on = (hdr.mode_extension & 0x1) != 0;
+
+                // Determine the intensity-stereo bound from the R channel's
+                // raw integer coefficients (encoder guarantees zeros above
+                // the bound). For non-IS frames the bound equals the full
+                // range and the IS path is a no-op.
+                //
+                // For now MPEG-2 / MPEG-2.5 IS (finer-grained is_pos table
+                // plus intensity_scale) is not implemented — those frames
+                // get only M/S, and the R channel remains the "M/S residual"
+                // representation above the bound. This matches the behaviour
+                // documented in the crate README and is acceptable because
+                // MPEG-2 IS coding is comparatively rare; MPEG-1 IS is the
+                // common case and is handled here.
+                let is_gc_r = si.granules[gr][1];
+                let is_bound = if is_on {
+                    find_is_bound_sfb(&is_ch[1], &is_gc_r, hdr.sample_rate)
+                } else {
+                    // IS off → boundary at end → IS path processes nothing.
+                    if is_gc_r.window_switching_flag && is_gc_r.block_type == 2 {
+                        13
+                    } else {
+                        21
+                    }
+                };
+
+                if is_on && !is_mpeg2 {
+                    // Apply MPEG-1 IS on bands ≥ is_bound. This runs BEFORE
+                    // M/S so that M/S only touches bands below the bound.
                     let (l, r) = pcm[gr].split_at_mut(1);
-                    ms_stereo(&mut l[0], &mut r[0]);
+                    intensity_stereo_mpeg1(
+                        &mut l[0],
+                        &mut r[0],
+                        &sf_ch[1],
+                        &is_gc_r,
+                        hdr.sample_rate,
+                        is_bound,
+                    );
                 }
-                // Intensity stereo not yet implemented — leave as-is (MS is
-                // the dominant joint-stereo mode; pure-IS-only frames will
-                // sound off).
+
+                if ms_on {
+                    // M/S on the below-bound region only when IS is also on
+                    // (the IS path owns the above-bound coefficients). When
+                    // IS is off, M/S covers the full granule.
+                    let (l, r) = pcm[gr].split_at_mut(1);
+                    if is_on && !is_mpeg2 {
+                        // Rotate only samples below the IS bound. For long
+                        // blocks the bound is a single sample offset; for
+                        // short/mixed blocks use the same conservative
+                        // sample-index derived from the sfb bound.
+                        let boundary_sample = ms_boundary_sample(
+                            &is_gc_r,
+                            hdr.sample_rate,
+                            is_bound,
+                        );
+                        ms_stereo_range(&mut l[0], &mut r[0], 0, boundary_sample);
+                    } else {
+                        ms_stereo(&mut l[0], &mut r[0]);
+                    }
+                }
             }
 
             // Now antialias each channel (long blocks only / mixed-block
