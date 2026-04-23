@@ -272,9 +272,9 @@ pub(crate) const IS_RATIO_MPEG1: [(f32, f32); 7] = {
 ///   in that band; valid range 0..=6; `is_pos == 7` marks the band as
 ///   NOT intensity-coded (R stays zero). Ratio: `is_ratio = tan(is_pos * pi/12)`.
 /// * MPEG-2 / MPEG-2.5: ISO/IEC 13818-3 §2.4.3.2. Finer-grained
-///   `is_pos` (0..=30) and selectable `intensity_scale` — not implemented
-///   in this crate yet; MPEG-2 IS falls back to leaving R at zero above
-///   `is_bound`, which matches what the encoder wrote for that band.
+///   `is_pos` (0..=30, 31 = not IS-coded) with `intensity_scale` flag
+///   selecting a 3 dB or 6 dB step; implemented in
+///   [`intensity_stereo_mpeg2`].
 ///
 /// # Algorithm (MPEG-1)
 /// 1. Determine `is_bound_sfb` = the lowest sfb ≥ all nonzero R coefficients —
@@ -376,6 +376,133 @@ fn apply_is_band(xr_l: &mut [f32; 576], xr_r: &mut [f32; 576], lo: usize, hi: us
         let l = xr_l[i];
         xr_l[i] = l * k_l;
         xr_r[i] = l * k_r;
+    }
+}
+
+/// MPEG-2 / MPEG-2.5 intensity-stereo `(k_l, k_r)` factors.
+///
+/// # Spec
+/// ISO/IEC 13818-3 §2.4.3.2 defines a 5-bit `is_pos` (0..=30, with 31 as
+/// the "not IS-coded" sentinel) and a 1-bit `intensity_scale` flag (the
+/// LSB of the R-channel `scalefac_compress`). The two values together
+/// specify an L/R pan ratio on a logarithmic scale.
+///
+/// # Formula
+/// For `is_pos <= 30`:
+/// * Let `step = if intensity_scale == 1 { 0.25 } else { 0.5 }`
+///   (i.e. 6 dB per `is_pos` unit vs 3 dB per unit).
+/// * `ratio = step^((is_pos + 1) / 2)` (integer division).
+/// * If `is_pos` is even: `k_l = 1`, `k_r = ratio`.
+/// * If `is_pos` is odd:  `k_l = ratio`, `k_r = 1`.
+///
+/// This matches the geometric-sequence interpretation used by mpg123 /
+/// libmad and the most common reading of the MPEG-2 LSF standard. For
+/// `is_pos == 0` both channels get L unchanged (equal split).
+///
+/// `is_pos == 31` → band is NOT IS-coded: R left at 0, L unchanged.
+pub(crate) fn is_factors_mpeg2(is_pos: u8, intensity_scale: u8) -> (f32, f32) {
+    if is_pos == 0 {
+        // k_l = 1, k_r = 1: both channels get L unchanged.
+        return (1.0, 1.0);
+    }
+    // step^n where step < 1 and n = (is_pos + 1) / 2.
+    let step: f32 = if intensity_scale != 0 { 0.25 } else { 0.5 };
+    let n = ((is_pos as i32 + 1) / 2) as u32;
+    let ratio = step.powi(n as i32);
+    if is_pos & 1 == 0 {
+        // Even: L = 1, R = ratio.
+        (1.0, ratio)
+    } else {
+        // Odd: L = ratio, R = 1.
+        (ratio, 1.0)
+    }
+}
+
+/// Apply MPEG-2 / MPEG-2.5 IS coupling to the samples in `[lo, hi)`.
+/// `is_pos == 31` marks the band as NOT IS-coded — leave R = 0.
+fn apply_is_band_mpeg2(
+    xr_l: &mut [f32; 576],
+    xr_r: &mut [f32; 576],
+    lo: usize,
+    hi: usize,
+    is_pos: u8,
+    intensity_scale: u8,
+) {
+    if is_pos >= 31 {
+        for i in lo..hi.min(576) {
+            xr_r[i] = 0.0;
+        }
+        return;
+    }
+    let (k_l, k_r) = is_factors_mpeg2(is_pos, intensity_scale);
+    for i in lo..hi.min(576) {
+        let l = xr_l[i];
+        xr_l[i] = l * k_l;
+        xr_r[i] = l * k_r;
+    }
+}
+
+/// MPEG-2 / MPEG-2.5 intensity-stereo processing for one granule.
+///
+/// Uses the finer-grained 5-bit `is_pos` (0..=30 valid, 31 = NOT IS-coded)
+/// and the `intensity_scale` flag derived from the LSB of the R channel's
+/// `scalefac_compress`. The R-channel scalefactors decoded in IS mode
+/// (via `decode_mpeg2(.., intensity_stereo=true)`) carry the `is_pos`
+/// directly in `.l[sfb]` / `.s[sfb][win]`.
+///
+/// Behaviour mirrors [`intensity_stereo_mpeg1`] but with the MPEG-2 ratio
+/// table.
+pub fn intensity_stereo_mpeg2(
+    xr_l: &mut [f32; 576],
+    xr_r: &mut [f32; 576],
+    sf_r: &crate::scalefactor::ScaleFactors,
+    gc_r: &GranuleChannel,
+    sample_rate: u32,
+    is_bound_sfb: usize,
+    intensity_scale: u8,
+) {
+    if gc_r.window_switching_flag && gc_r.block_type == 2 {
+        let short_bounds = sfband_short(sample_rate);
+        let (long_end_sfb, long_bounds_end_sample) = if gc_r.mixed_block_flag {
+            (8usize, sfband_long(sample_rate)[8] as usize)
+        } else {
+            (0usize, 0usize)
+        };
+        let long_bounds = sfband_long(sample_rate);
+        for sfb in 0..long_end_sfb {
+            if sfb < is_bound_sfb {
+                continue;
+            }
+            let lo = long_bounds[sfb] as usize;
+            let hi = long_bounds[sfb + 1] as usize;
+            let is_pos = sf_r.l[sfb];
+            apply_is_band_mpeg2(xr_l, xr_r, lo, hi, is_pos, intensity_scale);
+        }
+        let short_start_sfb = if gc_r.mixed_block_flag { 3 } else { 0 };
+        let mut pos = long_bounds_end_sample;
+        for sfb in short_start_sfb..13 {
+            let w = (short_bounds[sfb + 1] - short_bounds[sfb]) as usize;
+            for win in 0..3 {
+                if sfb < is_bound_sfb {
+                    pos += w;
+                    continue;
+                }
+                let is_pos = sf_r.s[sfb][win];
+                apply_is_band_mpeg2(xr_l, xr_r, pos, pos + w, is_pos, intensity_scale);
+                pos += w;
+            }
+        }
+    } else {
+        let long_bounds = sfband_long(sample_rate);
+        for sfb in 0..21 {
+            if sfb < is_bound_sfb {
+                continue;
+            }
+            let lo = long_bounds[sfb] as usize;
+            let hi = long_bounds[sfb + 1] as usize;
+            let is_pos = sf_r.l[sfb];
+            apply_is_band_mpeg2(xr_l, xr_r, lo, hi, is_pos, intensity_scale);
+        }
     }
 }
 
@@ -594,5 +721,95 @@ mod tests {
         assert_eq!(ms_boundary_sample(&gc, 44_100, 0), 0);
         // Out-of-range sfb clamps to the end of the table.
         assert!(ms_boundary_sample(&gc, 44_100, 30) <= 576);
+    }
+
+    // -------- MPEG-2 / MPEG-2.5 IS tests --------
+
+    #[test]
+    fn mpeg2_is_factors_is_pos_zero_is_identity() {
+        // is_pos = 0 → both channels get L unchanged (k_l = k_r = 1).
+        let (k_l, k_r) = is_factors_mpeg2(0, 0);
+        assert!((k_l - 1.0).abs() < 1e-6);
+        assert!((k_r - 1.0).abs() < 1e-6);
+        let (k_l, k_r) = is_factors_mpeg2(0, 1);
+        assert!((k_l - 1.0).abs() < 1e-6);
+        assert!((k_r - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mpeg2_is_factors_even_pos_attenuates_r_scale0() {
+        // is_pos = 2, intensity_scale = 0 → step=0.5, n=(2+1)/2 = 1.
+        // Even → k_l=1, k_r = 0.5.
+        let (k_l, k_r) = is_factors_mpeg2(2, 0);
+        assert!((k_l - 1.0).abs() < 1e-6);
+        assert!((k_r - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mpeg2_is_factors_odd_pos_attenuates_l_scale0() {
+        // is_pos = 3, intensity_scale = 0 → step=0.5, n=(3+1)/2 = 2.
+        // Odd → k_l = 0.25, k_r = 1.
+        let (k_l, k_r) = is_factors_mpeg2(3, 0);
+        assert!((k_l - 0.25).abs() < 1e-6);
+        assert!((k_r - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mpeg2_is_factors_scale1_double_exponent() {
+        // intensity_scale = 1 → step = 0.25 (double the 3-dB exponent).
+        // is_pos = 2: n = 1, even → k_l=1, k_r = 0.25.
+        let (k_l, k_r) = is_factors_mpeg2(2, 1);
+        assert!((k_l - 1.0).abs() < 1e-6);
+        assert!((k_r - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mpeg2_is_factors_sentinel() {
+        // is_pos == 31 → band not IS-coded. apply_is_band_mpeg2 should zero R.
+        let mut l = [0.0f32; 576];
+        let mut r = [0.0f32; 576];
+        l[10] = 0.5;
+        r[10] = 77.0; // pre-IS garbage
+        apply_is_band_mpeg2(&mut l, &mut r, 10, 11, 31, 0);
+        assert_eq!(l[10], 0.5); // unchanged
+        assert_eq!(r[10], 0.0); // wiped
+    }
+
+    #[test]
+    fn mpeg2_is_long_block_applies_only_above_bound() {
+        // Same setup as the MPEG-1 test, but with MPEG-2 IS: set is_pos=2
+        // (even → k_l=1, k_r=0.5) for all sfbs ≥ 6; verify L/R at index
+        // 400.
+        let mut xr_l = [0.0f32; 576];
+        let mut xr_r = [0.0f32; 576];
+        xr_l[400] = 0.8;
+        xr_r[400] = 0.1;
+        let gc = GranuleChannel::default();
+        let mut sf = ScaleFactors::default();
+        for sfb in 6..21 {
+            sf.l[sfb] = 2;
+        }
+        intensity_stereo_mpeg2(&mut xr_l, &mut xr_r, &sf, &gc, 44_100, 6, 0);
+        // is_pos=2, scale=0 → k_l=1, k_r=0.5. So L[400]=0.8, R[400]=0.4.
+        assert!((xr_l[400] - 0.8).abs() < 1e-6);
+        assert!((xr_r[400] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mpeg2_is_below_bound_is_no_op() {
+        // Set is_pos for all sfbs but is_bound_sfb = 20 (just sfb 20 IS-coded).
+        let mut xr_l = [0.0f32; 576];
+        let mut xr_r = [0.0f32; 576];
+        // Idx 100 is in sfb < 20 → untouched.
+        xr_l[100] = 0.3;
+        xr_r[100] = 0.4;
+        let gc = GranuleChannel::default();
+        let mut sf = ScaleFactors::default();
+        for sfb in 0..21 {
+            sf.l[sfb] = 2;
+        }
+        intensity_stereo_mpeg2(&mut xr_l, &mut xr_r, &sf, &gc, 44_100, 20, 0);
+        assert_eq!(xr_l[100], 0.3);
+        assert_eq!(xr_r[100], 0.4);
     }
 }

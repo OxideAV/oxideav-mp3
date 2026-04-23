@@ -344,3 +344,144 @@ fn mpeg25_decode_silent_frame_8k_mono() {
         .unwrap_or(0);
     assert_eq!(max_abs, 0);
 }
+
+/// End-to-end test for MPEG-2 LSF intensity stereo. ffmpeg (libmp3lame)
+/// is asked to encode a stereo signal where the two channels differ by
+/// amplitude at 16 kHz / 32 kbit/s / joint-stereo — a configuration that
+/// strongly encourages the encoder to switch to MPEG-2 IS coding on high
+/// frequencies. The decoded R channel must carry non-zero audio content
+/// (before the MPEG-2 IS landing, the R channel was zero above the IS
+/// bound because the is_pos path was a no-op).
+#[test]
+fn mpeg2_lsf_joint_stereo_ffmpeg_encoded_440hz_16k_decodes_r_channel() {
+    const FFMPEG: &str = "/usr/bin/ffmpeg";
+    if !std::path::Path::new(FFMPEG).exists() {
+        eprintln!("skipping: {FFMPEG} not found");
+        return;
+    }
+    let tmp = std::env::temp_dir().join("oxideav_mp3_mpeg2lsf_js_16k.mp3");
+    // Dual-tone stereo input: L gets a 440 Hz sine, R a 523.25 Hz sine
+    // (different frequency so the decoder really has to reconstruct R
+    // rather than copy L). Merged with lavfi amerge.
+    let status = std::process::Command::new(FFMPEG)
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=16000:duration=1.5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=523.25:sample_rate=16000:duration=1.5",
+            "-filter_complex",
+            "[0:a][1:a]amerge=inputs=2,volume=0.6[a]",
+            "-map",
+            "[a]",
+            "-ac",
+            "2",
+            "-ar",
+            "16000",
+            "-b:a",
+            "32k",
+            "-joint_stereo",
+            "1",
+            "-f",
+            "mp3",
+            tmp.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg encode failed");
+
+    let bytes = std::fs::read(&tmp).expect("read mp3");
+
+    // Skip ID3v2 prefix if any.
+    let mut pos = 0usize;
+    if bytes.len() >= 10 && &bytes[0..3] == b"ID3" {
+        let sz = ((bytes[6] as usize) << 21)
+            | ((bytes[7] as usize) << 14)
+            | ((bytes[8] as usize) << 7)
+            | (bytes[9] as usize);
+        pos = 10 + sz;
+    }
+
+    let params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+    let mut dec = make_decoder(&params).expect("decoder");
+    let tb = TimeBase::new(1, 16_000);
+    let mut pcm_l: Vec<f32> = Vec::new();
+    let mut pcm_r: Vec<f32> = Vec::new();
+    let mut saw_mpeg2 = false;
+    let mut saw_js = false;
+    let mut saw_is_mode = false;
+    while pos + 4 <= bytes.len() {
+        let Ok(hdr) = parse_frame_header(&bytes[pos..]) else {
+            pos += 1;
+            continue;
+        };
+        if hdr.version == MpegVersion::Mpeg2 {
+            saw_mpeg2 = true;
+        }
+        if hdr.channel_mode == ChannelMode::JointStereo {
+            saw_js = true;
+            if hdr.mode_extension & 0x1 != 0 {
+                saw_is_mode = true;
+            }
+        }
+        let Some(flen) = hdr.frame_bytes() else { break };
+        let flen = flen as usize;
+        if pos + flen > bytes.len() {
+            break;
+        }
+        let pkt = Packet::new(0, tb, bytes[pos..pos + flen].to_vec());
+        if dec.send_packet(&pkt).is_ok() {
+            if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                for chunk in a.data[0].chunks_exact(4) {
+                    pcm_l.push(
+                        i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0,
+                    );
+                    pcm_r.push(
+                        i16::from_le_bytes([chunk[2], chunk[3]]) as f32 / 32768.0,
+                    );
+                }
+            }
+        }
+        pos += flen;
+    }
+    assert!(saw_mpeg2, "expected at least one MPEG-2 LSF frame");
+    assert!(saw_js, "expected joint-stereo mode");
+    eprintln!(
+        "MPEG-2 LSF JS test: saw_mpeg2={saw_mpeg2}, saw_js={saw_js}, saw_is_mode={saw_is_mode}"
+    );
+
+    assert!(
+        pcm_l.len() > 4 * 576,
+        "too few samples decoded: {}",
+        pcm_l.len()
+    );
+    assert_eq!(pcm_l.len(), pcm_r.len());
+
+    // Skip warm-up.
+    let warmup = 4 * 576;
+    let l_tail = &pcm_l[warmup..];
+    let r_tail = &pcm_r[warmup..];
+
+    let rms = |x: &[f32]| {
+        (x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / x.len() as f64).sqrt()
+    };
+    let rms_l = rms(l_tail);
+    let rms_r = rms(r_tail);
+    eprintln!("MPEG-2 LSF JS decoded RMS: L={rms_l:.5}, R={rms_r:.5}");
+
+    // L channel must have meaningful audio. R channel must also be
+    // non-zero (regression check: before MPEG-2 IS landed, R could be
+    // near-silent above the IS bound).
+    assert!(rms_l > 0.01, "L channel too quiet, RMS={rms_l}");
+    assert!(
+        rms_r > 0.001,
+        "R channel near-silent — MPEG-2 LSF IS not applied? RMS={rms_r}"
+    );
+}

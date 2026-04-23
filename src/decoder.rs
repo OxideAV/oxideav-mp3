@@ -13,13 +13,11 @@
 //! - mono / stereo / joint-stereo (M/S and intensity) / dual-channel.
 //! - Long / short / start / stop / mixed block types. scfsi reuse.
 //!   Bit reservoir look-back up to the per-version cap.
+//! - MPEG-1 (3-bit `is_pos`, tan-ratio) and MPEG-2 / MPEG-2.5 (5-bit
+//!   `is_pos` with selectable `intensity_scale`) intensity stereo;
+//!   ISO/IEC 11172-3 §2.4.3.4.9.3 and ISO/IEC 13818-3 §2.4.3.2.
 //!
 //! **Not implemented**:
-//! - MPEG-2 / MPEG-2.5 intensity stereo (the finer-grained `is_pos`
-//!   table and selectable `intensity_scale` of ISO 13818-3 §2.4.3.2).
-//!   For those frames M/S applies but the IS path is a no-op; R
-//!   remains the M/S-residual representation above the IS bound.
-//!   MPEG-1 intensity stereo (the dominant IS variant) IS supported.
 //! - CRC-16 verification — the CRC bytes are consumed but not checked.
 
 use oxideav_codec::Decoder;
@@ -31,8 +29,8 @@ use crate::frame::{parse_frame_header, ChannelMode, MpegVersion};
 use crate::huffman::{decode_count1, decode_pair};
 use crate::imdct::{imdct_granule, ImdctState};
 use crate::requantize::{
-    antialias, find_is_bound_sfb, intensity_stereo_mpeg1, ms_boundary_sample, ms_stereo,
-    ms_stereo_range, reorder_short, requantize_granule,
+    antialias, find_is_bound_sfb, intensity_stereo_mpeg1, intensity_stereo_mpeg2,
+    ms_boundary_sample, ms_stereo, ms_stereo_range, reorder_short, requantize_granule,
 };
 use crate::reservoir::Reservoir;
 use crate::scalefactor::{
@@ -191,6 +189,12 @@ impl Mp3Decoder {
         // this lets each granule start cleanly at part2_3_length boundary
         // even when the previous one over- or under-read by a few bits.
         let mut next_granule_bit: u64 = 0;
+        // Precompute joint-stereo flags; needed inside the channel loop so
+        // the R channel's scalefactor decode can switch to MPEG-2 IS mode
+        // (where R's scalefactor partition row changes and the LSB of
+        // `scalefac_compress` carries `intensity_scale`).
+        let js = channels == 2 && hdr.channel_mode == ChannelMode::JointStereo;
+        let is_on_hdr = js && (hdr.mode_extension & 0x1) != 0;
         for gr in 0..num_granules {
             // Per-channel raw-integer coefficients and scalefactors from this
             // granule — kept in full resolution until after stereo decoupling
@@ -222,8 +226,17 @@ impl Mp3Decoder {
                 // Scalefactors. MPEG-1: scfsi-based reuse across the two
                 // granules of one frame. MPEG-2 / MPEG-2.5: one granule per
                 // frame, no scfsi; slens come from a 9-bit scalefac_compress.
+                //
+                // For the R channel of an IS-enabled MPEG-2 / MPEG-2.5 frame,
+                // `decode_mpeg2` must be called with `intensity_stereo=true`
+                // so the partition row / `slen` widths come from the IS half
+                // of the MPEG-2 scalefactor-compress tables (ISO/IEC 13818-3
+                // §2.4.3.2, SCF_PARTITIONS_MPEG2 offsets 16..28). The
+                // resulting `.l` / `.s` values then hold `is_pos` for each
+                // sfb, which the IS coupling step consumes.
+                let ist_r = is_mpeg2 && is_on_hdr && ch == 1;
                 let sf = if is_mpeg2 {
-                    decode_sf_mpeg2(&mut br, &gc, false)?
+                    decode_sf_mpeg2(&mut br, &gc, ist_r)?
                 } else {
                     decode_sf_mpeg1(&mut br, &gc, &si.scfsi[ch], gr, &frame_gr0_sf[ch])?
                 };
@@ -317,13 +330,11 @@ impl Mp3Decoder {
                 // the bound). For non-IS frames the bound equals the full
                 // range and the IS path is a no-op.
                 //
-                // For now MPEG-2 / MPEG-2.5 IS (finer-grained is_pos table
-                // plus intensity_scale) is not implemented — those frames
-                // get only M/S, and the R channel remains the "M/S residual"
-                // representation above the bound. This matches the behaviour
-                // documented in the crate README and is acceptable because
-                // MPEG-2 IS coding is comparatively rare; MPEG-1 IS is the
-                // common case and is handled here.
+                // MPEG-1 IS uses a 3-bit `is_pos` (0..=6, 7 = sentinel) with
+                // the `tan(is_pos * pi/12)` ratio. MPEG-2 / MPEG-2.5 IS uses
+                // a 5-bit `is_pos` (0..=30, 31 = sentinel) with a geometric
+                // step selected by `intensity_scale` (the LSB of R's 9-bit
+                // `scalefac_compress`); see `intensity_stereo_mpeg2`.
                 let is_gc_r = si.granules[gr][1];
                 let is_bound = if is_on {
                     find_is_bound_sfb(&is_ch[1], &is_gc_r, hdr.sample_rate)
@@ -348,6 +359,22 @@ impl Mp3Decoder {
                         hdr.sample_rate,
                         is_bound,
                     );
+                } else if is_on && is_mpeg2 {
+                    // MPEG-2 / MPEG-2.5 IS. `sf_ch[1]` contains per-sfb
+                    // `is_pos` values decoded via the IS scalefactor
+                    // partition rows; `intensity_scale` is the LSB of the
+                    // R channel's 9-bit `scalefac_compress`.
+                    let intensity_scale = (si.granules[gr][1].scalefac_compress_9 & 1) as u8;
+                    let (l, r) = pcm[gr].split_at_mut(1);
+                    intensity_stereo_mpeg2(
+                        &mut l[0],
+                        &mut r[0],
+                        &sf_ch[1],
+                        &is_gc_r,
+                        hdr.sample_rate,
+                        is_bound,
+                        intensity_scale,
+                    );
                 }
 
                 if ms_on {
@@ -355,7 +382,7 @@ impl Mp3Decoder {
                     // (the IS path owns the above-bound coefficients). When
                     // IS is off, M/S covers the full granule.
                     let (l, r) = pcm[gr].split_at_mut(1);
-                    if is_on && !is_mpeg2 {
+                    if is_on {
                         // Rotate only samples below the IS bound. For long
                         // blocks the bound is a single sample offset; for
                         // short/mixed blocks use the same conservative
