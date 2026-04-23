@@ -511,3 +511,171 @@ fn decoder_multi_bitrate() {
         );
     }
 }
+
+/// Encode stereo content at low bitrate in joint-stereo mode so the
+/// lame encoder is likely to exercise intensity stereo on high-frequency
+/// bands, then decode the stream with our decoder and verify:
+/// 1. At least one frame with mode_extension bit 0x1 (intensity stereo)
+///    is present (otherwise the test is not actually exercising IS).
+/// 2. The decoded PCM RMS difference vs ffmpeg's own decode stays below
+///    a loose threshold (the IS coupling is a lossy equal-energy split,
+///    so we don't require bit-exactness — only that our decoder does
+///    NOT silently zero the R channel above the IS bound).
+#[test]
+fn decoder_handles_intensity_stereo_frames() {
+    if !ffmpeg_available() {
+        eprintln!("skip: ffmpeg unavailable");
+        return;
+    }
+    // Panned high-frequency content biases lame toward intensity stereo:
+    // L carries a 440 Hz tone, R carries a 7 kHz tone. Different
+    // content on each channel with HF concentrated on R gives the
+    // encoder room to IS-code the upper sfbs (R amplitude there is
+    // large and differs from L → is_pos != 3 will be chosen).
+    let sr: u32 = 44_100;
+    let ch: u16 = 2;
+    let n = (sr as f32 * 2.0) as usize;
+    let mut pcm: Vec<i16> = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f64 / sr as f64;
+        let l = 0.5 * (2.0 * std::f64::consts::PI * 440.0 * t).sin();
+        let r = 0.5 * (2.0 * std::f64::consts::PI * 7000.0 * t).sin();
+        pcm.push((l.clamp(-1.0, 1.0) * 30000.0) as i16);
+        pcm.push((r.clamp(-1.0, 1.0) * 30000.0) as i16);
+    }
+
+    let raw_path = tmp("oxideav-mp3-is-test.raw");
+    write_pcm_s16le(&raw_path, &pcm);
+
+    // Very low bitrate + forced joint-stereo: strongly biases lame toward IS.
+    let mp3_path = tmp("oxideav-mp3-is-test.mp3");
+    let st = Command::new(FFMPEG)
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            &sr.to_string(),
+            "-ac",
+            &ch.to_string(),
+            "-i",
+        ])
+        .arg(&raw_path)
+        .args([
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "32k",
+            "-joint_stereo",
+            "1",
+        ])
+        .arg(&mp3_path)
+        .status();
+    if !matches!(st, Ok(s) if s.success()) {
+        eprintln!("skip: ffmpeg encode failed");
+        return;
+    }
+
+    let mp3_data = std::fs::read(&mp3_path).expect("read mp3");
+
+    // Scan the bitstream for any frame with mode_extension bit 0x1 set.
+    let mut saw_is = false;
+    let mut pos = 0usize;
+    if mp3_data.len() >= 10 && &mp3_data[0..3] == b"ID3" {
+        let sz = (((mp3_data[6] & 0x7F) as usize) << 21)
+            | (((mp3_data[7] & 0x7F) as usize) << 14)
+            | (((mp3_data[8] & 0x7F) as usize) << 7)
+            | ((mp3_data[9] & 0x7F) as usize);
+        pos = 10 + sz;
+    }
+    // Byte-by-byte scan (don't assume every sync is at predicted frame_bytes
+    // boundary — padding and Xing info frames can desync a step-by-flen loop).
+    let mut total_frames = 0u32;
+    let mut is_count = 0u32;
+    let mut ms_count = 0u32;
+    while pos + 4 <= mp3_data.len() {
+        if mp3_data[pos] == 0xFF && (mp3_data[pos + 1] & 0xE0) == 0xE0 {
+            // Decode mode_ext directly from header bytes, without
+            // restricting to Layer III — older copies of the helper
+            // reject anything that isn't L3 or fails other checks.
+            let me = (mp3_data[pos + 3] >> 4) & 0x3;
+            let cm = (mp3_data[pos + 3] >> 6) & 0x3;
+            total_frames += 1;
+            if cm == 1 {
+                if (me & 0x1) != 0 {
+                    saw_is = true;
+                    is_count += 1;
+                }
+                if (me & 0x2) != 0 {
+                    ms_count += 1;
+                }
+            }
+        }
+        pos += 1;
+    }
+    eprintln!(
+        "IS test scan: total={total_frames} IS={is_count} MS={ms_count} saw_is={saw_is}"
+    );
+    if !saw_is {
+        eprintln!("skip: lame did not emit any IS frames at these settings");
+        return;
+    }
+
+    // Compare vs ffmpeg's own decode.
+    let ffmpeg_decoded_path = tmp("oxideav-mp3-is-test-ref.raw");
+    let st = Command::new(FFMPEG)
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&mp3_path)
+        .args([
+            "-f",
+            "s16le",
+            "-ar",
+            &sr.to_string(),
+            "-ac",
+            &ch.to_string(),
+        ])
+        .arg(&ffmpeg_decoded_path)
+        .status();
+    if !matches!(st, Ok(s) if s.success()) {
+        eprintln!("skip: ffmpeg decode failed");
+        return;
+    }
+
+    let our_decoded = decode_with_ours(&mp3_data, sr);
+    let ffmpeg_decoded = read_pcm_s16le(&ffmpeg_decoded_path);
+
+    // Truncate to the shorter of the two buffers — ffmpeg trims encoder
+    // delay from the front, so we align by taking the overlap tail.
+    let common_len = our_decoded.len().min(ffmpeg_decoded.len());
+    let drop_our = our_decoded.len() - common_len;
+    let drop_ff = ffmpeg_decoded.len() - common_len;
+    let our_aligned = &our_decoded[drop_our..];
+    let ff_aligned = &ffmpeg_decoded[drop_ff..];
+
+    // Focus on the R channel — the one IS reconstructs. Interleaved layout:
+    // odd indices are R samples.
+    let our_r: Vec<i16> = our_aligned.iter().skip(1).step_by(2).copied().collect();
+    let ff_r: Vec<i16> = ff_aligned.iter().skip(1).step_by(2).copied().collect();
+
+    // Also total RMS.
+    let rms = rms_diff(our_aligned, ff_aligned);
+    let rms_r = rms_diff(&our_r, &ff_r);
+    eprintln!(
+        "IS test: total RMS={rms:.4}  R-channel RMS={rms_r:.4}  ours={} ffmpeg={}",
+        our_decoded.len(),
+        ffmpeg_decoded.len()
+    );
+    // Without IS support the R channel would be badly wrong (high RMS).
+    // With IS, both channels should roughly match ffmpeg. The low-bitrate
+    // encoder introduces its own distortion, so we only require that
+    // the R channel isn't catastrophically off — RMS < 0.3 is a loose
+    // correctness bound that a silent-R or reversed-R implementation
+    // would fail.
+    assert!(
+        rms_r < 0.3,
+        "R-channel RMS {rms_r:.4} too high — intensity stereo likely wrong"
+    );
+}
