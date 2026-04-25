@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-mp3/compare/v0.0.4...v0.0.5) - 2026-04-25
+
+### Other
+
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- implement MPEG-2 / MPEG-2.5 intensity stereo
+- add NOTICES for minimp3 references
+- add ffmpeg-based intensity-stereo end-to-end test
+- implement MPEG-1 intensity stereo decode
+- enable MPEG-2.5 decode (8 / 11.025 / 12 kHz)
+- bump oxideav-container dep to "0.1"
+- drop Cargo.lock — this crate is a library
+- bump oxideav-core / oxideav-codec dep examples to "0.1"
+- bump to oxideav-core 0.1.1 + codec 0.1.1
+- migrate register() to CodecInfo builder
+- bump oxideav-core + oxideav-codec deps to "0.1"
+- thread &dyn CodecResolver through open()
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-mp3/compare/v0.0.3...v0.0.4) - 2026-04-19
 
 ### Other
