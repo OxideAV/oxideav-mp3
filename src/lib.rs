@@ -43,9 +43,9 @@ pub mod sideinfo;
 pub mod synthesis;
 pub mod window;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub const CODEC_ID_STR: &str = "mp3";
 

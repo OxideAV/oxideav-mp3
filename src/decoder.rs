@@ -1,4 +1,4 @@
-//! MP3 packet → AudioFrame decoder, wired into [`oxideav_codec::Decoder`].
+//! MP3 packet → AudioFrame decoder, wired into [`oxideav_core::Decoder`].
 //!
 //! The decoder threads side info, scalefactors, Huffman, requantise,
 //! antialias, IMDCT, and polyphase synthesis. It maintains a per-channel
@@ -20,7 +20,7 @@
 //! **Not implemented**:
 //! - CRC-16 verification — the CRC bytes are consumed but not checked.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
@@ -387,11 +387,8 @@ impl Mp3Decoder {
                         // blocks the bound is a single sample offset; for
                         // short/mixed blocks use the same conservative
                         // sample-index derived from the sfb bound.
-                        let boundary_sample = ms_boundary_sample(
-                            &is_gc_r,
-                            hdr.sample_rate,
-                            is_bound,
-                        );
+                        let boundary_sample =
+                            ms_boundary_sample(&is_gc_r, hdr.sample_rate, is_bound);
                         ms_stereo_range(&mut l[0], &mut r[0], 0, boundary_sample);
                     } else {
                         ms_stereo(&mut l[0], &mut r[0]);

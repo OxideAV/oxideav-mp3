@@ -440,12 +440,8 @@ fn mpeg2_lsf_joint_stereo_ffmpeg_encoded_440hz_16k_decodes_r_channel() {
         if dec.send_packet(&pkt).is_ok() {
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
                 for chunk in a.data[0].chunks_exact(4) {
-                    pcm_l.push(
-                        i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0,
-                    );
-                    pcm_r.push(
-                        i16::from_le_bytes([chunk[2], chunk[3]]) as f32 / 32768.0,
-                    );
+                    pcm_l.push(i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0);
+                    pcm_r.push(i16::from_le_bytes([chunk[2], chunk[3]]) as f32 / 32768.0);
                 }
             }
         }
@@ -469,9 +465,8 @@ fn mpeg2_lsf_joint_stereo_ffmpeg_encoded_440hz_16k_decodes_r_channel() {
     let l_tail = &pcm_l[warmup..];
     let r_tail = &pcm_r[warmup..];
 
-    let rms = |x: &[f32]| {
-        (x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / x.len() as f64).sqrt()
-    };
+    let rms =
+        |x: &[f32]| (x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / x.len() as f64).sqrt();
     let rms_l = rms(l_tail);
     let rms_r = rms(r_tail);
     eprintln!("MPEG-2 LSF JS decoded RMS: L={rms_l:.5}, R={rms_r:.5}");

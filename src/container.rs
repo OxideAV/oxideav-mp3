@@ -20,11 +20,11 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use oxideav_container::{ContainerRegistry, Demuxer, ProbeData, ReadSeek};
 use oxideav_core::{
     AttachedPicture, CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result,
     SampleFormat, StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, ProbeData, ReadSeek};
 
 use crate::frame::parse_frame_header_any_layer;
 

@@ -9,7 +9,7 @@
 
 use std::io::Cursor;
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::PictureType;
 
 /// Build a minimal ID3v2.3 tag carrying TIT2, TPE1, and an APIC.
@@ -79,7 +79,7 @@ fn mp3_metadata_and_pictures_flow_through() {
     let mut reg = ContainerRegistry::new();
     oxideav_mp3::register_containers(&mut reg);
 
-    let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
     let demuxer = reg
         .open_demuxer("mp3", cursor, &oxideav_core::NullCodecResolver)
         .expect("open mp3 demuxer");

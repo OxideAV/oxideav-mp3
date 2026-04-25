@@ -217,12 +217,7 @@ pub fn ms_stereo(xr_l: &mut [f32; 576], xr_r: &mut [f32; 576]) {
 
 /// Apply MS stereo only on samples in `[lo, hi)`. Used when IS and MS
 /// coexist — MS covers the below-IS-bound region, IS covers above.
-pub fn ms_stereo_range(
-    xr_l: &mut [f32; 576],
-    xr_r: &mut [f32; 576],
-    lo: usize,
-    hi: usize,
-) {
+pub fn ms_stereo_range(xr_l: &mut [f32; 576], xr_r: &mut [f32; 576], lo: usize, hi: usize) {
     let inv_sqrt2 = 1.0 / 2.0_f32.sqrt();
     let end = hi.min(576);
     for i in lo..end {
@@ -362,7 +357,13 @@ pub fn intensity_stereo_mpeg1(
 
 /// Apply the MPEG-1 IS coupling to the samples in `[lo, hi)`.
 /// `is_pos == 7` is the "not intensity-coded" sentinel — leave R = 0.
-fn apply_is_band(xr_l: &mut [f32; 576], xr_r: &mut [f32; 576], lo: usize, hi: usize, is_pos: usize) {
+fn apply_is_band(
+    xr_l: &mut [f32; 576],
+    xr_r: &mut [f32; 576],
+    lo: usize,
+    hi: usize,
+    is_pos: usize,
+) {
     if is_pos >= 7 {
         // Not IS-coded: R stays zero (encoder silenced it). L unchanged.
         // Defensively set R to 0 in this band.
@@ -511,11 +512,7 @@ pub fn intensity_stereo_mpeg2(
 /// simply `long_bounds[bound]`. For short / mixed blocks we return the
 /// sample index where that sfb starts in the coefficient layout (post-
 /// reorder, i.e. interleaved-by-window for short).
-pub fn ms_boundary_sample(
-    gc_r: &GranuleChannel,
-    sample_rate: u32,
-    is_bound_sfb: usize,
-) -> usize {
+pub fn ms_boundary_sample(gc_r: &GranuleChannel, sample_rate: u32, is_bound_sfb: usize) -> usize {
     if gc_r.window_switching_flag && gc_r.block_type == 2 {
         let short_bounds = sfband_short(sample_rate);
         let long_bounds = sfband_long(sample_rate);
@@ -555,11 +552,7 @@ pub fn ms_boundary_sample(
 /// index across all three windows. This matches the common pattern
 /// from minimp3 and libmad within a few sfbs and is correct for
 /// encoder outputs where R is flat-zero above the IS bound.
-pub fn find_is_bound_sfb(
-    is_r: &[i32; 576],
-    gc_r: &GranuleChannel,
-    sample_rate: u32,
-) -> usize {
+pub fn find_is_bound_sfb(is_r: &[i32; 576], gc_r: &GranuleChannel, sample_rate: u32) -> usize {
     if gc_r.window_switching_flag && gc_r.block_type == 2 {
         // Short / mixed. Walk sfb from end down; the first sfb with a
         // nonzero R coeff in ANY window defines the bound (bound_sfb + 1).

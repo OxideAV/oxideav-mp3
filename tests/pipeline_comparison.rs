@@ -122,10 +122,10 @@ fn encode_with_ours(pcm: &[i16], sample_rate: u32, channels: u16, bitrate: u32) 
 /// Decode MP3 bytes with our decoder via the MP3 container demuxer,
 /// which handles frame sync and splits into individual packets.
 fn decode_with_ours(mp3: &[u8], _sample_rate: u32) -> Vec<i16> {
-    use oxideav_container::ReadSeek;
+    use oxideav_core::ReadSeek;
     use std::io::Cursor;
 
-    let mut reg = oxideav_container::ContainerRegistry::new();
+    let mut reg = oxideav_core::ContainerRegistry::new();
     oxideav_mp3::register_containers(&mut reg);
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(mp3.to_vec()));
     let mut demuxer = reg
@@ -564,14 +564,7 @@ fn decoder_handles_intensity_stereo_frames() {
             "-i",
         ])
         .arg(&raw_path)
-        .args([
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "32k",
-            "-joint_stereo",
-            "1",
-        ])
+        .args(["-c:a", "libmp3lame", "-b:a", "32k", "-joint_stereo", "1"])
         .arg(&mp3_path)
         .status();
     if !matches!(st, Ok(s) if s.success()) {
@@ -616,9 +609,7 @@ fn decoder_handles_intensity_stereo_frames() {
         }
         pos += 1;
     }
-    eprintln!(
-        "IS test scan: total={total_frames} IS={is_count} MS={ms_count} saw_is={saw_is}"
-    );
+    eprintln!("IS test scan: total={total_frames} IS={is_count} MS={ms_count} saw_is={saw_is}");
     if !saw_is {
         eprintln!("skip: lame did not emit any IS frames at these settings");
         return;
