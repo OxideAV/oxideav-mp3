@@ -67,8 +67,8 @@ fn mpeg2_lsf_decode_silent_frame_produces_576_samples() {
         Frame::Audio(a) => a,
         _ => panic!("expected AudioFrame"),
     };
-    assert_eq!(audio.sample_rate, 24_000);
-    assert_eq!(audio.channels, 2);
+    // Stream-level rate/channels live in the MP3 frame header (24 kHz
+    // stereo built explicitly above); not on the slim AudioFrame.
     // MPEG-2 LSF: 576 samples per frame (1 granule × 576).
     assert_eq!(audio.samples, 576);
     // S16 stereo → 576 * 2 channels * 2 bytes = 2304 bytes.
@@ -232,7 +232,7 @@ fn mpeg2_lsf_decode_silent_frame_mono_22050() {
         _ => panic!("expected AudioFrame"),
     };
     assert_eq!(audio.samples, 576);
-    assert_eq!(audio.channels, 1);
+    // Stream-level channels live in the MP3 frame header (mono above).
     // Mono: 576 * 1 * 2 bytes.
     assert_eq!(audio.data[0].len(), 576 * 2);
     let max_abs = audio.data[0]
@@ -283,8 +283,8 @@ fn mpeg25_header_parses_and_decode_silent_frame_12k_stereo() {
         Frame::Audio(a) => a,
         _ => panic!("expected AudioFrame"),
     };
-    assert_eq!(audio.sample_rate, 12_000);
-    assert_eq!(audio.channels, 2);
+    // Stream-level rate/channels live in the MP3 frame header (12 kHz
+    // stereo built explicitly above).
     assert_eq!(audio.samples, 576);
     assert_eq!(audio.data[0].len(), 576 * 2 * 2);
     let max_abs = audio.data[0]
@@ -333,8 +333,8 @@ fn mpeg25_decode_silent_frame_8k_mono() {
         Frame::Audio(a) => a,
         _ => panic!("expected AudioFrame"),
     };
-    assert_eq!(audio.sample_rate, 8_000);
-    assert_eq!(audio.channels, 1);
+    // Stream-level rate/channels live in the MP3 frame header (8 kHz
+    // mono built explicitly above).
     assert_eq!(audio.samples, 576);
     assert_eq!(audio.data[0].len(), 576 * 2);
     let max_abs = audio.data[0]

@@ -129,9 +129,9 @@ fn decode_mono_first_frame() {
     dec.send_packet(&pkt).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
     if let oxideav_core::Frame::Audio(a) = frame {
+        // Stream-level rate/channels live in `hdr` (parse_frame_header
+        // above); the slim AudioFrame doesn't carry them per-frame.
         assert_eq!(a.samples, 1152);
-        assert_eq!(a.channels, 1);
-        assert_eq!(a.sample_rate, hdr.sample_rate);
     } else {
         panic!("not an audio frame");
     }
@@ -162,9 +162,9 @@ fn decode_stereo_first_frame() {
     dec.send_packet(&pkt).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
     if let oxideav_core::Frame::Audio(a) = frame {
+        // Stream-level rate/channels live in `hdr`; the slim AudioFrame
+        // doesn't carry them per-frame.
         assert_eq!(a.samples, 1152);
-        assert_eq!(a.channels, 2);
-        assert_eq!(a.sample_rate, hdr.sample_rate);
         // Interleaved S16: 1152 samples * 2 channels * 2 bytes.
         assert_eq!(a.data.len(), 1);
         assert_eq!(a.data[0].len(), 1152 * 2 * 2);
@@ -216,7 +216,8 @@ fn decode_mono_dominant_frequency_is_440hz() {
             break;
         };
         if let oxideav_core::Frame::Audio(a) = frame {
-            sample_rate = a.sample_rate;
+            // Stream-level rate lives in the MP3 frame header (`hdr`).
+            sample_rate = hdr.sample_rate;
             for chunk in a.data[0].chunks_exact(2) {
                 let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
                 all_pcm.push(s);
@@ -365,7 +366,8 @@ fn decode_440hz_steady_state_zero_crossings() {
             break;
         };
         if let oxideav_core::Frame::Audio(a) = frame {
-            sample_rate = a.sample_rate;
+            // Stream-level rate lives in the MP3 frame header (`hdr`).
+            sample_rate = hdr.sample_rate;
             for chunk in a.data[0].chunks_exact(2) {
                 all_pcm.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
@@ -423,9 +425,9 @@ fn decode_silence_path_via_reservoir() {
     dec.send_packet(&pkt).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
     if let oxideav_core::Frame::Audio(a) = frame {
+        // Stream-level rate/channels are encoded in the MP3 frame header
+        // built explicitly above (48 kHz mono).
         assert_eq!(a.samples, 1152);
-        assert_eq!(a.channels, 1);
-        assert_eq!(a.sample_rate, 48_000);
         assert_eq!(a.data.len(), 1);
         // Silence: every sample exactly zero.
         for chunk in a.data[0].chunks_exact(2) {

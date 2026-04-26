@@ -56,7 +56,6 @@ fn encode_to_bytes(pcm: &[i16], sample_rate: u32, channels: u16, bitrate_bps: u6
     params.bit_rate = Some(bitrate_bps);
 
     let mut enc = make_encoder(&params).expect("encoder");
-    let tb = TimeBase::new(1, sample_rate as i64);
 
     // Feed in chunks of 1152 samples per channel.
     let chunk = 1152 * channels as usize;
@@ -68,12 +67,8 @@ fn encode_to_bytes(pcm: &[i16], sample_rate: u32, channels: u16, bitrate_bps: u6
     for slice in bytes_in.chunks(chunk * 2) {
         let n_samples = slice.len() / (2 * channels as usize);
         let frame = AudioFrame {
-            format: SampleFormat::S16,
-            channels,
-            sample_rate,
             samples: n_samples as u32,
             pts: Some(pts),
-            time_base: tb,
             data: vec![slice.to_vec()],
         };
         enc.send_frame(&Frame::Audio(frame)).expect("send_frame");

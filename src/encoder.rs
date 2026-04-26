@@ -261,16 +261,9 @@ impl Mp3Encoder {
     }
 
     fn ingest(&mut self, frame: &AudioFrame) -> Result<()> {
-        if frame.channels != self.channels || frame.sample_rate != self.sample_rate {
-            return Err(Error::invalid(
-                "MP3 encoder: frame channel/sample-rate mismatch",
-            ));
-        }
-        if frame.format != SampleFormat::S16 {
-            return Err(Error::invalid(
-                "MP3 encoder: input frames must be S16 interleaved",
-            ));
-        }
+        // Stream-level validation (channel count, sample rate, S16
+        // sample format) is owned by the factory at construction —
+        // see `make_encoder`. The slim AudioFrame doesn't carry them.
         let data = frame
             .data
             .first()

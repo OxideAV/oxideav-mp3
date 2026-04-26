@@ -22,7 +22,7 @@
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat,
 };
 
 use crate::frame::{parse_frame_header, ChannelMode, MpegVersion};
@@ -44,7 +44,6 @@ use oxideav_core::bits::BitReader;
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Mp3Decoder {
         codec_id: params.codec_id.clone(),
-        time_base: TimeBase::new(1, 48_000),
         pending: None,
         reservoir: Reservoir::new(),
         prev_sf: [[ScaleFactors::default(); 2]; 2],
@@ -59,7 +58,6 @@ impl Copy for ScaleFactors {}
 
 struct Mp3Decoder {
     codec_id: CodecId,
-    time_base: TimeBase,
     pending: Option<Packet>,
     reservoir: Reservoir,
     /// prev_sf[gr][ch] — only [1][ch] matters for scfsi reuse.
@@ -146,7 +144,6 @@ impl Mp3Decoder {
         };
 
         // Update time base on first frame.
-        self.time_base = TimeBase::new(1, hdr.sample_rate as i64);
 
         let main_data_start = header_len + si_bytes;
         let main_data = &data[main_data_start..];
@@ -163,12 +160,8 @@ impl Mp3Decoder {
                 let n = hdr.samples_per_frame() as usize;
                 let bytes = vec![0u8; n * channels * 2];
                 return Ok(Frame::Audio(AudioFrame {
-                    format: SampleFormat::S16,
-                    channels: channels as u16,
-                    sample_rate: hdr.sample_rate,
                     samples: n as u32,
                     pts: pkt.pts,
-                    time_base: self.time_base,
                     data: vec![bytes],
                 }));
             }
@@ -444,12 +437,8 @@ impl Mp3Decoder {
         self.reservoir.append(main_data);
 
         Ok(Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: channels as u16,
-            sample_rate: hdr.sample_rate,
             samples: total_samples,
             pts: pkt.pts,
-            time_base: self.time_base,
             data: vec![out_bytes],
         }))
     }
