@@ -118,8 +118,10 @@ rate-control modes:
 - **Versions**: MPEG-1 (32 / 44.1 / 48 kHz) and MPEG-2 LSF
   (16 / 22.05 / 24 kHz). MPEG-1 emits 2 granules per frame, MPEG-2 LSF
   emits 1.
-- **Channels**: mono or dual-channel stereo. No joint-stereo, no
-  intensity-stereo.
+- **Channels**: mono, dual-channel stereo, joint-stereo (M/S — picked
+  per frame from the spectral correlation; ISO/IEC 11172-3
+  §2.4.3.4.10). Intensity stereo on the encode side is out of scope.
+  Disable MS with `joint_stereo=0`.
 - **Blocks**: long blocks only (block_type = 0). No window switching.
 - **Rate control**:
   - **CBR** (default): one rate per encoder instance, picked from the

@@ -7,13 +7,14 @@
 //! and scfsi reuse. CRC bytes are consumed but not verified.
 //!
 //! Encoder is a minimum-viable MPEG-1 / MPEG-2 LSF Layer III encoder:
-//! long blocks only, no joint-stereo, with two rate-control strategies:
-//! CBR (global-gain bisection to fit a fixed per-frame bit budget) and
-//! VBR (lightweight per-band masking model in [`psy`] picks the smallest
-//! quantizer step that satisfies a quality-derived noise-to-mask
-//! threshold). The bit reservoir rolls forward via `main_data_begin`
-//! across frames within the per-version lookback cap (511 bytes MPEG-1 /
-//! 255 bytes MPEG-2 LSF).
+//! long blocks only, optional MS joint-stereo (picked per frame from
+//! spectral correlation; ISO/IEC 11172-3 §2.4.3.4.10), with two
+//! rate-control strategies: CBR (global-gain bisection to fit a fixed
+//! per-frame bit budget) and VBR (lightweight per-band masking model
+//! in [`psy`] picks the smallest quantizer step that satisfies a
+//! quality-derived noise-to-mask threshold). The bit reservoir rolls
+//! forward via `main_data_begin` across frames within the per-version
+//! lookback cap (511 bytes MPEG-1 / 255 bytes MPEG-2 LSF).
 //!
 //! The container demuxer at [`container`] accepts `.mp1` / `.mp2` / `.mp3`
 //! raw streams (with ID3v2 prefix + ID3v1 trailer) and routes packets to

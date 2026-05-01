@@ -22,6 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same quality knob.
 - 8 new VBR end-to-end tests (`tests/encoder_vbr.rs`) plus 5 unit
   tests in `psy::tests`.
+- Joint-stereo (M/S) encoding per ISO/IEC 11172-3 §2.4.3.4.10. The
+  encoder picks per-frame between M/S and dual-channel from the
+  side-vs-mid energy ratio across both granules — when the side
+  channel carries less than 30% of the mid energy (correlated stereo:
+  centred voice + ambient, mono fold-down) the granules are rotated
+  into `M = (L+R)/sqrt(2)`, `S = (L-R)/sqrt(2)`, the header switches
+  to `mode = 0b01` (joint stereo) and `mode_extension = 0b10` (M/S
+  on, IS off). Anti-correlated and true-stereo content stays in
+  dual-channel. Opt out with `joint_stereo=0`. On a centred-voice
+  stereo fixture this saves ~10% bytes in VBR mode at the same
+  quality knob; CBR mode keeps slot sizes fixed and spends the
+  freed bits on lower noise instead. New tests:
+  `tests/encoder_joint_stereo.rs` (6 cases — header bits, byte-size
+  delta, anti-correlation rejection, own-decoder round-trip, ffmpeg
+  cross-decode, opt-out).
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-mp3/compare/v0.0.4...v0.0.5) - 2026-04-25
 

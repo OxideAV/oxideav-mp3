@@ -3,7 +3,7 @@
 //! Scope (deliberately narrow):
 //! - MPEG-1 Layer III (32 / 44.1 / 48 kHz, 2 granules/frame) and
 //!   MPEG-2 LSF Layer III (16 / 22.05 / 24 kHz, 1 granule/frame),
-//!   mono or "dual-channel" stereo (no joint stereo / MS / IS).
+//!   mono / dual-channel stereo / joint stereo (M/S only — no IS).
 //! - One CBR bitrate per encoder instance, picked from the version's
 //!   standard bitrate table.
 //! - Long blocks only (block_type = 0). No window switching.
@@ -83,12 +83,29 @@ pub enum RateControl {
 ///   Mirrors LAME's V0..V9 spirit without copying their tables.
 /// - `cbr_bitrate_kbps` — `u32` CBR slot in kbps. When `vbr_quality`
 ///   is unset, this overrides `CodecParameters::bit_rate`.
-#[derive(Default, Debug, Clone)]
+/// - `joint_stereo` — `u32` 0/1. When `1` (the default for stereo
+///   inputs), the encoder may emit MS-stereo joint-stereo frames per
+///   ISO/IEC 11172-3 §2.4.3.4.10 — picked per frame from a spectral
+///   correlation metric. When `0` the encoder always emits
+///   dual-channel (mode = `0b10`) frames.
+#[derive(Debug, Clone)]
 pub struct Mp3EncoderOptions {
     /// `Some(0..=9)` → switch to VBR with the given quality index.
     pub vbr_quality: Option<u8>,
     /// Override for the CBR slot (kbps). Only consulted in CBR mode.
     pub cbr_bitrate_kbps: Option<u32>,
+    /// Allow joint-stereo (MS) coding for stereo inputs. Default: `true`.
+    pub joint_stereo: bool,
+}
+
+impl Default for Mp3EncoderOptions {
+    fn default() -> Self {
+        Self {
+            vbr_quality: None,
+            cbr_bitrate_kbps: None,
+            joint_stereo: true,
+        }
+    }
 }
 
 impl CodecOptionsStruct for Mp3EncoderOptions {
@@ -104,6 +121,12 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
             kind: OptionKind::U32,
             default: OptionValue::U32(0),
             help: "Override CBR bitrate in kbps. Ignored when vbr_quality is set.",
+        },
+        OptionField {
+            name: "joint_stereo",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "Allow joint-stereo (MS) coding when the spectrum is highly correlated. 0 = always dual-channel, 1 = enable MS (default).",
         },
     ];
 
@@ -123,6 +146,10 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
                 if n > 0 {
                     self.cbr_bitrate_kbps = Some(n);
                 }
+            }
+            "joint_stereo" => {
+                let n = v.as_u32()?;
+                self.joint_stereo = n != 0;
             }
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -235,6 +262,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         RateControl::Cbr
     };
     let vbr_quality = opts.vbr_quality.unwrap_or(2);
+    // Joint stereo only makes sense for two-channel input. For mono /
+    // dual-channel-forced configurations the flag stays effectively off.
+    let allow_joint_stereo = opts.joint_stereo && channels == 2;
 
     // CBR slot: explicit option override > params.bit_rate > version default.
     let default_kbps = if is_mpeg2 { 64 } else { 128 };
@@ -277,6 +307,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         is_mpeg2,
         rate_control,
         vbr_quality,
+        allow_joint_stereo,
         time_base: TimeBase::new(1, sample_rate as i64),
         analysis_state: [AnalysisState::new(), AnalysisState::new()],
         mdct_state: [MdctState::new(), MdctState::new()],
@@ -305,6 +336,9 @@ struct Mp3Encoder {
     rate_control: RateControl,
     /// VBR quality 0..=9; only consulted when `rate_control == Vbr`.
     vbr_quality: u8,
+    /// `true` when the encoder may emit joint-stereo (MS) frames. Only
+    /// meaningful for two-channel inputs.
+    allow_joint_stereo: bool,
     time_base: TimeBase,
     analysis_state: [AnalysisState; 2],
     mdct_state: [MdctState; 2],
@@ -460,6 +494,29 @@ impl Mp3Encoder {
             }
         }
 
+        // Joint-stereo (MS) decision (ISO/IEC 11172-3 §2.4.3.4.10).
+        // The frame-level `mode_extension` field is shared across both
+        // granules, so the decision is taken once per frame from the
+        // aggregated spectral correlation.
+        //
+        // Heuristic: compute mid/side energies in the canonical basis
+        //   M[k] = (L[k] + R[k]) / sqrt(2)
+        //   S[k] = (L[k] - R[k]) / sqrt(2)
+        // (mass-preserving: |M|^2 + |S|^2 = |L|^2 + |R|^2). The frame is
+        // a good candidate for MS when the side energy is small relative
+        // to the mid energy — i.e. L and R are highly correlated. We use
+        // a conservative ratio (S energy < 30% of M energy) that mirrors
+        // LAME's spec-compliant default behaviour without copying its
+        // tables: it consistently shrinks correlated material (centred
+        // voice, mono-fold-down) and stays out of the way for true
+        // stereo content where MS would lose energy compaction.
+        let use_ms = self.allow_joint_stereo && n_ch == 2 && should_use_ms_stereo(&xr, n_gr);
+        if use_ms {
+            for gr in 0..n_gr {
+                rotate_to_ms(&mut xr[gr]);
+            }
+        }
+
         // Frame layout / size. In CBR mode the slot is fixed by the
         // encoder's bitrate; in VBR mode we encode first then pick the
         // smallest standard slot that fits.
@@ -582,10 +639,20 @@ impl Mp3Encoder {
         hw.write_u32(self.sr_index as u32, 2);
         hw.write_u32(if padding { 1 } else { 0 }, 1);
         hw.write_u32(0, 1); // private
-                            // Channel mode: mono = 0b11, dual-channel = 0b10.
-        let mode_bits = if n_ch == 1 { 0b11u32 } else { 0b10 };
+                            // Channel mode: mono = 0b11, dual-channel = 0b10,
+                            // joint stereo = 0b01. Stereo-but-not-joint = 0b00
+                            // (we don't currently emit this — joint or
+                            // dual-channel are the only stereo paths).
+        let mode_bits: u32 = match (n_ch, use_ms) {
+            (1, _) => 0b11,
+            (_, true) => 0b01,
+            _ => 0b10,
+        };
         hw.write_u32(mode_bits, 2);
-        hw.write_u32(0, 2); // mode_extension (unused for non-joint stereo)
+        // mode_extension (joint-stereo only): bit 0x2 = MS on, bit 0x1
+        // = IS on. We ship MS without IS.
+        let mode_ext: u32 = if use_ms { 0b10 } else { 0 };
+        hw.write_u32(mode_ext, 2);
         hw.write_u32(0, 1); // copyright
         hw.write_u32(0, 1); // original
         hw.write_u32(0, 2); // emphasis
@@ -720,6 +787,59 @@ impl Encoder for Mp3Encoder {
             self.flush_ready_frames(true)?;
         }
         Ok(())
+    }
+}
+
+// ---------------- Joint-stereo (MS) helpers ----------------
+
+/// Per ISO/IEC 11172-3 §2.4.3.4.10, MS-stereo coding rotates the (L, R)
+/// pair into (M, S) with `M = (L+R)/sqrt(2)`, `S = (L-R)/sqrt(2)`. The
+/// rotation is energy-preserving but redistributes spectral energy: for
+/// highly-correlated stereo content the side channel collapses to near
+/// zero and Huffman coding spends almost no bits on it.
+///
+/// Decision rule: enable MS when, *summed across both granules*, the
+/// side energy is below 30% of the mid energy. This is intentionally
+/// conservative — it triggers reliably on centred-voice / ambient mixes
+/// and stays off for true wide-stereo content where MS would introduce
+/// quantisation cross-talk between channels.
+fn should_use_ms_stereo(xr: &[Vec<[f32; 576]>], n_gr: usize) -> bool {
+    let mut e_mid: f64 = 0.0;
+    let mut e_side: f64 = 0.0;
+    for gr in 0..n_gr {
+        let l = &xr[gr][0];
+        let r = &xr[gr][1];
+        for i in 0..576 {
+            let m = (l[i] + r[i]) as f64;
+            let s = (l[i] - r[i]) as f64;
+            e_mid += m * m;
+            e_side += s * s;
+        }
+    }
+    // Need *some* signal energy before the ratio is meaningful — pure
+    // silence on both channels produces 0/0; default to dual-channel
+    // (it matters little but keeps the bitstream stable on silent
+    // intervals).
+    if e_mid <= 1.0e-12 {
+        return false;
+    }
+    e_side / e_mid < 0.30
+}
+
+/// Rotate a stereo granule of MDCT coefficients from (L, R) to (M, S)
+/// in place. Mirrors `requantize::ms_stereo`'s decoder-side rotation:
+/// applying the same transform a second time restores the original.
+fn rotate_to_ms(channels: &mut [[f32; 576]]) {
+    debug_assert_eq!(channels.len(), 2);
+    let inv_sqrt2 = 1.0 / std::f32::consts::SQRT_2;
+    let (l_slot, r_slot) = channels.split_at_mut(1);
+    let l = &mut l_slot[0];
+    let r = &mut r_slot[0];
+    for i in 0..576 {
+        let lv = l[i];
+        let rv = r[i];
+        l[i] = (lv + rv) * inv_sqrt2;
+        r[i] = (lv - rv) * inv_sqrt2;
     }
 }
 
