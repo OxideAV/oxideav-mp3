@@ -34,8 +34,12 @@ use oxideav_core::{
 use crate::analysis::{analyze_granule, AnalysisState};
 use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A};
 use crate::mdct::{mdct_granule, MdctState};
+use crate::psy::{global_gain_to_step, vbr_quality_to_mask_ratio, GranuleMask};
 use crate::CODEC_ID_STR;
 use oxideav_core::bits::BitWriter;
+use oxideav_core::options::{
+    parse_options, CodecOptionsStruct, OptionField, OptionKind, OptionValue,
+};
 
 /// Max reservoir lookback (bytes) for MPEG-1 — `main_data_begin` is 9 bits.
 const MAX_LOOKBACK_MPEG1: usize = 511;
@@ -48,7 +52,153 @@ const MAX_LOOKBACK_MPEG2: usize = 255;
 /// (table indices 16-23 reuse TABLE_16 with linbits 1..13).
 const BIG_VALUE_CANDIDATES: &[u8] = &[1, 5, 7, 13, 16, 17, 18, 19, 20, 21, 22, 23];
 
-/// Build a CBR encoder for the requested parameters.
+/// Per-granule bit reservoir hard cap (ISO 11172-3 §2.4.3.4.7.2):
+/// part2_3_length is a 12-bit field, so a granule cannot exceed
+/// 4095 bits. The spec further pins the absolute ceiling for a single
+/// granule's main_data at 7680 bits (= 960 bytes) — that's where the
+/// "bit reservoir is bounded" claim in the encoder comments comes from.
+const VBR_PER_GRANULE_BIT_CAP: usize = 7680;
+
+/// Encoder rate-control mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateControl {
+    /// Constant bit rate — current behaviour. `bitrate_kbps` is fixed
+    /// for the lifetime of the encoder.
+    Cbr,
+    /// Variable bit rate — quantizer step picked per granule by a
+    /// lightweight per-band masking model in [`crate::psy`]. Frame
+    /// bitrate slot is picked per frame from the standard table to
+    /// fit the resulting bit count.
+    Vbr,
+}
+
+/// Typed options consumed by the MP3 encoder. Wired into
+/// [`CodecParameters::options`] via [`oxideav_core::options`].
+///
+/// Recognised keys:
+///
+/// - `vbr_quality` — `u32` 0..=9. When set, switches the encoder to VBR
+///   and the value selects the per-band SNR target (0 = highest
+///   quality / largest files, 9 = lowest quality / smallest files).
+///   Mirrors LAME's V0..V9 spirit without copying their tables.
+/// - `cbr_bitrate_kbps` — `u32` CBR slot in kbps. When `vbr_quality`
+///   is unset, this overrides `CodecParameters::bit_rate`.
+#[derive(Default, Debug, Clone)]
+pub struct Mp3EncoderOptions {
+    /// `Some(0..=9)` → switch to VBR with the given quality index.
+    pub vbr_quality: Option<u8>,
+    /// Override for the CBR slot (kbps). Only consulted in CBR mode.
+    pub cbr_bitrate_kbps: Option<u32>,
+}
+
+impl CodecOptionsStruct for Mp3EncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "vbr_quality",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(u32::MAX),
+            help: "VBR quality 0..=9 (0=best, 9=smallest). Switches to VBR mode.",
+        },
+        OptionField {
+            name: "cbr_bitrate_kbps",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "Override CBR bitrate in kbps. Ignored when vbr_quality is set.",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
+        match key {
+            "vbr_quality" => {
+                let n = v.as_u32()?;
+                if n > 9 {
+                    return Err(Error::invalid(format!(
+                        "MP3 encoder: vbr_quality must be 0..=9, got {n}"
+                    )));
+                }
+                self.vbr_quality = Some(n as u8);
+            }
+            "cbr_bitrate_kbps" => {
+                let n = v.as_u32()?;
+                if n > 0 {
+                    self.cbr_bitrate_kbps = Some(n);
+                }
+            }
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
+/// MPEG-1 Layer III standard bitrate slots, in kbps. Index 0 = "free
+/// format" (encoder doesn't emit), index 15 = forbidden. Per ISO/IEC
+/// 11172-3 Table 2.4.2.3.
+const MPEG1_BITRATES_KBPS: [u32; 15] = [
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+];
+
+/// MPEG-2 LSF Layer III standard bitrate slots, in kbps. ISO/IEC
+/// 13818-3 Table 2.4.2.3 (low-sample-rate addendum).
+const MPEG2_BITRATES_KBPS: [u32; 15] =
+    [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+
+/// Map a kbps slot to its bitrate-table index. Returns `None` when the
+/// slot isn't in the standard table for the version.
+fn bitrate_index_for(is_mpeg2: bool, kbps: u32) -> Option<u8> {
+    let table = if is_mpeg2 {
+        &MPEG2_BITRATES_KBPS
+    } else {
+        &MPEG1_BITRATES_KBPS
+    };
+    table
+        .iter()
+        .position(|&k| k == kbps)
+        .filter(|&i| i > 0)
+        .map(|i| i as u8)
+}
+
+/// Pick the smallest standard-table bitrate slot whose CBR frame size
+/// (in bytes) accommodates the requested main-data bytes plus header
+/// + side info. Returns the (index, kbps) pair. If no standard slot
+/// fits (shouldn't happen for sub-7680-bit granules), returns the
+/// max slot — the caller will then truncate.
+fn pick_vbr_bitrate_slot(
+    is_mpeg2: bool,
+    sample_rate: u32,
+    needed_main_data_bytes: usize,
+    side_info_bytes: usize,
+) -> (u8, u32) {
+    let header_bytes = 4usize;
+    let table = if is_mpeg2 {
+        &MPEG2_BITRATES_KBPS
+    } else {
+        &MPEG1_BITRATES_KBPS
+    };
+    let num = if is_mpeg2 { 72u32 } else { 144 };
+    // Iterate slots from smallest to largest; first that fits wins.
+    for (i, &kbps) in table.iter().enumerate() {
+        if i == 0 {
+            continue; // skip "free format"
+        }
+        // Frame bytes for this slot, no padding.
+        let frame_bytes = (num * kbps * 1000 / sample_rate) as usize;
+        let slot_bytes = frame_bytes.saturating_sub(header_bytes + side_info_bytes);
+        if slot_bytes >= needed_main_data_bytes {
+            return (i as u8, kbps);
+        }
+    }
+    // Fall back to the largest slot.
+    let last_idx = (table.len() - 1) as u8;
+    (last_idx, table[last_idx as usize])
+}
+
+/// Build an encoder for the requested parameters.
+///
+/// Mode selection:
+/// - When `params.options` contains `vbr_quality` (0..=9) the encoder
+///   runs in VBR mode and ignores `params.bit_rate`.
+/// - Otherwise it runs in CBR mode at `params.bit_rate` (or the
+///   version's default kbps).
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let channels = params
         .channels
@@ -76,60 +226,31 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
     };
 
-    // Bit rate: default 128 kbps (MPEG-1) or 64 kbps (MPEG-2 LSF).
-    let default_kbps = if is_mpeg2 { 64 } else { 128 };
-    let bitrate_kbps = params
-        .bit_rate
-        .map(|b| (b / 1000) as u32)
-        .unwrap_or(default_kbps);
-    let br_index = if is_mpeg2 {
-        // MPEG-2 LSF Layer III bitrate table (ISO 13818-3 Table 2.4.2.3):
-        // [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, free].
-        match bitrate_kbps {
-            8 => 1u8,
-            16 => 2,
-            24 => 3,
-            32 => 4,
-            40 => 5,
-            48 => 6,
-            56 => 7,
-            64 => 8,
-            80 => 9,
-            96 => 10,
-            112 => 11,
-            128 => 12,
-            144 => 13,
-            160 => 14,
-            _ => {
-                return Err(Error::unsupported(format!(
-                    "MP3 encoder: unsupported MPEG-2 LSF bitrate {bitrate_kbps} kbps"
-                )));
-            }
-        }
+    // Parse encoder options. `vbr_quality` switches on VBR; otherwise
+    // we stay in CBR.
+    let opts: Mp3EncoderOptions = parse_options(&params.options)?;
+    let rate_control = if opts.vbr_quality.is_some() {
+        RateControl::Vbr
     } else {
-        // MPEG-1 Layer III bitrate table.
-        match bitrate_kbps {
-            32 => 1u8,
-            40 => 2,
-            48 => 3,
-            56 => 4,
-            64 => 5,
-            80 => 6,
-            96 => 7,
-            112 => 8,
-            128 => 9,
-            160 => 10,
-            192 => 11,
-            224 => 12,
-            256 => 13,
-            320 => 14,
-            _ => {
-                return Err(Error::unsupported(format!(
-                    "MP3 encoder: unsupported MPEG-1 bitrate {bitrate_kbps} kbps"
-                )));
-            }
-        }
+        RateControl::Cbr
     };
+    let vbr_quality = opts.vbr_quality.unwrap_or(2);
+
+    // CBR slot: explicit option override > params.bit_rate > version default.
+    let default_kbps = if is_mpeg2 { 64 } else { 128 };
+    let bitrate_kbps = opts
+        .cbr_bitrate_kbps
+        .or_else(|| params.bit_rate.map(|b| (b / 1000) as u32))
+        .unwrap_or(default_kbps);
+
+    // Validate the CBR slot up-front even in VBR mode (used as the
+    // initial slot in the header before per-frame substitution).
+    let br_index = bitrate_index_for(is_mpeg2, bitrate_kbps).ok_or_else(|| {
+        Error::unsupported(format!(
+            "MP3 encoder: unsupported {} bitrate {bitrate_kbps} kbps",
+            if is_mpeg2 { "MPEG-2 LSF" } else { "MPEG-1" }
+        ))
+    })?;
 
     let sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
     if sample_format != SampleFormat::S16 {
@@ -154,6 +275,8 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         sr_index,
         br_index,
         is_mpeg2,
+        rate_control,
+        vbr_quality,
         time_base: TimeBase::new(1, sample_rate as i64),
         analysis_state: [AnalysisState::new(), AnalysisState::new()],
         mdct_state: [MdctState::new(), MdctState::new()],
@@ -170,12 +293,18 @@ struct Mp3Encoder {
     output_params: CodecParameters,
     channels: u16,
     sample_rate: u32,
+    /// Default / "anchor" CBR bitrate. In VBR mode this is only used
+    /// for the cumulative-padding accounting; the per-frame slot is
+    /// substituted by [`pick_vbr_bitrate_slot`].
     bitrate_kbps: u32,
     sr_index: u8,
     br_index: u8,
     /// `true` for MPEG-2 LSF (16/22.05/24 kHz, 1 granule/frame);
     /// `false` for MPEG-1 (32/44.1/48 kHz, 2 granules/frame).
     is_mpeg2: bool,
+    rate_control: RateControl,
+    /// VBR quality 0..=9; only consulted when `rate_control == Vbr`.
+    vbr_quality: u8,
     time_base: TimeBase,
     analysis_state: [AnalysisState; 2],
     mdct_state: [MdctState; 2],
@@ -331,64 +460,92 @@ impl Mp3Encoder {
             }
         }
 
-        // Frame layout / size.
-        let padding = self.next_padding();
-        let frame_bytes = self.frame_bytes(padding);
+        // Frame layout / size. In CBR mode the slot is fixed by the
+        // encoder's bitrate; in VBR mode we encode first then pick the
+        // smallest standard slot that fits.
         let header_bytes = 4usize;
         let si_bytes = self.side_info_bytes();
-        let main_data_slot_bytes = frame_bytes - header_bytes - si_bytes;
         let max_lookback = self.max_lookback();
 
-        // The encoder maintains a single byte stream of main_data
-        // (`self.main_data_queue`). For this frame:
-        //   1. main_data_begin = current queue length (capped at max_lookback).
-        //   2. Generate this frame's main_data bytes from Huffman.
-        //   3. Append to queue.
-        //   4. Pop the first `main_data_slot_bytes` from the queue into the
-        //      on-wire slot. Pad with zeros if the queue is short.
-        //
-        // For the budget we target this frame's main_data_bytes length so
-        // that the queue stays within max_lookback after popping the slot.
         let pre_queue = self.main_data_queue.len();
         debug_assert!(pre_queue <= max_lookback);
         let main_data_begin = pre_queue as u16;
 
-        // Constraints on the size of THIS frame's main_data, in bytes:
-        // (A) Decode constraint: this frame's main_data must fit in the
-        //     `mdb + slot` window the decoder constructs:
-        //       M_N <= pre_queue + main_data_slot_bytes
-        // (B) Lookback constraint for FUTURE frames: queue after this
-        //     frame (= pre_queue + M_N - main_data_slot_bytes, clamped at
-        //     0) must be reachable as a lookback in frame N+1:
-        //       queue_after <= max_lookback   (decoder reservoir cap)
-        // Combining: M_N <= main_data_slot_bytes + max_lookback - pre_queue
-        //                  AND M_N <= pre_queue + main_data_slot_bytes.
-        // (A) is the tighter constraint while pre_queue < max_lookback / 2.
-        let max_main_bytes_a = pre_queue + main_data_slot_bytes;
-        let max_main_bytes_b = main_data_slot_bytes + max_lookback - pre_queue;
-        let max_main_bytes = max_main_bytes_a.min(max_main_bytes_b);
-        let max_main_bits = max_main_bytes * 8;
-        let unit_count = n_gr * n_ch;
-        let per_unit_budget = max_main_bits / unit_count.max(1);
+        // Per-mode encode of granules and computation of the on-wire
+        // bitrate slot / frame bytes.
+        let (granule_data, frame_bytes, padding, frame_br_index) = match self.rate_control {
+            RateControl::Cbr => {
+                let padding = self.next_padding();
+                let frame_bytes = self.frame_bytes(padding);
+                let main_data_slot_bytes = frame_bytes - header_bytes - si_bytes;
+                let max_main_bytes_a = pre_queue + main_data_slot_bytes;
+                let max_main_bytes_b = main_data_slot_bytes + max_lookback - pre_queue;
+                let max_main_bytes = max_main_bytes_a.min(max_main_bytes_b);
+                let max_main_bits = max_main_bytes * 8;
+                let unit_count = n_gr * n_ch;
+                let per_unit_budget = max_main_bits / unit_count.max(1);
 
-        // Encode each granule/channel.
-        let mut granule_data: Vec<Vec<GranuleEncoded>> =
-            (0..n_gr).map(|_| Vec::with_capacity(n_ch)).collect();
-        let mut bits_used_total: usize = 0;
-        for gr in 0..n_gr {
-            for ch in 0..n_ch {
-                let remaining = max_main_bits.saturating_sub(bits_used_total);
-                let units_left = (n_gr - gr) * n_ch - ch;
-                let target = remaining / units_left.max(1);
-                let target = target.min(per_unit_budget * 2).max(64);
-                let g = encode_granule(&xr[gr][ch], target);
-                bits_used_total += g.total_bits;
-                granule_data[gr].push(g);
+                let mut granule_data: Vec<Vec<GranuleEncoded>> =
+                    (0..n_gr).map(|_| Vec::with_capacity(n_ch)).collect();
+                let mut bits_used_total: usize = 0;
+                for gr in 0..n_gr {
+                    for ch in 0..n_ch {
+                        let remaining = max_main_bits.saturating_sub(bits_used_total);
+                        let units_left = (n_gr - gr) * n_ch - ch;
+                        let target = remaining / units_left.max(1);
+                        let target = target.min(per_unit_budget * 2).max(64);
+                        let g = encode_granule(&xr[gr][ch], target);
+                        bits_used_total += g.total_bits;
+                        granule_data[gr].push(g);
+                    }
+                }
+                (granule_data, frame_bytes, padding, self.br_index)
             }
-        }
+            RateControl::Vbr => {
+                // Drive the per-granule quantizer from the masking
+                // model: pick the smallest global_gain that satisfies
+                // worst_nmr_db <= 0 across bands.
+                let mask_ratio = vbr_quality_to_mask_ratio(self.vbr_quality);
+                let mut granule_data: Vec<Vec<GranuleEncoded>> =
+                    (0..n_gr).map(|_| Vec::with_capacity(n_ch)).collect();
+                let mut total_bits: usize = 0;
+                for gr in 0..n_gr {
+                    for ch in 0..n_ch {
+                        let mask = GranuleMask::analyze(&xr[gr][ch], self.sample_rate, mask_ratio);
+                        let g = encode_granule_vbr(&xr[gr][ch], &mask);
+                        total_bits += g.total_bits;
+                        granule_data[gr].push(g);
+                    }
+                }
+                let main_data_bytes_needed = total_bits.div_ceil(8);
+                // Pick a standard bitrate slot whose unpadded slot can
+                // hold the result. The reservoir absorbs the rest.
+                // In practice the slot is sized to the *current frame's*
+                // main_data, ignoring the queued reservoir — that's the
+                // whole point: future frames can use surplus bits.
+                let (idx, _kbps) = pick_vbr_bitrate_slot(
+                    self.is_mpeg2,
+                    self.sample_rate,
+                    main_data_bytes_needed,
+                    si_bytes,
+                );
+                // Frame bytes for that slot, no padding (VBR doesn't use
+                // the CBR padding accumulator — bitrate index changes
+                // already absorb the fractional-byte slack).
+                let num = if self.is_mpeg2 { 72u32 } else { 144 };
+                let kbps = if self.is_mpeg2 {
+                    MPEG2_BITRATES_KBPS[idx as usize]
+                } else {
+                    MPEG1_BITRATES_KBPS[idx as usize]
+                };
+                let frame_bytes = (num * kbps * 1000 / self.sample_rate) as usize;
+                (granule_data, frame_bytes, false, idx)
+            }
+        };
+        let main_data_slot_bytes = frame_bytes - header_bytes - si_bytes;
 
         // Compose this frame's main-data bytes.
-        let mut main_w = BitWriter::with_capacity(max_main_bits / 8 + 4);
+        let mut main_w = BitWriter::with_capacity(main_data_slot_bytes + 16);
         for gr_data in granule_data.iter() {
             for g in gr_data.iter() {
                 g.emit_main_data(&mut main_w);
@@ -421,7 +578,7 @@ impl Mp3Encoder {
         hw.write_u32(version_bits, 2);
         hw.write_u32(0b01, 2); // Layer III
         hw.write_u32(1, 1); // protection bit (1 = no CRC)
-        hw.write_u32(self.br_index as u32, 4);
+        hw.write_u32(frame_br_index as u32, 4);
         hw.write_u32(self.sr_index as u32, 2);
         hw.write_u32(if padding { 1 } else { 0 }, 1);
         hw.write_u32(0, 1); // private
@@ -617,6 +774,57 @@ fn encode_granule(xr: &[f32; 576], bit_target: usize) -> GranuleEncoded {
     }
     // Fallback: return the highest-gain (smallest-bits) result.
     quantize_and_encode(xr, 255)
+}
+
+/// VBR per-granule encode — pick the **largest** global_gain (= fewest
+/// bits) such that the per-band quantization noise still satisfies
+/// `worst_nmr_db <= 0` (i.e. noise below the masking threshold in
+/// every band that has signal energy), subject to the absolute
+/// 7680-bit per-granule cap (ISO 11172-3 §2.4.3.4.7.2).
+///
+/// For pure-silence granules ([`GranuleMask::worst_nmr_db`] returns
+/// `NEG_INFINITY`) any gain masks; we pick a high gain so the encode
+/// collapses to (near) zero bits — no point in spending bits on
+/// silence.
+fn encode_granule_vbr(xr: &[f32; 576], mask: &GranuleMask) -> GranuleEncoded {
+    // Energy gate: if every band is essentially silent, skip the
+    // search entirely and emit a high-gain (ne ar-zero-bit) granule.
+    let any_energy = mask.energy.iter().any(|&e| e > 1.0e-12);
+    if !any_energy {
+        return quantize_and_encode(xr, 240);
+    }
+
+    // Step 1: find the smallest gain where NMR <= 0. Walk *upwards*:
+    // higher gain → coarser step → larger noise → larger NMR. So once
+    // we pass the masking threshold, NMR > 0 forever. The crossing
+    // point is the *largest* gain that still masks; we want the gain
+    // *just before* that.
+    //
+    // Walking upward at step 1 is cheap (a few mask-noise scalar
+    // multiplies per gain) and we only call quantize_and_encode for
+    // the chosen point.
+    let mut last_masked: Option<u8> = None;
+    for gain in 60..=255u8 {
+        let step = global_gain_to_step(gain);
+        let nmr = mask.worst_nmr_db(step);
+        if nmr <= 0.0 {
+            last_masked = Some(gain);
+        } else {
+            break;
+        }
+    }
+    let chosen = last_masked.unwrap_or(60);
+
+    // Step 2: bit-cap fallback. If the chosen gain exceeds the
+    // per-granule bit cap (very loud, very wideband content) we
+    // need to raise the gain further. Walk upward until we fit.
+    let mut g = quantize_and_encode(xr, chosen);
+    let mut gain = chosen;
+    while g.total_bits > VBR_PER_GRANULE_BIT_CAP && gain < 255 {
+        gain = gain.saturating_add(2);
+        g = quantize_and_encode(xr, gain);
+    }
+    g
 }
 
 fn quantize_and_encode(xr: &[f32; 576], global_gain: u8) -> GranuleEncoded {

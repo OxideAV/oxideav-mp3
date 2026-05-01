@@ -1,6 +1,6 @@
 # oxideav-mp3
 
-Pure-Rust **MPEG-1 / MPEG-2 Audio Layer III (MP3)** decoder + CBR
+Pure-Rust **MPEG-1 / MPEG-2 Audio Layer III (MP3)** decoder + CBR/VBR
 encoder + container demuxer. MPEG-1 covers 32 / 44.1 / 48 kHz; MPEG-2
 LSF covers 16 / 22.05 / 24 kHz. Handles mono, stereo, joint-stereo
 (M/S), dual-channel, every block type (long, short, start, stop,
@@ -55,7 +55,7 @@ loop {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-### Encoder
+### Encoder (CBR)
 
 ```rust
 use oxideav_core::{CodecId, CodecParameters, SampleFormat};
@@ -71,6 +71,28 @@ enc.send_frame(&Frame::Audio(pcm_frame_s16_interleaved))?;
 enc.flush()?;
 while let Ok(pkt) = enc.receive_packet() {
     // pkt.data is a raw MPEG audio frame ready to concatenate.
+}
+```
+
+### Encoder (VBR)
+
+```rust
+use oxideav_core::options::CodecOptions;
+use oxideav_core::{CodecId, CodecParameters, SampleFormat};
+
+let mut params = CodecParameters::audio(CodecId::new("mp3"));
+params.channels = Some(2);
+params.sample_rate = Some(44_100);
+params.sample_format = Some(SampleFormat::S16);
+// vbr_quality = 0 (best) .. 9 (smallest). Switches the encoder to
+// VBR — `bit_rate` is ignored.
+params.options = CodecOptions::new().set("vbr_quality", "2");
+let mut enc = codecs.make_encoder(&params)?;
+
+enc.send_frame(&Frame::Audio(pcm_frame_s16_interleaved))?;
+enc.flush()?;
+while let Ok(pkt) = enc.receive_packet() {
+    // pkt.data carries a per-frame variable-bitrate slot.
 }
 ```
 
@@ -90,7 +112,8 @@ format bitstreams.
 
 ## Encoder support
 
-Minimum-viable CBR encoder for archival / interop:
+Minimum-viable encoder for archival / interop, with both CBR and VBR
+rate-control modes:
 
 - **Versions**: MPEG-1 (32 / 44.1 / 48 kHz) and MPEG-2 LSF
   (16 / 22.05 / 24 kHz). MPEG-1 emits 2 granules per frame, MPEG-2 LSF
@@ -98,13 +121,24 @@ Minimum-viable CBR encoder for archival / interop:
 - **Channels**: mono or dual-channel stereo. No joint-stereo, no
   intensity-stereo.
 - **Blocks**: long blocks only (block_type = 0). No window switching.
-- **Bitrate**: one CBR rate per encoder instance, picked from the
-  standard version-specific bitrate table (defaults: 128 kbps MPEG-1,
-  64 kbps MPEG-2 LSF).
+- **Rate control**:
+  - **CBR** (default): one rate per encoder instance, picked from the
+    standard version-specific bitrate table (defaults: 128 kbps
+    MPEG-1, 64 kbps MPEG-2 LSF). Quantizer fits the per-granule bit
+    budget by global-gain bisection.
+  - **VBR**: opt in via `CodecOptions::set("vbr_quality", "0".."9")`.
+    A lightweight per-band masking model in `psy` (inspired by ISO
+    11172-3 §C.1 Model 1, but without the FFT and Bark-spreading
+    layers) picks the smallest quantizer step that satisfies a
+    quality-derived noise-to-mask threshold. The per-frame bitrate
+    slot is then chosen from the standard table to fit the resulting
+    main-data byte count, yielding files that shrink for silence /
+    pure-tone content and grow for spectrally rich content at the
+    same quality knob.
 - **Bit reservoir**: rolled forward via `main_data_begin` within the
   per-version cap (511 bytes MPEG-1 / 255 bytes MPEG-2 LSF).
-- **Quantisation**: global-gain bisection to fit the per-granule bit
-  budget. No psychoacoustic model. No CRC. count1 uses table A.
+- **Quantisation**: per-coefficient uniform quantizer driven by
+  `global_gain`. No CRC. count1 uses table A.
 
 Input must be `SampleFormat::S16` interleaved PCM.
 

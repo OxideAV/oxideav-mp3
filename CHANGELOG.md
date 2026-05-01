@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- VBR (variable bit-rate) encoding mode. Opt in by setting
+  `CodecParameters::options` to `CodecOptions::new().set("vbr_quality",
+  "0".."9")` (0 = highest quality / largest files, 9 = smallest). A
+  new `psy` module computes a per-scalefactor-band energy + masking
+  estimate inspired by ISO 11172-3 §C.1 (psychoacoustic model 1) and
+  drives the per-granule global-gain selection so the worst-band
+  noise-to-mask ratio stays under the quality target. The per-frame
+  bitrate slot is then chosen from the standard table to fit the
+  resulting main-data byte count, yielding files that shrink for
+  silent / pure-tone content and grow for spectrally-rich content at
+  the same quality knob.
+- 8 new VBR end-to-end tests (`tests/encoder_vbr.rs`) plus 5 unit
+  tests in `psy::tests`.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-mp3/compare/v0.0.4...v0.0.5) - 2026-04-25
 
 ### Other
