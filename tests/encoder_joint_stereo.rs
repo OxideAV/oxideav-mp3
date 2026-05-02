@@ -168,10 +168,13 @@ fn correlated_stereo_triggers_ms_header_bits() {
     assert!(!frames.is_empty(), "no frames emitted");
 
     // We expect the vast majority of frames to be marked joint-stereo
-    // (mode = 0b01) with mode_extension = 0b10 (MS on, IS off).
+    // (mode = 0b01) with the MS bit (0x2) set in mode_extension. The
+    // IS bit (0x1) may or may not also be set depending on whether the
+    // post-#174 IS path qualifies the HF tail of the same correlated
+    // material; checking only the MS bit isolates the #115 contract.
     let js_ms = frames
         .iter()
-        .filter(|(mode, ext, _)| *mode == 0b01 && *ext == 0b10)
+        .filter(|(mode, ext, _)| *mode == 0b01 && (*ext & 0b10) != 0)
         .count();
     let total = frames.len();
     eprintln!("joint-stereo MS frames: {js_ms} / {total}");

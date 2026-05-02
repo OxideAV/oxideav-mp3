@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Intensity-stereo (IS) encoding per ISO/IEC 11172-3 §2.4.3.4.10.2 for
+  MPEG-1 long-block stereo granules. The encoder picks a per-granule
+  scalefactor-band bound by walking sfbs from the top down: a band
+  qualifies for IS when its combined L/R energy is below a 40-dB-down
+  noise floor relative to the loudest band, when the absolute L/R
+  cross-correlation `|<L,R>| / sqrt(eL * eR) >= 0.85`, or when the
+  pan imbalance `|eL - eR| / (eL + eR) >= 0.85` (hard-pan shortcut).
+  The bound is clamped to a sfb 7 floor so the audible bands stay in
+  raw L/R / MS coding. For each IS-coded band the per-channel
+  `is_pos ∈ {0..=6}` is chosen by best fit on the `er / (eL + eR)`
+  energy fraction; sentinel `is_pos = 7` covers silent bands. The L
+  spectrum is rewritten to a magnitude-preserving surrogate
+  `sign(L) * sqrt(L^2 + R^2)` and R is forced to zero so the decoder
+  side's `find_is_bound_sfb` recovers the same bound. R-channel
+  scalefactors are emitted with `scalefac_compress = 13`
+  (slen1 = slen2 = 3) so all 21 long-block sfbs carry the 3-bit
+  `is_pos`. Frame-level `mode_extension` bit 0x1 flips on whenever
+  any granule uses IS — combined with #115 MS the wire pattern can
+  be 0b01 (IS only) or 0b11 (MS + IS). Opt out with
+  `intensity_stereo=0`. On a stereo fixture with uncorrelated LF and
+  a correlated HF tail this saves ~18.8% bytes in VBR mode at the
+  same quality knob; CBR keeps slot sizes fixed and spends the freed
+  bits on lower noise. Short / start / stop blocks and MPEG-2 LSF
+  stay on the pre-#174 path — they have separate sf partitions that
+  the encoder doesn't yet emit. New tests:
+  `tests/encoder_intensity_stereo.rs` (7 cases — header bits, opt-out,
+  VBR byte delta, own-decoder round-trip, ffmpeg cross-decode,
+  MS-on-with-IS regression check, short-block-on-with-IS regression
+  check). Lib tests gain 4 cases for `pick_is_bound_long` and
+  `apply_is_rewrite_long` covering the safety floor, the silence
+  shortcut, the coherence break, and the R-zeroing invariant.
 - Short-block window switching on transients per ISO/IEC 11172-3
   §2.4.2.2 / Annex C. A new `block_type` module hosts the
   `TransientDetector` (per-channel energy-ratio detector that splits

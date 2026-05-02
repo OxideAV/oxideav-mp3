@@ -118,10 +118,16 @@ rate-control modes:
 - **Versions**: MPEG-1 (32 / 44.1 / 48 kHz) and MPEG-2 LSF
   (16 / 22.05 / 24 kHz). MPEG-1 emits 2 granules per frame, MPEG-2 LSF
   emits 1.
-- **Channels**: mono, dual-channel stereo, joint-stereo (M/S — picked
-  per frame from the spectral correlation; ISO/IEC 11172-3
-  §2.4.3.4.10). Intensity stereo on the encode side is out of scope.
-  Disable MS with `joint_stereo=0`.
+- **Channels**: mono, dual-channel stereo, joint-stereo (M/S and
+  intensity stereo). MS coupling is picked per frame from the spectral
+  correlation (ISO/IEC 11172-3 §2.4.3.4.10); intensity stereo is
+  evaluated per granule on top of MS for MPEG-1 long blocks per
+  §2.4.3.4.10.2 — the encoder walks scalefactor bands top-down and IS-
+  codes any HF tail whose L/R correlation, pan imbalance, or noise-floor
+  silence qualifies. The R-channel scalefactors then carry per-band
+  `is_pos`, R coefficients above the bound collapse to zero, and the
+  frame's `mode_extension` field flips the IS bit. Disable MS with
+  `joint_stereo=0` and IS with `intensity_stereo=0`.
 - **Blocks**: long, start, short, stop with automatic window-switching
   on transients per ISO/IEC 11172-3 §2.4.2.2 / Annex C. A per-channel
   energy-ratio transient detector flags 192-sample sub-frames whose

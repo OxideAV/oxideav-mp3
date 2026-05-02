@@ -24,6 +24,19 @@
 //! The pipeline is the mirror of the decoder:
 //!   PCM → polyphase analysis → forward MDCT → quantise →
 //!   Huffman encode → side info + main data → frame emission.
+//!
+//! Joint-stereo coding currently supports MS-only (mode_extension =
+//! 0b10), IS-only (mode_extension = 0b01) and combined MS+IS
+//! (mode_extension = 0b11) per ISO/IEC 11172-3 §2.4.3.4.10.{1,2}.
+//! Intensity stereo applies to long-block stereo granules at the
+//! frame level: a per-granule "intensity bound" sfb is selected
+//! (highest sfb such that the L/R energy ratio above it is dominated
+//! by L), and bands at or above that bound are encoded as a single
+//! L spectrum + per-channel intensity-position scalefactors carried
+//! in the R channel's slot. Short / start / stop granules currently
+//! stay out of IS; they fall back to the MS-only or dual-channel
+//! path of #115. The MPEG-1 path uses 3-bit `is_pos` values; the
+//! MPEG-2 LSF path keeps IS off for now.
 
 use std::collections::VecDeque;
 
@@ -96,6 +109,13 @@ pub enum RateControl {
 ///   §2.4.2.2 to suppress pre-echo. When `0` the encoder always emits
 ///   long blocks regardless of input — useful for benchmarking pre-
 ///   echo behaviour or for matching the pre-round-24 output exactly.
+/// - `intensity_stereo` — `u32` 0/1. When `1` (the default for stereo
+///   inputs), the encoder may also enable intensity stereo per ISO/IEC
+///   11172-3 §2.4.3.4.10.2 for long-block stereo granules where the
+///   high-frequency L/R correlation lets the side info encode a per-band
+///   intensity position instead of full R coefficients. Sets
+///   `mode_extension` bit 0x1 when active. Only meaningful when
+///   `joint_stereo` is also enabled.
 #[derive(Debug, Clone)]
 pub struct Mp3EncoderOptions {
     /// `Some(0..=9)` → switch to VBR with the given quality index.
@@ -106,6 +126,9 @@ pub struct Mp3EncoderOptions {
     pub joint_stereo: bool,
     /// Allow short-block window switching on transients. Default: `true`.
     pub short_blocks: bool,
+    /// Allow intensity-stereo coding (MPEG-1 long blocks only). Default:
+    /// `true`. Only consulted when `joint_stereo` is also `true`.
+    pub intensity_stereo: bool,
 }
 
 impl Default for Mp3EncoderOptions {
@@ -115,6 +138,7 @@ impl Default for Mp3EncoderOptions {
             cbr_bitrate_kbps: None,
             joint_stereo: true,
             short_blocks: true,
+            intensity_stereo: true,
         }
     }
 }
@@ -145,6 +169,12 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
             default: OptionValue::U32(1),
             help: "Allow short-block window switching on transients. 0 = always long blocks, 1 = enable short blocks (default).",
         },
+        OptionField {
+            name: "intensity_stereo",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "Allow intensity-stereo (IS) coding on top of joint-stereo for long-block stereo granules. 0 = never IS, 1 = enable IS when HF correlation is high (default).",
+        },
     ];
 
     fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
@@ -171,6 +201,10 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
             "short_blocks" => {
                 let n = v.as_u32()?;
                 self.short_blocks = n != 0;
+            }
+            "intensity_stereo" => {
+                let n = v.as_u32()?;
+                self.intensity_stereo = n != 0;
             }
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -287,6 +321,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // dual-channel-forced configurations the flag stays effectively off.
     let allow_joint_stereo = opts.joint_stereo && channels == 2;
     let allow_short_blocks = opts.short_blocks;
+    // IS only applies when joint-stereo is on AND we're MPEG-1 stereo.
+    // The MPEG-2 LSF path keeps IS off — IS sf-decoding for MPEG-2 uses
+    // a separate `is_pos` partition row (`SCF_PARTITIONS_MPEG2[..][16..]`)
+    // that the encoder doesn't yet emit.
+    let allow_intensity_stereo = opts.intensity_stereo && allow_joint_stereo && !is_mpeg2;
 
     // CBR slot: explicit option override > params.bit_rate > version default.
     let default_kbps = if is_mpeg2 { 64 } else { 128 };
@@ -331,6 +370,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         vbr_quality,
         allow_joint_stereo,
         allow_short_blocks,
+        allow_intensity_stereo,
         time_base: TimeBase::new(1, sample_rate as i64),
         analysis_state: [AnalysisState::new(), AnalysisState::new()],
         mdct_state: [MdctState::new(), MdctState::new()],
@@ -368,6 +408,10 @@ struct Mp3Encoder {
     /// transients (default). When `false` every granule is emitted as
     /// a long block — matches the pre-round-24 encoder exactly.
     allow_short_blocks: bool,
+    /// `true` when the encoder may enable intensity stereo on top of
+    /// joint stereo for long-block stereo granules (MPEG-1 only). Implies
+    /// `allow_joint_stereo` and `!is_mpeg2`.
+    allow_intensity_stereo: bool,
     time_base: TimeBase,
     analysis_state: [AnalysisState; 2],
     mdct_state: [MdctState; 2],
@@ -620,6 +664,42 @@ impl Mp3Encoder {
             }
         }
 
+        // Intensity-stereo (IS) decision (ISO/IEC 11172-3 §2.4.3.4.10.2).
+        // Per-granule: pick a scalefactor-band bound such that all sfbs at
+        // or above the bound are IS-coded (R coefficients zeroed, L holds
+        // a per-sfb energy-sum surrogate, R-channel scalefactors carry
+        // `is_pos`). Below the bound the granule keeps whatever stereo
+        // representation is already in `xr` (raw L/R, or M/S after the
+        // rotation above when `use_ms`). Only long blocks are IS-coded
+        // for now — short / start / stop block scalefactor layouts use
+        // `s[sfb][win]` triplets and would need a separate emit path.
+        //
+        // The frame-level mode_extension field shares one IS bit across
+        // both granules, so we enable IS on the whole frame as soon as
+        // any granule benefits. Granules whose chosen bound would equal
+        // the maximum (= IS does not fire) keep their full L/R content
+        // and contribute no IS rewrite.
+        let mut is_pos_per_gr_ch: Vec<Vec<[u8; 22]>> = vec![vec![[7u8; 22]; n_ch]; n_gr]; // default: 7 = "not IS-coded" sentinel
+        let mut is_bound_per_gr: Vec<usize> = vec![21; n_gr];
+        let mut any_is_active = false;
+        if self.allow_intensity_stereo
+            && n_ch == 2
+            && (0..n_gr).all(|gr| {
+                block_types[gr][0] == BlockType::Long && block_types[gr][1] == BlockType::Long
+            })
+        {
+            for gr in 0..n_gr {
+                let (bound, ipos) = pick_is_bound_long(&xr[gr], self.sample_rate);
+                if bound < 21 {
+                    any_is_active = true;
+                    apply_is_rewrite_long(&mut xr[gr], self.sample_rate, bound, &ipos);
+                    is_pos_per_gr_ch[gr][1] = ipos;
+                    is_bound_per_gr[gr] = bound;
+                }
+            }
+        }
+        let use_is = any_is_active;
+
         // Frame layout / size. In CBR mode the slot is fixed by the
         // encoder's bitrate; in VBR mode we encode first then pick the
         // smallest standard slot that fits.
@@ -654,7 +734,16 @@ impl Mp3Encoder {
                         let units_left = (n_gr - gr) * n_ch - ch;
                         let target = remaining / units_left.max(1);
                         let target = target.min(per_unit_budget * 2).max(64);
-                        let g = encode_granule(&xr[gr][ch], target, block_types[gr][ch]);
+                        // R channel of an IS-active granule carries the
+                        // `is_pos` table as long-block scalefactors and
+                        // selects scalefac_compress = 13 (slen1=3, slen2=3).
+                        let is_pos_for_ch = if use_is && ch == 1 {
+                            Some(&is_pos_per_gr_ch[gr][1])
+                        } else {
+                            None
+                        };
+                        let g =
+                            encode_granule(&xr[gr][ch], target, block_types[gr][ch], is_pos_for_ch);
                         bits_used_total += g.total_bits;
                         granule_data[gr].push(g);
                     }
@@ -672,7 +761,17 @@ impl Mp3Encoder {
                 for gr in 0..n_gr {
                     for ch in 0..n_ch {
                         let mask = GranuleMask::analyze(&xr[gr][ch], self.sample_rate, mask_ratio);
-                        let g = encode_granule_vbr(&xr[gr][ch], &mask, block_types[gr][ch]);
+                        let is_pos_for_ch = if use_is && ch == 1 {
+                            Some(&is_pos_per_gr_ch[gr][1])
+                        } else {
+                            None
+                        };
+                        let g = encode_granule_vbr(
+                            &xr[gr][ch],
+                            &mask,
+                            block_types[gr][ch],
+                            is_pos_for_ch,
+                        );
                         total_bits += g.total_bits;
                         granule_data[gr].push(g);
                     }
@@ -746,15 +845,25 @@ impl Mp3Encoder {
                             // joint stereo = 0b01. Stereo-but-not-joint = 0b00
                             // (we don't currently emit this — joint or
                             // dual-channel are the only stereo paths).
-        let mode_bits: u32 = match (n_ch, use_ms) {
+                            // Joint stereo (mode = 0b01) is required as soon as either MS or
+                            // IS is in play; the per-frame mode_extension bits then disambiguate.
+        let any_joint = use_ms || use_is;
+        let mode_bits: u32 = match (n_ch, any_joint) {
             (1, _) => 0b11,
             (_, true) => 0b01,
             _ => 0b10,
         };
         hw.write_u32(mode_bits, 2);
         // mode_extension (joint-stereo only): bit 0x2 = MS on, bit 0x1
-        // = IS on. We ship MS without IS.
-        let mode_ext: u32 = if use_ms { 0b10 } else { 0 };
+        // = IS on (ISO/IEC 11172-3 Table 2-B.4). 0b00 / 0b10 / 0b01 / 0b11
+        // map respectively to "stereo" / "MS only" / "IS only" / "MS + IS".
+        let mut mode_ext: u32 = 0;
+        if use_ms {
+            mode_ext |= 0b10;
+        }
+        if use_is {
+            mode_ext |= 0b01;
+        }
         hw.write_u32(mode_ext, 2);
         hw.write_u32(0, 1); // copyright
         hw.write_u32(0, 1); // original
@@ -810,7 +919,13 @@ impl Mp3Encoder {
                 si_w.write_u32(g.part2_3_length as u32, 12);
                 si_w.write_u32(g.big_values as u32, 9);
                 si_w.write_u32(g.global_gain as u32, 8);
-                si_w.write_u32(0, 4); // scalefac_compress = 0 (slen1=0, slen2=0)
+                // scalefac_compress: 0 means (slen1=0, slen2=0) and emits no
+                // scalefactor bits — used for any granule that does not need
+                // IS scalefactors. When IS is engaged on the R channel we
+                // pick 13 = (slen1=3, slen2=3) so each long-block sfb gets
+                // 3 bits, enough to encode `is_pos` 0..=7 across the whole
+                // 21-sfb range.
+                si_w.write_u32(g.scalefac_compress as u32, 4);
                 emit_window_switching_tail_mpeg1(si_w, g);
             }
         }
@@ -993,6 +1108,220 @@ fn rotate_to_ms(channels: &mut [[f32; 576]]) {
     }
 }
 
+// ---------------- Intensity-stereo (IS) helpers ----------------
+
+/// Per ISO/IEC 11172-3 §2.4.3.4.10.2 / Table 3-B.4 the intensity-stereo
+/// pan position `is_pos` (0..=6) maps to a left/right split where
+///
+/// ```text
+///   is_ratio = tan(is_pos * PI / 12)
+///   k_l = is_ratio / (1 + is_ratio)
+///   k_r = 1.0      / (1 + is_ratio)
+/// ```
+///
+/// (`is_pos == 7` is the "not IS-coded" sentinel — for that band the
+/// decoder leaves R at zero and the L coefficient stays untouched.)
+///
+/// On the encoder side we run the rule in reverse: given the per-band L
+/// and R energies, pick the integer `is_pos` whose `(k_l, k_r)` ratio
+/// best matches the observed energy split. We then rewrite the band so
+/// that L holds the *combined-magnitude* surrogate that the decoder
+/// will scale back into L and R; R is forced to zero so
+/// `find_is_bound_sfb` on the decode side recovers the same bound.
+const IS_RATIO_TAB: [(f32, f32); 7] = [
+    (0.0, 1.0),                   // is_pos = 0
+    (0.211_324_87, 0.788_675_13), // is_pos = 1, tan(pi/12) ≈ 0.268
+    (0.366_025_4, 0.633_974_6),   // is_pos = 2
+    (0.5, 0.5),                   // is_pos = 3
+    (0.633_974_6, 0.366_025_4),   // is_pos = 4
+    (0.788_675_13, 0.211_324_87), // is_pos = 5
+    (1.0, 0.0),                   // is_pos = 6
+];
+
+/// Pick the per-granule intensity-stereo bound (lowest sfb such that all
+/// bands at or above it can be IS-coded), and the per-band `is_pos`
+/// integer for the IS-coded bands.
+///
+/// Selection rule (per ISO/IEC 11172-3 §2.4.3.4.10.2 — the spec
+/// describes the wire format but leaves bound + is_pos picking to the
+/// encoder):
+///   * Walk sfbs from the top (sfb 20) down to sfb 7. (Sfb 21 is the
+///     un-scalefactored padding band; sfbs 0..7 carry too much audible
+///     energy to encode as a single mono surrogate.)
+///   * Compute per-sfb L energy `el`, R energy `er`, and the cross-
+///     correlation `c = sum(L[i] * R[i])` using the post-rotation MDCT
+///     coefficients. (When MS is on the L slot already holds M and the
+///     R slot S — IS rides on those, which still produces a valid
+///     bitstream because the decoder applies IS *before* MS unrotation
+///     per ISO/IEC 11172-3 §2.4.3.4.10.)
+///   * A band qualifies for IS coding when *either*
+///       (a) the combined energy is below a noise-floor threshold
+///           (silent ⇒ replacing R with zero is free), OR
+///       (b) the absolute coherence `|c| / sqrt(el * er)` is high
+///           (≥ 0.85) — i.e. R is essentially a scaled copy of L. In
+///           that regime the IS surrogate `sqrt(el + er)` plus the
+///           per-band `is_pos` recovers `(L, R)` with negligible
+///           perceptual loss.
+///   * The *bound* is the lowest sfb whose own band and every band
+///     above qualifies.
+///
+/// Returns `(bound, is_pos)`. When no IS coding is worthwhile the bound
+/// equals 21 and `is_pos[..]` stays at the 7-sentinel.
+fn pick_is_bound_long(xr: &[[f32; 576]], sample_rate: u32) -> (usize, [u8; 22]) {
+    use crate::sfband::sfband_long;
+    debug_assert_eq!(xr.len(), 2);
+    let bounds = sfband_long(sample_rate);
+
+    /// Lowest sfb the encoder will tag for IS coding. Below this the
+    /// loss from collapsing L/R into a single mono surrogate isn't
+    /// worth the bit savings — the audible bands carry too much
+    /// stereo image information.
+    const MIN_IS_BOUND_SFB: usize = 7;
+    /// Coherence threshold for IS qualification. 0.85 is the pivot
+    /// where the surrogate's reconstruction error stays below ~1 dB on
+    /// real music — tighter than that snaps too few bands; looser
+    /// blurs true-stereo HF.
+    const COHERENCE_THRESHOLD: f64 = 0.85;
+    /// Pan-imbalance shortcut. A band with `||el| - |er|| / (el+er)`
+    /// above this is essentially mono on one side — IS captures it
+    /// exactly regardless of coherence (the sided channel is silent
+    /// so any waveform on the other side rebuilds via `is_pos`).
+    const PAN_SHORTCUT_THRESHOLD: f64 = 0.85;
+
+    // Establish a noise-floor energy. Bands whose own combined energy
+    // sits below this are treated as silent (IS-coded with the 7
+    // sentinel) so spectral-leakage tails of LF tones do not block
+    // the bound walk into the genuine HF tail.
+    let mut max_band_e = 0.0f64;
+    for sfb in 0..21 {
+        let lo = bounds[sfb] as usize;
+        let hi = bounds[sfb + 1] as usize;
+        if hi > 576 {
+            break;
+        }
+        let mut e = 0.0f64;
+        for i in lo..hi {
+            let lv = xr[0][i] as f64;
+            let rv = xr[1][i] as f64;
+            e += lv * lv + rv * rv;
+        }
+        if e > max_band_e {
+            max_band_e = e;
+        }
+    }
+    // Anything more than ~40 dB below the loudest band is effectively
+    // silent for IS-decision purposes.
+    let silence_threshold = max_band_e.max(1.0e-12) * 1.0e-4;
+
+    let mut is_pos = [7u8; 22];
+    let mut bound = 21usize;
+    for sfb in (MIN_IS_BOUND_SFB..21).rev() {
+        let lo = bounds[sfb] as usize;
+        let hi = bounds[sfb + 1] as usize;
+        if hi > 576 || lo >= 576 {
+            break;
+        }
+        let mut el = 0.0f64;
+        let mut er = 0.0f64;
+        let mut c = 0.0f64;
+        for i in lo..hi {
+            let lv = xr[0][i] as f64;
+            let rv = xr[1][i] as f64;
+            el += lv * lv;
+            er += rv * rv;
+            c += lv * rv;
+        }
+        let total_e = el + er;
+        if total_e < silence_threshold {
+            is_pos[sfb] = 7; // sentinel ⇒ R forced to zero, L untouched
+            bound = sfb;
+            continue;
+        }
+        // Pan shortcut: if one channel is essentially silent in this
+        // band (loud-LR fold-down, hard panning) IS captures the band
+        // exactly even though linear coherence is undefined.
+        let pan_imbalance = (el - er).abs() / total_e;
+        let pan_qualifies = pan_imbalance >= PAN_SHORTCUT_THRESHOLD;
+        let denom = (el * er).sqrt();
+        let coherence_qualifies = denom > 1.0e-12 && (c.abs() / denom) >= COHERENCE_THRESHOLD;
+        if !(pan_qualifies || coherence_qualifies) {
+            break;
+        }
+        is_pos[sfb] = best_is_pos_from_energy(el, er);
+        bound = sfb;
+    }
+    (bound, is_pos)
+}
+
+/// Pick the integer `is_pos ∈ 0..=6` whose `(k_l, k_r)` ratio best
+/// matches the observed per-band L / R energies. Used after the
+/// coherence check qualifies the band.
+fn best_is_pos_from_energy(el: f64, er: f64) -> u8 {
+    let total = el + er;
+    if total <= 0.0 {
+        return 7; // shouldn't reach here; defensive
+    }
+    let observed = (er / total).clamp(0.0, 1.0);
+    let mut best_pos = 0u8;
+    let mut best_err = f64::INFINITY;
+    for (i, &(k_l, k_r)) in IS_RATIO_TAB.iter().enumerate() {
+        let kl = k_l as f64;
+        let kr = k_r as f64;
+        let denom = kl * kl + kr * kr;
+        let pred = if denom > 0.0 { kr * kr / denom } else { 0.0 };
+        let err = (pred - observed).abs();
+        if err < best_err {
+            best_err = err;
+            best_pos = i as u8;
+        }
+    }
+    best_pos
+}
+
+/// Rewrite a stereo long-block granule of MDCT coefficients in place so
+/// that all sfbs at or above `bound` are IS-coded. For each IS-coded
+/// band we replace L with a magnitude-preserving surrogate
+/// `sqrt(L^2 + R^2)` (sign from L) and force R to zero. The decoder
+/// reads `is_pos` from the R channel's scalefactor slot and recovers
+/// `(L_out, R_out) = (surrogate * k_l, surrogate * k_r)`.
+fn apply_is_rewrite_long(xr: &mut [[f32; 576]], sample_rate: u32, bound: usize, is_pos: &[u8; 22]) {
+    use crate::sfband::sfband_long;
+    debug_assert_eq!(xr.len(), 2);
+    let bounds = sfband_long(sample_rate);
+    let (l_slot, r_slot) = xr.split_at_mut(1);
+    let l = &mut l_slot[0];
+    let r = &mut r_slot[0];
+    for sfb in bound..21 {
+        let lo = bounds[sfb] as usize;
+        let hi = bounds[sfb + 1] as usize;
+        if hi > 576 {
+            break;
+        }
+        // is_pos sentinel ⇒ this band stays "not IS-coded" — leave L
+        // alone, force R to zero so `find_is_bound_sfb` agrees with the
+        // bound we set in side info.
+        if is_pos[sfb] == 7 {
+            for i in lo..hi {
+                r[i] = 0.0;
+            }
+            continue;
+        }
+        for i in lo..hi {
+            let lv = l[i];
+            let rv = r[i];
+            let mag = (lv * lv + rv * rv).sqrt();
+            // Sign of the surrogate from L (or R when L is zero).
+            let sign = if lv < 0.0 || (lv == 0.0 && rv < 0.0) {
+                -1.0
+            } else {
+                1.0
+            };
+            l[i] = sign * mag;
+            r[i] = 0.0;
+        }
+    }
+}
+
 // ---------------- Per-granule encoding ----------------
 
 #[derive(Clone)]
@@ -1003,25 +1332,47 @@ struct GranuleEncoded {
     /// All Huffman-encoded bytes (big_values + count1) staged as a
     /// list of (code, len) writes.
     main_writes: Vec<(u32, u32)>,
-    /// Pre-summed bits for the writes.
+    /// Pre-summed bits for the writes (scalefactors + Huffman).
     total_bits: usize,
     part2_3_length: u16,
     /// Block type chosen for this granule. `BlockType::Long` keeps the
     /// long-block side-info layout (window_switching_flag = 0); any
     /// other value triggers the window-switching path.
     block_type: BlockType,
+    /// MPEG-1 4-bit `scalefac_compress` index (Table 3-B.32). 0 ⇒ no
+    /// scalefactor bits (slen1=slen2=0); 13 ⇒ (slen1=3, slen2=3) for
+    /// the IS R-channel path.
+    scalefac_compress: u8,
+    /// Optional pre-Huffman scalefactor writes (for the R channel of an
+    /// IS-active granule). `(value, len_bits)` pairs in sfb order matching
+    /// the chosen `scalefac_compress`. Empty when no scalefactors are
+    /// transmitted.
+    sf_writes: Vec<(u32, u32)>,
+    /// Bit count contributed by `sf_writes`. Cached to keep
+    /// `part2_3_length` accounting straightforward.
+    sf_bits: usize,
 }
 
 impl GranuleEncoded {
     fn emit_main_data(&self, w: &mut BitWriter) {
-        // We do NOT write any scalefactors because slen1 = slen2 = 0.
+        // Scalefactors first (part2), then Huffman (part3). The decoder
+        // counts both into `part2_3_length` and assumes they are emitted
+        // in this order (ISO/IEC 11172-3 §2.4.1.7).
+        for (val, len) in &self.sf_writes {
+            w.write_u32(*val, *len);
+        }
         for (code, len) in &self.main_writes {
             w.write_u32(*code, *len);
         }
     }
 }
 
-fn encode_granule(xr: &[f32; 576], bit_target: usize, block_type: BlockType) -> GranuleEncoded {
+fn encode_granule(
+    xr: &[f32; 576],
+    bit_target: usize,
+    block_type: BlockType,
+    is_pos: Option<&[u8; 22]>,
+) -> GranuleEncoded {
     // Pick global_gain by binary search to fit `bit_target`. Higher
     // global_gain -> smaller is[] values -> fewer bits.
     //
@@ -1033,7 +1384,7 @@ fn encode_granule(xr: &[f32; 576], bit_target: usize, block_type: BlockType) -> 
     let mut best: Option<GranuleEncoded> = None;
     while lo <= hi {
         let mid = (lo + hi) / 2;
-        let g = quantize_and_encode(xr, mid as u8, block_type);
+        let g = quantize_and_encode(xr, mid as u8, block_type, is_pos);
         if g.total_bits <= bit_target {
             // This fits — try a smaller gain (more precision).
             best = Some(g);
@@ -1047,7 +1398,7 @@ fn encode_granule(xr: &[f32; 576], bit_target: usize, block_type: BlockType) -> 
         return g;
     }
     // Fallback: return the highest-gain (smallest-bits) result.
-    quantize_and_encode(xr, 255, block_type)
+    quantize_and_encode(xr, 255, block_type, is_pos)
 }
 
 /// VBR per-granule encode — pick the **largest** global_gain (= fewest
@@ -1064,12 +1415,13 @@ fn encode_granule_vbr(
     xr: &[f32; 576],
     mask: &GranuleMask,
     block_type: BlockType,
+    is_pos: Option<&[u8; 22]>,
 ) -> GranuleEncoded {
     // Energy gate: if every band is essentially silent, skip the
     // search entirely and emit a high-gain (ne ar-zero-bit) granule.
     let any_energy = mask.energy.iter().any(|&e| e > 1.0e-12);
     if !any_energy {
-        return quantize_and_encode(xr, 240, block_type);
+        return quantize_and_encode(xr, 240, block_type, is_pos);
     }
 
     // Step 1: find the smallest gain where NMR <= 0. Walk *upwards*:
@@ -1096,16 +1448,21 @@ fn encode_granule_vbr(
     // Step 2: bit-cap fallback. If the chosen gain exceeds the
     // per-granule bit cap (very loud, very wideband content) we
     // need to raise the gain further. Walk upward until we fit.
-    let mut g = quantize_and_encode(xr, chosen, block_type);
+    let mut g = quantize_and_encode(xr, chosen, block_type, is_pos);
     let mut gain = chosen;
     while g.total_bits > VBR_PER_GRANULE_BIT_CAP && gain < 255 {
         gain = gain.saturating_add(2);
-        g = quantize_and_encode(xr, gain, block_type);
+        g = quantize_and_encode(xr, gain, block_type, is_pos);
     }
     g
 }
 
-fn quantize_and_encode(xr: &[f32; 576], global_gain: u8, block_type: BlockType) -> GranuleEncoded {
+fn quantize_and_encode(
+    xr: &[f32; 576],
+    global_gain: u8,
+    block_type: BlockType,
+    is_pos: Option<&[u8; 22]>,
+) -> GranuleEncoded {
     // Quantisation step: step_factor = 2^((global_gain - 210) / 4).
     // is[i] = nint( (|xr[i]|/step_factor)^(3/4) - 0.0946 )
     //       = nint( |xr[i]|^(3/4) * 2^(-(global_gain-210)*3/16) - 0.0946 )
@@ -1206,7 +1563,26 @@ fn quantize_and_encode(xr: &[f32; 576], global_gain: u8, block_type: BlockType) 
         total_bits += bits;
     }
 
-    // part2_3_length = scalefactor bits (0) + huffman bits (total_bits).
+    // Scalefactor emit (R channel of an IS-active long-block granule).
+    // We pack `is_pos` into the long-block scalefactor slots described by
+    // ISO/IEC 11172-3 Table 3-B.32 with `scalefac_compress = 13`
+    // ⇒ (slen1 = 3, slen2 = 3): six 3-bit values for sfb 0..5, five
+    // for sfb 6..10, five for sfb 11..15, and five for sfb 16..20 — all
+    // 3 bits wide. is_pos values are 0..=6 for IS-coded bands or 7 for
+    // the "not IS-coded" sentinel.
+    let (sf_writes, sf_bits, scalefac_compress) = match is_pos {
+        Some(positions) if block_type == BlockType::Long => {
+            let mut sf: Vec<(u32, u32)> = Vec::with_capacity(21);
+            for &p in positions.iter().take(21) {
+                sf.push(((p as u32) & 0x7, 3));
+            }
+            (sf, 21 * 3, 13u8)
+        }
+        _ => (Vec::new(), 0usize, 0u8),
+    };
+    let total_bits = total_bits + sf_bits;
+
+    // part2_3_length = scalefactor bits + huffman bits.
     let part2_3_length = total_bits as u16;
 
     GranuleEncoded {
@@ -1217,6 +1593,9 @@ fn quantize_and_encode(xr: &[f32; 576], global_gain: u8, block_type: BlockType) 
         total_bits,
         part2_3_length,
         block_type,
+        scalefac_compress,
+        sf_writes,
+        sf_bits,
     }
 }
 
@@ -1364,8 +1743,93 @@ mod tests {
     #[test]
     fn quantize_silence_gives_zero_bits() {
         let xr = [0.0f32; 576];
-        let g = quantize_and_encode(&xr, 100, BlockType::Long);
+        let g = quantize_and_encode(&xr, 100, BlockType::Long, None);
         assert_eq!(g.total_bits, 0);
         assert_eq!(g.big_values, 0);
+    }
+
+    #[test]
+    fn pick_is_bound_zero_r_returns_min_bound() {
+        // L-only signal (R == 0 everywhere) above the safety floor:
+        // every band has 100 % pan imbalance and qualifies. Bound
+        // pins at 7.
+        let mut xr: Vec<[f32; 576]> = vec![[0.0f32; 576]; 2];
+        for i in 100..400 {
+            xr[0][i] = 0.5;
+        }
+        let (bound, ipos) = pick_is_bound_long(&xr, 44_100);
+        assert_eq!(bound, 7, "expected the safety-floor bound 7, got {bound}");
+        // For IS-coded bands (sfb >= 7) chosen is_pos should be 6
+        // (all energy on L: er fraction = 0 ⇒ closest is_pos = 6).
+        // Silent bands (sfb >= 17 ish where xr[0][i] is zero) ride
+        // the silence path with is_pos = 7. Both are acceptable.
+        for &p in ipos.iter().skip(7).take(14) {
+            assert!(p == 6 || p == 7, "expected 6 or 7 for pure-L band, got {p}");
+        }
+    }
+
+    #[test]
+    fn pick_is_bound_uncorrelated_band_breaks_walk() {
+        // Construct a granule where sfbs 19, 20 are highly correlated
+        // (R = L) and qualify, but sfb 18 is uncorrelated noise on
+        // both channels — coherence should fail there and the bound
+        // should pin at sfb 19 (NOT walk past 18).
+        let mut xr: Vec<[f32; 576]> = vec![[0.0f32; 576]; 2];
+        // Sfbs 19, 20 (samples 288..418): R = L.
+        for i in 288..418 {
+            xr[0][i] = 0.5;
+            xr[1][i] = 0.5;
+        }
+        // Sfb 18 (samples 238..288): uncorrelated triangles. L is a
+        // sawtooth, R is a phase-flipped sawtooth-like sequence with
+        // a 90-degree shift so coherence is approximately zero.
+        for i in 238..288 {
+            let k = (i - 238) as f32;
+            xr[0][i] = (k.sin()) * 0.3;
+            xr[1][i] = (k.cos()) * 0.3;
+        }
+        let (bound, _) = pick_is_bound_long(&xr, 44_100);
+        assert!(bound >= 19, "expected bound >= 19, got {bound}");
+    }
+
+    #[test]
+    fn apply_is_rewrite_zeroes_r_above_bound() {
+        let mut xr: Vec<[f32; 576]> = vec![[0.0f32; 576]; 2];
+        for i in 0..576 {
+            xr[0][i] = 0.3;
+            xr[1][i] = 0.3;
+        }
+        let mut ipos = [0u8; 22];
+        for p in ipos.iter_mut() {
+            *p = 3;
+        }
+        // Bound at sfb 6 ⇒ R must be zero from sample 24 (= bounds[6])
+        // up through the end of sfb 20 = sample 418. Sfb 21 (samples
+        // 418..576) is outside the IS-coded range so R there stays as
+        // the input had it.
+        apply_is_rewrite_long(&mut xr, 44_100, 6, &ipos);
+        for i in 24..418 {
+            assert_eq!(xr[1][i], 0.0, "R[{i}] not zeroed");
+        }
+        // Below the bound the IS rewrite leaves L/R alone.
+        for i in 0..24 {
+            assert_eq!(xr[0][i], 0.3);
+            assert_eq!(xr[1][i], 0.3);
+        }
+    }
+
+    #[test]
+    fn pick_is_bound_correlated_full_band_walks_to_floor() {
+        // Highly correlated stereo across the full granule should
+        // qualify every IS-eligible band. Bound clamps at the safety
+        // floor (7).
+        let mut xr: Vec<[f32; 576]> = vec![[0.0f32; 576]; 2];
+        for i in 0..576 {
+            let v = (i as f32 * 0.1).sin() * 0.3;
+            xr[0][i] = v;
+            xr[1][i] = v; // perfect correlation
+        }
+        let (bound, _) = pick_is_bound_long(&xr, 44_100);
+        assert_eq!(bound, 7, "expected safety-floor bound 7, got {bound}");
     }
 }
