@@ -27,16 +27,22 @@
 //!
 //! Joint-stereo coding currently supports MS-only (mode_extension =
 //! 0b10), IS-only (mode_extension = 0b01) and combined MS+IS
-//! (mode_extension = 0b11) per ISO/IEC 11172-3 §2.4.3.4.10.{1,2}.
-//! Intensity stereo applies to long-block stereo granules at the
-//! frame level: a per-granule "intensity bound" sfb is selected
-//! (highest sfb such that the L/R energy ratio above it is dominated
-//! by L), and bands at or above that bound are encoded as a single
-//! L spectrum + per-channel intensity-position scalefactors carried
-//! in the R channel's slot. Short / start / stop granules currently
+//! (mode_extension = 0b11) per ISO/IEC 11172-3 §2.4.3.4.10.{1,2} and
+//! ISO/IEC 13818-3 §2.4.2.7 / §2.4.3.4.10.2 (LSF). Intensity stereo
+//! applies to long-block stereo granules at the frame level: a
+//! per-granule "intensity bound" sfb is selected (highest sfb such
+//! that the L/R energy ratio above it is dominated by one channel),
+//! and bands at or above that bound are encoded as a single L
+//! spectrum + per-channel intensity-position scalefactors carried in
+//! the R channel's slot. Short / start / stop granules currently
 //! stay out of IS; they fall back to the MS-only or dual-channel
-//! path of #115. The MPEG-1 path uses 3-bit `is_pos` values; the
-//! MPEG-2 LSF path keeps IS off for now.
+//! path of #115. The MPEG-1 path uses 3-bit `is_pos` values
+//! (0..=6 with 7 = sentinel) packed into Table 3-B.32 sfb groups
+//! via `scalefac_compress = 13`. The MPEG-2 LSF path uses 5-bit
+//! `is_pos` values (0..=30 with 31 = sentinel) packed into the
+//! intensity-stereo half of `SCF_PARTITIONS_MPEG2[..][16..28]`
+//! using a fixed `scalefac_compress_9 = 358` (slens [4, 5, 5, 0],
+//! intensity_scale = 0).
 
 use std::collections::VecDeque;
 
@@ -126,8 +132,9 @@ pub struct Mp3EncoderOptions {
     pub joint_stereo: bool,
     /// Allow short-block window switching on transients. Default: `true`.
     pub short_blocks: bool,
-    /// Allow intensity-stereo coding (MPEG-1 long blocks only). Default:
-    /// `true`. Only consulted when `joint_stereo` is also `true`.
+    /// Allow intensity-stereo coding (long blocks; MPEG-1 and MPEG-2
+    /// LSF). Default: `true`. Only consulted when `joint_stereo` is
+    /// also `true`.
     pub intensity_stereo: bool,
 }
 
@@ -321,11 +328,12 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // dual-channel-forced configurations the flag stays effectively off.
     let allow_joint_stereo = opts.joint_stereo && channels == 2;
     let allow_short_blocks = opts.short_blocks;
-    // IS only applies when joint-stereo is on AND we're MPEG-1 stereo.
-    // The MPEG-2 LSF path keeps IS off — IS sf-decoding for MPEG-2 uses
-    // a separate `is_pos` partition row (`SCF_PARTITIONS_MPEG2[..][16..]`)
-    // that the encoder doesn't yet emit.
-    let allow_intensity_stereo = opts.intensity_stereo && allow_joint_stereo && !is_mpeg2;
+    // IS applies when joint-stereo is on AND we have stereo input. Both
+    // the MPEG-1 (3-bit is_pos, Table 3-B.32 row at scalefac_compress=13)
+    // and MPEG-2 LSF (5-bit is_pos, ISO/IEC 13818-3 §2.4.3.4.10.2 /
+    // SCF_PARTITIONS_MPEG2 IS rows at offsets 16..28) variants are wired
+    // up below.
+    let allow_intensity_stereo = opts.intensity_stereo && allow_joint_stereo;
 
     // CBR slot: explicit option override > params.bit_rate > version default.
     let default_kbps = if is_mpeg2 { 64 } else { 128 };
@@ -409,8 +417,8 @@ struct Mp3Encoder {
     /// a long block — matches the pre-round-24 encoder exactly.
     allow_short_blocks: bool,
     /// `true` when the encoder may enable intensity stereo on top of
-    /// joint stereo for long-block stereo granules (MPEG-1 only). Implies
-    /// `allow_joint_stereo` and `!is_mpeg2`.
+    /// joint stereo for long-block stereo granules (MPEG-1 and MPEG-2
+    /// LSF). Implies `allow_joint_stereo`.
     allow_intensity_stereo: bool,
     time_base: TimeBase,
     analysis_state: [AnalysisState; 2],
@@ -679,7 +687,16 @@ impl Mp3Encoder {
         // any granule benefits. Granules whose chosen bound would equal
         // the maximum (= IS does not fire) keep their full L/R content
         // and contribute no IS rewrite.
-        let mut is_pos_per_gr_ch: Vec<Vec<[u8; 22]>> = vec![vec![[7u8; 22]; n_ch]; n_gr]; // default: 7 = "not IS-coded" sentinel
+        // Default sentinel for "not IS-coded": 7 for MPEG-1 (3-bit field),
+        // 31 for MPEG-2 LSF (5-bit field). The pickers below also leave
+        // the value at the variant's sentinel for any band kept out of IS.
+        let is_variant = if self.is_mpeg2 {
+            IsVariant::Mpeg2
+        } else {
+            IsVariant::Mpeg1
+        };
+        let sentinel = is_variant.sentinel();
+        let mut is_pos_per_gr_ch: Vec<Vec<[u8; 22]>> = vec![vec![[sentinel; 22]; n_ch]; n_gr];
         let mut is_bound_per_gr: Vec<usize> = vec![21; n_gr];
         let mut any_is_active = false;
         if self.allow_intensity_stereo
@@ -689,10 +706,25 @@ impl Mp3Encoder {
             })
         {
             for gr in 0..n_gr {
-                let (bound, ipos) = pick_is_bound_long(&xr[gr], self.sample_rate);
+                let (bound, ipos) = match is_variant {
+                    IsVariant::Mpeg1 => pick_is_bound_long(&xr[gr], self.sample_rate),
+                    IsVariant::Mpeg2 => pick_is_bound_long_mpeg2(&xr[gr], self.sample_rate),
+                };
                 if bound < 21 {
                     any_is_active = true;
-                    apply_is_rewrite_long(&mut xr[gr], self.sample_rate, bound, &ipos);
+                    match is_variant {
+                        IsVariant::Mpeg1 => {
+                            apply_is_rewrite_long(&mut xr[gr], self.sample_rate, bound, &ipos);
+                        }
+                        IsVariant::Mpeg2 => {
+                            apply_is_rewrite_long_mpeg2(
+                                &mut xr[gr],
+                                self.sample_rate,
+                                bound,
+                                &ipos,
+                            );
+                        }
+                    }
                     is_pos_per_gr_ch[gr][1] = ipos;
                     is_bound_per_gr[gr] = bound;
                 }
@@ -735,15 +767,23 @@ impl Mp3Encoder {
                         let target = remaining / units_left.max(1);
                         let target = target.min(per_unit_budget * 2).max(64);
                         // R channel of an IS-active granule carries the
-                        // `is_pos` table as long-block scalefactors and
-                        // selects scalefac_compress = 13 (slen1=3, slen2=3).
+                        // `is_pos` table as long-block scalefactors. MPEG-1
+                        // selects scalefac_compress = 13 (slen1 = slen2 = 3,
+                        // 21 × 3 = 63 bits); MPEG-2 LSF selects
+                        // scalefac_compress_9 = 358 (slen = [4, 5, 5, 0],
+                        // 7×4 + 7×5 + 7×5 = 98 bits, intensity_scale = 0).
                         let is_pos_for_ch = if use_is && ch == 1 {
                             Some(&is_pos_per_gr_ch[gr][1])
                         } else {
                             None
                         };
-                        let g =
-                            encode_granule(&xr[gr][ch], target, block_types[gr][ch], is_pos_for_ch);
+                        let g = encode_granule(
+                            &xr[gr][ch],
+                            target,
+                            block_types[gr][ch],
+                            is_pos_for_ch,
+                            is_variant,
+                        );
                         bits_used_total += g.total_bits;
                         granule_data[gr].push(g);
                     }
@@ -771,6 +811,7 @@ impl Mp3Encoder {
                             &mask,
                             block_types[gr][ch],
                             is_pos_for_ch,
+                            is_variant,
                         );
                         total_bits += g.total_bits;
                         granule_data[gr].push(g);
@@ -938,11 +979,15 @@ impl Mp3Encoder {
     /// - `private_bits` is 1 (mono) / 2 (stereo).
     /// - No `scfsi` (single granule per frame).
     /// - Exactly one granule per channel.
-    /// - `scalefac_compress` is 9 bits — we emit 0, which decomposes via
-    ///   `SCF_MOD_MPEG2` to `slen = [0, 0, 0, 0]` (long-block row, all
-    ///   scalefactor widths zero, so no scalefactor bits in main_data).
+    /// - `scalefac_compress` is 9 bits. The L channel and the R channel
+    ///   of an MS-only / dual-channel frame emit 0 ⇒ slen = [0, 0, 0, 0]
+    ///   (no scalefactor bits in main_data). The R channel of an
+    ///   IS-active frame emits `MPEG2_IS_SCALEFAC_COMPRESS_9` = 358
+    ///   ⇒ slen = [4, 5, 5, 0] with `intensity_scale = 0`, carrying
+    ///   the per-sfb `is_pos` table consumed by `intensity_stereo_mpeg2`.
     /// - No transmitted `preflag` bit (derived by the decoder from
-    ///   `scalefac_compress >= 500`; with 0 this is false).
+    ///   `scalefac_compress >= 500`; the IS value 358 falls below that
+    ///   threshold so preflag stays false).
     fn emit_side_info_mpeg2(
         &self,
         si_w: &mut BitWriter,
@@ -958,7 +1003,7 @@ impl Mp3Encoder {
             si_w.write_u32(g.part2_3_length as u32, 12);
             si_w.write_u32(g.big_values as u32, 9);
             si_w.write_u32(g.global_gain as u32, 8);
-            si_w.write_u32(0, 9); // scalefac_compress = 0 → slen=[0,0,0,0]
+            si_w.write_u32(g.scalefac_compress_9 as u32, 9);
             emit_window_switching_tail_mpeg2(si_w, g);
         }
     }
@@ -1109,6 +1154,56 @@ fn rotate_to_ms(channels: &mut [[f32; 576]]) {
 }
 
 // ---------------- Intensity-stereo (IS) helpers ----------------
+
+/// Which IS variant the encoder is using for a frame. Drives the
+/// per-band `is_pos` field width, the sentinel value used for
+/// "not IS-coded", and the side-info `scalefac_compress` value
+/// emitted on the R channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IsVariant {
+    /// MPEG-1 Layer III intensity stereo (ISO/IEC 11172-3
+    /// §2.4.3.4.10.2). 3-bit `is_pos` per long-block sfb (0..=6),
+    /// sentinel = 7. Encoded into Table 3-B.32 row at
+    /// `scalefac_compress = 13` (slen1 = slen2 = 3).
+    Mpeg1,
+    /// MPEG-2 LSF Layer III intensity stereo (ISO/IEC 13818-3
+    /// §2.4.3.2 + §2.4.3.4.10.2). 5-bit `is_pos` per long-block sfb
+    /// (0..=30), sentinel = 31. Packed into the IS half of
+    /// `SCF_PARTITIONS_MPEG2[0][16..28]` via a fixed
+    /// `scalefac_compress_9 = 358` ⇒ slen = [4, 5, 5, 0],
+    /// `intensity_scale = 0`. The slen-4 group covers sfb 0..6 (kept
+    /// out of IS by the encoder's safety floor), so the lower 5-bit
+    /// resolution of slen[0] is harmless.
+    Mpeg2,
+}
+
+impl IsVariant {
+    /// Sentinel value for "not IS-coded" in this variant.
+    fn sentinel(self) -> u8 {
+        match self {
+            IsVariant::Mpeg1 => 7,
+            IsVariant::Mpeg2 => 31,
+        }
+    }
+}
+
+/// Fixed `scalefac_compress_9` value emitted on the R channel of an
+/// MPEG-2 LSF intensity-stereo granule. Decomposes via `SCF_MOD_MPEG2`
+/// (rows 3..5) to slen = [4, 5, 5, 0] with `intensity_scale = 0` (LSB
+/// of the 9-bit field). The matching `nr_of_sfb` partition row
+/// (`SCF_PARTITIONS_MPEG2[0][16..20]`) is `[7, 7, 7, 0]`, covering all
+/// 21 long-block sfbs at 4-, 5-, 5- bit widths respectively. Total
+/// scalefactor cost = 7×4 + 7×5 + 7×5 = 98 bits per IS-active R
+/// channel.
+///
+/// Derivation:
+///   sfc = scalefac_compress_9 >> 1 = 179. SCF_MOD_MPEG2[12..16] =
+///   [5, 6, 6, 1] ⇒ slen[3] = 179/1 % 1 = 0, slen[2] = 179/1 % 6 = 5,
+///   slen[1] = 179/6 % 6 = 5, slen[0] = 179/36 % 5 = 4. modprod = 180,
+///   sfc - 180 = -1, loop exits with k = 16. Partition row 0 offset 16
+///   ⇒ nr_of_sfb = [7, 7, 7, 0]. Verified against
+///   `decode_mpeg2(.., intensity_stereo = true)` in `scalefactor.rs`.
+const MPEG2_IS_SCALEFAC_COMPRESS_9: u16 = 358;
 
 /// Per ISO/IEC 11172-3 §2.4.3.4.10.2 / Table 3-B.4 the intensity-stereo
 /// pan position `is_pos` (0..=6) maps to a left/right split where
@@ -1322,6 +1417,211 @@ fn apply_is_rewrite_long(xr: &mut [[f32; 576]], sample_rate: u32, bound: usize, 
     }
 }
 
+// ---------------- MPEG-2 LSF IS variant ----------------
+
+/// MPEG-2 LSF intensity-stereo `(k_l, k_r)` factors for `is_pos = 0..=30`
+/// at `intensity_scale = 0` (geometric step 0.5, i.e. 6 dB per pair).
+///
+/// Mirror of `requantize::is_factors_mpeg2(is_pos, 0)`. Used by the
+/// encoder to pick the integer `is_pos` whose `(k_l, k_r)` ratio best
+/// matches the per-band L / R energy split — exactly the inverse of the
+/// decoder's reconstruction pass.
+fn mpeg2_is_factors_scale0(is_pos: u8) -> (f64, f64) {
+    if is_pos == 0 {
+        return (1.0, 1.0);
+    }
+    let n = ((is_pos as i32 + 1) / 2) as i32;
+    let ratio = 0.5_f64.powi(n);
+    if is_pos & 1 == 0 {
+        (1.0, ratio)
+    } else {
+        (ratio, 1.0)
+    }
+}
+
+/// MPEG-2 LSF variant of [`pick_is_bound_long`]. Returns a 5-bit
+/// `is_pos` per long-block sfb (sentinel = 31 for "not IS-coded"). The
+/// decoder pipeline mirrors MPEG-1: the R channel's integer
+/// coefficients are zero from the IS bound upward, so the decoder
+/// recovers the same bound via `find_is_bound_sfb`.
+fn pick_is_bound_long_mpeg2(xr: &[[f32; 576]], sample_rate: u32) -> (usize, [u8; 22]) {
+    use crate::sfband::sfband_long;
+    debug_assert_eq!(xr.len(), 2);
+    let bounds = sfband_long(sample_rate);
+
+    /// Same safety floor as MPEG-1: sfb 7 is the lowest band the
+    /// encoder ever tags for IS coding.
+    const MIN_IS_BOUND_SFB: usize = 7;
+    /// Same coherence threshold (and rationale) as MPEG-1.
+    const COHERENCE_THRESHOLD: f64 = 0.85;
+    /// Same pan-imbalance shortcut as MPEG-1.
+    const PAN_SHORTCUT_THRESHOLD: f64 = 0.85;
+
+    // Establish a noise-floor energy (mirrors MPEG-1 logic).
+    let mut max_band_e = 0.0f64;
+    for sfb in 0..21 {
+        let lo = bounds[sfb] as usize;
+        let hi = bounds[sfb + 1] as usize;
+        if hi > 576 {
+            break;
+        }
+        let mut e = 0.0f64;
+        for i in lo..hi {
+            let lv = xr[0][i] as f64;
+            let rv = xr[1][i] as f64;
+            e += lv * lv + rv * rv;
+        }
+        if e > max_band_e {
+            max_band_e = e;
+        }
+    }
+    let silence_threshold = max_band_e.max(1.0e-12) * 1.0e-4;
+
+    let mut is_pos = [31u8; 22];
+    let mut bound = 21usize;
+    for sfb in (MIN_IS_BOUND_SFB..21).rev() {
+        let lo = bounds[sfb] as usize;
+        let hi = bounds[sfb + 1] as usize;
+        if hi > 576 || lo >= 576 {
+            break;
+        }
+        let mut el = 0.0f64;
+        let mut er = 0.0f64;
+        let mut c = 0.0f64;
+        for i in lo..hi {
+            let lv = xr[0][i] as f64;
+            let rv = xr[1][i] as f64;
+            el += lv * lv;
+            er += rv * rv;
+            c += lv * rv;
+        }
+        let total_e = el + er;
+        if total_e < silence_threshold {
+            // Silent band: keep R = 0 (no IS coupling required, the
+            // decoder reads is_pos = 0 ⇒ k_l = k_r = 1 but with the
+            // surrogate near zero the result is still ~silent). Using
+            // is_pos = 0 (rather than the sentinel) keeps the bound
+            // walking — sentinel 31 would force the decoder's
+            // `find_is_bound_sfb` to look further down for the bound.
+            is_pos[sfb] = 0;
+            bound = sfb;
+            continue;
+        }
+        let pan_imbalance = (el - er).abs() / total_e;
+        let pan_qualifies = pan_imbalance >= PAN_SHORTCUT_THRESHOLD;
+        let denom = (el * er).sqrt();
+        let coherence_qualifies = denom > 1.0e-12 && (c.abs() / denom) >= COHERENCE_THRESHOLD;
+        if !(pan_qualifies || coherence_qualifies) {
+            break;
+        }
+        is_pos[sfb] = best_is_pos_from_energy_mpeg2(el, er);
+        bound = sfb;
+    }
+    (bound, is_pos)
+}
+
+/// Pick the integer MPEG-2 `is_pos ∈ 0..=30` whose `(k_l, k_r)` ratio
+/// at `intensity_scale = 0` best matches the observed per-band L / R
+/// energies. Matches `best_is_pos_from_energy` but with the MPEG-2
+/// geometric ratio table.
+fn best_is_pos_from_energy_mpeg2(el: f64, er: f64) -> u8 {
+    let total = el + er;
+    if total <= 0.0 {
+        return 0; // defensive — caller already filtered silent bands
+    }
+    let observed = (er / total).clamp(0.0, 1.0);
+    let mut best_pos = 0u8;
+    let mut best_err = f64::INFINITY;
+    for pos in 0u8..=30 {
+        let (k_l, k_r) = mpeg2_is_factors_scale0(pos);
+        let denom = k_l * k_l + k_r * k_r;
+        let pred = if denom > 0.0 { k_r * k_r / denom } else { 0.0 };
+        let err = (pred - observed).abs();
+        if err < best_err {
+            best_err = err;
+            best_pos = pos;
+        }
+    }
+    best_pos
+}
+
+/// MPEG-2 LSF variant of [`apply_is_rewrite_long`]. For each IS-coded
+/// band we compute a per-band surrogate that, when multiplied by the
+/// decoder's `(k_l, k_r)` factors, reproduces the original L / R
+/// magnitudes as closely as possible:
+///
+/// * For `is_pos == 0` (`k_l = k_r = 1`) we write the per-sample average
+///   `(L + R) / 2` — both decoded channels match this surrogate
+///   directly.
+/// * For other values, exactly one of `k_l` / `k_r` is `1` (whichever
+///   side was louder); the surrogate amplitude equals that channel's
+///   original waveform, and the attenuated side is reconstructed by
+///   the matching factor.
+/// * The sentinel (`is_pos == 31`) leaves L untouched and zeroes R, so
+///   `find_is_bound_sfb` keeps the bound aligned with our choice.
+///
+/// R is forced to zero on every IS-coded band so the decoder's
+/// `find_is_bound_sfb` recovers the same bound from the integer
+/// coefficient layout.
+fn apply_is_rewrite_long_mpeg2(
+    xr: &mut [[f32; 576]],
+    sample_rate: u32,
+    bound: usize,
+    is_pos: &[u8; 22],
+) {
+    use crate::sfband::sfband_long;
+    debug_assert_eq!(xr.len(), 2);
+    let bounds = sfband_long(sample_rate);
+    let (l_slot, r_slot) = xr.split_at_mut(1);
+    let l = &mut l_slot[0];
+    let r = &mut r_slot[0];
+    for sfb in bound..21 {
+        let lo = bounds[sfb] as usize;
+        let hi = bounds[sfb + 1] as usize;
+        if hi > 576 {
+            break;
+        }
+        let pos = is_pos[sfb];
+        if pos == 31 {
+            // Sentinel ⇒ leave L alone, force R to zero.
+            for i in lo..hi {
+                r[i] = 0.0;
+            }
+            continue;
+        }
+        if pos == 0 {
+            // Equal split: surrogate is the average of L and R
+            // (energy split goes back to both channels via k = 1).
+            for i in lo..hi {
+                let lv = l[i];
+                let rv = r[i];
+                l[i] = 0.5 * (lv + rv);
+                r[i] = 0.0;
+            }
+            continue;
+        }
+        // is_pos > 0: exactly one factor is 1, the other is < 1. Let
+        // the surrogate equal the louder channel's waveform — its k = 1
+        // factor reproduces it exactly, and the attenuated side reads
+        // back as `surrogate * k_attenuated`.
+        if pos & 1 == 0 {
+            // Even ⇒ k_l = 1, k_r < 1: L louder. Surrogate already
+            // sits in L, just zero R.
+            for i in lo..hi {
+                r[i] = 0.0;
+            }
+        } else {
+            // Odd ⇒ k_l < 1, k_r = 1: R louder. Move R into L (the
+            // decoder's surrogate-by-k_l reconstructs the attenuated
+            // L), zero R.
+            for i in lo..hi {
+                l[i] = r[i];
+                r[i] = 0.0;
+            }
+        }
+    }
+}
+
 // ---------------- Per-granule encoding ----------------
 
 #[derive(Clone)]
@@ -1341,8 +1641,15 @@ struct GranuleEncoded {
     block_type: BlockType,
     /// MPEG-1 4-bit `scalefac_compress` index (Table 3-B.32). 0 ⇒ no
     /// scalefactor bits (slen1=slen2=0); 13 ⇒ (slen1=3, slen2=3) for
-    /// the IS R-channel path.
+    /// the MPEG-1 IS R-channel path. Ignored for MPEG-2 LSF (which
+    /// uses `scalefac_compress_9` below).
     scalefac_compress: u8,
+    /// MPEG-2 LSF 9-bit `scalefac_compress` field. 0 ⇒ no scalefactor
+    /// bits emitted; `MPEG2_IS_SCALEFAC_COMPRESS_9` = 358 ⇒ slen =
+    /// [4, 5, 5, 0], `intensity_scale = 0` for the MPEG-2 LSF IS
+    /// R-channel path. Ignored for MPEG-1 (which uses
+    /// `scalefac_compress` above).
+    scalefac_compress_9: u16,
     /// Optional pre-Huffman scalefactor writes (for the R channel of an
     /// IS-active granule). `(value, len_bits)` pairs in sfb order matching
     /// the chosen `scalefac_compress`. Empty when no scalefactors are
@@ -1372,6 +1679,7 @@ fn encode_granule(
     bit_target: usize,
     block_type: BlockType,
     is_pos: Option<&[u8; 22]>,
+    is_variant: IsVariant,
 ) -> GranuleEncoded {
     // Pick global_gain by binary search to fit `bit_target`. Higher
     // global_gain -> smaller is[] values -> fewer bits.
@@ -1384,7 +1692,7 @@ fn encode_granule(
     let mut best: Option<GranuleEncoded> = None;
     while lo <= hi {
         let mid = (lo + hi) / 2;
-        let g = quantize_and_encode(xr, mid as u8, block_type, is_pos);
+        let g = quantize_and_encode(xr, mid as u8, block_type, is_pos, is_variant);
         if g.total_bits <= bit_target {
             // This fits — try a smaller gain (more precision).
             best = Some(g);
@@ -1398,7 +1706,7 @@ fn encode_granule(
         return g;
     }
     // Fallback: return the highest-gain (smallest-bits) result.
-    quantize_and_encode(xr, 255, block_type, is_pos)
+    quantize_and_encode(xr, 255, block_type, is_pos, is_variant)
 }
 
 /// VBR per-granule encode — pick the **largest** global_gain (= fewest
@@ -1416,12 +1724,13 @@ fn encode_granule_vbr(
     mask: &GranuleMask,
     block_type: BlockType,
     is_pos: Option<&[u8; 22]>,
+    is_variant: IsVariant,
 ) -> GranuleEncoded {
     // Energy gate: if every band is essentially silent, skip the
     // search entirely and emit a high-gain (ne ar-zero-bit) granule.
     let any_energy = mask.energy.iter().any(|&e| e > 1.0e-12);
     if !any_energy {
-        return quantize_and_encode(xr, 240, block_type, is_pos);
+        return quantize_and_encode(xr, 240, block_type, is_pos, is_variant);
     }
 
     // Step 1: find the smallest gain where NMR <= 0. Walk *upwards*:
@@ -1448,11 +1757,11 @@ fn encode_granule_vbr(
     // Step 2: bit-cap fallback. If the chosen gain exceeds the
     // per-granule bit cap (very loud, very wideband content) we
     // need to raise the gain further. Walk upward until we fit.
-    let mut g = quantize_and_encode(xr, chosen, block_type, is_pos);
+    let mut g = quantize_and_encode(xr, chosen, block_type, is_pos, is_variant);
     let mut gain = chosen;
     while g.total_bits > VBR_PER_GRANULE_BIT_CAP && gain < 255 {
         gain = gain.saturating_add(2);
-        g = quantize_and_encode(xr, gain, block_type, is_pos);
+        g = quantize_and_encode(xr, gain, block_type, is_pos, is_variant);
     }
     g
 }
@@ -1462,6 +1771,7 @@ fn quantize_and_encode(
     global_gain: u8,
     block_type: BlockType,
     is_pos: Option<&[u8; 22]>,
+    is_variant: IsVariant,
 ) -> GranuleEncoded {
     // Quantisation step: step_factor = 2^((global_gain - 210) / 4).
     // is[i] = nint( (|xr[i]|/step_factor)^(3/4) - 0.0946 )
@@ -1564,21 +1874,59 @@ fn quantize_and_encode(
     }
 
     // Scalefactor emit (R channel of an IS-active long-block granule).
-    // We pack `is_pos` into the long-block scalefactor slots described by
-    // ISO/IEC 11172-3 Table 3-B.32 with `scalefac_compress = 13`
-    // ⇒ (slen1 = 3, slen2 = 3): six 3-bit values for sfb 0..5, five
-    // for sfb 6..10, five for sfb 11..15, and five for sfb 16..20 — all
-    // 3 bits wide. is_pos values are 0..=6 for IS-coded bands or 7 for
-    // the "not IS-coded" sentinel.
-    let (sf_writes, sf_bits, scalefac_compress) = match is_pos {
-        Some(positions) if block_type == BlockType::Long => {
-            let mut sf: Vec<(u32, u32)> = Vec::with_capacity(21);
-            for &p in positions.iter().take(21) {
-                sf.push(((p as u32) & 0x7, 3));
+    //
+    // MPEG-1: pack into Table 3-B.32 row at `scalefac_compress = 13`
+    //   ⇒ (slen1, slen2) = (3, 3). 21 sfbs × 3 bits = 63 bits. is_pos
+    //   values are 0..=6 (IS-coded) with 7 = "not IS-coded" sentinel.
+    //
+    // MPEG-2 LSF: pack into the IS half of `SCF_PARTITIONS_MPEG2[0]`
+    //   at `scalefac_compress_9 = 358` ⇒ slen = [4, 5, 5, 0],
+    //   nr_of_sfb = [7, 7, 7, 0]. Total 7×4 + 7×5 + 7×5 = 98 bits.
+    //   is_pos values are 0..=30 (IS-coded) with 31 = "not IS-coded"
+    //   sentinel. The slen-4 group covers sfb 0..6 (always below the
+    //   IS bound thanks to the encoder's safety floor at sfb 7), so
+    //   that group's is_pos values are written as 0 — they're
+    //   ignored by the decoder because `find_is_bound_sfb` places the
+    //   bound at sfb 7+.
+    //
+    // The MPEG-2 path also encodes `intensity_scale = 0` (the LSB of
+    // `scalefac_compress_9 = 358`), matching the geometric step
+    // 0.5^n the encoder used to pick `is_pos` (see
+    // `mpeg2_is_factors_scale0`).
+    let (sf_writes, sf_bits, scalefac_compress, scalefac_compress_9) = match is_pos {
+        Some(positions) if block_type == BlockType::Long => match is_variant {
+            IsVariant::Mpeg1 => {
+                let mut sf: Vec<(u32, u32)> = Vec::with_capacity(21);
+                for &p in positions.iter().take(21) {
+                    sf.push(((p as u32) & 0x7, 3));
+                }
+                (sf, 21 * 3, 13u8, 0u16)
             }
-            (sf, 21 * 3, 13u8)
-        }
-        _ => (Vec::new(), 0usize, 0u8),
+            IsVariant::Mpeg2 => {
+                // Group 0: sfb 0..6 at slen = 4 (7 entries, 4 bits each).
+                // Group 1: sfb 7..13 at slen = 5 (7 entries, 5 bits each).
+                // Group 2: sfb 14..20 at slen = 5 (7 entries, 5 bits each).
+                let mut sf: Vec<(u32, u32)> = Vec::with_capacity(21);
+                for &p in positions.iter().take(7) {
+                    // Cap at 4-bit width — sfb 0..6 are below the IS
+                    // bound (the picker keeps them at sentinel = 31)
+                    // but slen here is only 4 bits, so we'd truncate
+                    // 31 to 15. Override with 0 for these bands; the
+                    // decoder ignores them anyway (bound starts at
+                    // sfb 7+).
+                    let v = if p == 31 { 0 } else { p as u32 & 0xF };
+                    sf.push((v, 4));
+                }
+                for &p in positions.iter().skip(7).take(7) {
+                    sf.push(((p as u32) & 0x1F, 5));
+                }
+                for &p in positions.iter().skip(14).take(7) {
+                    sf.push(((p as u32) & 0x1F, 5));
+                }
+                (sf, 7 * 4 + 7 * 5 + 7 * 5, 0u8, MPEG2_IS_SCALEFAC_COMPRESS_9)
+            }
+        },
+        _ => (Vec::new(), 0usize, 0u8, 0u16),
     };
     let total_bits = total_bits + sf_bits;
 
@@ -1594,6 +1942,7 @@ fn quantize_and_encode(
         part2_3_length,
         block_type,
         scalefac_compress,
+        scalefac_compress_9,
         sf_writes,
         sf_bits,
     }
@@ -1743,7 +2092,7 @@ mod tests {
     #[test]
     fn quantize_silence_gives_zero_bits() {
         let xr = [0.0f32; 576];
-        let g = quantize_and_encode(&xr, 100, BlockType::Long, None);
+        let g = quantize_and_encode(&xr, 100, BlockType::Long, None, IsVariant::Mpeg1);
         assert_eq!(g.total_bits, 0);
         assert_eq!(g.big_values, 0);
     }

@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Intensity-stereo (IS) encoding for MPEG-2 LSF (Low Sampling Frequency)
+  Layer III long-block stereo granules per ISO/IEC 13818-3 §2.4.2.7 and
+  §2.4.3.4.10.2. Extends the MPEG-1 IS picker / rewriter to the LSF
+  variant: the per-band `is_pos` is now a 5-bit field (0..=30 with 31 =
+  "not IS-coded" sentinel) selected from the geometric ratio table at
+  `intensity_scale = 0` (mirror of `is_factors_mpeg2(.., 0)` — step
+  0.5^n where `n = (is_pos+1)/2`). The same safety-floor / coherence /
+  pan-imbalance rules from the MPEG-1 path drive bound selection. The
+  L spectrum is rewritten to the louder channel's waveform per band
+  (or the (L+R)/2 average when `is_pos = 0`), R is forced to zero so
+  `find_is_bound_sfb` recovers the same bound. R-channel scalefactors
+  pack into the IS half of `SCF_PARTITIONS_MPEG2[0][16..28]` via a
+  fixed `scalefac_compress_9 = 358` ⇒ slen = [4, 5, 5, 0],
+  `nr_of_sfb = [7, 7, 7, 0]`, total 7×4 + 7×5 + 7×5 = 98 scalefactor
+  bits per IS-active R channel. The slen-4 group covers sfb 0..6 (kept
+  out of IS by the encoder's safety floor at sfb 7), so its lower
+  resolution is harmless. Frame-level `mode_extension` semantics are
+  unchanged from the MPEG-1 path (bit 0x1 = IS on). Opt out with
+  `intensity_stereo=0`. On a 22.05 kHz stereo fixture with uncorrelated
+  LF and a 4-9 kHz correlated HF tail this saves ~27.9% bytes in VBR
+  mode versus IS-disabled (well above the 5-8% target); ffmpeg
+  cross-decode is clean. Short / start / stop / mixed LSF blocks stay
+  out of IS. New tests: `tests/encoder_intensity_stereo_mpeg2.rs`
+  (5 cases — header bits, opt-out, VBR byte delta, own-decoder
+  round-trip, ffmpeg cross-decode).
 - Intensity-stereo (IS) encoding per ISO/IEC 11172-3 §2.4.3.4.10.2 for
   MPEG-1 long-block stereo granules. The encoder picks a per-granule
   scalefactor-band bound by walking sfbs from the top down: a band
