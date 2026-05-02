@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Short-block window switching on transients per ISO/IEC 11172-3
+  §2.4.2.2 / Annex C. A new `block_type` module hosts the
+  `TransientDetector` (per-channel energy-ratio detector that splits
+  every 576-sample granule into three 192-sample sub-frames and
+  flags any sub-frame whose energy exceeds the smoothed long-term
+  average by more than 4×) and the `BlockTypeMachine` (per-channel
+  state machine that bridges the legal long → start → short → stop
+  sequence using one granule of PCM lookahead). The MDCT now
+  branches on block type: long / start / stop drive the existing
+  36-point long MDCT with the type's window envelope; short uses
+  three 12-point MDCTs per subband, followed by the inverse-reorder
+  step that mirrors the decoder's `reorder_short`. Side-info emit
+  switches to the window-switching layout (2 × `table_select` + 3 ×
+  `subblock_gain`, no region counts) for non-long granules. On an
+  isolated 50 ms transient at 44.1 kHz / 192 kbps the pre-onset
+  PSNR jumps from 54 dB (long-only) to >120 dB with short blocks
+  engaged. Opt out with `short_blocks=0`. New tests: 8 unit tests
+  in `block_type::tests`, 2 mdct unit tests, and 5 end-to-end tests
+  in `tests/encoder_short_blocks.rs` covering block-type detection,
+  steady-tone false-positive rejection, isolated-transient pre-echo
+  PSNR delta, ffmpeg cross-decode, and our-decoder round-trip
+  energy parity.
 - VBR (variable bit-rate) encoding mode. Opt in by setting
   `CodecParameters::options` to `CodecOptions::new().set("vbr_quality",
   "0".."9")` (0 = highest quality / largest files, 9 = smallest). A

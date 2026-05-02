@@ -6,7 +6,9 @@
 //!   mono / dual-channel stereo / joint stereo (M/S only — no IS).
 //! - One CBR bitrate per encoder instance, picked from the version's
 //!   standard bitrate table.
-//! - Long blocks only (block_type = 0). No window switching.
+//! - Long, start, short, stop blocks with automatic window switching
+//!   on transients per ISO/IEC 11172-3 §2.4.2.2 (see
+//!   [`crate::block_type`]). Mixed blocks are not emitted.
 //! - No CRC. No psychoacoustic model. No rate-distortion: a simple
 //!   global-gain bisection sets the quantisation step so the Huffman bit
 //!   count fits in the available main-data budget.
@@ -32,6 +34,7 @@ use oxideav_core::{
 };
 
 use crate::analysis::{analyze_granule, AnalysisState};
+use crate::block_type::{BlockType, BlockTypeMachine, TransientDetector};
 use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A};
 use crate::mdct::{mdct_granule, MdctState};
 use crate::psy::{global_gain_to_step, vbr_quality_to_mask_ratio, GranuleMask};
@@ -88,6 +91,11 @@ pub enum RateControl {
 ///   ISO/IEC 11172-3 §2.4.3.4.10 — picked per frame from a spectral
 ///   correlation metric. When `0` the encoder always emits
 ///   dual-channel (mode = `0b10`) frames.
+/// - `short_blocks` — `u32` 0/1. When `1` (the default), the encoder
+///   may switch to short blocks on transients per ISO/IEC 11172-3
+///   §2.4.2.2 to suppress pre-echo. When `0` the encoder always emits
+///   long blocks regardless of input — useful for benchmarking pre-
+///   echo behaviour or for matching the pre-round-24 output exactly.
 #[derive(Debug, Clone)]
 pub struct Mp3EncoderOptions {
     /// `Some(0..=9)` → switch to VBR with the given quality index.
@@ -96,6 +104,8 @@ pub struct Mp3EncoderOptions {
     pub cbr_bitrate_kbps: Option<u32>,
     /// Allow joint-stereo (MS) coding for stereo inputs. Default: `true`.
     pub joint_stereo: bool,
+    /// Allow short-block window switching on transients. Default: `true`.
+    pub short_blocks: bool,
 }
 
 impl Default for Mp3EncoderOptions {
@@ -104,6 +114,7 @@ impl Default for Mp3EncoderOptions {
             vbr_quality: None,
             cbr_bitrate_kbps: None,
             joint_stereo: true,
+            short_blocks: true,
         }
     }
 }
@@ -128,6 +139,12 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
             default: OptionValue::U32(1),
             help: "Allow joint-stereo (MS) coding when the spectrum is highly correlated. 0 = always dual-channel, 1 = enable MS (default).",
         },
+        OptionField {
+            name: "short_blocks",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "Allow short-block window switching on transients. 0 = always long blocks, 1 = enable short blocks (default).",
+        },
     ];
 
     fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
@@ -150,6 +167,10 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
             "joint_stereo" => {
                 let n = v.as_u32()?;
                 self.joint_stereo = n != 0;
+            }
+            "short_blocks" => {
+                let n = v.as_u32()?;
+                self.short_blocks = n != 0;
             }
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -265,6 +286,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // Joint stereo only makes sense for two-channel input. For mono /
     // dual-channel-forced configurations the flag stays effectively off.
     let allow_joint_stereo = opts.joint_stereo && channels == 2;
+    let allow_short_blocks = opts.short_blocks;
 
     // CBR slot: explicit option override > params.bit_rate > version default.
     let default_kbps = if is_mpeg2 { 64 } else { 128 };
@@ -308,9 +330,12 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         rate_control,
         vbr_quality,
         allow_joint_stereo,
+        allow_short_blocks,
         time_base: TimeBase::new(1, sample_rate as i64),
         analysis_state: [AnalysisState::new(), AnalysisState::new()],
         mdct_state: [MdctState::new(), MdctState::new()],
+        transient_det: [TransientDetector::new(), TransientDetector::new()],
+        block_machine: [BlockTypeMachine::new(), BlockTypeMachine::new()],
         pcm_queue: vec![Vec::new(); channels as usize],
         main_data_queue: Vec::new(),
         pending_packets: VecDeque::new(),
@@ -339,9 +364,20 @@ struct Mp3Encoder {
     /// `true` when the encoder may emit joint-stereo (MS) frames. Only
     /// meaningful for two-channel inputs.
     allow_joint_stereo: bool,
+    /// `true` when the encoder may switch to short blocks on detected
+    /// transients (default). When `false` every granule is emitted as
+    /// a long block — matches the pre-round-24 encoder exactly.
+    allow_short_blocks: bool,
     time_base: TimeBase,
     analysis_state: [AnalysisState; 2],
     mdct_state: [MdctState; 2],
+    /// Per-channel transient detector — drives short-block selection per
+    /// ISO/IEC 11172-3 §2.4.2.2 / Annex C.
+    transient_det: [TransientDetector; 2],
+    /// Per-channel block-type state machine. Owns the previous granule's
+    /// chosen window so transitions stay legal (long → start → short →
+    /// stop → long).
+    block_machine: [BlockTypeMachine; 2],
     /// Per-channel float queue (samples in -1..=1).
     pcm_queue: Vec<Vec<f32>>,
     /// Pending main-data bytes that have not yet been written to a frame
@@ -446,11 +482,22 @@ impl Mp3Encoder {
     fn flush_ready_frames(&mut self, drain: bool) -> Result<()> {
         // MPEG-1: 1152 samples per frame (2 granules of 576).
         // MPEG-2 LSF: 576 samples per frame (1 granule of 576).
+        //
+        // We need ONE extra granule of lookahead so the block-type
+        // machine can retroactively mark the last granule of THIS frame
+        // as a `start` window when the very next granule (the first one
+        // of the following frame) is transient. While draining we don't
+        // have any lookahead so the lookahead PCM is zero-padded — the
+        // detector sees silence and the machine drops into long.
         let n_ch = self.channels as usize;
         let spf = self.samples_per_frame();
+        // Lookahead only needed when the block-type detector might use
+        // it to mark the last granule of this frame as `start`.
+        let lookahead = if self.allow_short_blocks { 576 } else { 0 };
+        let needed = if drain { spf } else { spf + lookahead };
         loop {
             let avail = self.pcm_queue[0].len();
-            if avail < spf {
+            if avail < needed {
                 if drain && avail > 0 {
                     // Pad with zeros up to spf to flush the tail.
                     for ch in 0..n_ch {
@@ -479,8 +526,57 @@ impl Mp3Encoder {
             pcm_in[ch].copy_from_slice(&self.pcm_queue[ch][..spf]);
             self.pcm_queue[ch].drain(..spf);
         }
+        // Lookahead: peek (without draining) one extra granule for the
+        // block-type decision. If the queue is shorter than that
+        // (typically only at end-of-stream after `flush`) we treat the
+        // missing samples as silence — silence cannot trigger the
+        // transient detector, so the trailing granule will not be
+        // marked as `start`.
+        let mut pcm_lookahead: Vec<[f32; 576]> = vec![[0.0f32; 576]; n_ch];
+        for ch in 0..n_ch {
+            let avail = self.pcm_queue[ch].len();
+            let take = avail.min(576);
+            pcm_lookahead[ch][..take].copy_from_slice(&self.pcm_queue[ch][..take]);
+        }
 
-        // Analysis + MDCT per granule per channel.
+        // Decide per-granule per-channel block type. We feed the
+        // detector each granule in order (so its smoothed-energy
+        // tracker stays up to date) and look one granule ahead so the
+        // state machine can pick `start` for the last granule of this
+        // frame when the first granule of the next frame is transient.
+        //
+        // Note: the detector is *stateful* — calling `is_transient`
+        // mutates its smoothed average — so we have to drive it in PCM
+        // order and use the verdicts before deciding block types.
+        let mut block_types: Vec<Vec<BlockType>> =
+            (0..n_gr).map(|_| vec![BlockType::Long; n_ch]).collect();
+        if self.allow_short_blocks {
+            for ch in 0..n_ch {
+                // Per-granule transient verdicts for this channel: the n_gr
+                // granules of this frame plus the one-granule lookahead.
+                let mut verdicts: Vec<bool> = Vec::with_capacity(n_gr + 1);
+                for gr in 0..n_gr {
+                    let mut pcm_gr = [0.0f32; 576];
+                    pcm_gr.copy_from_slice(&pcm_in[ch][gr * 576..gr * 576 + 576]);
+                    verdicts.push(self.transient_det[ch].is_transient(&pcm_gr));
+                }
+                // Lookahead verdict — uses a *clone* of the detector so the
+                // real detector's smoothed-average state is not advanced
+                // by samples we will see again next frame. Without the
+                // clone the detector would fast-forward and misfire.
+                {
+                    let mut peek = self.transient_det[ch].clone();
+                    verdicts.push(peek.is_transient(&pcm_lookahead[ch]));
+                }
+                // Drive the state machine with (this, next) pairs.
+                for gr in 0..n_gr {
+                    let bt = self.block_machine[ch].decide(verdicts[gr], verdicts[gr + 1]);
+                    block_types[gr][ch] = bt;
+                }
+            }
+        }
+
+        // Analysis + MDCT per granule per channel — now block-type aware.
         let mut xr: Vec<Vec<[f32; 576]>> = (0..n_gr)
             .map(|_| (0..n_ch).map(|_| [0.0f32; 576]).collect())
             .collect();
@@ -490,7 +586,14 @@ impl Mp3Encoder {
                 pcm_gr.copy_from_slice(&pcm_in[ch][gr * 576..gr * 576 + 576]);
                 let mut sub = [[0.0f32; 18]; 32];
                 analyze_granule(&mut self.analysis_state[ch], &pcm_gr, &mut sub);
-                mdct_granule(&sub, &mut xr[gr][ch], &mut self.mdct_state[ch]);
+                let bt = block_types[gr][ch].as_u8();
+                mdct_granule(
+                    &sub,
+                    &mut xr[gr][ch],
+                    &mut self.mdct_state[ch],
+                    bt,
+                    self.sample_rate,
+                );
             }
         }
 
@@ -551,7 +654,7 @@ impl Mp3Encoder {
                         let units_left = (n_gr - gr) * n_ch - ch;
                         let target = remaining / units_left.max(1);
                         let target = target.min(per_unit_budget * 2).max(64);
-                        let g = encode_granule(&xr[gr][ch], target);
+                        let g = encode_granule(&xr[gr][ch], target, block_types[gr][ch]);
                         bits_used_total += g.total_bits;
                         granule_data[gr].push(g);
                     }
@@ -569,7 +672,7 @@ impl Mp3Encoder {
                 for gr in 0..n_gr {
                     for ch in 0..n_ch {
                         let mask = GranuleMask::analyze(&xr[gr][ch], self.sample_rate, mask_ratio);
-                        let g = encode_granule_vbr(&xr[gr][ch], &mask);
+                        let g = encode_granule_vbr(&xr[gr][ch], &mask, block_types[gr][ch]);
                         total_bits += g.total_bits;
                         granule_data[gr].push(g);
                     }
@@ -708,15 +811,7 @@ impl Mp3Encoder {
                 si_w.write_u32(g.big_values as u32, 9);
                 si_w.write_u32(g.global_gain as u32, 8);
                 si_w.write_u32(0, 4); // scalefac_compress = 0 (slen1=0, slen2=0)
-                si_w.write_u32(0, 1); // window_switching_flag = 0 (long blocks)
-                si_w.write_u32(g.table_select as u32, 5);
-                si_w.write_u32(g.table_select as u32, 5);
-                si_w.write_u32(g.table_select as u32, 5);
-                si_w.write_u32(15, 4); // region0_count
-                si_w.write_u32(7, 3); // region1_count
-                si_w.write_u32(0, 1); // preflag
-                si_w.write_u32(0, 1); // scalefac_scale
-                si_w.write_u32(0, 1); // count1table_select = 0 (table A)
+                emit_window_switching_tail_mpeg1(si_w, g);
             }
         }
     }
@@ -749,17 +844,72 @@ impl Mp3Encoder {
             si_w.write_u32(g.big_values as u32, 9);
             si_w.write_u32(g.global_gain as u32, 8);
             si_w.write_u32(0, 9); // scalefac_compress = 0 → slen=[0,0,0,0]
-            si_w.write_u32(0, 1); // window_switching_flag = 0 (long blocks)
-            si_w.write_u32(g.table_select as u32, 5);
-            si_w.write_u32(g.table_select as u32, 5);
-            si_w.write_u32(g.table_select as u32, 5);
-            si_w.write_u32(15, 4); // region0_count
-            si_w.write_u32(7, 3); // region1_count
-                                  // MPEG-2 has NO preflag bit in the bitstream.
-            si_w.write_u32(0, 1); // scalefac_scale
-            si_w.write_u32(0, 1); // count1table_select = 0 (table A)
+            emit_window_switching_tail_mpeg2(si_w, g);
         }
     }
+}
+
+/// Emit the post-`scalefac_compress` tail of a MPEG-1 granule's side
+/// info block (window_switching_flag through count1table_select).
+///
+/// Long blocks: window_switching_flag = 0, three identical
+/// table_select entries, region0_count = 15 / region1_count = 7
+/// (so region0 covers 0..big_end and region1/2 are empty).
+///
+/// Window-switching blocks (start / short / stop): the side info layout
+/// changes — only TWO table_select entries (region2 vanishes), then
+/// three subblock_gain entries instead of region0/1_count. Region
+/// boundaries are *implicit*: per ISO 11172-3 §2.4.2.7 / decoder
+/// `decoder.rs`, short blocks split big_values at offset 36 between
+/// table_select[0] and table_select[1].
+fn emit_window_switching_tail_mpeg1(si_w: &mut BitWriter, g: &GranuleEncoded) {
+    if g.block_type == BlockType::Long {
+        si_w.write_u32(0, 1); // window_switching_flag = 0
+        si_w.write_u32(g.table_select as u32, 5);
+        si_w.write_u32(g.table_select as u32, 5);
+        si_w.write_u32(g.table_select as u32, 5);
+        si_w.write_u32(15, 4); // region0_count
+        si_w.write_u32(7, 3); // region1_count
+    } else {
+        si_w.write_u32(1, 1); // window_switching_flag = 1
+        si_w.write_u32(g.block_type.as_u8() as u32, 2); // block_type
+        si_w.write_u32(0, 1); // mixed_block_flag = 0 (pure short on switch)
+        si_w.write_u32(g.table_select as u32, 5); // table_select[0]
+        si_w.write_u32(g.table_select as u32, 5); // table_select[1]
+                                                  // 3 × subblock_gain — keep at 0 (no per-window pre-emphasis).
+        si_w.write_u32(0, 3);
+        si_w.write_u32(0, 3);
+        si_w.write_u32(0, 3);
+    }
+    si_w.write_u32(0, 1); // preflag
+    si_w.write_u32(0, 1); // scalefac_scale
+    si_w.write_u32(0, 1); // count1table_select = 0 (table A)
+}
+
+/// MPEG-2 LSF variant of [`emit_window_switching_tail_mpeg1`]. The
+/// only on-wire difference is the absence of the explicit `preflag`
+/// bit (MPEG-2 derives it from `scalefac_compress >= 500`).
+fn emit_window_switching_tail_mpeg2(si_w: &mut BitWriter, g: &GranuleEncoded) {
+    if g.block_type == BlockType::Long {
+        si_w.write_u32(0, 1); // window_switching_flag = 0
+        si_w.write_u32(g.table_select as u32, 5);
+        si_w.write_u32(g.table_select as u32, 5);
+        si_w.write_u32(g.table_select as u32, 5);
+        si_w.write_u32(15, 4); // region0_count
+        si_w.write_u32(7, 3); // region1_count
+    } else {
+        si_w.write_u32(1, 1); // window_switching_flag = 1
+        si_w.write_u32(g.block_type.as_u8() as u32, 2);
+        si_w.write_u32(0, 1); // mixed_block_flag = 0
+        si_w.write_u32(g.table_select as u32, 5);
+        si_w.write_u32(g.table_select as u32, 5);
+        si_w.write_u32(0, 3);
+        si_w.write_u32(0, 3);
+        si_w.write_u32(0, 3);
+    }
+    // MPEG-2 has NO preflag bit in the bitstream.
+    si_w.write_u32(0, 1); // scalefac_scale
+    si_w.write_u32(0, 1); // count1table_select = 0 (table A)
 }
 
 impl Encoder for Mp3Encoder {
@@ -856,6 +1006,10 @@ struct GranuleEncoded {
     /// Pre-summed bits for the writes.
     total_bits: usize,
     part2_3_length: u16,
+    /// Block type chosen for this granule. `BlockType::Long` keeps the
+    /// long-block side-info layout (window_switching_flag = 0); any
+    /// other value triggers the window-switching path.
+    block_type: BlockType,
 }
 
 impl GranuleEncoded {
@@ -867,7 +1021,7 @@ impl GranuleEncoded {
     }
 }
 
-fn encode_granule(xr: &[f32; 576], bit_target: usize) -> GranuleEncoded {
+fn encode_granule(xr: &[f32; 576], bit_target: usize, block_type: BlockType) -> GranuleEncoded {
     // Pick global_gain by binary search to fit `bit_target`. Higher
     // global_gain -> smaller is[] values -> fewer bits.
     //
@@ -879,7 +1033,7 @@ fn encode_granule(xr: &[f32; 576], bit_target: usize) -> GranuleEncoded {
     let mut best: Option<GranuleEncoded> = None;
     while lo <= hi {
         let mid = (lo + hi) / 2;
-        let g = quantize_and_encode(xr, mid as u8);
+        let g = quantize_and_encode(xr, mid as u8, block_type);
         if g.total_bits <= bit_target {
             // This fits — try a smaller gain (more precision).
             best = Some(g);
@@ -893,7 +1047,7 @@ fn encode_granule(xr: &[f32; 576], bit_target: usize) -> GranuleEncoded {
         return g;
     }
     // Fallback: return the highest-gain (smallest-bits) result.
-    quantize_and_encode(xr, 255)
+    quantize_and_encode(xr, 255, block_type)
 }
 
 /// VBR per-granule encode — pick the **largest** global_gain (= fewest
@@ -906,12 +1060,16 @@ fn encode_granule(xr: &[f32; 576], bit_target: usize) -> GranuleEncoded {
 /// `NEG_INFINITY`) any gain masks; we pick a high gain so the encode
 /// collapses to (near) zero bits — no point in spending bits on
 /// silence.
-fn encode_granule_vbr(xr: &[f32; 576], mask: &GranuleMask) -> GranuleEncoded {
+fn encode_granule_vbr(
+    xr: &[f32; 576],
+    mask: &GranuleMask,
+    block_type: BlockType,
+) -> GranuleEncoded {
     // Energy gate: if every band is essentially silent, skip the
     // search entirely and emit a high-gain (ne ar-zero-bit) granule.
     let any_energy = mask.energy.iter().any(|&e| e > 1.0e-12);
     if !any_energy {
-        return quantize_and_encode(xr, 240);
+        return quantize_and_encode(xr, 240, block_type);
     }
 
     // Step 1: find the smallest gain where NMR <= 0. Walk *upwards*:
@@ -938,16 +1096,16 @@ fn encode_granule_vbr(xr: &[f32; 576], mask: &GranuleMask) -> GranuleEncoded {
     // Step 2: bit-cap fallback. If the chosen gain exceeds the
     // per-granule bit cap (very loud, very wideband content) we
     // need to raise the gain further. Walk upward until we fit.
-    let mut g = quantize_and_encode(xr, chosen);
+    let mut g = quantize_and_encode(xr, chosen, block_type);
     let mut gain = chosen;
     while g.total_bits > VBR_PER_GRANULE_BIT_CAP && gain < 255 {
         gain = gain.saturating_add(2);
-        g = quantize_and_encode(xr, gain);
+        g = quantize_and_encode(xr, gain, block_type);
     }
     g
 }
 
-fn quantize_and_encode(xr: &[f32; 576], global_gain: u8) -> GranuleEncoded {
+fn quantize_and_encode(xr: &[f32; 576], global_gain: u8, block_type: BlockType) -> GranuleEncoded {
     // Quantisation step: step_factor = 2^((global_gain - 210) / 4).
     // is[i] = nint( (|xr[i]|/step_factor)^(3/4) - 0.0946 )
     //       = nint( |xr[i]|^(3/4) * 2^(-(global_gain-210)*3/16) - 0.0946 )
@@ -1058,6 +1216,7 @@ fn quantize_and_encode(xr: &[f32; 576], global_gain: u8) -> GranuleEncoded {
         main_writes: writes,
         total_bits,
         part2_3_length,
+        block_type,
     }
 }
 
@@ -1205,7 +1364,7 @@ mod tests {
     #[test]
     fn quantize_silence_gives_zero_bits() {
         let xr = [0.0f32; 576];
-        let g = quantize_and_encode(&xr, 100);
+        let g = quantize_and_encode(&xr, 100, BlockType::Long);
         assert_eq!(g.total_bits, 0);
         assert_eq!(g.big_values, 0);
     }

@@ -122,7 +122,14 @@ rate-control modes:
   per frame from the spectral correlation; ISO/IEC 11172-3
   §2.4.3.4.10). Intensity stereo on the encode side is out of scope.
   Disable MS with `joint_stereo=0`.
-- **Blocks**: long blocks only (block_type = 0). No window switching.
+- **Blocks**: long, start, short, stop with automatic window-switching
+  on transients per ISO/IEC 11172-3 §2.4.2.2 / Annex C. A per-channel
+  energy-ratio transient detector flags 192-sample sub-frames whose
+  energy jumps more than 4× above the smoothed long-term average; a
+  per-channel state machine then bridges the long → start → short →
+  stop → long sequence using one granule of PCM lookahead. Disable
+  with `short_blocks=0` (matches the pre-round-24 long-only encoder).
+  Mixed blocks are not emitted (always pure short on switch).
 - **Rate control**:
   - **CBR** (default): one rate per encoder instance, picked from the
     standard version-specific bitrate table (defaults: 128 kbps
