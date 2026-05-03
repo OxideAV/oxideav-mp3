@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-mp3/compare/v0.0.5...v0.0.6) - 2026-05-02
+
+### Other
+
+- migrate to centralized OxideAV/.github reusable workflows
+- add MPEG-2 LSF intensity-stereo encoding
+- add intensity-stereo encoding per ISO 11172-3 §2.4.3.4.10.2
+- add short-block window switching on transients
+- add joint-stereo (M/S) encoding per ISO 11172-3 §2.4.3.4.10
+- add VBR mode with per-band masking model
+- adopt slim VideoFrame/AudioFrame shape
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - Intensity-stereo (IS) encoding for MPEG-2 LSF (Low Sampling Frequency)
