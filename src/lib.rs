@@ -12,11 +12,14 @@
 //! joint-stereo (picked per frame from spectral correlation; ISO/IEC
 //! 11172-3 §2.4.3.4.10), with two rate-control strategies: CBR
 //! (global-gain bisection to fit a fixed per-frame bit budget) and VBR
-//! (lightweight per-band masking model in [`psy`] picks the smallest
-//! quantizer step that satisfies a quality-derived noise-to-mask
-//! threshold). The bit reservoir rolls forward via `main_data_begin`
-//! across frames within the per-version lookback cap (511 bytes
-//! MPEG-1 / 255 bytes MPEG-2 LSF).
+//! with a switchable psychoacoustic model — `psy_model = 0` is the
+//! lightweight per-sfb energy mask in [`psy`]; `psy_model = 1`
+//! (default) is the full ISO/IEC 11172-3 Annex D Psy Model 1 in
+//! [`psy1`] with 24 Bark-partition spreading, SFM-based tonality
+//! estimate, tonal-vs-noise SNR offsets, and an iterate-until-stable
+//! noise-allocation outer loop. The bit reservoir rolls forward via
+//! `main_data_begin` across frames within the per-version lookback cap
+//! (511 bytes MPEG-1 / 255 bytes MPEG-2 LSF).
 //!
 //! The container demuxer at [`container`] accepts `.mp1` / `.mp2` / `.mp3`
 //! raw streams (with ID3v2 prefix + ID3v1 trailer) and routes packets to
@@ -43,6 +46,7 @@ pub mod huffman;
 pub mod imdct;
 pub mod mdct;
 pub mod psy;
+pub mod psy1;
 pub mod requantize;
 pub mod reservoir;
 pub mod scalefactor;

@@ -145,14 +145,23 @@ rate-control modes:
     MPEG-1, 64 kbps MPEG-2 LSF). Quantizer fits the per-granule bit
     budget by global-gain bisection.
   - **VBR**: opt in via `CodecOptions::set("vbr_quality", "0".."9")`.
-    A lightweight per-band masking model in `psy` (inspired by ISO
-    11172-3 §C.1 Model 1, but without the FFT and Bark-spreading
-    layers) picks the smallest quantizer step that satisfies a
-    quality-derived noise-to-mask threshold. The per-frame bitrate
-    slot is then chosen from the standard table to fit the resulting
-    main-data byte count, yielding files that shrink for silence /
-    pure-tone content and grow for spectrally rich content at the
-    same quality knob.
+    Two psychoacoustic models are available:
+    - `psy_model=0` — lightweight per-sfb energy mask in `psy`. Picks
+      the smallest quantizer step that satisfies a quality-derived
+      noise-to-mask threshold per scalefactor band.
+    - `psy_model=1` (default) — full ISO/IEC 11172-3 Annex D
+      **Psy Model 1** in `psy1`: 24 Bark-partition spreader,
+      Schroeder-form spreading function across the Bark axis,
+      SFM-based per-partition tonality estimate, tonal-vs-noise SNR
+      offsets (TMN ~14.5 dB / NMT ~5.5 dB), and an iterative noise-
+      allocation outer loop (§C.1.5.4.4). Drives a per-sfb SMR that
+      lets the encoder spend bits where the ear actually needs them
+      (mask floors raised by neighbouring tonal partitions, spread
+      asymmetric on the Bark axis).
+    The per-frame bitrate slot is then chosen from the standard
+    table to fit the resulting main-data byte count, yielding files
+    that shrink for silence / pure-tone content and grow for
+    spectrally rich content at the same quality knob.
 - **Bit reservoir**: rolled forward via `main_data_begin` within the
   per-version cap (511 bytes MPEG-1 / 255 bytes MPEG-2 LSF).
 - **Quantisation**: per-coefficient uniform quantizer driven by

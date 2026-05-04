@@ -57,6 +57,7 @@ use crate::block_type::{BlockType, BlockTypeMachine, TransientDetector};
 use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A};
 use crate::mdct::{mdct_granule, MdctState};
 use crate::psy::{global_gain_to_step, vbr_quality_to_mask_ratio, GranuleMask};
+use crate::psy1::{vbr_quality_to_psy1_gain, Psy1Mask};
 use crate::CODEC_ID_STR;
 use oxideav_core::bits::BitWriter;
 use oxideav_core::options::{
@@ -122,6 +123,12 @@ pub enum RateControl {
 ///   intensity position instead of full R coefficients. Sets
 ///   `mode_extension` bit 0x1 when active. Only meaningful when
 ///   `joint_stereo` is also enabled.
+/// - `psy_model` — `u32` 0/1. Selects the VBR psychoacoustic model.
+///   `0` (default) uses the simple per-sfb energy mask in
+///   [`crate::psy`]; `1` engages the full ISO/IEC 11172-3 Annex D
+///   Psy Model 1 with Bark-partition spreading + tonality-driven
+///   tone-vs-noise SNR offsets in [`crate::psy1`]. Only consulted in
+///   VBR mode.
 #[derive(Debug, Clone)]
 pub struct Mp3EncoderOptions {
     /// `Some(0..=9)` → switch to VBR with the given quality index.
@@ -136,6 +143,10 @@ pub struct Mp3EncoderOptions {
     /// LSF). Default: `true`. Only consulted when `joint_stereo` is
     /// also `true`.
     pub intensity_stereo: bool,
+    /// `0` = simple per-sfb energy mask (`crate::psy`); `1` = Annex D
+    /// Psy Model 1 with Bark-partition spreading (`crate::psy1`).
+    /// Default: `1`. Only consulted in VBR mode.
+    pub psy_model: u8,
 }
 
 impl Default for Mp3EncoderOptions {
@@ -146,6 +157,7 @@ impl Default for Mp3EncoderOptions {
             joint_stereo: true,
             short_blocks: true,
             intensity_stereo: true,
+            psy_model: 1,
         }
     }
 }
@@ -182,6 +194,12 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
             default: OptionValue::U32(1),
             help: "Allow intensity-stereo (IS) coding on top of joint-stereo for long-block stereo granules. 0 = never IS, 1 = enable IS when HF correlation is high (default).",
         },
+        OptionField {
+            name: "psy_model",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "VBR psychoacoustic model. 0 = simple per-sfb energy mask; 1 = Annex D Psy-1 with Bark-partition spreading (default). Only consulted in VBR mode.",
+        },
     ];
 
     fn apply(&mut self, key: &str, v: &OptionValue) -> Result<()> {
@@ -212,6 +230,15 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
             "intensity_stereo" => {
                 let n = v.as_u32()?;
                 self.intensity_stereo = n != 0;
+            }
+            "psy_model" => {
+                let n = v.as_u32()?;
+                if n > 1 {
+                    return Err(Error::invalid(format!(
+                        "MP3 encoder: psy_model must be 0 or 1, got {n}"
+                    )));
+                }
+                self.psy_model = n as u8;
             }
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -334,6 +361,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // SCF_PARTITIONS_MPEG2 IS rows at offsets 16..28) variants are wired
     // up below.
     let allow_intensity_stereo = opts.intensity_stereo && allow_joint_stereo;
+    let psy_model = opts.psy_model;
 
     // CBR slot: explicit option override > params.bit_rate > version default.
     let default_kbps = if is_mpeg2 { 64 } else { 128 };
@@ -376,6 +404,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         is_mpeg2,
         rate_control,
         vbr_quality,
+        psy_model,
         allow_joint_stereo,
         allow_short_blocks,
         allow_intensity_stereo,
@@ -409,6 +438,10 @@ struct Mp3Encoder {
     rate_control: RateControl,
     /// VBR quality 0..=9; only consulted when `rate_control == Vbr`.
     vbr_quality: u8,
+    /// VBR psychoacoustic model. `0` = simple per-sfb energy mask
+    /// ([`crate::psy`]); `1` = Annex D Psy-1 with Bark-partition
+    /// spreading ([`crate::psy1`]). Only consulted in VBR mode.
+    psy_model: u8,
     /// `true` when the encoder may emit joint-stereo (MS) frames. Only
     /// meaningful for two-channel inputs.
     allow_joint_stereo: bool,
@@ -793,26 +826,42 @@ impl Mp3Encoder {
             RateControl::Vbr => {
                 // Drive the per-granule quantizer from the masking
                 // model: pick the smallest global_gain that satisfies
-                // worst_nmr_db <= 0 across bands.
-                let mask_ratio = vbr_quality_to_mask_ratio(self.vbr_quality);
+                // worst_nmr_db <= 0 across bands. The model itself is
+                // selected by `psy_model` — `0` is the simple per-sfb
+                // energy mask, `1` engages the Annex D Psy-1 with
+                // Bark-partition spreading + tonality-driven SNR.
                 let mut granule_data: Vec<Vec<GranuleEncoded>> =
                     (0..n_gr).map(|_| Vec::with_capacity(n_ch)).collect();
                 let mut total_bits: usize = 0;
                 for gr in 0..n_gr {
                     for ch in 0..n_ch {
-                        let mask = GranuleMask::analyze(&xr[gr][ch], self.sample_rate, mask_ratio);
                         let is_pos_for_ch = if use_is && ch == 1 {
                             Some(&is_pos_per_gr_ch[gr][1])
                         } else {
                             None
                         };
-                        let g = encode_granule_vbr(
-                            &xr[gr][ch],
-                            &mask,
-                            block_types[gr][ch],
-                            is_pos_for_ch,
-                            is_variant,
-                        );
+                        let g = if self.psy_model == 1 {
+                            let gain = vbr_quality_to_psy1_gain(self.vbr_quality);
+                            let mask = Psy1Mask::analyze(&xr[gr][ch], self.sample_rate, gain);
+                            encode_granule_vbr_psy1(
+                                &xr[gr][ch],
+                                &mask,
+                                block_types[gr][ch],
+                                is_pos_for_ch,
+                                is_variant,
+                            )
+                        } else {
+                            let mask_ratio = vbr_quality_to_mask_ratio(self.vbr_quality);
+                            let mask =
+                                GranuleMask::analyze(&xr[gr][ch], self.sample_rate, mask_ratio);
+                            encode_granule_vbr(
+                                &xr[gr][ch],
+                                &mask,
+                                block_types[gr][ch],
+                                is_pos_for_ch,
+                                is_variant,
+                            )
+                        };
                         total_bits += g.total_bits;
                         granule_data[gr].push(g);
                     }
@@ -1760,6 +1809,76 @@ fn encode_granule_vbr(
     let mut g = quantize_and_encode(xr, chosen, block_type, is_pos, is_variant);
     let mut gain = chosen;
     while g.total_bits > VBR_PER_GRANULE_BIT_CAP && gain < 255 {
+        gain = gain.saturating_add(2);
+        g = quantize_and_encode(xr, gain, block_type, is_pos, is_variant);
+    }
+    g
+}
+
+/// VBR per-granule encode using the **Annex D Psy-1** model in
+/// [`crate::psy1`]. Mirrors [`encode_granule_vbr`] but with two
+/// extensions:
+///
+/// 1. **Bark-partition spread mask.** The masking threshold per sfb
+///    comes from the Bark-domain spread + tonality model (not just the
+///    raw per-sfb energy / mask_ratio of the simple model), which lets
+///    the encoder spend bits where the ear actually needs them — bands
+///    sitting between two loud tones get partial masking from
+///    *both* tones; pure-tone neighbours of noise bands get a stricter
+///    budget than the simple model would assign.
+///
+/// 2. **Until-stable noise-allocation loop.** ISO/IEC 11172-3
+///    §C.1.5.4.4 recommends running the inner+outer iteration loop
+///    until either every per-band NMR satisfies the mask or the
+///    iteration count reaches a hard cap. The simple-model path of
+///    [`encode_granule_vbr`] is single-pass (one global_gain for the
+///    whole granule); here we follow the spec recommendation and
+///    re-quantise after each gain bump until either NMR <= 0 in every
+///    band or the per-granule bit cap is reached.
+fn encode_granule_vbr_psy1(
+    xr: &[f32; 576],
+    mask: &Psy1Mask,
+    block_type: BlockType,
+    is_pos: Option<&[u8; 22]>,
+    is_variant: IsVariant,
+) -> GranuleEncoded {
+    // Energy gate: pure silence ⇒ skip to high gain (no point spending
+    // bits on a granule whose every sfb is below noise floor).
+    let any_energy = mask.energy.iter().any(|&e| e > 1.0e-12);
+    if !any_energy {
+        return quantize_and_encode(xr, 240, block_type, is_pos, is_variant);
+    }
+
+    // Initial gain pick: walk upward at step 1 until the worst-band
+    // NMR crosses zero. The largest gain that still masks is our
+    // starting point.
+    let mut last_masked: Option<u8> = None;
+    for gain in 60..=255u8 {
+        let step = global_gain_to_step(gain);
+        let nmr = mask.worst_nmr_db(step);
+        if nmr <= 0.0 {
+            last_masked = Some(gain);
+        } else {
+            break;
+        }
+    }
+    let chosen = last_masked.unwrap_or(60);
+
+    // Outer iteration loop (ISO 11172-3 §C.1.5.4.4 recommendation):
+    // re-quantise + re-check until either the per-granule bit cap
+    // is satisfied or we've burned the loop budget. A small `max_iter`
+    // (8) is enough — each iteration bumps `gain` by a fixed step so
+    // the worst case is bounded.
+    const MAX_ITER: usize = 8;
+    let mut g = quantize_and_encode(xr, chosen, block_type, is_pos, is_variant);
+    let mut gain = chosen;
+    for _ in 0..MAX_ITER {
+        if g.total_bits <= VBR_PER_GRANULE_BIT_CAP {
+            break;
+        }
+        if gain == 255 {
+            break;
+        }
         gain = gain.saturating_add(2);
         g = quantize_and_encode(xr, gain, block_type, is_pos, is_variant);
     }

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ISO/IEC 11172-3 **Annex D Psychoacoustic Model 1** (Bark-partition
+  spreading) for the VBR encoder, in a new `psy1` module. The model
+  partitions the long-block MDCT spectrum across 24 Bark-axis
+  partitions (Zwicker boundaries, mapped from each coefficient's
+  centre frequency `(k + 0.5) * sr / 1152`), accumulates per-partition
+  energy, and convolves the result with the Schroeder closed-form
+  spreading function `sf(dz) = 15.81 + 7.5*(dz+0.474) - 17.5*sqrt(1 +
+  (dz+0.474)^2)` (open-literature, no specific encoder consulted).
+  Tonality is estimated via the spectral flatness measure
+  `SFM = exp(mean(ln |X|^2)) / mean(|X|^2)` per partition and mapped
+  to `[0, 1]` over the conventional 0..-60 dB SFM range; tonal
+  partitions get the wider TMN ~14.5 dB SNR offset, noise partitions
+  get the tighter NMT ~5.5 dB. The spread per-partition energy
+  threshold is re-binned to the 22 long-block scalefactor bands as
+  the per-sfb mask threshold, which feeds a new
+  `encode_granule_vbr_psy1` outer loop that follows the spec's
+  §C.1.5.4.4 iterate-until-stable-or-N-iter recommendation
+  (`MAX_ITER = 8`). Engaged by default in VBR mode (new
+  `psy_model = 1` option, default `1`); the previous lightweight
+  per-sfb mask is still reachable via `psy_model = 0`. Psy-1 changes
+  bit allocation to favour bands with no nearby tonal masker and
+  lets neighbouring tones partially relax each other's mask — the
+  spread mask plus the tone-vs-noise SNR split give the encoder
+  meaningful spectrally-aware budget control without copying any
+  external encoder's tuning table. New tests:
+  `tests/encoder_psy1.rs` (8 cases — default-model selection, VBR
+  round-trip across both models, ffmpeg cross-decode, multi-tone
+  per-partial SNR, tonality-driven byte delta, Psy-1 ≠ simple-model
+  byte regression guard, MPEG-2 LSF round-trip, invalid-option
+  rejection). `psy1::tests` adds 11 unit cases (Bark-axis
+  monotonicity, partition assignment, spreading-function shape +
+  asymmetry, silence/tone/noise tonality limits, SMR sign across a
+  hot vs silent band, neighbour-threshold spreading, quality-knob
+  monotonicity, finer-quantizer NMR sanity, partition count).
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-mp3/compare/v0.0.5...v0.0.6) - 2026-05-02
 
 ### Other
