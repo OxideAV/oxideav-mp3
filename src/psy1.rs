@@ -325,13 +325,22 @@ impl Psy1Mask {
     /// Run the Psy-1 analysis for a **short-block granule** (block
     /// type = 2). Short blocks pack three independent 192-coefficient
     /// MDCT windows into the same 576-coefficient granule, in
-    /// sfb-window-major order: `xr[0..192]` is window 0,
-    /// `xr[192..384]` is window 1, `xr[384..576]` is window 2. Each
-    /// window is processed independently — its own per-Bark
-    /// partition energy, spreading + tonality, and threshold — and
-    /// then the per-window 13 short-block sfbs are concatenated into
-    /// 39 entries on the output mask. The encoder's noise allocator
-    /// sees one bigger energy/threshold vector and naturally drives
+    /// **sfb-major then window-major within sfb** layout (matches the
+    /// post-`unreorder_short_inplace` bit-stream order in
+    /// [`crate::mdct`] / [`crate::requantize::reorder_short`]):
+    ///
+    /// * sfb 0 width = w0; xr\[0..3w0\] holds window 0 (w0), window 1
+    ///   (w0), window 2 (w0).
+    /// * sfb 1 width = w1; xr\[3w0..3(w0+w1)\] holds the three windows
+    ///   of sfb 1's coefficients.
+    /// * ... etc., concatenated up to xr\[576\].
+    ///
+    /// Per-window 192-coefficient frequency-ordered views are
+    /// extracted from this layout so the Bark-partition spreader sees
+    /// each window's full spectrum independently. The output mask
+    /// carries 39 entries (3 windows × 13 short sfbs), one per
+    /// contiguous (sfb, window) chunk in the bit-stream layout. The
+    /// encoder's noise allocator walks all 39 entries and drives
     /// global_gain to mask the worst window/sfb combo.
     ///
     /// This is the spec-mandated path for transient content: each
@@ -345,42 +354,38 @@ impl Psy1Mask {
         let coeff_partition = build_coeff_partition_short(sample_rate);
         let sfb_short = sfband_short(sample_rate);
 
-        let mut energy = vec![0.0f32; 3 * 13];
-        let mut threshold = vec![0.0f32; 3 * 13];
-        let mut width = vec![0u16; 3 * 13];
-        let mut start = vec![0u16; 3 * 13];
+        // Step 1: extract per-window 192-coefficient frequency-ordered
+        // views from the sfb-major bit-stream layout.
+        // `windows[w][f]` = MDCT coefficient at frequency bin f
+        // (0..192) of window w (0..3).
+        let mut windows = [[0.0f32; 192]; 3];
+        let mut pos = 0usize;
+        for sfb in 0..13 {
+            let f_off = sfb_short[sfb] as usize;
+            let width = sfb_short[sfb + 1] as usize - f_off;
+            for w in 0..3 {
+                for f in 0..width {
+                    let src = pos + w * width + f;
+                    if src < 576 && f_off + f < 192 {
+                        windows[w][f_off + f] = xr[src];
+                    }
+                }
+            }
+            pos += 3 * width;
+        }
+
+        // Step 2: per-window Bark-partition pass. Each window gets its
+        // own 192-coefficient threshold + tonality estimate.
+        let mut per_coeff_thr = [[0.0f32; 192]; 3];
         let mut tonality_sum = [0.0f32; N_BARK_PARTITIONS];
         let mut peak_tonality_sum = [0.0f32; N_BARK_PARTITIONS];
         let mut tonality_count = [0u32; N_BARK_PARTITIONS];
         let mut part_threshold_sum = [0.0f32; N_BARK_PARTITIONS];
 
         for w in 0..3 {
-            let off = w * 192;
-            let mut win = [0.0f32; 192];
-            win.copy_from_slice(&xr[off..off + 192]);
-            let (per_coeff_thr_192, part_thr, part_ton, part_peak_ton) =
-                partition_pass_short(&win, &coeff_partition, sample_rate, gain);
-
-            // Walk the 13 short-block sfbs for this window. The output
-            // sfb index is `w * 13 + b` (window-major then sfb).
-            for b in 0..13 {
-                let s = sfb_short[b] as usize;
-                let e_idx = (sfb_short[b + 1] as usize).min(192);
-                let lo = s.min(e_idx);
-                let hi = e_idx;
-                let mut e = 0.0f32;
-                let mut thr = 0.0f32;
-                for k in lo..hi {
-                    e += win[k] * win[k];
-                    thr += per_coeff_thr_192[k];
-                }
-                let out_idx = w * 13 + b;
-                energy[out_idx] = e;
-                threshold[out_idx] = thr;
-                width[out_idx] = (hi - lo) as u16;
-                start[out_idx] = (off + lo) as u16;
-            }
-
+            let (thr_192, part_thr, part_ton, part_peak_ton) =
+                partition_pass_short(&windows[w], &coeff_partition, sample_rate, gain);
+            per_coeff_thr[w] = thr_192;
             for p in 0..N_BARK_PARTITIONS {
                 if part_thr[p] > 0.0 {
                     part_threshold_sum[p] += part_thr[p];
@@ -389,6 +394,43 @@ impl Psy1Mask {
                     tonality_count[p] += 1;
                 }
             }
+        }
+
+        // Step 3: re-bin back into the sfb-major bit-stream layout so
+        // each output `(sfb, window)` entry covers a contiguous range
+        // of `xr` coefficients. Output index `b * 3 + w` corresponds
+        // to `xr[pos + w*width .. pos + (w+1)*width]` where `pos`
+        // accumulates `3 * width` per sfb.
+        let mut energy = vec![0.0f32; 3 * 13];
+        let mut threshold = vec![0.0f32; 3 * 13];
+        let mut width_v = vec![0u16; 3 * 13];
+        let mut start_v = vec![0u16; 3 * 13];
+
+        let mut pos = 0usize;
+        for sfb in 0..13 {
+            let f_off = sfb_short[sfb] as usize;
+            let width = sfb_short[sfb + 1] as usize - f_off;
+            for w in 0..3 {
+                let chunk_start = pos + w * width;
+                let mut e = 0.0f32;
+                let mut thr = 0.0f32;
+                for f in 0..width {
+                    let src = chunk_start + f;
+                    if src < 576 {
+                        let v = xr[src];
+                        e += v * v;
+                    }
+                    if f_off + f < 192 {
+                        thr += per_coeff_thr[w][f_off + f];
+                    }
+                }
+                let out_idx = sfb * 3 + w;
+                energy[out_idx] = e;
+                threshold[out_idx] = thr;
+                width_v[out_idx] = width as u16;
+                start_v[out_idx] = chunk_start as u16;
+            }
+            pos += 3 * width;
         }
 
         // Per-sfb floor across the whole granule to keep silent bands
@@ -415,8 +457,8 @@ impl Psy1Mask {
             n_sfb: 3 * 13,
             energy,
             threshold,
-            width,
-            start,
+            width: width_v,
+            start: start_v,
             partition_tonality,
             partition_peak_tonality,
             partition_threshold: part_threshold_sum,
@@ -929,32 +971,95 @@ mod tests {
 
     #[test]
     fn psy1_short_independent_per_window() {
-        // Build a granule whose three short windows carry very
-        // different content: window 0 = silent, window 1 = a hot
-        // mid-band tone, window 2 = a hot HF tone. The per-window
-        // sfb energies in the resulting mask should mirror those
-        // shapes (not be smeared across all 3 windows).
+        // Build a granule whose three short windows carry distinct
+        // content. The bit-stream layout is sfb-major then window-
+        // major within each sfb: each sfb's 3 windows occupy a
+        // contiguous `3 * width` chunk, packed window-by-window.
+        // Inject a per-window hit into sfb 4 (4..6 freq range, width
+        // = 2 at 44.1k post-sfband_short[4]=16 → sfband_short[5]=22,
+        // width=6) — pick window 1's slot inside that chunk.
+        //
+        // sfb 0..3: widths 4,4,4,4 → chunk widths 12,12,12,12 →
+        //   pos at sfb 4 = 4*12 = 48.
+        // sfb 4 width = 6, so chunk = xr[48..66] holding:
+        //   window 0 = xr[48..54], window 1 = xr[54..60],
+        //   window 2 = xr[60..66].
+        //
+        // Hit coeff in each window's slot of sfb 4. Output sfb index
+        // is `sfb * 3 + w` so we expect entries 12, 13, 14 to all
+        // have positive energy.
         let mut xr = [0.0f32; 576];
-        // Window 1 mid-band hit
-        xr[192 + 50] = 1.0;
-        // Window 2 HF hit
-        xr[384 + 150] = 1.0;
+        xr[48 + 1] = 1.0; // window 0 of sfb 4
+        xr[48 + 6 + 2] = 1.0; // window 1 of sfb 4
+        xr[48 + 12 + 3] = 1.0; // window 2 of sfb 4
         let m = Psy1Mask::analyze_short(&xr, 44_100, 1.0);
-        // Window 0 sfb energies all zero
-        for b in 0..13 {
-            assert_eq!(
-                m.energy[b], 0.0,
-                "expected window 0 sfb {b} silent, got {}",
-                m.energy[b]
+        assert_eq!(m.n_sfb, 39);
+        for w in 0..3 {
+            let idx = 4 * 3 + w;
+            assert!(
+                m.energy[idx] > 0.0,
+                "expected energy in sfb 4 window {w} (output idx {idx}), got {}",
+                m.energy[idx]
             );
         }
-        // Window 1 should have non-zero energy in the sfb that
-        // contains coeff 50 (low-mid). Window 2 should have non-zero
-        // energy in the sfb that contains coeff 150 (HF).
-        let any_w1: f32 = (13..26).map(|b| m.energy[b]).sum();
-        let any_w2: f32 = (26..39).map(|b| m.energy[b]).sum();
-        assert!(any_w1 > 0.0, "window 1 should carry energy");
-        assert!(any_w2 > 0.0, "window 2 should carry energy");
+        // Sibling sfbs of the same windows must be zero — energy
+        // shouldn't leak across sfbs.
+        for w in 0..3 {
+            assert_eq!(
+                m.energy[3 * 3 + w],
+                0.0,
+                "unexpected energy in sfb 3 window {w}: {}",
+                m.energy[3 * 3 + w]
+            );
+            assert_eq!(
+                m.energy[5 * 3 + w],
+                0.0,
+                "unexpected energy in sfb 5 window {w}: {}",
+                m.energy[5 * 3 + w]
+            );
+        }
+    }
+
+    #[test]
+    fn psy1_short_per_window_isolated_burst() {
+        // A burst that lives ONLY in window 1 (extracted from the
+        // sfb-major layout) should produce non-zero energy in every
+        // sfb's window-1 slot but zero in window-0 and window-2
+        // slots of those sfbs. Build the burst by writing 1.0 into
+        // each sfb's window-1 chunk.
+        let mut xr = [0.0f32; 576];
+        let sfb = crate::sfband::sfband_short(44_100);
+        let mut pos = 0usize;
+        for b in 0..13 {
+            let w_off = sfb[b] as usize;
+            let width = sfb[b + 1] as usize - w_off;
+            // Write into window 1's chunk at the first freq slot.
+            xr[pos + width] = 0.5;
+            pos += 3 * width;
+        }
+        let m = Psy1Mask::analyze_short(&xr, 44_100, 1.0);
+        // Every window-1 output slot should have energy; window 0
+        // and 2 slots should be zero.
+        for b in 0..13 {
+            let w0 = b * 3;
+            let w1 = b * 3 + 1;
+            let w2 = b * 3 + 2;
+            assert!(
+                m.energy[w1] > 0.0,
+                "sfb {b} window 1 should carry the burst energy, got {}",
+                m.energy[w1]
+            );
+            assert_eq!(
+                m.energy[w0], 0.0,
+                "sfb {b} window 0 should be silent, got {}",
+                m.energy[w0]
+            );
+            assert_eq!(
+                m.energy[w2], 0.0,
+                "sfb {b} window 2 should be silent, got {}",
+                m.energy[w2]
+            );
+        }
     }
 
     #[test]

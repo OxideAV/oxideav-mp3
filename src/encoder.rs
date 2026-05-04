@@ -848,7 +848,13 @@ impl Mp3Encoder {
                             // local spectrum (rather than the full
                             // 576-coefficient long-block view, which
                             // smears transients). Long / start / stop
-                            // stay on the long-block path.
+                            // stay on the long-block path. The short
+                            // analyzer extracts per-window views from
+                            // the encoder's sfb-major bit-stream
+                            // layout, runs the Bark spreader per
+                            // window, and re-bins to one
+                            // (sfb, window) entry per contiguous
+                            // chunk.
                             let mask = if block_types[gr][ch] == BlockType::Short {
                                 Psy1Mask::analyze_short(&xr[gr][ch], self.sample_rate, gain)
                             } else {
