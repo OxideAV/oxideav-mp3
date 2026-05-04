@@ -842,7 +842,18 @@ impl Mp3Encoder {
                         };
                         let g = if self.psy_model == 1 {
                             let gain = vbr_quality_to_psy1_gain(self.vbr_quality);
-                            let mask = Psy1Mask::analyze(&xr[gr][ch], self.sample_rate, gain);
+                            // Short-block granules get the per-window
+                            // 192-coefficient Psy-1 path so the
+                            // partition spreader sees each window's
+                            // local spectrum (rather than the full
+                            // 576-coefficient long-block view, which
+                            // smears transients). Long / start / stop
+                            // stay on the long-block path.
+                            let mask = if block_types[gr][ch] == BlockType::Short {
+                                Psy1Mask::analyze_short(&xr[gr][ch], self.sample_rate, gain)
+                            } else {
+                                Psy1Mask::analyze(&xr[gr][ch], self.sample_rate, gain)
+                            };
                             encode_granule_vbr_psy1(
                                 &xr[gr][ch],
                                 &mask,

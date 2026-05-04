@@ -417,3 +417,179 @@ fn psy1_invalid_psy_model_rejected() {
     let res = make_encoder(&params);
     assert!(res.is_err(), "psy_model=5 should be rejected");
 }
+
+/// Build a transient-rich castanet signal (mirrors the
+/// `tests/encoder_short_blocks.rs` builder, kept independent so this
+/// test file can be run in isolation).
+fn build_psy1_castanet_pcm(sample_rate: u32, duration_s: f32) -> Vec<i16> {
+    let n = (sample_rate as f32 * duration_s) as usize;
+    let mut out = Vec::with_capacity(n);
+    let burst_period = sample_rate as usize / 4;
+    let burst_len = sample_rate as usize / 100;
+    let mut rng_state: u32 = 0xdead_beef;
+    for i in 0..n {
+        rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+        let noise = ((rng_state >> 16) as i16 as f32) / 32768.0 * 0.005;
+        let phase = i % burst_period;
+        let burst = if phase < burst_len {
+            let t = phase as f32 / burst_len as f32;
+            let env = (-4.0 * t).exp();
+            env * 0.6 * (2.0 * std::f32::consts::PI * 2000.0 * i as f32 / sample_rate as f32).sin()
+        } else {
+            0.0
+        };
+        let s = noise + burst;
+        out.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+    }
+    out
+}
+
+/// Short-block Psy-1 must produce a different bitstream than long-block
+/// Psy-1 on transient content. With short_blocks=0 the encoder is
+/// pinned to long blocks (so Psy-1 long path); with short_blocks=1
+/// (default) the transient detector switches and the per-window
+/// Bark-partition mask in `Psy1Mask::analyze_short` drives the
+/// quantizer. Bitwise-equal output would mean the new short-block
+/// path silently falls through to the long-block mask.
+#[test]
+fn psy1_short_block_path_differs_from_long_only() {
+    let sample_rate = 44_100u32;
+    let pcm = build_psy1_castanet_pcm(sample_rate, 1.0);
+
+    // Default = short_blocks=1 + psy_model=1 → engages
+    // `Psy1Mask::analyze_short` on every short-block granule.
+    let opts_short = CodecOptions::new().set("vbr_quality", "3");
+    let bytes_short = encode_with_options(&pcm, sample_rate, 1, opts_short);
+
+    // short_blocks=0 → encoder pinned to long blocks → Psy-1 long path
+    // throughout. Same `psy_model=1` so the model still runs.
+    let opts_long = CodecOptions::new()
+        .set("vbr_quality", "3")
+        .set("short_blocks", "0");
+    let bytes_long = encode_with_options(&pcm, sample_rate, 1, opts_long);
+
+    eprintln!(
+        "psy1 short-vs-long: short={} B, long={} B",
+        bytes_short.len(),
+        bytes_long.len()
+    );
+    assert_ne!(
+        bytes_short, bytes_long,
+        "short-block Psy-1 path should produce a different bitstream than the long-only path"
+    );
+}
+
+/// Hard-asserted ffmpeg cross-decode of short-block Psy-1 output on
+/// transient content. The window-switching side-info layout combined
+/// with the per-window 192-coefficient mask must produce a clean
+/// bitstream that any third-party Layer III decoder accepts without
+/// warnings.
+#[test]
+fn psy1_short_block_ffmpeg_cross_decode_castanet() {
+    use std::process::{Command, Stdio};
+    if Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("ffmpeg not available — skipping Psy-1 short-block ffmpeg interop");
+        return;
+    }
+    let sample_rate = 44_100u32;
+    let pcm = build_psy1_castanet_pcm(sample_rate, 1.0);
+    // Default Psy-1 + short-blocks-on path.
+    let opts = CodecOptions::new().set("vbr_quality", "3");
+    let bytes = encode_with_options(&pcm, sample_rate, 1, opts);
+    assert!(!bytes.is_empty(), "no Psy-1 short-block output");
+
+    let tmp_mp3 = std::env::temp_dir().join("oxideav_mp3_psy1_short_castanet.mp3");
+    let tmp_wav = std::env::temp_dir().join("oxideav_mp3_psy1_short_castanet.wav");
+    std::fs::write(&tmp_mp3, &bytes).expect("write mp3");
+    let out = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("warning")
+        .arg("-i")
+        .arg(&tmp_mp3)
+        .arg("-f")
+        .arg("wav")
+        .arg(&tmp_wav)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("ffmpeg run");
+    assert!(out.status.success(), "ffmpeg failed: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let suspicious: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.contains("Estimating duration from bitrate"))
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert!(
+        suspicious.is_empty(),
+        "ffmpeg emitted warnings on Psy-1 short-block bitstream: {suspicious:?}"
+    );
+    let wav = std::fs::read(&tmp_wav).expect("wav");
+    let data_off = wav
+        .windows(4)
+        .position(|w| w == b"data")
+        .expect("WAV data tag")
+        + 8;
+    let mut decoded: Vec<f32> = Vec::new();
+    for ch in wav[data_off..].chunks_exact(2) {
+        decoded.push(i16::from_le_bytes([ch[0], ch[1]]) as f32 / 32768.0);
+    }
+    assert!(
+        decoded.len() > 4 * 1152,
+        "ffmpeg decoded too few samples: {}",
+        decoded.len()
+    );
+    for v in decoded.iter() {
+        assert!(v.is_finite(), "ffmpeg decoded NaN/Inf");
+    }
+
+    // Sanity: cross-check ffmpeg's decoded total energy against our
+    // own decoder's total energy on the same bitstream. They should
+    // match within ~50% — broken short-block sf allocation would
+    // diverge them by orders of magnitude (one decoder reading the
+    // window-switching layout differently than the other). The
+    // raw input-vs-decoded ratio is dominated by the encoder's
+    // quantization noise floor on this near-silent castanet input
+    // (mostly silence + brief bursts), so we don't compare to it.
+    let own_decoded = decode_to_pcm(&bytes, sample_rate);
+    let in_e: f64 = pcm.iter().map(|&s| (s as f64 / 32768.0).powi(2)).sum();
+    let out_e: f64 = decoded.iter().map(|&v| (v as f64).powi(2)).sum();
+    let own_e: f64 = own_decoded.iter().map(|&v| (v as f64).powi(2)).sum();
+    let cross_ratio = out_e / own_e.max(1e-12);
+    eprintln!(
+        "psy1 short-block ffmpeg cross-decode: bytes={} in_e={in_e:.4} ffmpeg_e={out_e:.4} own_e={own_e:.4} cross_ratio={cross_ratio:.3}",
+        bytes.len()
+    );
+    assert!(
+        (0.5..=2.0).contains(&cross_ratio),
+        "ffmpeg vs own-decoder energy diverged: cross_ratio={cross_ratio:.3} (ffmpeg={out_e:.4} own={own_e:.4})"
+    );
+}
+
+/// Round-trip a transient signal through our own decoder using the
+/// short-block Psy-1 path. Output must be finite, in-range, and carry
+/// non-trivial total energy (a broken short-block mask path would
+/// either blow up or silence the burst regions).
+#[test]
+fn psy1_short_block_own_decode_roundtrip_castanet() {
+    let sample_rate = 44_100u32;
+    let pcm = build_psy1_castanet_pcm(sample_rate, 1.0);
+    let opts = CodecOptions::new().set("vbr_quality", "2");
+    let bytes = encode_with_options(&pcm, sample_rate, 1, opts);
+    let dec = decode_to_pcm(&bytes, sample_rate);
+    assert!(
+        dec.len() > 4 * 1152,
+        "too few samples decoded: {}",
+        dec.len()
+    );
+    for v in dec.iter() {
+        assert!(v.is_finite(), "decoded NaN/Inf");
+        assert!((-1.5..=1.5).contains(v), "decoded sample out of range: {v}");
+    }
+    let out_e: f64 = dec.iter().map(|&v| (v as f64).powi(2)).sum();
+    assert!(
+        out_e > 1.0,
+        "Psy-1 short-block round-trip produced near-silent output: {out_e:.6}"
+    );
+}

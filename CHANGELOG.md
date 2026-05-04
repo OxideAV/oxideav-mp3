@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Short-block path for Psy-1.** New `Psy1Mask::analyze_short`
+  constructor runs the Bark-partition spreader independently on each
+  of the three 192-coefficient short-block windows packed into a
+  granule (sfb-window-major: window 0 = `xr[0..192]`, window 1 =
+  `xr[192..384]`, window 2 = `xr[384..576]`). Per-window centre
+  frequency is `(k + 0.5) * sr / 384` (twice the long-block bin
+  width); each window builds its own per-Bark-partition energy +
+  log-energy accumulator, runs the same Schroeder spreader, applies
+  tone-vs-noise SNR offsets, and re-bins to that window's 13 short-
+  block sfbs. The output mask carries 39 entries (3 × 13) and the
+  encoder's `worst_nmr_db` walks all of them — so a short-block
+  granule whose burst energy lives in window 1 only allocates bits
+  to that window's sfbs without smearing the threshold across the
+  silent sibling windows. The encoder dispatches based on
+  `BlockType::Short` so long / start / stop granules keep using the
+  long-block 576-coefficient path. Most impactful on transient
+  content (drums, plosives, attacks) — confirmed by an ffmpeg
+  cross-decode + own-decoder round-trip on a castanet-style
+  fixture, both clean. The Psy-1 long → short bitstreams differ on
+  transient input (regression guard via `assert_ne!` on the encoded
+  bytes); on this castanet fixture the per-decoder energy ratio
+  agrees within 50 % between ffmpeg and our own decoder, confirming
+  the on-wire window-switching layout is correct end-to-end.
+- **Peak-detection tonality estimator.** `Psy1Mask` now carries a
+  `partition_peak_tonality` field alongside the existing SFM-based
+  `partition_tonality`. The peak detector walks each partition's
+  squared-magnitude spectrum, finds local maxima
+  (`|X[k]|^2 > |X[k-1]|^2` and `> |X[k+1]|^2`), and computes
+  `peak_ratio = max_peak_energy / mean_partition_energy`. A pure
+  tone gives `peak_ratio ≈ partition_count` (very large); white
+  noise gives `peak_ratio ≈ 1`. Mapped to `[0, 1]` over `[0, 20]
+  dB`. The combined per-partition tonality used by the spreader is
+  now `t = max(t_sfm, t_peak)` so a partition flagged as tonal by
+  *either* estimator gets the wider TMN ~14.5 dB SNR budget. This
+  matches the Annex D.2.4.4 wording on local-maximum detection
+  more closely than the previous SFM-only estimate (which is
+  open-literature equivalent but doesn't model the spec's
+  peak-finder). Two new unit cases:
+  `psy1_peak_tonality_high_for_pure_tone` and
+  `psy1_peak_tonality_low_for_flat_partition`.
+- **Refactor:** `Psy1Mask::energy / threshold / width / start` are
+  now `Vec<f32>` / `Vec<u16>` (length 22 for long, 39 for short)
+  rather than `[_; 22]`. The encoder consumes them via `.iter()` /
+  `.len()` so the change is API-compatible at the call site; the
+  `worst_nmr_db` / `estimate_noise` / `smr_db` helpers iterate up
+  to `n_sfb` (new field). Three new integration tests in
+  `tests/encoder_psy1.rs` cover the short-block path:
+  `psy1_short_block_path_differs_from_long_only` (regression guard
+  vs long-only Psy-1), `psy1_short_block_ffmpeg_cross_decode_castanet`
+  (ffmpeg interop on transient content, ffmpeg-vs-own-decoder
+  energy parity check), and `psy1_short_block_own_decode_roundtrip_castanet`
+  (own-decoder finite-output sanity). Three new `psy1::tests`
+  cases cover the short-block analyzer
+  (`coeff_partition_short_assigns_increasing`,
+  `psy1_short_silence_has_floor_thresholds`,
+  `psy1_short_finer_quantizer_means_lower_nmr`,
+  `psy1_short_independent_per_window`).
 - ISO/IEC 11172-3 **Annex D Psychoacoustic Model 1** (Bark-partition
   spreading) for the VBR encoder, in a new `psy1` module. The model
   partitions the long-block MDCT spectrum across 24 Bark-axis

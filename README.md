@@ -152,12 +152,18 @@ rate-control modes:
     - `psy_model=1` (default) — full ISO/IEC 11172-3 Annex D
       **Psy Model 1** in `psy1`: 24 Bark-partition spreader,
       Schroeder-form spreading function across the Bark axis,
-      SFM-based per-partition tonality estimate, tonal-vs-noise SNR
+      combined SFM + peak-detection per-partition tonality estimate
+      (Annex D.2.4.4 local-maximum wording), tonal-vs-noise SNR
       offsets (TMN ~14.5 dB / NMT ~5.5 dB), and an iterative noise-
       allocation outer loop (§C.1.5.4.4). Drives a per-sfb SMR that
       lets the encoder spend bits where the ear actually needs them
       (mask floors raised by neighbouring tonal partitions, spread
-      asymmetric on the Bark axis).
+      asymmetric on the Bark axis). Short-block granules dispatch
+      to a per-window 192-coefficient analyzer
+      (`Psy1Mask::analyze_short`) so the partition spreader sees
+      each window's local spectrum independently — critical for
+      transient content where the burst energy lives in only one
+      of the three sibling windows.
     The per-frame bitrate slot is then chosen from the standard
     table to fit the resulting main-data byte count, yielding files
     that shrink for silence / pure-tone content and grow for
