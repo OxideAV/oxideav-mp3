@@ -13,4 +13,9 @@ on:
 jobs:
   ci:
     uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
+    with:
+      # mixed_blocks_decode_via_ffmpeg hard-asserts on ffmpeg presence.
+      extra_packages_apt: "ffmpeg"
+      extra_packages_brew: "ffmpeg"
+      extra_packages_choco: "ffmpeg"
     secrets: inherit

@@ -509,7 +509,9 @@ fn mixed_blocks_roundtrip_decode_cleanly() {
 /// long table + short-tail scalefactors at sfb 3..=12 × 3 windows of
 /// the short table) deviates from the spec, ffmpeg will either reject
 /// the frame, emit warnings, or produce garbage samples. This test
-/// fails — not skips — when ffmpeg is unavailable on the host.
+/// fails — not skips — when ffmpeg is unavailable on the host. CI
+/// installs ffmpeg via the OxideAV/.github reusable workflow's
+/// `extra_packages_apt` / `_brew` / `_choco` inputs.
 #[test]
 fn mixed_blocks_decode_via_ffmpeg() {
     use std::process::{Command, Stdio};
