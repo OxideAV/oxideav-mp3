@@ -59,6 +59,7 @@ use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A};
 use crate::mdct::{mdct_granule_full, MdctState};
 use crate::psy::{global_gain_to_step, vbr_quality_to_mask_ratio, GranuleMask};
 use crate::psy1::{vbr_quality_to_psy1_gain, Psy1Mask};
+use crate::psy2::{vbr_quality_to_psy2_gain, Psy2Mask};
 use crate::sfband::{sfband_long, sfband_short};
 use crate::CODEC_ID_STR;
 use oxideav_core::bits::BitWriter;
@@ -71,11 +72,14 @@ const MAX_LOOKBACK_MPEG1: usize = 511;
 /// Max reservoir lookback (bytes) for MPEG-2 LSF — `main_data_begin` is 8 bits.
 const MAX_LOOKBACK_MPEG2: usize = 255;
 
-/// Candidate big-value tables, in priority order. We try the lowest-cost
-/// table first — values bounded by 15 use table 13 (no linbits); larger
-/// magnitudes fall through to one of the linbits-equipped variants
-/// (table indices 16-23 reuse TABLE_16 with linbits 1..13).
-const BIG_VALUE_CANDIDATES: &[u8] = &[1, 5, 7, 13, 16, 17, 18, 19, 20, 21, 22, 23];
+/// All non-reserved big-value table indices. Used by the RD-driven
+/// `choose_big_value_table` which evaluates the actual bit cost of
+/// every candidate over the granule's coefficient pairs and picks the
+/// minimum. Tables 4 and 14 are reserved (empty tabs) and are skipped.
+const BIG_VALUE_ALL_TABLES: &[u8] = &[
+    1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    29, 30, 31,
+];
 
 /// Per-granule bit reservoir hard cap (ISO 11172-3 §2.4.3.4.7.2):
 /// part2_3_length is a 12-bit field, so a granule cannot exceed
@@ -200,7 +204,7 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
             name: "psy_model",
             kind: OptionKind::U32,
             default: OptionValue::U32(1),
-            help: "VBR psychoacoustic model. 0 = simple per-sfb energy mask; 1 = Annex D Psy-1 with Bark-partition spreading (default). Only consulted in VBR mode.",
+            help: "VBR psychoacoustic model. 0 = simple per-sfb energy mask; 1 = Annex D Psy-1 with Bark-partition spreading (default); 2 = Annex D Psy-2 baseline with complex-prediction unpredictability. Only consulted in VBR mode.",
         },
     ];
 
@@ -235,9 +239,9 @@ impl CodecOptionsStruct for Mp3EncoderOptions {
             }
             "psy_model" => {
                 let n = v.as_u32()?;
-                if n > 1 {
+                if n > 2 {
                     return Err(Error::invalid(format!(
-                        "MP3 encoder: psy_model must be 0 or 1, got {n}"
+                        "MP3 encoder: psy_model must be 0, 1, or 2, got {n}"
                     )));
                 }
                 self.psy_model = n as u8;
@@ -708,14 +712,28 @@ impl Mp3Encoder {
         let mut fft_power: Vec<Vec<[f32; FFT_N / 2 + 1]>> = (0..n_gr)
             .map(|_| (0..n_ch).map(|_| [0.0f32; FFT_N / 2 + 1]).collect())
             .collect();
+        // Complex FFT spectrum for Psy-2's complex-prediction tonality.
+        // Only allocated when psy_model = 2; otherwise stays empty to
+        // avoid the Box<…> overhead on every frame at other model levels.
+        let mut fft_complex: Vec<Vec<Box<[[f32; 2]; FFT_N / 2 + 1]>>> = Vec::new();
         // FFT pre-analysis runs for any VBR mode — psy_model=1 fuses it
         // into the Annex D Bark spreader (`Psy1Mask::analyze_with_fft`),
         // psy_model=0 uses it as a per-sfb tonality lift on the simple
-        // mask (`GranuleMask::analyze_with_fft`). Both consume the same
-        // 1024-point Hann-windowed power spectrum + rolling history,
-        // so we always compute it in VBR mode.
+        // mask (`GranuleMask::analyze_with_fft`), psy_model=2 produces
+        // both a power spectrum (for the partition-energy pass) and the
+        // complex spectrum (for the predictor-error unpredictability pass).
         let need_fft = self.rate_control == RateControl::Vbr;
         if need_fft {
+            let need_complex = self.psy_model == 2;
+            if need_complex {
+                fft_complex = (0..n_gr)
+                    .map(|_| {
+                        (0..n_ch)
+                            .map(|_| Box::new([[0.0f32; 2]; FFT_N / 2 + 1]))
+                            .collect()
+                    })
+                    .collect();
+            }
             for gr in 0..n_gr {
                 for ch in 0..n_ch {
                     let mut input = [0.0f32; FFT_N];
@@ -726,7 +744,16 @@ impl Mp3Encoder {
                     for i in 0..FFT_N {
                         input[i] *= self.psy_fft_window[i];
                     }
-                    fft_power[gr][ch] = self.psy_fft.power_spectrum(&input);
+                    if need_complex {
+                        // Compute complex spectrum; derive power from it.
+                        let cx = self.psy_fft.complex_spectrum(&input);
+                        for k in 0..=FFT_N / 2 {
+                            fft_power[gr][ch][k] = cx[k][0] * cx[k][0] + cx[k][1] * cx[k][1];
+                        }
+                        *fft_complex[gr][ch] = cx;
+                    } else {
+                        fft_power[gr][ch] = self.psy_fft.power_spectrum(&input);
+                    }
                     // Roll the history forward by 576 so the next
                     // granule's FFT input picks up the most recent
                     // tail. The history holds the trailing 448
@@ -951,7 +978,51 @@ impl Mp3Encoder {
                         } else {
                             None
                         };
-                        let g = if self.psy_model == 1 {
+                        let g = if self.psy_model == 2 {
+                            let gain = vbr_quality_to_psy2_gain(self.vbr_quality);
+                            // Psy-2 uses complex-prediction unpredictability
+                            // for long / start / stop blocks; short and mixed
+                            // blocks fall back to Psy-1's per-window Bark
+                            // spreader (the 1024-pt FFT is long-block sized
+                            // and doesn't map cleanly onto 192-coefficient
+                            // short windows).
+                            if block_types[gr][ch] == BlockType::Short {
+                                let mask = if mixed_flags[gr][ch] {
+                                    Psy1Mask::analyze_mixed(&xr[gr][ch], self.sample_rate, gain)
+                                } else {
+                                    Psy1Mask::analyze_short(&xr[gr][ch], self.sample_rate, gain)
+                                };
+                                encode_granule_vbr_psy1(
+                                    &xr[gr][ch],
+                                    &mask,
+                                    block_types[gr][ch],
+                                    mixed_flags[gr][ch],
+                                    is_pos_for_ch,
+                                    is_variant,
+                                    self.sample_rate,
+                                )
+                            } else {
+                                // Long / start / stop: complex-prediction
+                                // unpredictability from the FFT complex
+                                // spectrum. `fft_complex` is populated in the
+                                // pre-analysis pass above when psy_model == 2.
+                                let mask = Psy2Mask::analyze(
+                                    &xr[gr][ch],
+                                    &fft_complex[gr][ch],
+                                    self.sample_rate,
+                                    gain,
+                                );
+                                encode_granule_vbr_psy2(
+                                    &xr[gr][ch],
+                                    &mask,
+                                    block_types[gr][ch],
+                                    mixed_flags[gr][ch],
+                                    is_pos_for_ch,
+                                    is_variant,
+                                    self.sample_rate,
+                                )
+                            }
+                        } else if self.psy_model == 1 {
                             let gain = vbr_quality_to_psy1_gain(self.vbr_quality);
                             // Short-block granules get the per-window
                             // 192-coefficient Psy-1 path so the
@@ -2169,6 +2240,79 @@ fn encode_granule_vbr_psy1(
     g
 }
 
+/// VBR granule encoder driven by the Annex D Psy-2 masking model
+/// (complex-prediction unpredictability). Mirrors `encode_granule_vbr_psy1`
+/// but queries [`Psy2Mask::worst_nmr_db`] for the gain search. Short and
+/// mixed blocks call this function only via the Psy-1 fallback path in the
+/// dispatch loop; the `block_type` / `mixed_block_flag` here will always be
+/// Long / start / stop.
+fn encode_granule_vbr_psy2(
+    xr: &[f32; 576],
+    mask: &Psy2Mask,
+    block_type: BlockType,
+    mixed_block_flag: bool,
+    is_pos: Option<&[u8; 22]>,
+    is_variant: IsVariant,
+    sample_rate: u32,
+) -> GranuleEncoded {
+    // Psy-2 only has a long-block analysis path; subblock_gain is only
+    // meaningful for short blocks (which are routed through Psy-1 in the
+    // dispatch loop and never reach here).
+    let subblock_gain = [0u8; 3];
+    let sr_for_short = if block_type == BlockType::Short {
+        Some(sample_rate)
+    } else {
+        None
+    };
+    let do_quantize = |gain: u8| -> GranuleEncoded {
+        quantize_and_encode_full(
+            xr,
+            gain,
+            subblock_gain,
+            block_type,
+            mixed_block_flag,
+            is_pos,
+            is_variant,
+            sr_for_short,
+        )
+    };
+
+    // Energy gate: pure silence ⇒ skip to high gain.
+    let any_energy = mask.energy.iter().any(|&e| e > 1.0e-12);
+    if !any_energy {
+        return do_quantize(240);
+    }
+
+    // Walk upward from gain=60 until worst-band NMR crosses zero.
+    let mut last_masked: Option<u8> = None;
+    for gain in 60..=255u8 {
+        let step = global_gain_to_step(gain);
+        let nmr = mask.worst_nmr_db(step);
+        if nmr <= 0.0 {
+            last_masked = Some(gain);
+        } else {
+            break;
+        }
+    }
+    let chosen = last_masked.unwrap_or(60);
+
+    // Outer iteration loop: re-quantise until bit cap is met.
+    const MAX_ITER: usize = 8;
+    let mut g = do_quantize(chosen);
+    let mut gain = chosen;
+    for _ in 0..MAX_ITER {
+        if g.total_bits <= VBR_PER_GRANULE_BIT_CAP {
+            break;
+        }
+        if gain == 255 {
+            break;
+        }
+        gain = gain.saturating_add(2);
+        g = do_quantize(gain);
+    }
+    g
+}
+
 #[cfg(test)]
 fn quantize_and_encode(
     xr: &[f32; 576],
@@ -2572,8 +2716,83 @@ fn build_mixed_coeff_window_map(sample_rate: u32) -> [u8; 576] {
     map
 }
 
+/// Compute the bit cost of encoding one (x, y) big-value pair with the
+/// given table index, without writing anything. Returns `usize::MAX`
+/// when the table cannot represent the pair (range too small). This is
+/// the dry-run companion to `emit_big_pair`.
+fn pair_bit_cost(table_idx: u8, ax: i32, ay: i32) -> usize {
+    let bvt = &BIG_VALUE_TABLES[table_idx as usize];
+    if bvt.tab.is_empty() {
+        return usize::MAX;
+    }
+    // Check table reach (same logic as range check in the old picker).
+    let max_xy = bvt.tab.iter().map(|e| e.2.max(e.3)).max().unwrap_or(0) as i32;
+    let reach = if bvt.linbits == 0 {
+        max_xy
+    } else {
+        max_xy + (1i32 << bvt.linbits) - 1
+    };
+    if reach < ax || reach < ay {
+        return usize::MAX;
+    }
+
+    let (sym_x, _lin_x) = if bvt.linbits > 0 && ax >= 15 {
+        (15i32, ax - 15)
+    } else {
+        (ax, 0)
+    };
+    let (sym_y, _lin_y) = if bvt.linbits > 0 && ay >= 15 {
+        (15i32, ay - 15)
+    } else {
+        (ay, 0)
+    };
+
+    // Find the Huffman codeword length.
+    let code_len = bvt
+        .tab
+        .iter()
+        .find(|&&(_c, _l, tx, ty)| tx as i32 == sym_x && ty as i32 == sym_y)
+        .map(|e| e.1 as usize)
+        .unwrap_or(usize::MAX / 2); // shouldn't happen given range check above
+
+    let mut bits = code_len;
+    if bvt.linbits > 0 && ax >= 15 {
+        bits += bvt.linbits as usize;
+    }
+    if ax != 0 {
+        bits += 1; // sign bit
+    }
+    if bvt.linbits > 0 && ay >= 15 {
+        bits += bvt.linbits as usize;
+    }
+    if ay != 0 {
+        bits += 1; // sign bit
+    }
+    bits
+}
+
+/// Pick the big-value Huffman table index that minimises the total bit
+/// cost for encoding all `(x, y)` pairs in `is_[0..big_end]`.
+///
+/// Algorithm:
+///   1. Find `max_abs` — the largest coefficient magnitude. Tables whose
+///      range doesn't cover `max_abs` are skipped immediately.
+///   2. For each surviving table, compute the total bit cost by summing
+///      `pair_bit_cost(t, ax, ay)` over all pairs. This is exact:
+///      different tables have different codeword lengths for the same
+///      `(sym_x, sym_y)` symbol, so the only way to find the best
+///      is to price each candidate against the actual data.
+///   3. Return the table index with the minimum total cost.
+///
+/// Falls back to table 23 (TABLE_16 with linbits=13, widest range) if
+/// no other table covers the data — that should never happen for valid
+/// quantized MP3 coefficients bounded by 8191.
 fn choose_big_value_table(is_: &[i32; 576], big_end: usize) -> u8 {
-    // Find the maximum coefficient magnitude in the big-values region.
+    if big_end == 0 {
+        return 1; // any no-op table works for an empty region; 1 is the smallest non-trivial
+    }
+
+    // Step 1: max coefficient magnitude in the big-values region.
     let mut max_abs = 0i32;
     for i in 0..big_end {
         let a = is_[i].abs();
@@ -2581,27 +2800,51 @@ fn choose_big_value_table(is_: &[i32; 576], big_end: usize) -> u8 {
             max_abs = a;
         }
     }
-    // Try candidates in priority order; pick the first whose effective
-    // range covers max_abs. Range = 15 + (1 << linbits) - 1 when
-    // linbits>0, else 15.
-    for &t in BIG_VALUE_CANDIDATES {
+
+    // Step 2: for each candidate table, evaluate total bit cost.
+    let mut best_table: u8 = 23;
+    let mut best_bits: usize = usize::MAX;
+
+    for &t in BIG_VALUE_ALL_TABLES {
         let bvt = &BIG_VALUE_TABLES[t as usize];
         if bvt.tab.is_empty() {
             continue;
         }
-        // Find max (x,y) value in this table.
+        // Quick range check — skip tables that can't represent max_abs.
         let max_xy = bvt.tab.iter().map(|e| e.2.max(e.3)).max().unwrap_or(0) as i32;
         let reach = if bvt.linbits == 0 {
             max_xy
         } else {
-            // Symbol 15 + linbits → up to 15 + (2^linbits - 1).
             max_xy + (1i32 << bvt.linbits) - 1
         };
-        if reach >= max_abs {
-            return t;
+        if reach < max_abs {
+            continue;
+        }
+
+        // Accumulate exact bit cost for this table.
+        let mut total = 0usize;
+        let mut overflow = false;
+        for i in (0..big_end).step_by(2) {
+            let ax = is_[i].abs();
+            let ay = is_.get(i + 1).copied().unwrap_or(0).abs();
+            let cost = pair_bit_cost(t, ax, ay);
+            if cost == usize::MAX {
+                overflow = true;
+                break;
+            }
+            total += cost;
+            if total >= best_bits {
+                // Already worse than the current best; prune.
+                overflow = true;
+                break;
+            }
+        }
+        if !overflow && total < best_bits {
+            best_bits = total;
+            best_table = t;
         }
     }
-    23 // last-resort: TABLE_16 with linbits=13
+    best_table
 }
 
 fn emit_big_pair(table_idx: u8, x: i32, y: i32, writes: &mut Vec<(u32, u32)>) -> usize {

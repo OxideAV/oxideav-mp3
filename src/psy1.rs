@@ -240,7 +240,7 @@ pub fn partition_bark_centres(sample_rate: u32) -> [f32; N_BARK_PARTITIONS] {
 
 /// Pre-computed spreading-matrix row: `spread_db[b][i]` is the dB
 /// contribution from masker `i` to maskee `b`. Always <= 0.
-fn build_spreading_matrix(sample_rate: u32) -> [[f32; N_BARK_PARTITIONS]; N_BARK_PARTITIONS] {
+pub fn build_spreading_matrix(sample_rate: u32) -> [[f32; N_BARK_PARTITIONS]; N_BARK_PARTITIONS] {
     let centres = partition_bark_centres(sample_rate);
     let mut mat = [[0.0f32; N_BARK_PARTITIONS]; N_BARK_PARTITIONS];
     for b in 0..N_BARK_PARTITIONS {

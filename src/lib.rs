@@ -48,6 +48,7 @@ pub mod imdct;
 pub mod mdct;
 pub mod psy;
 pub mod psy1;
+pub mod psy2;
 pub mod requantize;
 pub mod reservoir;
 pub mod scalefactor;

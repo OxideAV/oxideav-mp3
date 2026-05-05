@@ -143,7 +143,8 @@ rate-control modes:
   burst on top — picker (`block_type::should_use_mixed_block`)
   bandpass-splits the granule via 3-tap LP/HP FIRs at fs/4, then
   checks per-sub-frame LF peak-to-mean (sustained: < 2×) AND HF
-  peak-to-min (transient: > 8×). Disable short / mixed with
+  peak-to-min (transient: > 6×; down from 8× to catch moderate
+  transients like lightly struck percussion on a bass note). Disable short / mixed with
   `short_blocks=0` (matches the pre-round-24 long-only encoder).
   ffmpeg cross-decode confirms mixed-block bitstreams round-trip
   cleanly with energy matching our own decoder within 1×.
@@ -191,6 +192,21 @@ rate-control modes:
       HF tail; output mask carries 38 entries (8 long + 30
       short-window) and the noise allocator drives `global_gain` to
       mask the worst (sfb, window) pair across both regions.
+    - `psy_model=2` — ISO/IEC 11172-3 Annex D **Psy Model 2**
+      baseline in `psy2`: replaces Psy-1's SFM tonality estimate with
+      a **complex-prediction unpredictability measure** on the 1024-pt
+      FFT complex spectrum. Per-bin: `c[k] = |X[k] - (2X[k-1] -
+      X[k-2])| / (|X[k]| + |X_hat[k]| + ε)`; 0 = perfectly
+      predictable (tone), 1 = unpredictable (noise). Per Bark
+      partition: `c_b = mean(c[k])`, tonality `t_b = 1 - c_b`. This
+      catches between-frame phase coherence that the MDCT-domain SFM
+      misses — a tone maintains a stable complex trajectory across
+      FFT frames and registers low `c_b` even when its MDCT energy
+      straddles two coefficients. Everything downstream (spreading,
+      TMN/NMT offsets, sfb re-binning, gain bisection) is identical to
+      Psy-1. Short / mixed blocks fall back to Psy-1's per-window path
+      since the 1024-pt FFT doesn't align with 192-coefficient short
+      windows.
     The per-frame bitrate slot is then chosen from the standard
     table to fit the resulting main-data byte count, yielding files
     that shrink for silence / pure-tone content and grow for

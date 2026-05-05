@@ -103,34 +103,17 @@ impl Fft1024 {
         }
     }
 
-    /// Compute the magnitude-squared spectrum `|X[k]|^2` of a real
-    /// 1024-sample input window, returning the first half (513 bins,
-    /// k = 0..=N/2). The caller is expected to have already applied
-    /// the Hann window to the input.
-    ///
-    /// The magnitude-squared form is exactly what the Bark-partition
-    /// spreader consumes — no need to take square roots.
-    pub fn power_spectrum(&self, input: &[f32; FFT_N]) -> [f32; FFT_N / 2 + 1] {
-        // Bit-reverse + load real input into complex buffer.
-        let mut re = [0.0f32; FFT_N];
-        let mut im = [0.0f32; FFT_N];
-        for i in 0..FFT_N {
-            re[self.bitrev[i]] = input[i];
-        }
-
-        // Iterative Cooley-Tukey: 10 stages of butterflies with
-        // sub-FFT size doubling each stage.
+    /// Core FFT transform — writes the complex output into `re` and `im`.
+    /// Caller must have pre-bit-reversed the input data.
+    fn fft_inplace(re: &mut [f32; FFT_N], im: &mut [f32; FFT_N], twiddles: &[(f32, f32)]) {
         for stage in 1..=FFT_LOG2 {
-            let m = 1usize << stage; // sub-FFT length this stage
+            let m = 1usize << stage;
             let m_half = m >> 1;
-            // Twiddle stride into the global table = N / m. At stage 1
-            // m=2 so we pull twiddle index 0 only; at the final stage
-            // m=N so we pull every twiddle.
             let stride = FFT_N / m;
             let mut k = 0usize;
             while k < FFT_N {
                 for j in 0..m_half {
-                    let twi = self.twiddles[j * stride];
+                    let twi = twiddles[j * stride];
                     let i_top = k + j;
                     let i_bot = i_top + m_half;
                     let bot_re = re[i_bot] * twi.0 - im[i_bot] * twi.1;
@@ -145,12 +128,45 @@ impl Fft1024 {
                 k += m;
             }
         }
+    }
 
-        // Return |X[k]|^2 for k = 0..=N/2 (real input ⇒ symmetric;
-        // upper half mirrors the lower half).
+    /// Compute the magnitude-squared spectrum `|X[k]|^2` of a real
+    /// 1024-sample input window, returning the first half (513 bins,
+    /// k = 0..=N/2). The caller is expected to have already applied
+    /// the Hann window to the input.
+    ///
+    /// The magnitude-squared form is exactly what the Bark-partition
+    /// spreader consumes — no need to take square roots.
+    pub fn power_spectrum(&self, input: &[f32; FFT_N]) -> [f32; FFT_N / 2 + 1] {
+        // Bit-reverse + load real input into complex buffer.
+        let mut re = [0.0f32; FFT_N];
+        let mut im = [0.0f32; FFT_N];
+        for i in 0..FFT_N {
+            re[self.bitrev[i]] = input[i];
+        }
+        Self::fft_inplace(&mut re, &mut im, &self.twiddles);
+        // Return |X[k]|^2 for k = 0..=N/2.
         let mut out = [0.0f32; FFT_N / 2 + 1];
         for k in 0..=FFT_N / 2 {
             out[k] = re[k] * re[k] + im[k] * im[k];
+        }
+        out
+    }
+
+    /// Compute the full complex spectrum for k = 0..=N/2, returning the
+    /// `[re, im]` pairs. Used by the Psy-2 complex-prediction path which
+    /// needs the complex-valued FFT output (not just power) to compute
+    /// the second-order predictor error.
+    pub fn complex_spectrum(&self, input: &[f32; FFT_N]) -> [[f32; 2]; FFT_N / 2 + 1] {
+        let mut re = [0.0f32; FFT_N];
+        let mut im = [0.0f32; FFT_N];
+        for i in 0..FFT_N {
+            re[self.bitrev[i]] = input[i];
+        }
+        Self::fft_inplace(&mut re, &mut im, &self.twiddles);
+        let mut out = [[0.0f32; 2]; FFT_N / 2 + 1];
+        for k in 0..=FFT_N / 2 {
+            out[k] = [re[k], im[k]];
         }
         out
     }

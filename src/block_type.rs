@@ -295,10 +295,13 @@ pub fn should_use_mixed_block(pcm: &[f32; 576]) -> bool {
     } else {
         1.0
     };
-    // Mixed when HF transient is sharp (min/max > 8×, i.e. clear
+    // Mixed when HF transient is sharp (min/max > 6×, i.e. clear
     // burst-vs-quiet contrast across sub-frames) and LF is sustained
-    // (peak-to-mean < 2×).
-    hi_ratio > 8.0 && lo_ratio < 2.0
+    // (peak-to-mean < 2×). The threshold was lowered from 8.0 to 6.0
+    // to catch moderate transients (e.g. lightly struck percussion on
+    // a bass note) that the 8× gate missed, reducing pre-echo on
+    // transient-heavy material.
+    hi_ratio > 6.0 && lo_ratio < 2.0
 }
 
 #[cfg(test)]

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Annex D Psy Model 2 (`psy_model = 2`).** New `psy2` module
+  implements the ISO/IEC 11172-3 §D.2 complex-prediction
+  unpredictability measure: per-bin `c[k] = |X[k] - X_hat[k]| /
+  (|X[k]| + |X_hat[k]| + ε)` where `X_hat[k] = 2X[k-1] - X[k-2]`
+  is a second-order linear complex-FFT extrapolator. Partition
+  tonality `t_b = 1 - mean(c_b)` replaces Psy-1's SFM estimate;
+  everything downstream (Schroeder spreading, TMN/NMT SNR offsets,
+  sfb re-binning) is identical to Psy-1. Short and mixed blocks fall
+  back to Psy-1's per-window Bark-partition path (the 1024-pt FFT
+  doesn't map onto 192-coefficient short windows). `Fft1024::complex_spectrum`
+  was added alongside the existing `power_spectrum` to supply the
+  complex `[re, im]` pairs required by the predictor. Six integration
+  tests in `tests/encoder_psy2.rs` cover: round-trip SNR, output
+  distinctness from Psy-1, ffmpeg cross-decode, short-block fallback,
+  MPEG-2 LSF mode, and long-input stability.
+
+- **RD-driven Huffman big-value table selection.** `choose_big_value_table`
+  now enumerates all 29 non-reserved Layer III big-value tables
+  (tables 1–3, 5–13, 15–31; skipping reserved 4 and 14) and picks
+  the one with minimum total bit cost via exact pair-by-pair
+  `pair_bit_cost` accounting, including linbits extensions. The old
+  code sampled only 12 tables and did not evaluate actual bit cost.
+
+- **Mixed-block threshold tuned from 8× to 6×.** `should_use_mixed_block`
+  now fires on HF peak-to-min ratios above 6× (down from 8×) with a
+  sustained LF component, catching moderate transients (lightly struck
+  percussion on a bass note) that the previous threshold missed.
+
 ## [0.1.1](https://github.com/OxideAV/oxideav-mp3/compare/v0.1.0...v0.1.1) - 2026-05-05
 
 ### Other
