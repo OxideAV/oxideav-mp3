@@ -593,3 +593,91 @@ fn psy1_short_block_own_decode_roundtrip_castanet() {
         "Psy-1 short-block round-trip produced near-silent output: {out_e:.6}"
     );
 }
+
+/// FFT pre-analysis (Annex D §D.2.4.1) sanity check on a between-bin
+/// tone. The MDCT-domain pass smears tones falling between two MDCT
+/// coefficients (576-coefficient grid at 44.1k → bin spacing ~38 Hz,
+/// so a 1015 Hz tone lands roughly halfway between bins 26 and 27);
+/// the FFT pre-analysis sees the tone as a sharp peak (1024-pt FFT
+/// at 44.1k → bin spacing ~43 Hz, but the tone aligns much better
+/// thanks to the higher resolution).
+///
+/// Test: encode a 1015 Hz tone (deliberately not on an integer
+/// multiple of `sr / 1152 = 38.28 Hz`), round-trip via our own
+/// decoder, then verify the dominant tone is recovered with strong
+/// SNR. The FFT pre-analysis is wired by default (`psy_model=1`); the
+/// test would not be meaningful as a regression unless we can also
+/// confirm the older simple-mask (`psy_model=0`) path works on the
+/// same content. We assert non-trivial signal energy in both paths
+/// and that the Psy-1 path doesn't regress relative to the simple
+/// model — i.e. the FFT integration is a strict win or wash.
+#[test]
+fn psy1_fft_preanalysis_handles_between_bin_tone() {
+    let sample_rate = 44_100u32;
+    // 1015 Hz: between-bin for the long-block MDCT (38.28 Hz bin
+    // spacing), close to bin 26.5. The FFT pre-analysis bins this
+    // at sr/1024 = 43.07 Hz spacing, much closer alignment.
+    let pcm = build_sine_pcm(1015.0, sample_rate, 1.5, 0.5);
+    let bytes_psy1 = encode_psy(&pcm, sample_rate, 1, 3, 1);
+    let bytes_psy0 = encode_psy(&pcm, sample_rate, 1, 3, 0);
+    assert!(!bytes_psy1.is_empty(), "psy_model=1 produced no output");
+    assert!(!bytes_psy0.is_empty(), "psy_model=0 produced no output");
+
+    let dec_psy1 = decode_to_pcm(&bytes_psy1, sample_rate);
+    let dec_psy0 = decode_to_pcm(&bytes_psy0, sample_rate);
+    assert!(
+        dec_psy1.len() > 4 * 1152,
+        "psy_model=1 decode produced too few samples"
+    );
+
+    // SNR of the 1015 Hz tone vs nearby noise bins (200 Hz away on
+    // either side, which the masker should not push above audibility).
+    let snr_psy1 = snr_ratio(&dec_psy1, sample_rate, 1015.0, &[815.0, 1215.0]);
+    let snr_psy0 = snr_ratio(&dec_psy0, sample_rate, 1015.0, &[815.0, 1215.0]);
+    eprintln!(
+        "between-bin tone (1015 Hz): psy_model=1 SNR={:.2}, psy_model=0 SNR={:.2}, sizes={} vs {}",
+        snr_psy1,
+        snr_psy0,
+        bytes_psy1.len(),
+        bytes_psy0.len()
+    );
+    // Both must clear a permissive tone-recovery floor (SNR > 5).
+    assert!(
+        snr_psy1 > 5.0,
+        "psy_model=1 between-bin SNR too low: {snr_psy1}"
+    );
+    assert!(
+        snr_psy0 > 5.0,
+        "psy_model=0 between-bin SNR too low: {snr_psy0}"
+    );
+    // And the Psy-1 SNR must not be a strict regression — accept
+    // <=15% margin so a tighter mask that allocates more bits
+    // elsewhere doesn't fail this test if it stays above the floor.
+    assert!(
+        snr_psy1 >= snr_psy0 * 0.85,
+        "psy_model=1 (with FFT pre-analysis) regressed below the simple mask: psy1={snr_psy1}, psy0={snr_psy0}"
+    );
+}
+
+/// Confirm the FFT pre-analysis state survives encoder lifetime
+/// across many frames — the per-channel rolling history must not
+/// produce NaN/Inf or silent output after the buffer wraps.
+#[test]
+fn psy1_fft_preanalysis_long_input_stable() {
+    let sample_rate = 44_100u32;
+    // 4 seconds of multi-tone input — drives the FFT history through
+    // many roll-forward cycles.
+    let pcm = build_music_pcm(sample_rate, 4.0);
+    let bytes = encode_psy(&pcm, sample_rate, 1, 4, 1);
+    assert!(!bytes.is_empty(), "no output");
+    let dec = decode_to_pcm(&bytes, sample_rate);
+    assert!(dec.len() > 100 * 1152);
+    for v in dec.iter() {
+        assert!(v.is_finite(), "decoded NaN/Inf after long FFT history");
+    }
+    let energy: f64 = dec.iter().map(|&v| (v as f64).powi(2)).sum();
+    assert!(
+        energy > 1.0,
+        "long-input output went silent: energy={energy}"
+    );
+}

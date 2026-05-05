@@ -41,6 +41,7 @@ pub mod block_type;
 pub mod container;
 pub mod decoder;
 pub mod encoder;
+pub mod fft;
 pub mod frame;
 pub mod huffman;
 pub mod imdct;

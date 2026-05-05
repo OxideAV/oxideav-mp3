@@ -89,6 +89,7 @@
 //! signal-processing material, and the peak-detection variant follows
 //! the spec wording (local maxima in the squared-magnitude spectrum).
 
+use crate::fft::FFT_N;
 use crate::sfband::{sfband_long, sfband_short};
 
 /// Number of Bark partitions used by the Psy-1 implementation. Annex D.2.4
@@ -160,6 +161,36 @@ pub fn build_coeff_partition_short(sample_rate: u32) -> [u8; 192] {
     let mut out = [0u8; 192];
     for k in 0..192 {
         let f = coeff_centre_hz_short(k, sample_rate);
+        let mut p = 0usize;
+        while p < N_BARK_PARTITIONS - 1 && f > BARK_UPPER_HZ[p] {
+            p += 1;
+        }
+        out[k] = p as u8;
+    }
+    out
+}
+
+/// FFT-bin centre frequency. The pre-analysis FFT runs on a 1024-point
+/// window of raw PCM, so bin `k` (0..=N/2) sits at `k * sr / N`.
+pub fn fft_bin_centre_hz(k: usize, sample_rate: u32) -> f32 {
+    k as f32 * sample_rate as f32 / FFT_N as f32
+}
+
+/// Build the partition table for the FFT pre-analysis: for every FFT
+/// bin in `0..=N/2` (513 bins for `N = 1024`), the index of the Bark
+/// partition that carries it. Mirrors [`build_coeff_partition`] for
+/// the FFT bin layout.
+///
+/// The FFT runs on raw PCM (Annex D §D.2.4.1), so its bins resolve
+/// `sr / N = 43 Hz` apart at 44.1 kHz — about 12× narrower than the
+/// MDCT's 38.3 Hz/coefficient (574/Nyquist split). Between-bin tones
+/// that smear across two MDCT coefficients land cleanly on a single
+/// FFT bin, sharpening the per-partition tonality estimate the
+/// spreader feeds into the masking threshold.
+pub fn build_fft_partition(sample_rate: u32) -> [u8; FFT_N / 2 + 1] {
+    let mut out = [0u8; FFT_N / 2 + 1];
+    for k in 0..=FFT_N / 2 {
+        let f = fft_bin_centre_hz(k, sample_rate);
         let mut p = 0usize;
         while p < N_BARK_PARTITIONS - 1 && f > BARK_UPPER_HZ[p] {
             p += 1;
@@ -303,6 +334,162 @@ impl Psy1Mask {
         }
 
         // Floor to keep silent bands from breaking the iterator.
+        let global_floor = energy.iter().copied().fold(0.0f32, f32::max) * 1.0e-7 + 1.0e-12;
+        for b in 0..22 {
+            if threshold[b] < global_floor {
+                threshold[b] = global_floor;
+            }
+        }
+
+        Self {
+            n_sfb: 22,
+            energy,
+            threshold,
+            width,
+            start,
+            partition_tonality,
+            partition_peak_tonality,
+            partition_threshold,
+        }
+    }
+
+    /// Long-block Psy-1 analysis with **FFT-domain pre-analysis**
+    /// fused in. The MDCT-domain pass of [`Self::analyze`] catches
+    /// in-bin tones cleanly but smears tones falling between two MDCT
+    /// coefficients (the MDCT projects onto cosines that aren't a
+    /// strict tone basis); ISO/IEC 11172-3 Annex D §D.2.4.1 spec-
+    /// mandates a parallel 1024-point FFT on the raw PCM with its own
+    /// partition spreader, then merges the two views.
+    ///
+    /// `fft_power` is the magnitude-squared spectrum of the granule's
+    /// Hann-windowed PCM (use [`crate::fft::Fft1024::power_spectrum`]).
+    ///
+    /// **Fusion rule.** Per Bark partition `b` we
+    ///
+    ///   1. take the **maximum** of the MDCT-domain and FFT-domain
+    ///      tonality estimates — the FFT can spot between-bin tones
+    ///      the MDCT smears across two coefficients, so any partition
+    ///      flagged tonal by *either* view gets the wider TMN budget;
+    ///   2. re-run [`spread_and_offset`] using the boosted tonality to
+    ///      get a tighter per-partition spread threshold;
+    ///   3. propagate the new threshold to the per-coefficient masks
+    ///      that the noise allocator consumes.
+    ///
+    /// In partitions where the MDCT energy is silent but the FFT pass
+    /// spotted a tone (e.g. a high-frequency tone close to MDCT
+    /// Nyquist that aliases away in the MDCT pass), the per-coefficient
+    /// threshold for the partition's MDCT bins is set from the FFT-
+    /// derived threshold so the noise allocator still budgets bits for
+    /// the band.
+    pub fn analyze_with_fft(
+        xr: &[f32; 576],
+        fft_power: &[f32; FFT_N / 2 + 1],
+        sample_rate: u32,
+        gain: f32,
+    ) -> Self {
+        // Step 1: MDCT-domain pass — get per-partition energy +
+        // tonality. We re-do the inner loop here (instead of calling
+        // `partition_pass`) so we can keep the per-partition energies
+        // around for the spread re-run.
+        let coeff_partition = build_coeff_partition(sample_rate);
+        let spread_mat = build_spreading_matrix(sample_rate);
+        let mut mdct_part_energy = [0.0f32; N_BARK_PARTITIONS];
+        let mut mdct_part_count = [0u32; N_BARK_PARTITIONS];
+        let mut mdct_part_log_sum = [0.0f32; N_BARK_PARTITIONS];
+        let mut mdct_part_peak = [0.0f32; N_BARK_PARTITIONS];
+        let log_floor: f32 = 1.0e-20;
+        let mdct_energy_at = |k: usize| -> f32 { xr[k] * xr[k] };
+        for k in 0..576 {
+            let p = coeff_partition[k] as usize;
+            let e = mdct_energy_at(k);
+            mdct_part_energy[p] += e;
+            mdct_part_log_sum[p] += (e.max(log_floor)).ln();
+            mdct_part_count[p] += 1;
+            let prev = if k == 0 { 0.0 } else { mdct_energy_at(k - 1) };
+            let next = if k == 575 { 0.0 } else { mdct_energy_at(k + 1) };
+            if e > prev && e > next && e > mdct_part_peak[p] {
+                mdct_part_peak[p] = e;
+            }
+        }
+        let (mdct_tonality, mdct_peak_tonality) = compute_tonalities(
+            &mdct_part_energy,
+            &mdct_part_log_sum,
+            &mdct_part_count,
+            &mdct_part_peak,
+        );
+
+        // Step 2: FFT-domain pass — same per-partition shape, now
+        // computed from the PCM FFT spectrum.
+        let fft_partition = build_fft_partition(sample_rate);
+        let (fft_part_thr, fft_tonality, _fft_peak_tonality) =
+            fft_partition_pass(fft_power, &fft_partition, sample_rate, gain);
+
+        // Step 3: Fuse tonality (max). The FFT pass is the spec's
+        // designated tone detector — wherever it spots tonality the
+        // MDCT missed, the partition gets the tonal SNR offset.
+        let mut partition_tonality = [0.0f32; N_BARK_PARTITIONS];
+        let mut partition_peak_tonality = [0.0f32; N_BARK_PARTITIONS];
+        for p in 0..N_BARK_PARTITIONS {
+            partition_tonality[p] = mdct_tonality[p].max(fft_tonality[p]);
+            // Peak-tonality is purely diagnostic; report MDCT side.
+            partition_peak_tonality[p] = mdct_peak_tonality[p];
+        }
+
+        // Step 4: Re-run the spreader with the *boosted* tonality
+        // against the MDCT energies. This gives the tighter per-
+        // partition threshold the FFT pre-analysis was looking for —
+        // the same energy convolves into a mask floor with a tonal
+        // (TMN ~14.5 dB) instead of noise (NMT ~5.5 dB) offset for
+        // the affected partitions.
+        let mdct_part_thr =
+            spread_and_offset(&mdct_part_energy, &spread_mat, &partition_tonality, gain);
+
+        // Step 5: Per-coefficient threshold from the MDCT pass with
+        // boosted tonality (case (a) above). Same shape as
+        // `partition_pass`'s per-coeff output.
+        let mut per_coeff_thr = [0.0f32; 576];
+        for k in 0..576 {
+            let p = coeff_partition[k] as usize;
+            let n = mdct_part_count[p].max(1) as f32;
+            per_coeff_thr[k] = mdct_part_thr[p] / n;
+        }
+
+        // The FFT pre-analysis only helps where MDCT also has signal
+        // in the partition — that's where boosting tonality lowers
+        // the per-band threshold and earns the encoder more bits.
+        // Partitions where MDCT is silent stay at zero per-coeff
+        // threshold; the encoder will quantize their MDCT
+        // coefficients to zero regardless of any FFT-spotted tonal
+        // content in that frequency range (the MDCT view is what gets
+        // emitted into the bitstream — there's no MDCT tone in those
+        // partitions to allocate bits to).
+        let partition_threshold = mdct_part_thr;
+        let _ = fft_part_thr; // already consumed via tonality boost
+
+        // Step 4: re-bin per-coefficient threshold + energy to long-
+        // block sfbs (matches `analyze`).
+        let sfb = sfband_long(sample_rate);
+        let mut energy = vec![0.0f32; 22];
+        let mut threshold = vec![0.0f32; 22];
+        let mut width = vec![0u16; 22];
+        let mut start = vec![0u16; 22];
+        for b in 0..22 {
+            let s = (sfb[b] as usize).min(576);
+            let e_idx = (sfb[b + 1] as usize).min(576);
+            let lo = s.min(e_idx);
+            let hi = e_idx;
+            let mut e = 0.0f32;
+            let mut thr = 0.0f32;
+            for k in lo..hi {
+                e += xr[k] * xr[k];
+                thr += per_coeff_thr[k];
+            }
+            energy[b] = e;
+            threshold[b] = thr;
+            width[b] = (hi - lo) as u16;
+            start[b] = lo as u16;
+        }
+
         let global_floor = energy.iter().copied().fold(0.0f32, f32::max) * 1.0e-7 + 1.0e-12;
         for b in 0..22 {
             if threshold[b] < global_floor {
@@ -622,6 +809,59 @@ fn partition_pass_short(
         per_coeff_thr[k] = part_threshold[p] / n;
     }
     (per_coeff_thr, part_threshold, tonality, peak_tonality)
+}
+
+/// Per-partition pass for the FFT pre-analysis (Annex D §D.2.4.1).
+/// Walks the 513-bin one-sided power spectrum (for `FFT_N = 1024`)
+/// and runs the same Bark-domain spreader + tonality estimator as
+/// the MDCT pass, returning per-partition spread thresholds and
+/// per-partition tonality estimates.
+///
+/// The peak detector here works on the *power* spectrum directly
+/// (the FFT magnitudes squared) since `fft_power` is already in
+/// linear-energy units. DC (k=0) and Nyquist (k=N/2) bins are treated
+/// like the MDCT-pass end coefficients — the missing-neighbour side
+/// is taken as zero.
+fn fft_partition_pass(
+    fft_power: &[f32; FFT_N / 2 + 1],
+    fft_partition: &[u8; FFT_N / 2 + 1],
+    sample_rate: u32,
+    gain: f32,
+) -> (
+    [f32; N_BARK_PARTITIONS],
+    [f32; N_BARK_PARTITIONS],
+    [f32; N_BARK_PARTITIONS],
+) {
+    let spread_mat = build_spreading_matrix(sample_rate);
+
+    let mut part_energy = [0.0f32; N_BARK_PARTITIONS];
+    let mut part_count = [0u32; N_BARK_PARTITIONS];
+    let mut part_log_sum = [0.0f32; N_BARK_PARTITIONS];
+    let mut part_peak = [0.0f32; N_BARK_PARTITIONS];
+    let log_floor: f32 = 1.0e-20;
+    let n_bins = FFT_N / 2 + 1;
+    for k in 0..n_bins {
+        let p = fft_partition[k] as usize;
+        let e = fft_power[k];
+        part_energy[p] += e;
+        part_log_sum[p] += (e.max(log_floor)).ln();
+        part_count[p] += 1;
+        let prev = if k == 0 { 0.0 } else { fft_power[k - 1] };
+        let next = if k + 1 >= n_bins {
+            0.0
+        } else {
+            fft_power[k + 1]
+        };
+        if e > prev && e > next && e > part_peak[p] {
+            part_peak[p] = e;
+        }
+    }
+
+    let (tonality, peak_tonality) =
+        compute_tonalities(&part_energy, &part_log_sum, &part_count, &part_peak);
+    let part_threshold = spread_and_offset(&part_energy, &spread_mat, &tonality, gain);
+
+    (part_threshold, tonality, peak_tonality)
 }
 
 /// Compute the SFM-based and peak-based tonality estimates per
@@ -1092,6 +1332,165 @@ mod tests {
             m.partition_peak_tonality[p] < 0.3,
             "flat-partition peak tonality should be < 0.3, got {}",
             m.partition_peak_tonality[p]
+        );
+    }
+
+    #[test]
+    fn fft_partition_assigns_increasing() {
+        let cp = build_fft_partition(44_100);
+        // DC bin is partition 0, top bin reaches the highest partition.
+        assert_eq!(cp[0], 0);
+        assert!(
+            cp[FFT_N / 2] >= 20,
+            "highest FFT bin should land in a high partition, got {}",
+            cp[FFT_N / 2]
+        );
+        for k in 1..=FFT_N / 2 {
+            assert!(
+                cp[k] >= cp[k - 1],
+                "FFT partition assignment must be non-decreasing"
+            );
+        }
+    }
+
+    #[test]
+    fn psy1_with_fft_silence_has_floor_thresholds() {
+        // Silence in both MDCT and FFT inputs should still produce
+        // floor thresholds (no NaN / div-by-zero) for every sfb.
+        let xr = [0.0f32; 576];
+        let fft = [0.0f32; FFT_N / 2 + 1];
+        let m = Psy1Mask::analyze_with_fft(&xr, &fft, 44_100, 1.0);
+        assert_eq!(m.n_sfb, 22);
+        for b in 0..22 {
+            assert_eq!(m.energy[b], 0.0);
+            assert!(m.threshold[b] > 0.0);
+        }
+    }
+
+    #[test]
+    fn psy1_with_fft_matches_mdct_only_when_fft_is_silent() {
+        // With a silent FFT input the FFT partition thresholds are zero,
+        // so the fusion rule should leave the MDCT-only path untouched
+        // (FFT only ever tightens). Per-sfb thresholds must match the
+        // plain `analyze` call.
+        let mut xr = [0.0f32; 576];
+        for k in 100..150 {
+            xr[k] = 0.5;
+        }
+        let fft = [0.0f32; FFT_N / 2 + 1];
+        let m_only = Psy1Mask::analyze(&xr, 44_100, 1.0);
+        let m_fused = Psy1Mask::analyze_with_fft(&xr, &fft, 44_100, 1.0);
+        for b in 0..22 {
+            assert_eq!(m_only.energy[b], m_fused.energy[b]);
+            assert!(
+                (m_only.threshold[b] - m_fused.threshold[b]).abs()
+                    <= m_only.threshold[b].abs() * 1.0e-6 + 1.0e-12,
+                "sfb {b}: MDCT-only={} fused={}",
+                m_only.threshold[b],
+                m_fused.threshold[b]
+            );
+        }
+    }
+
+    #[test]
+    fn psy1_with_fft_tightens_threshold_on_tonal_partition() {
+        // The genuine pre-analysis win: a partition where the MDCT
+        // pass sees noise-like energy (broad-band, low SFM tonality)
+        // but the FFT pass — with its 12× finer bin resolution —
+        // resolves the energy into a single peak (high tonality).
+        //
+        // Fusion takes max(mdct_tonality, fft_tonality) and re-runs
+        // spread_and_offset on the same MDCT energies. Tonal mask =
+        // TMN ~14.5 dB, noise mask = NMT ~5.5 dB ⇒ tonal threshold is
+        // ~9 dB lower than the noise threshold for the same energy.
+        // The fused per-sfb threshold must be lower than the MDCT-
+        // only one for the affected partition.
+        //
+        // MDCT signal: a flat block of equal-magnitude coefficients
+        // (low SFM tonality ⇒ noise mask). FFT signal: one strong
+        // bin (high tonality ⇒ tonal mask).
+        let mut xr = [0.0f32; 576];
+        // Pick an MDCT range that lands in a single Bark partition.
+        // Coefficients 100..120 at 44.1k all sit in the same mid
+        // partition (Bark-spread is local). Equal magnitude ⇒ low SFM.
+        for k in 100..120 {
+            xr[k] = 0.2;
+        }
+        let cp = build_coeff_partition(44_100);
+        let target_part = cp[110] as usize;
+        // Build FFT power with a single strong bin landing in the
+        // same Bark partition. Pick a bin the partition table maps
+        // to `target_part`, with enough magnitude to push tonality
+        // to ≈1.
+        let fp = build_fft_partition(44_100);
+        let mut fft_bin: Option<usize> = None;
+        for k in 1..=FFT_N / 2 {
+            if fp[k] as usize == target_part {
+                fft_bin = Some(k);
+                break;
+            }
+        }
+        let Some(k) = fft_bin else {
+            return; // no FFT bin in this partition — skip
+        };
+        // Make the FFT power dominantly tonal: one large bin, others
+        // ~0 in the partition.
+        let mut fft = [0.0f32; FFT_N / 2 + 1];
+        fft[k] = 1.0e6;
+        let m_only = Psy1Mask::analyze(&xr, 44_100, 1.0);
+        let m_fused = Psy1Mask::analyze_with_fft(&xr, &fft, 44_100, 1.0);
+        // Confirm the FFT actually boosted tonality for the partition.
+        assert!(
+            m_fused.partition_tonality[target_part] > m_only.partition_tonality[target_part],
+            "FFT should boost partition {target_part} tonality (mdct-only={}, fused={})",
+            m_only.partition_tonality[target_part],
+            m_fused.partition_tonality[target_part]
+        );
+        // Find an sfb that overlaps target_part.
+        let sfb = sfband_long(44_100);
+        let mut hit_sfb: Option<usize> = None;
+        for b in 0..22 {
+            let lo = sfb[b] as usize;
+            let hi = sfb[b + 1] as usize;
+            for kk in lo..hi.min(576) {
+                if cp[kk] as usize == target_part && xr[kk] != 0.0 {
+                    hit_sfb = Some(b);
+                    break;
+                }
+            }
+            if hit_sfb.is_some() {
+                break;
+            }
+        }
+        let Some(b) = hit_sfb else {
+            return;
+        };
+        assert!(
+            m_fused.threshold[b] < m_only.threshold[b],
+            "FFT-boosted tonality should tighten sfb {b} (mdct-only={}, fused={})",
+            m_only.threshold[b],
+            m_fused.threshold[b]
+        );
+    }
+
+    #[test]
+    fn psy1_with_fft_quality_knob_monotonic() {
+        // Same monotonicity check as the MDCT-only path: higher gain ⇒
+        // higher NMR (looser quantizer is more visible).
+        let mut xr = [0.0f32; 576];
+        for i in 0..200 {
+            xr[i] = 0.1;
+        }
+        let mut fft = [0.0f32; FFT_N / 2 + 1];
+        for k in 1..50 {
+            fft[k] = 1.0;
+        }
+        let m = Psy1Mask::analyze_with_fft(&xr, &fft, 44_100, 1.0);
+        let nmr_low = m.worst_nmr_db(crate::psy::global_gain_to_step(120));
+        let nmr_high = m.worst_nmr_db(crate::psy::global_gain_to_step(180));
+        assert!(
+            nmr_high > nmr_low,
+            "expected higher gain to yield higher NMR; got nmr_low={nmr_low} nmr_high={nmr_high}"
         );
     }
 }

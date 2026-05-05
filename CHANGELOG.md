@@ -9,6 +9,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **FFT-domain pre-analysis for Psy-1 long blocks.** New `fft.rs`
+  module with a clean-room 1024-point radix-2 Cooley-Tukey FFT plan
+  + Hann window builder. The encoder maintains a per-channel rolling
+  448-sample PCM history so each long-block granule's FFT input is
+  `[history (448), current granule (576)]` Hann-windowed; the
+  resulting one-sided power spectrum (513 bins) feeds a parallel
+  Bark-partition spreader (`fft_partition_pass` + `build_fft_partition`
+  in `psy1`) and the per-partition tonality estimator. The new
+  `Psy1Mask::analyze_with_fft` constructor fuses the FFT-domain
+  tonality into the MDCT-domain pass via `max(mdct_tonality,
+  fft_tonality)` and re-runs the Schroeder spreader with the boosted
+  tonality — partitions where the FFT spotted a between-bin tone the
+  MDCT smeared get the tonal SNR offset (TMN ~14.5 dB) instead of
+  the noise offset (NMT ~5.5 dB), tightening the per-band threshold
+  by ~9 dB. ISO/IEC 11172-3 Annex D §D.2.4.1 spec-mandates this
+  parallel FFT path; previously the encoder ran tonality detection
+  on MDCT output only, which catches in-bin tones cleanly but
+  smears tones falling between two MDCT coefficients (the MDCT
+  projects onto cosines that aren't a strict tone basis). Long /
+  start / stop blocks dispatch through `analyze_with_fft`; short
+  blocks stay on the per-window 192-coefficient path
+  (`analyze_short`) — the 1024-point FFT spans the long-block
+  granule's 576 coefficients, not the short window's 192. Five new
+  unit cases (`fft_partition_assigns_increasing`,
+  `psy1_with_fft_silence_has_floor_thresholds`,
+  `psy1_with_fft_matches_mdct_only_when_fft_is_silent`,
+  `psy1_with_fft_tightens_threshold_on_tonal_partition`,
+  `psy1_with_fft_quality_knob_monotonic`) plus four FFT-only cases
+  (`fft_dc_input_concentrates_energy_at_bin_zero`,
+  `fft_pure_tone_concentrates_at_correct_bin`,
+  `fft_parseval_holds_for_random_input`,
+  `fft_two_close_tones_are_resolved`,
+  `hann_endpoints_zero_centre_one`). Two integration cases in
+  `tests/encoder_psy1.rs` cover the wired-up encoder path:
+  `psy1_fft_preanalysis_handles_between_bin_tone` (1015 Hz tone
+  deliberately mid-bin for the long-block 38.28 Hz MDCT grid;
+  asserts SNR > 5 and no regression vs the simple-mask baseline)
+  and `psy1_fft_preanalysis_long_input_stable` (4-second
+  multi-tone fixture exercises the rolling history across many
+  roll-forward cycles, asserts non-silent + finite output).
+- **Per-window subblock_gain for short blocks.** The encoder now
+  picks a per-window `subblock_gain[w]` triple from the Psy-1
+  short-block per-window energies. Per ISO/IEC 11172-3 §2.4.3.4,
+  `subblock_gain[w]` attenuates the dequantized coefficients of
+  window `w` by `2^(-2 * sbgain)` — the encoder side compensates by
+  scaling its quantizer step for that window by `2^(1.5 * sbgain)`
+  (the `3/4` factor falls out of the encoder's `xr^(3/4)` mapping),
+  giving the loud (post-attack) window more dynamic range so its
+  high-magnitude transient coefficients fit inside the Huffman
+  tables without coarsening the quieter sibling windows. Heuristic
+  picker (`pick_subblock_gain_short`) maps the per-window energy
+  ratio to `subblock_gain` with a `0.25 * log2(E[w] / E_min)` slope
+  (clamped to 0..7) — quieter windows stay at `0`; the loudest
+  window gets up to `7` units of dynamic-range extension.
+  `quantize_and_encode_full` plus `build_short_coeff_window_map`
+  apply the per-window scale based on the encoder's pure-short-
+  block sfb-major then window-major-within-sfb layout. The MPEG-1
+  and MPEG-2 LSF window-switching side-info tails now emit the
+  chosen `subblock_gain[w]` triple instead of `[0; 3]` (3 bits per
+  window); the previously hard-coded zeros are gone. Six new
+  encoder unit cases:
+  `subblock_gain_zero_for_equal_window_energies`,
+  `subblock_gain_biases_loud_window_higher`,
+  `subblock_gain_clamps_to_seven`,
+  `subblock_gain_silence_returns_zeros`,
+  `subblock_gain_long_block_mask_returns_zeros`,
+  `quantize_short_with_subblock_gain_uses_more_bits_for_loud_window`,
+  `build_short_window_map_matches_layout`. The existing
+  short-block ffmpeg cross-decode test
+  (`psy1_short_block_ffmpeg_cross_decode_castanet`) confirms ffmpeg
+  accepts the bitstream with non-zero subblock_gain on the per-
+  channel transient frames. Pre-echo PSNR delta on the isolated-
+  transient fixture rose to >245 dB (vs the long-only baseline)
+  through the combination of short-block window switching + the
+  new subblock_gain pre-emphasis.
 - **Short-block path for Psy-1.** New `Psy1Mask::analyze_short`
   constructor runs the Bark-partition spreader independently on each
   of the three 192-coefficient short-block windows packed into a

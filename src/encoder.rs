@@ -54,10 +54,12 @@ use oxideav_core::{
 
 use crate::analysis::{analyze_granule, AnalysisState};
 use crate::block_type::{BlockType, BlockTypeMachine, TransientDetector};
+use crate::fft::{hann_window, Fft1024, FFT_N};
 use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A};
 use crate::mdct::{mdct_granule, MdctState};
 use crate::psy::{global_gain_to_step, vbr_quality_to_mask_ratio, GranuleMask};
 use crate::psy1::{vbr_quality_to_psy1_gain, Psy1Mask};
+use crate::sfband::sfband_short;
 use crate::CODEC_ID_STR;
 use oxideav_core::bits::BitWriter;
 use oxideav_core::options::{
@@ -414,6 +416,20 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         transient_det: [TransientDetector::new(), TransientDetector::new()],
         block_machine: [BlockTypeMachine::new(), BlockTypeMachine::new()],
         pcm_queue: vec![Vec::new(); channels as usize],
+        // Annex D §D.2.4.1 FFT pre-analysis state. The FFT spans
+        // `FFT_N = 1024` samples per granule; we maintain a history of
+        // the trailing `FFT_N - 576` samples per channel so each
+        // granule's FFT input is `[history, current 576-sample
+        // granule]`. Initially zero (the first granule sees a
+        // zero-padded prefix).
+        psy_fft_history: vec![vec![0.0f32; FFT_N - 576]; channels as usize],
+        psy_fft: Fft1024::new(),
+        psy_fft_window: {
+            let w = hann_window(FFT_N);
+            let mut arr = [0.0f32; FFT_N];
+            arr.copy_from_slice(&w);
+            arr
+        },
         main_data_queue: Vec::new(),
         pending_packets: VecDeque::new(),
         frame_index: 0,
@@ -465,6 +481,18 @@ struct Mp3Encoder {
     block_machine: [BlockTypeMachine; 2],
     /// Per-channel float queue (samples in -1..=1).
     pcm_queue: Vec<Vec<f32>>,
+    /// Per-channel rolling PCM history for the Annex D §D.2.4.1 FFT
+    /// pre-analysis. Holds the last `FFT_N - 576 = 448` samples (per
+    /// channel) so the FFT input for each granule is `[history,
+    /// current 576-sample granule]`. Updated after each granule is
+    /// analysed.
+    psy_fft_history: Vec<Vec<f32>>,
+    /// Cooley-Tukey 1024-point FFT plan (allocates twiddle +
+    /// bit-reversal tables once and reuses them per granule).
+    psy_fft: Fft1024,
+    /// Hann analysis window pre-computed at encoder creation. Applied
+    /// to each granule's FFT input before [`Fft1024::power_spectrum`].
+    psy_fft_window: [f32; FFT_N],
     /// Pending main-data bytes that have not yet been written to a frame
     /// slot. The next frame's `main_data_begin` is exactly this length
     /// (capped at the version's max lookback) BEFORE the new main_data
@@ -657,6 +685,59 @@ impl Mp3Encoder {
                 for gr in 0..n_gr {
                     let bt = self.block_machine[ch].decide(verdicts[gr], verdicts[gr + 1]);
                     block_types[gr][ch] = bt;
+                }
+            }
+        }
+
+        // Annex D §D.2.4.1 FFT pre-analysis. Compute the 1024-point
+        // Hann-windowed power spectrum per (granule, channel) BEFORE
+        // we drive the analysis filter / MDCT. The FFT input for
+        // granule `gr` is the concatenation of the per-channel PCM
+        // history (`FFT_N - 576` samples carried over from the
+        // previous frame's tail) and the granule's 576 raw samples.
+        // After the loop the history is updated with the most recent
+        // `FFT_N - 576` samples we've seen — for MPEG-1 (2 granules
+        // per frame) that's the trailing tail of granule 1; for
+        // MPEG-2 LSF (1 granule per frame) it's the trailing tail of
+        // the single granule.
+        //
+        // VBR Psy-1 below consults these as the parallel between-bin
+        // tonality detector. CBR doesn't need them — but computing
+        // them for every frame keeps the history coherent across
+        // mode-switches and the overhead is small.
+        let mut fft_power: Vec<Vec<[f32; FFT_N / 2 + 1]>> = (0..n_gr)
+            .map(|_| (0..n_ch).map(|_| [0.0f32; FFT_N / 2 + 1]).collect())
+            .collect();
+        let need_fft = self.rate_control == RateControl::Vbr && self.psy_model == 1;
+        if need_fft {
+            for gr in 0..n_gr {
+                for ch in 0..n_ch {
+                    let mut input = [0.0f32; FFT_N];
+                    let hist_len = FFT_N - 576;
+                    input[..hist_len].copy_from_slice(&self.psy_fft_history[ch]);
+                    input[hist_len..].copy_from_slice(&pcm_in[ch][gr * 576..gr * 576 + 576]);
+                    // Apply Hann window in place.
+                    for i in 0..FFT_N {
+                        input[i] *= self.psy_fft_window[i];
+                    }
+                    fft_power[gr][ch] = self.psy_fft.power_spectrum(&input);
+                    // Roll the history forward by 576 so the next
+                    // granule's FFT input picks up the most recent
+                    // tail. The history holds the trailing 448
+                    // samples of the granule we just analysed.
+                    let new_hist_start = 576 - hist_len.min(576);
+                    self.psy_fft_history[ch][..hist_len.min(576)]
+                        .copy_from_slice(&pcm_in[ch][gr * 576 + new_hist_start..gr * 576 + 576]);
+                    if hist_len > 576 {
+                        // hist_len > 576 cannot happen for FFT_N=1024
+                        // (FFT_N - 576 = 448 < 576), but guard anyway
+                        // so future tweaks don't silently corrupt the
+                        // history.
+                        debug_assert!(
+                            false,
+                            "psy_fft_history > 576: would need a multi-granule rolling buffer"
+                        );
+                    }
                 }
             }
         }
@@ -856,9 +937,31 @@ impl Mp3Encoder {
                             // (sfb, window) entry per contiguous
                             // chunk.
                             let mask = if block_types[gr][ch] == BlockType::Short {
+                                // Short-block path: per-window
+                                // partition spreader on each
+                                // 192-coefficient MDCT window. The
+                                // FFT pre-analysis is long-block-only
+                                // (Annex D §D.2.4.1's 1024-pt FFT
+                                // matches the long-block 576-coeff
+                                // span, not the short-block 192
+                                // window) — short blocks rely on the
+                                // per-window Bark spreader for
+                                // tonality.
                                 Psy1Mask::analyze_short(&xr[gr][ch], self.sample_rate, gain)
                             } else {
-                                Psy1Mask::analyze(&xr[gr][ch], self.sample_rate, gain)
+                                // Long / start / stop blocks fuse the
+                                // MDCT-domain pass with the parallel
+                                // FFT-domain pre-analysis (Annex D
+                                // §D.2.4.1). The FFT spotter boosts
+                                // per-Bark-partition tonality wherever
+                                // the MDCT pass smeared a between-bin
+                                // tone.
+                                Psy1Mask::analyze_with_fft(
+                                    &xr[gr][ch],
+                                    &fft_power[gr][ch],
+                                    self.sample_rate,
+                                    gain,
+                                )
                             };
                             encode_granule_vbr_psy1(
                                 &xr[gr][ch],
@@ -866,6 +969,7 @@ impl Mp3Encoder {
                                 block_types[gr][ch],
                                 is_pos_for_ch,
                                 is_variant,
+                                self.sample_rate,
                             )
                         } else {
                             let mask_ratio = vbr_quality_to_mask_ratio(self.vbr_quality);
@@ -1102,10 +1206,11 @@ fn emit_window_switching_tail_mpeg1(si_w: &mut BitWriter, g: &GranuleEncoded) {
         si_w.write_u32(0, 1); // mixed_block_flag = 0 (pure short on switch)
         si_w.write_u32(g.table_select as u32, 5); // table_select[0]
         si_w.write_u32(g.table_select as u32, 5); // table_select[1]
-                                                  // 3 × subblock_gain — keep at 0 (no per-window pre-emphasis).
-        si_w.write_u32(0, 3);
-        si_w.write_u32(0, 3);
-        si_w.write_u32(0, 3);
+                                                  // 3 × subblock_gain — driven from per-window energies for
+                                                  // short blocks (Annex D pre-echo mitigation), 0 elsewhere.
+        si_w.write_u32(g.subblock_gain[0] as u32 & 0x7, 3);
+        si_w.write_u32(g.subblock_gain[1] as u32 & 0x7, 3);
+        si_w.write_u32(g.subblock_gain[2] as u32 & 0x7, 3);
     }
     si_w.write_u32(0, 1); // preflag
     si_w.write_u32(0, 1); // scalefac_scale
@@ -1129,9 +1234,9 @@ fn emit_window_switching_tail_mpeg2(si_w: &mut BitWriter, g: &GranuleEncoded) {
         si_w.write_u32(0, 1); // mixed_block_flag = 0
         si_w.write_u32(g.table_select as u32, 5);
         si_w.write_u32(g.table_select as u32, 5);
-        si_w.write_u32(0, 3);
-        si_w.write_u32(0, 3);
-        si_w.write_u32(0, 3);
+        si_w.write_u32(g.subblock_gain[0] as u32 & 0x7, 3);
+        si_w.write_u32(g.subblock_gain[1] as u32 & 0x7, 3);
+        si_w.write_u32(g.subblock_gain[2] as u32 & 0x7, 3);
     }
     // MPEG-2 has NO preflag bit in the bitstream.
     si_w.write_u32(0, 1); // scalefac_scale
@@ -1724,6 +1829,13 @@ struct GranuleEncoded {
     /// Bit count contributed by `sf_writes`. Cached to keep
     /// `part2_3_length` accounting straightforward.
     sf_bits: usize,
+    /// Per-window `subblock_gain` for short blocks (3 windows). Each
+    /// entry biases the dequantization step for its window by `-2`
+    /// per unit (coarser quantization → fewer bits → louder noise on
+    /// that window). Set to `[0; 3]` for long / start / stop blocks
+    /// where the field doesn't apply, and for short blocks where the
+    /// encoder picked a flat per-window step.
+    subblock_gain: [u8; 3],
 }
 
 impl GranuleEncoded {
@@ -1858,17 +1970,50 @@ fn encode_granule_vbr_psy1(
     block_type: BlockType,
     is_pos: Option<&[u8; 22]>,
     is_variant: IsVariant,
+    sample_rate: u32,
 ) -> GranuleEncoded {
+    // Per-window subblock_gain pre-emphasis (short blocks only). The
+    // Psy-1 short-block analyser exposes per-(sfb, window) energies in
+    // `mask.energy`; we collapse to per-window totals and bias the
+    // quieter windows' quantizer step coarser, freeing bits for the
+    // loudest window. Long / start / stop granules don't carry
+    // subblock_gain in their side-info layout — they get `[0; 3]`.
+    let subblock_gain = if block_type == BlockType::Short {
+        pick_subblock_gain_short(mask)
+    } else {
+        [0u8; 3]
+    };
+    let sr_for_short = if block_type == BlockType::Short {
+        Some(sample_rate)
+    } else {
+        None
+    };
+    let do_quantize = |gain: u8| -> GranuleEncoded {
+        quantize_and_encode_full(
+            xr,
+            gain,
+            subblock_gain,
+            block_type,
+            is_pos,
+            is_variant,
+            sr_for_short,
+        )
+    };
+
     // Energy gate: pure silence ⇒ skip to high gain (no point spending
     // bits on a granule whose every sfb is below noise floor).
     let any_energy = mask.energy.iter().any(|&e| e > 1.0e-12);
     if !any_energy {
-        return quantize_and_encode(xr, 240, block_type, is_pos, is_variant);
+        return do_quantize(240);
     }
 
     // Initial gain pick: walk upward at step 1 until the worst-band
     // NMR crosses zero. The largest gain that still masks is our
-    // starting point.
+    // starting point. For short blocks with non-zero subblock_gain,
+    // the worst-NMR computation here ignores the per-window step
+    // adjustment — so the chosen `global_gain` is conservative
+    // (slightly tighter than strictly needed), which is the desired
+    // direction.
     let mut last_masked: Option<u8> = None;
     for gain in 60..=255u8 {
         let step = global_gain_to_step(gain);
@@ -1887,7 +2032,7 @@ fn encode_granule_vbr_psy1(
     // (8) is enough — each iteration bumps `gain` by a fixed step so
     // the worst case is bounded.
     const MAX_ITER: usize = 8;
-    let mut g = quantize_and_encode(xr, chosen, block_type, is_pos, is_variant);
+    let mut g = do_quantize(chosen);
     let mut gain = chosen;
     for _ in 0..MAX_ITER {
         if g.total_bits <= VBR_PER_GRANULE_BIT_CAP {
@@ -1897,7 +2042,7 @@ fn encode_granule_vbr_psy1(
             break;
         }
         gain = gain.saturating_add(2);
-        g = quantize_and_encode(xr, gain, block_type, is_pos, is_variant);
+        g = do_quantize(gain);
     }
     g
 }
@@ -1909,26 +2054,65 @@ fn quantize_and_encode(
     is_pos: Option<&[u8; 22]>,
     is_variant: IsVariant,
 ) -> GranuleEncoded {
-    // Quantisation step: step_factor = 2^((global_gain - 210) / 4).
-    // is[i] = nint( (|xr[i]|/step_factor)^(3/4) - 0.0946 )
-    //       = nint( |xr[i]|^(3/4) * 2^(-(global_gain-210)*3/16) - 0.0946 )
-    //
-    // We compute per-sample directly to keep the code obvious. Cap |is|
-    // at 8191 (the spec's hard ceiling — table 24 with linbits=13 +
-    // value 15 reaches 32 + 8191 = 8223, but practical encoders cap
-    // at 8191 to be safe). For our v1 we cap at 8191 and rely on the
-    // outer global_gain bisection to keep us within table reach.
+    quantize_and_encode_full(
+        xr,
+        global_gain,
+        [0u8; 3],
+        block_type,
+        is_pos,
+        is_variant,
+        None,
+    )
+}
+
+/// Internal entry point for [`quantize_and_encode`] that also accepts a
+/// per-window `subblock_gain` (short blocks only) and an optional pure-
+/// short-block per-coefficient → window mapping. The dequantizer
+/// applies `-8 * subblock_gain[w]` to the per-window global-gain
+/// exponent (ISO/IEC 11172-3 §2.4.3.4 short-block case), so the
+/// encoder side scales `is[i]` for window `w` by an extra
+/// `2^(2 * subblock_gain[w])` factor: a positive subblock_gain shrinks
+/// the encoded magnitudes (= coarser quantization, fewer bits, louder
+/// noise on that window) so the `global_gain` budget can stay tight
+/// for the loudest window without over-spending on the quieter ones.
+fn quantize_and_encode_full(
+    xr: &[f32; 576],
+    global_gain: u8,
+    subblock_gain: [u8; 3],
+    block_type: BlockType,
+    is_pos: Option<&[u8; 22]>,
+    is_variant: IsVariant,
+    sample_rate_for_short: Option<u32>,
+) -> GranuleEncoded {
     let g = global_gain as i32;
-    // Effective scaling exponent after the 3/4 power is (210 - g)*3/16.
     let exp = ((210 - g) as f32) * 3.0 / 16.0;
     let scale = (exp * std::f32::consts::LN_2).exp();
+    // Per-window scale multipliers for short blocks. The decoder
+    // applies an extra `2^(0.25 * -8 * subblock_gain[w])` factor per
+    // window, so to preserve `xr` the encoder must scale `is` by the
+    // inverse `2^(0.25 * 8 * subblock_gain[w] * 3/4) = 2^(1.5 *
+    // subblock_gain[w])` (the `3/4` factor falls out of the encoder's
+    // `xr^(3/4)` mapping). Larger sbgain ⇒ larger is ⇒ more bits ⇒
+    // gives the encoder more headroom for the loud window's transient
+    // coefficients without coarsening the quieter sibling windows.
+    let scale_w: [f32; 3] = [
+        scale * f32_pow2_frac(1.5 * subblock_gain[0] as f32),
+        scale * f32_pow2_frac(1.5 * subblock_gain[1] as f32),
+        scale * f32_pow2_frac(1.5 * subblock_gain[2] as f32),
+    ];
+    let coeff_to_window: Option<[u8; 576]> = match (block_type, sample_rate_for_short) {
+        (BlockType::Short, Some(sr)) => Some(build_short_coeff_window_map(sr)),
+        _ => None,
+    };
     let mut is_ = [0i32; 576];
     let mut max_abs = 0i32;
     for i in 0..576 {
         let a = xr[i].abs();
-        let mag = a.powf(0.75) * scale;
-        // Spec's quantizer subtracts 0.0946 then rounds. LAME uses
-        // 0.4054 to bias toward over-quant; for simplicity we use 0.4054.
+        let s = match &coeff_to_window {
+            Some(map) => scale_w[map[i] as usize],
+            None => scale,
+        };
+        let mag = a.powf(0.75) * s;
         let v = (mag + 0.4054).floor() as i32;
         let v = v.min(8191);
         let signed = if xr[i] < 0.0 { -v } else { v };
@@ -2081,7 +2265,121 @@ fn quantize_and_encode(
         scalefac_compress_9,
         sf_writes,
         sf_bits,
+        subblock_gain,
     }
+}
+
+/// Pick a per-window `subblock_gain` triple for a short-block granule
+/// from the per-window energies of a [`Psy1Mask`] (short-block mask
+/// has `n_sfb = 39 = 3 * 13` entries, layout `sfb * 3 + w`).
+///
+/// Per ISO/IEC 11172-3 §2.4.3.4, `subblock_gain[w]` *attenuates* the
+/// dequantized coefficients of window `w` by `2^(-2 * sbgain)`. The
+/// encoder side compensates by writing larger `is` values for that
+/// window — i.e. positive `subblock_gain[w]` lets the encoder give
+/// the loudest window more dynamic range (the largest `xr[k]`
+/// coefficients map onto smaller `is[k]` after the per-window step,
+/// staying inside the Huffman tables' reach) without coarsening the
+/// quieter windows. This is the spec's pre-echo mitigation knob:
+/// spend the bit budget where it matters (on the loud post-attack
+/// window) by extending its quantizer headroom.
+///
+/// Heuristic mapping:
+///
+/// ```text
+///   subblock_gain[w] = clamp( round(c * log2(E[w] / E_min)), 0, 7 )
+/// ```
+///
+/// where `E[w] = sum_sfb mask.energy[sfb * 3 + w]`, `E_min` is the
+/// quietest window's energy, and `c = 0.25` (gentle slope — each
+/// subblock_gain step doubles the per-window magnitude on dequant,
+/// so a 6 dB energy delta = ~1 subblock_gain unit). When the windows
+/// are roughly equal in energy (within ~3 dB) the returned triple is
+/// `[0, 0, 0]` — preserves existing behaviour for near-stationary
+/// spectra.
+fn pick_subblock_gain_short(mask: &Psy1Mask) -> [u8; 3] {
+    if mask.n_sfb != 3 * 13 {
+        return [0u8; 3];
+    }
+    let mut energy = [0.0f32; 3];
+    for sfb in 0..13 {
+        for w in 0..3 {
+            energy[w] += mask.energy[sfb * 3 + w];
+        }
+    }
+    let e_max = energy.iter().copied().fold(0.0f32, f32::max);
+    let e_min = energy.iter().copied().fold(f32::INFINITY, f32::min);
+    if e_max <= 1.0e-12 || !e_min.is_finite() {
+        return [0u8; 3];
+    }
+    // No-op when every window is within ~3 dB of every other (~2× ratio).
+    if e_max / e_min.max(1.0e-30) < 2.0 {
+        return [0u8; 3];
+    }
+    let mut out = [0u8; 3];
+    for w in 0..3 {
+        let ratio = energy[w] / e_min.max(1.0e-30);
+        let log2_ratio = ratio.log2().max(0.0);
+        // Each subblock_gain unit doubles the per-window magnitude on
+        // dequant (`2^(-2)` for the dequant scale ⇒ `2^(+1)` per
+        // 0.5 unit of sbgain on amplitude). Quarter-unit slope is
+        // gentle: 6 dB ratio ⇒ 1 unit of subblock_gain. The clamp
+        // matches the spec's 3-bit field.
+        let g = (0.25 * log2_ratio).round();
+        out[w] = g.clamp(0.0, 7.0) as u8;
+    }
+    out
+}
+
+/// `2^n` for small integer exponents, computed without `powf`. Used by
+/// the short-block per-window quantizer scale.
+#[allow(dead_code)]
+fn f32_pow2_int(n: i32) -> f32 {
+    if n == 0 {
+        1.0
+    } else if n > 0 {
+        (1u64 << n) as f32
+    } else {
+        1.0 / (1u64 << (-n)) as f32
+    }
+}
+
+/// `2^x` for small fractional exponents (typically 0..=10.5 for
+/// subblock_gain ∈ 0..=7 with the encoder's 1.5 slope).
+fn f32_pow2_frac(x: f32) -> f32 {
+    (x * std::f32::consts::LN_2).exp()
+}
+
+/// Build a per-coefficient → short-block window map for the encoder's
+/// pure-short-block layout (sfb-major, then window-major within each
+/// sfb's chunk of `3 * sfb_width` coefficients). `out[i] = w` where
+/// `w ∈ {0, 1, 2}` is the short-block window that owns coefficient
+/// `i` of the 576-coefficient granule.
+///
+/// Indices that fall outside the populated range (e.g. when the
+/// short-block sfb table doesn't reach 576) are left at 0 — those
+/// coefficients are quantized with window 0's scale, which has no
+/// effect because the corresponding `xr` values are zero.
+fn build_short_coeff_window_map(sample_rate: u32) -> [u8; 576] {
+    let mut map = [0u8; 576];
+    let bounds = sfband_short(sample_rate);
+    let mut pos = 0usize;
+    for sfb in 0..13 {
+        let width = (bounds[sfb + 1] - bounds[sfb]) as usize;
+        for w in 0..3 {
+            for f in 0..width {
+                let idx = pos + w * width + f;
+                if idx < 576 {
+                    map[idx] = w as u8;
+                }
+            }
+        }
+        pos += 3 * width;
+        if pos >= 576 {
+            break;
+        }
+    }
+    map
 }
 
 fn choose_big_value_table(is_: &[i32; 576], big_end: usize) -> u8 {
@@ -2316,5 +2614,194 @@ mod tests {
         }
         let (bound, _) = pick_is_bound_long(&xr, 44_100);
         assert_eq!(bound, 7, "expected safety-floor bound 7, got {bound}");
+    }
+
+    #[test]
+    fn subblock_gain_zero_for_equal_window_energies() {
+        // Build a Psy1Mask where every (sfb, window) entry has the
+        // same energy — picker should return [0; 3] (no per-window
+        // bias needed).
+        let mut energy = vec![0.0f32; 39];
+        let mut threshold = vec![1.0f32; 39];
+        let mut width = vec![6u16; 39];
+        let mut start = vec![0u16; 39];
+        for i in 0..39 {
+            energy[i] = 1.0;
+            threshold[i] = 1.0;
+            width[i] = 6;
+            start[i] = (i * 6) as u16;
+        }
+        let mask = Psy1Mask {
+            n_sfb: 39,
+            energy,
+            threshold,
+            width,
+            start,
+            partition_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_peak_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_threshold: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+        };
+        let sb = pick_subblock_gain_short(&mask);
+        assert_eq!(sb, [0u8; 3], "expected flat gain for equal windows");
+    }
+
+    #[test]
+    fn subblock_gain_biases_loud_window_higher() {
+        // Window 2 is loud (transient post-attack), windows 0 and 1
+        // are 16× quieter. The picker should give the loud window a
+        // positive subblock_gain (extra dynamic range / more bits)
+        // and keep the quiet windows at 0 (no over-coding of
+        // sub-masker energy). Loud / quiet energy ratio is 100×
+        // ⇒ log2(100) ≈ 6.64 ⇒ rounded(0.25 * 6.64) = 2.
+        let mut energy = vec![0.0f32; 39];
+        for sfb in 0..13 {
+            energy[sfb * 3] = 0.01; // window 0 quiet
+            energy[sfb * 3 + 1] = 0.01; // window 1 quiet
+            energy[sfb * 3 + 2] = 1.0; // window 2 loud
+        }
+        let mask = Psy1Mask {
+            n_sfb: 39,
+            energy,
+            threshold: vec![1.0f32; 39],
+            width: vec![6u16; 39],
+            start: vec![0u16; 39],
+            partition_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_peak_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_threshold: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+        };
+        let sb = pick_subblock_gain_short(&mask);
+        assert_eq!(sb[0], 0, "expected quiet window 0 to keep gain 0: {sb:?}");
+        assert_eq!(sb[1], 0, "expected quiet window 1 to keep gain 0: {sb:?}");
+        assert!(
+            sb[2] >= 1,
+            "expected loud window 2 to get extra subblock_gain: {sb:?}"
+        );
+    }
+
+    #[test]
+    fn subblock_gain_clamps_to_seven() {
+        // Pathological energy ratio (loud window 2^60 louder than
+        // quiet siblings) — the picker should clamp the loud window's
+        // subblock_gain to the spec's 3-bit max of 7.
+        let mut energy = vec![0.0f32; 39];
+        for sfb in 0..13 {
+            energy[sfb * 3] = 1.0e-30;
+            energy[sfb * 3 + 1] = 1.0e-30;
+            energy[sfb * 3 + 2] = 1.0e30;
+        }
+        let mask = Psy1Mask {
+            n_sfb: 39,
+            energy,
+            threshold: vec![1.0f32; 39],
+            width: vec![6u16; 39],
+            start: vec![0u16; 39],
+            partition_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_peak_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_threshold: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+        };
+        let sb = pick_subblock_gain_short(&mask);
+        assert_eq!(sb[0], 0);
+        assert_eq!(sb[1], 0);
+        assert_eq!(sb[2], 7);
+    }
+
+    #[test]
+    fn subblock_gain_silence_returns_zeros() {
+        let mask = Psy1Mask {
+            n_sfb: 39,
+            energy: vec![0.0f32; 39],
+            threshold: vec![1.0f32; 39],
+            width: vec![6u16; 39],
+            start: vec![0u16; 39],
+            partition_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_peak_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_threshold: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+        };
+        let sb = pick_subblock_gain_short(&mask);
+        assert_eq!(sb, [0u8; 3]);
+    }
+
+    #[test]
+    fn subblock_gain_long_block_mask_returns_zeros() {
+        // Long-block mask (n_sfb = 22) is not a short-block input —
+        // picker should bail with [0; 3].
+        let mask = Psy1Mask {
+            n_sfb: 22,
+            energy: vec![1.0f32; 22],
+            threshold: vec![1.0f32; 22],
+            width: vec![10u16; 22],
+            start: vec![0u16; 22],
+            partition_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_peak_tonality: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+            partition_threshold: [0.0f32; crate::psy1::N_BARK_PARTITIONS],
+        };
+        let sb = pick_subblock_gain_short(&mask);
+        assert_eq!(sb, [0u8; 3]);
+    }
+
+    #[test]
+    fn quantize_short_with_subblock_gain_uses_more_bits_for_loud_window() {
+        // Per ISO/IEC 11172-3 §2.4.3.4, positive `subblock_gain[w]`
+        // attenuates the dequantized coefficients of window `w` by
+        // `2^(-2 * sbgain)`. The encoder side compensates by writing
+        // *larger* `is` values for that window — the spec's intent
+        // is to give the loud window more dynamic range (the largest
+        // coefficients map onto smaller `is/2^(2*sbgain)` after the
+        // per-window step, staying inside the Huffman tables) without
+        // coarsening the quieter siblings.
+        //
+        // Test: same xr, two quantize calls with different
+        // subblock_gain. The non-zero sbgain call must produce
+        // strictly *more* bits (because window 2's `is` values grew
+        // by the per-window scale factor 2^(1.5*sbgain) ≈ 2.83 for
+        // sbgain=1).
+        let mut xr = [0.0f32; 576];
+        for i in 0..576 {
+            xr[i] = 0.05;
+        }
+        let g0 = quantize_and_encode_full(
+            &xr,
+            200,
+            [0u8; 3],
+            BlockType::Short,
+            None,
+            IsVariant::Mpeg1,
+            Some(44_100),
+        );
+        let g1 = quantize_and_encode_full(
+            &xr,
+            200,
+            [0u8, 0, 3],
+            BlockType::Short,
+            None,
+            IsVariant::Mpeg1,
+            Some(44_100),
+        );
+        assert!(
+            g1.total_bits > g0.total_bits,
+            "subblock_gain on a loud window should grow its is values (flat={} bias={})",
+            g0.total_bits,
+            g1.total_bits
+        );
+        assert_eq!(g1.subblock_gain, [0u8, 0, 3]);
+    }
+
+    #[test]
+    fn build_short_window_map_matches_layout() {
+        // First 4 sfbs at 44.1 k all have width 4, so window-major
+        // chunks have width 4 each. Position 0..4 = w0, 4..8 = w1,
+        // 8..12 = w2 of sfb 0; 12..16 = w0 of sfb 1; etc.
+        let map = build_short_coeff_window_map(44_100);
+        for f in 0..4 {
+            assert_eq!(map[f], 0, "coeff {f} should be window 0");
+            assert_eq!(map[4 + f], 1, "coeff {} should be window 1", 4 + f);
+            assert_eq!(map[8 + f], 2, "coeff {} should be window 2", 8 + f);
+            assert_eq!(
+                map[12 + f],
+                0,
+                "coeff {} should be window 0 (sfb 1)",
+                12 + f
+            );
+        }
     }
 }
