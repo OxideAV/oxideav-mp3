@@ -57,15 +57,17 @@ pub mod synthesis;
 pub mod window;
 
 use oxideav_core::ContainerRegistry;
+use oxideav_core::RuntimeContext;
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub const CODEC_ID_STR: &str = "mp3";
 
-/// Back-compat alias for callers that wired up the codec-only `register`.
-/// Prefer `register_codecs` + `register_containers`.
-pub fn register(reg: &mut CodecRegistry) {
-    register_codecs(reg);
+/// Unified entry point: install every codec and container provided by
+/// `oxideav-mp3` into a [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 pub fn register_codecs(reg: &mut CodecRegistry) {
@@ -107,4 +109,23 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 
 fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     encoder::make_encoder(params)
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_factories() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        assert!(
+            ctx.codecs.decoder_ids().next().is_some(),
+            "register(ctx) should install codec decoder factories"
+        );
+        assert!(
+            ctx.containers.demuxer_names().next().is_some(),
+            "register(ctx) should install container demuxer factories"
+        );
+    }
 }
