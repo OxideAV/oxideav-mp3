@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/OxideAV/oxideav-mp3/compare/v0.1.0...v0.1.1) - 2026-05-05
+
+### Other
+
+- install ffmpeg via reusable workflow's extra_packages_* inputs
+- add mixed-block window-switching + simple-mask FFT lift
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-mp3/compare/v0.0.6...v0.0.7) - 2026-05-05
 
 ### Other
