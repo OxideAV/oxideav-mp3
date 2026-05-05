@@ -63,6 +63,30 @@ pub fn mdct_granule(
     block_type: u8,
     sample_rate: u32,
 ) {
+    mdct_granule_full(subbands_in, xr, state, block_type, false, sample_rate);
+}
+
+/// Mixed-block-aware variant of [`mdct_granule`]. When
+/// `mixed_block_flag` is `true` (only meaningful for `block_type == 2`),
+/// the first two polyphase subbands (sb 0..2, covering long sfbs 0..7
+/// at 44.1 kHz with `sfband_long[8] = 36`) are MDCTed with the long-
+/// block 36-point transform + normal sine window, and the remaining 30
+/// subbands (sb 2..32) get the 3 × 12-point short-block path. Mirrors
+/// the decoder's per-subband dispatch in [`crate::imdct::imdct_granule`]
+/// (`sub_bt = if mixed_block_flag && sb < 2 { 0 } else { block_type }`).
+///
+/// Per ISO/IEC 11172-3 §2.4.2.2, mixed blocks bridge a long-block low
+/// frequency region (good for tonal content) with short-block high
+/// frequencies (good for transient localisation) — useful when a
+/// transient sits on top of a sustained low-band tone.
+pub fn mdct_granule_full(
+    subbands_in: &[[f32; 18]; 32],
+    xr: &mut [f32; 576],
+    state: &mut MdctState,
+    block_type: u8,
+    mixed_block_flag: bool,
+    sample_rate: u32,
+) {
     for sb in 0..32 {
         // 36-sample input = previous half (18) + current half (18).
         let mut in36 = [0.0f32; 36];
@@ -77,7 +101,14 @@ pub fn mdct_granule(
         // odd-indexed samples in odd subbands) is its own concern.
 
         let base = sb * 18;
-        if block_type == 2 {
+        // Per-subband effective block type — mixed-block long prefix
+        // forces `sub_bt = 0` for subbands 0..2 to match the decoder.
+        let sub_bt = if mixed_block_flag && block_type == 2 && sb < 2 {
+            0
+        } else {
+            block_type
+        };
+        if sub_bt == 2 {
             // Short blocks: 3 × 12-point MDCT with the short sine window.
             // The 36 input samples are partitioned into three overlapping
             // 12-sample windows starting at offsets 6, 12, 18 (centered
@@ -104,7 +135,7 @@ pub fn mdct_granule(
             }
         } else {
             // Long / start / stop: 36-point MDCT, type-specific window.
-            let win = imdct_window_long(block_type);
+            let win = imdct_window_long(sub_bt);
             for n in 0..36 {
                 in36[n] *= win[n];
             }
@@ -119,9 +150,18 @@ pub fn mdct_granule(
     // layout the decoder's IMDCT will read). Convert to bit-stream
     // layout (sfb-window-major) so quantisation + Huffman coding
     // sees the right linear order — exact inverse of
-    // [`crate::requantize::reorder_short`].
+    // [`crate::requantize::reorder_short`]. For mixed blocks the
+    // long-prefix coefficients (xr[0..36] at 44.1 kHz) stay in the
+    // long-block linear layout the decoder's requantizer reads first,
+    // and only the short-region tail is unreordered starting at
+    // sfb 3 of the short table (matches `requantize::reorder_short`'s
+    // mixed-block branch).
     if block_type == 2 {
-        unreorder_short_inplace(xr, sample_rate);
+        if mixed_block_flag {
+            unreorder_short_mixed_inplace(xr, sample_rate);
+        } else {
+            unreorder_short_inplace(xr, sample_rate);
+        }
     }
 }
 
@@ -155,6 +195,42 @@ fn unreorder_short_inplace(xr: &mut [f32; 576], sample_rate: u32) {
         sfb += 1;
     }
     xr[..pos].copy_from_slice(&buf[..pos]);
+}
+
+/// Mixed-block variant of [`unreorder_short_inplace`]. The long-prefix
+/// coefficients (xr[0..long_bounds[8]] = first two subbands at
+/// 44.1 kHz: 36 samples) are NOT touched — they sit in the long-block
+/// linear order the decoder's requantizer reads as long sfbs 0..=7.
+/// Only the short-region tail starting at `region_start` is converted
+/// from frequency-interleaved-by-window to window-major-within-sfb,
+/// walking short sfbs 3..13 (matches the decoder's
+/// `requantize::reorder_short` mixed branch).
+fn unreorder_short_mixed_inplace(xr: &mut [f32; 576], sample_rate: u32) {
+    let short_bounds = crate::sfband::sfband_short(sample_rate);
+    let long_bounds = crate::sfband::sfband_long(sample_rate);
+    // Mixed-block long prefix occupies long sfbs 0..=7 ⇒ ends at
+    // `long_bounds[8]` (36 at 44.1 kHz, matching subband boundary 2).
+    let region_start = long_bounds[8] as usize;
+    let mut buf = [0.0f32; 576];
+    let mut pos = region_start;
+    let mut sfb = 3usize;
+    while pos < 576 && sfb < 13 {
+        let width = (short_bounds[sfb + 1] - short_bounds[sfb]) as usize;
+        for w in 0..3 {
+            for f in 0..width {
+                let src = pos + 3 * f + w;
+                let dst = pos + w * width + f;
+                if src < 576 && dst < 576 {
+                    buf[dst] = xr[src];
+                }
+            }
+        }
+        pos += 3 * width;
+        sfb += 1;
+    }
+    if pos > region_start {
+        xr[region_start..pos].copy_from_slice(&buf[region_start..pos]);
+    }
 }
 
 /// Forward 36-point MDCT (direct O(N^2) form). Inverse of

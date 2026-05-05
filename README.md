@@ -131,14 +131,22 @@ rate-control modes:
   `intensity_scale = 0`), R coefficients above the bound collapse to
   zero, and the frame's `mode_extension` field flips the IS bit.
   Disable MS with `joint_stereo=0` and IS with `intensity_stereo=0`.
-- **Blocks**: long, start, short, stop with automatic window-switching
-  on transients per ISO/IEC 11172-3 §2.4.2.2 / Annex C. A per-channel
-  energy-ratio transient detector flags 192-sample sub-frames whose
-  energy jumps more than 4× above the smoothed long-term average; a
-  per-channel state machine then bridges the long → start → short →
-  stop → long sequence using one granule of PCM lookahead. Disable
-  with `short_blocks=0` (matches the pre-round-24 long-only encoder).
-  Mixed blocks are not emitted (always pure short on switch).
+- **Blocks**: long, start, short, stop, **mixed** with automatic
+  window-switching on transients per ISO/IEC 11172-3 §2.4.2.2 /
+  Annex C. A per-channel energy-ratio transient detector flags
+  192-sample sub-frames whose energy jumps more than 4× above the
+  smoothed long-term average; a per-channel state machine then
+  bridges the long → start → short → stop → long sequence using one
+  granule of PCM lookahead. Mixed blocks (long-prefix sfb 0..=7 of
+  the long table + short-tail sfb 3..=12 × 3 windows) fire when the
+  granule carries a sustained low-frequency tone with a transient
+  burst on top — picker (`block_type::should_use_mixed_block`)
+  bandpass-splits the granule via 3-tap LP/HP FIRs at fs/4, then
+  checks per-sub-frame LF peak-to-mean (sustained: < 2×) AND HF
+  peak-to-min (transient: > 8×). Disable short / mixed with
+  `short_blocks=0` (matches the pre-round-24 long-only encoder).
+  ffmpeg cross-decode confirms mixed-block bitstreams round-trip
+  cleanly with energy matching our own decoder within 1×.
 - **Rate control**:
   - **CBR** (default): one rate per encoder instance, picked from the
     standard version-specific bitrate table (defaults: 128 kbps
@@ -148,7 +156,12 @@ rate-control modes:
     Two psychoacoustic models are available:
     - `psy_model=0` — lightweight per-sfb energy mask in `psy`. Picks
       the smallest quantizer step that satisfies a quality-derived
-      noise-to-mask threshold per scalefactor band.
+      noise-to-mask threshold per scalefactor band. Long-block
+      granules consume the same parallel 1024-point FFT pre-analysis
+      (Annex D §D.2.4.1) as `psy_model=1`, applied here as a 3 dB
+      tonality lift on per-sfb thresholds wherever the FFT spotted a
+      between-bin tone (`GranuleMask::analyze_with_fft`). Short /
+      start / stop stay on the base mask.
     - `psy_model=1` (default) — full ISO/IEC 11172-3 Annex D
       **Psy Model 1** in `psy1`: 24 Bark-partition spreader,
       Schroeder-form spreading function across the Bark axis,
@@ -172,6 +185,12 @@ rate-control modes:
       partition spreader sees each window's local spectrum
       independently — critical for transient content where the
       burst energy lives in only one of the three sibling windows.
+      Mixed-block granules dispatch to `Psy1Mask::analyze_mixed`
+      which runs the long-block spreader on the LF prefix
+      (`xr[0..36]`) and the per-window short-block spreader on the
+      HF tail; output mask carries 38 entries (8 long + 30
+      short-window) and the noise allocator drives `global_gain` to
+      mask the worst (sfb, window) pair across both regions.
     The per-frame bitrate slot is then chosen from the standard
     table to fit the resulting main-data byte count, yielding files
     that shrink for silence / pure-tone content and grow for

@@ -33,6 +33,8 @@
 //! or absolute-threshold-of-hearing effects — but those would be
 //! quality refinements on top of this same iteration loop.
 
+use crate::fft::FFT_N;
+use crate::psy1::{build_fft_partition, N_BARK_PARTITIONS};
 use crate::sfband::sfband_long;
 
 /// Per-granule masking estimate for the 22 long-block sfb bands.
@@ -89,6 +91,110 @@ impl GranuleMask {
             width,
             start,
         }
+    }
+
+    /// Variant of [`Self::analyze`] that consumes an FFT-domain
+    /// pre-analysis power spectrum to **tighten** the per-sfb threshold
+    /// in tonal partitions. The simple-mask model otherwise treats every
+    /// band as noise-like (one mask_ratio for everyone). With a parallel
+    /// 1024-point FFT (Annex D §D.2.4.1) we can spot between-bin tones
+    /// the MDCT smears across two coefficients — those partitions are
+    /// tonal, the noise floor under a tone has to sit further down to
+    /// stay inaudible (TMN ~14.5 dB vs NMT ~5.5 dB in Annex D), so the
+    /// mask threshold for the affected sfb is divided by an extra
+    /// `tonal_lift` factor (~3 dB ≈ 2× linear).
+    ///
+    /// `fft_power` is the magnitude-squared spectrum of the granule's
+    /// Hann-windowed PCM ([`crate::fft::Fft1024::power_spectrum`] output).
+    ///
+    /// The lift is conservative — without a full Bark spreader we
+    /// only know per-FFT-partition tonality (SFM-derived); we don't
+    /// know how the spread mask would re-balance against neighbouring
+    /// noise partitions. So we apply a fixed 3 dB tightening rather
+    /// than the full Annex D 9 dB delta. Larger lifts can over-spend
+    /// bits on between-bin tones whose audibility is already covered
+    /// by neighbouring band masking.
+    pub fn analyze_with_fft(
+        xr: &[f32; 576],
+        fft_power: &[f32; FFT_N / 2 + 1],
+        sample_rate: u32,
+        mask_ratio: f32,
+    ) -> Self {
+        // Step 1: standard energy / threshold pass.
+        let mut m = Self::analyze(xr, sample_rate, mask_ratio);
+
+        // Step 2: per-FFT-partition tonality via SFM (geometric mean
+        // over arithmetic mean of partition power). Same shape as the
+        // Psy-1 inner pass, but inlined so this module stays self-
+        // contained against psy1's evolving signature.
+        let fft_partition = build_fft_partition(sample_rate);
+        let n_bins = FFT_N / 2 + 1;
+        let log_floor: f32 = 1.0e-20;
+        let mut part_energy = [0.0f32; N_BARK_PARTITIONS];
+        let mut part_log_sum = [0.0f32; N_BARK_PARTITIONS];
+        let mut part_count = [0u32; N_BARK_PARTITIONS];
+        for k in 0..n_bins {
+            let p = fft_partition[k] as usize;
+            let e = fft_power[k];
+            part_energy[p] += e;
+            part_log_sum[p] += (e.max(log_floor)).ln();
+            part_count[p] += 1;
+        }
+        let mut tonality = [0.0f32; N_BARK_PARTITIONS];
+        for p in 0..N_BARK_PARTITIONS {
+            if part_count[p] == 0 || part_energy[p] <= log_floor {
+                continue;
+            }
+            let n = part_count[p] as f32;
+            let arith = part_energy[p] / n;
+            let geo = (part_log_sum[p] / n).exp();
+            let sfm = (geo / arith.max(log_floor)).clamp(1.0e-20, 1.0);
+            let sfm_db = 10.0 * sfm.log10();
+            tonality[p] = ((-sfm_db) / 60.0).clamp(0.0, 1.0);
+        }
+
+        // Step 3: per-sfb tonality via the FFT-bin → Bark-partition map.
+        // For each long-block sfb, walk its coefficient range and find
+        // the dominant Bark partition (by sample count); use that
+        // partition's tonality as the sfb's tonality estimate. Strongly
+        // tonal sfbs get the threshold tightened by `tonal_lift_db`.
+        let sfb = sfband_long(sample_rate);
+        // Tonal SNR boost: 3 dB tighter mask in fully-tonal partitions
+        // (linear factor 2.0). Smoothly interpolated against tonality.
+        let tonal_lift_db: f32 = 3.0;
+        for b in 0..22 {
+            let s = sfb[b] as usize;
+            let e = (sfb[b + 1] as usize).min(576);
+            let s = s.min(e);
+            // Pick the dominant Bark partition for this sfb by walking
+            // its FFT-bin span. Map via FFT-bin centre frequency rather
+            // than re-mapping MDCT indices — the FFT spans the granule's
+            // raw PCM (1024 samples, sr/N Hz/bin) so the partition
+            // assignment matches `build_fft_partition`.
+            let mut counts = [0u32; N_BARK_PARTITIONS];
+            for k in s..e {
+                // Approximate sfb's frequency centre per coefficient and
+                // walk the equivalent FFT bin.
+                let f_hz = (k as f32 + 0.5) * sample_rate as f32 / 1152.0;
+                let bin = (f_hz / (sample_rate as f32 / FFT_N as f32)).round() as usize;
+                let bin = bin.min(n_bins - 1);
+                let p = fft_partition[bin] as usize;
+                counts[p] += 1;
+            }
+            let dom = counts
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, &c)| c)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let t = tonality[dom];
+            if t > 0.0 {
+                let lift_db = tonal_lift_db * t;
+                let lift_lin = 10.0_f32.powf(-lift_db / 10.0);
+                m.threshold[b] *= lift_lin;
+            }
+        }
+        m
     }
 
     /// Estimate per-band noise for a uniform quantizer with step `q`
@@ -205,5 +311,56 @@ mod tests {
         let s2 = global_gain_to_step(214);
         // 4 gain units = 1 step doubling.
         assert!((s2 / s1 - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fft_lift_tightens_threshold_on_tonal_input() {
+        // Pure tone in the FFT power spectrum -> the partition is
+        // strongly tonal -> threshold for the corresponding sfb tightens.
+        let mut xr = [0.0f32; 576];
+        for i in 60..70 {
+            xr[i] = 0.3;
+        }
+        let mut fft_power = [0.0f32; FFT_N / 2 + 1];
+        // Single-bin tone at FFT bin 130 (~5.6 kHz at 44.1 kHz) — solidly
+        // inside one Bark partition.
+        fft_power[130] = 100.0;
+        let m_base = GranuleMask::analyze(&xr, 44_100, 100.0);
+        let m_fft = GranuleMask::analyze_with_fft(&xr, &fft_power, 44_100, 100.0);
+        // At least one band's threshold must be strictly tighter (FFT-
+        // tonality lift).
+        let mut tightened = 0usize;
+        for b in 0..22 {
+            assert!(m_fft.threshold[b] <= m_base.threshold[b] + 1.0e-12);
+            if m_fft.threshold[b] < m_base.threshold[b] * 0.99 {
+                tightened += 1;
+            }
+        }
+        assert!(
+            tightened > 0,
+            "expected FFT lift to tighten >=1 sfb threshold, got 0"
+        );
+    }
+
+    #[test]
+    fn fft_lift_silent_fft_matches_base() {
+        // A silent FFT input means tonality = 0 everywhere — the lift
+        // factor `10^(-0)` is 1, so the threshold is unchanged.
+        let mut xr = [0.0f32; 576];
+        for i in 0..200 {
+            xr[i] = 0.1;
+        }
+        let fft_power = [0.0f32; FFT_N / 2 + 1];
+        let m_base = GranuleMask::analyze(&xr, 44_100, 100.0);
+        let m_fft = GranuleMask::analyze_with_fft(&xr, &fft_power, 44_100, 100.0);
+        for b in 0..22 {
+            assert!(
+                (m_fft.threshold[b] - m_base.threshold[b]).abs() < 1.0e-12,
+                "silent FFT should leave sfb {} threshold unchanged: base={} fft={}",
+                b,
+                m_base.threshold[b],
+                m_fft.threshold[b]
+            );
+        }
     }
 }

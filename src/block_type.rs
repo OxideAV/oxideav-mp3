@@ -203,6 +203,104 @@ impl BlockTypeMachine {
     }
 }
 
+/// Mixed-block heuristic. ISO/IEC 11172-3 §2.4.2.2 lets a short-block
+/// granule keep its low-frequency prefix coded as a long block (sfb 0..=7
+/// of the long table — the lowest two polyphase subbands). This is
+/// useful when the granule carries a transient riding on top of a
+/// sustained low-frequency tone: pure-short coding smears the tone's
+/// energy across three short windows (each 4 ms at 44.1 kHz) which
+/// breaks the tone's spectral compaction; mixed coding keeps the
+/// long-block 13 ms time aperture for the bass region.
+///
+/// Returns `true` when the input granule's low-band (below ~3 kHz at
+/// 44.1 kHz, i.e. polyphase subbands 0..2) carries non-transient
+/// sustained energy AND the high-band (everything above) carries the
+/// transient. Both conditions must hold — a uniform-spectrum transient
+/// gets the standard pure-short window; a tonal LF + transient HF gets
+/// mixed.
+///
+/// Implementation: bandpass-split the 576-sample granule into LF and
+/// HF streams via short FIR low-pass and high-pass kernels (3-tap
+/// `[0.25, 0.5, 0.25]` and `[-0.25, 0.5, -0.25]` respectively — these
+/// are the simplest linear-phase pair that splits at fs/4 ≈ 11 kHz at
+/// 44.1 kHz, just above the long-prefix region's spectral upper edge).
+/// Then split each stream into three 192-sample sub-frames and compute
+/// per-sub-frame energy. Mixed fires when:
+///   * HF peak-to-mean ratio > 6× (sharp transient in HF)
+///   * LF peak-to-mean ratio < 2× (sustained LF)
+///   * LF mean energy is non-trivial (LF actually has content — a
+///     pure-noise-burst input should pick pure-short, not mixed)
+///
+/// The test is deliberately conservative — we'd rather pick pure-short
+/// than misfire mixed: the IMDCT path (`crate::imdct`) treats mixed-
+/// block long subbands with the long IMDCT and the rest with the
+/// short IMDCT, so a wrong mixed call leaves a long-window low
+/// region transient-smeared (worse than pure-short).
+pub fn should_use_mixed_block(pcm: &[f32; 576]) -> bool {
+    // 3-tap linear-phase LP / HP pair. These cancel out at the band
+    // mid-point (fs/4) so a tone exactly at fs/4 splits 50/50; a
+    // bass tone ≪ fs/4 lands almost entirely in `lp`; a wideband
+    // burst splits roughly 50/50 but its LF and HF copies arrive
+    // simultaneously so the energy ratio test below sees a per-
+    // sub-frame jump in BOTH bands. Distinguishing tonal-LF from
+    // burst-LF therefore needs the LF *peak-to-mean ratio* test
+    // (sustained vs spiky), not just the LF presence test.
+    let mut lp = [0.0f32; 576];
+    let mut hp = [0.0f32; 576];
+    for i in 0..576 {
+        let m1 = if i == 0 { 0.0 } else { pcm[i - 1] };
+        let p1 = if i + 1 >= 576 { 0.0 } else { pcm[i + 1] };
+        lp[i] = 0.25 * m1 + 0.5 * pcm[i] + 0.25 * p1;
+        hp[i] = -0.25 * m1 + 0.5 * pcm[i] - 0.25 * p1;
+    }
+    let mut lo_e = [0.0f32; 3];
+    let mut hi_e = [0.0f32; 3];
+    for w in 0..3 {
+        let off = w * 192;
+        let mut e_lo = 0.0f32;
+        let mut e_hi = 0.0f32;
+        for i in 0..192 {
+            e_lo += lp[off + i] * lp[off + i];
+            e_hi += hp[off + i] * hp[off + i];
+        }
+        lo_e[w] = e_lo / 192.0;
+        hi_e[w] = e_hi / 192.0;
+    }
+    let lo_max = lo_e.iter().copied().fold(0.0f32, f32::max);
+    let hi_max = hi_e.iter().copied().fold(0.0f32, f32::max);
+    let hi_min = hi_e.iter().copied().fold(f32::INFINITY, f32::min);
+    let lo_mean = (lo_e[0] + lo_e[1] + lo_e[2]) / 3.0;
+    let hi_mean = (hi_e[0] + hi_e[1] + hi_e[2]) / 3.0;
+    if hi_mean < SILENCE_FLOOR && lo_mean < SILENCE_FLOOR {
+        return false;
+    }
+    if lo_mean < SILENCE_FLOOR {
+        // No sustained LF content to protect — pure-short is fine.
+        return false;
+    }
+    let lo_ratio = if lo_mean > 1.0e-30 {
+        lo_max / lo_mean
+    } else {
+        1.0
+    };
+    // HF transient signature: peak-to-min ratio across the 3 sub-
+    // frames. With only one of three sub-frames carrying the burst,
+    // peak-to-mean caps at 3; peak-to-min is unbounded and gives a
+    // clean separation between sustained-HF and impulse-HF.
+    let hi_ratio = if hi_min > 1.0e-30 {
+        hi_max / hi_min
+    } else if hi_max > 1.0e-30 {
+        // One sub-frame is essentially silent — definitely transient.
+        f32::INFINITY
+    } else {
+        1.0
+    };
+    // Mixed when HF transient is sharp (min/max > 8×, i.e. clear
+    // burst-vs-quiet contrast across sub-frames) and LF is sustained
+    // (peak-to-mean < 2×).
+    hi_ratio > 8.0 && lo_ratio < 2.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +389,55 @@ mod tests {
         assert_eq!(m.decide(true, false), BlockType::Short);
         assert_eq!(m.decide(false, false), BlockType::Stop);
         assert_eq!(m.decide(false, false), BlockType::Long);
+    }
+
+    #[test]
+    fn mixed_picker_silence_returns_false() {
+        let pcm = [0.0f32; 576];
+        assert!(!should_use_mixed_block(&pcm));
+    }
+
+    #[test]
+    fn mixed_picker_pure_burst_returns_false() {
+        // A burst on silence (no sustained LF) should pick pure-short,
+        // not mixed.
+        let mut pcm = [0.0f32; 576];
+        let mut rng_state: u32 = 0xdead_beef;
+        for i in 192..192 + 60 {
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            pcm[i] = ((rng_state >> 16) as i16 as f32) / 32768.0 * 0.9;
+        }
+        assert!(
+            !should_use_mixed_block(&pcm),
+            "pure-burst-on-silence should pick pure-short"
+        );
+    }
+
+    #[test]
+    fn mixed_picker_sustained_low_with_burst_returns_true() {
+        // Sustained 80 Hz sine + a HF noise burst in the middle
+        // sub-frame: classic mixed-block fixture (bass note + drum
+        // stick). The picker should fire.
+        let two_pi = 2.0 * std::f32::consts::PI;
+        let mut pcm = [0.0f32; 576];
+        for i in 0..576 {
+            // Sustained low-frequency tone
+            let t = i as f32 / 44_100.0;
+            pcm[i] = (two_pi * 80.0 * t).sin() * 0.15;
+        }
+        // Add HF burst to middle sub-frame only
+        let mut rng_state: u32 = 0xabcd_1234;
+        for i in 230..280 {
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = ((rng_state >> 16) as i16 as f32) / 32768.0;
+            // Exponentially-decaying envelope so HF energy is spiky.
+            let env = (-((i - 230) as f32) / 15.0).exp();
+            pcm[i] += env * 0.85 * noise;
+        }
+        assert!(
+            should_use_mixed_block(&pcm),
+            "sustained LF + HF burst should pick mixed"
+        );
     }
 
     #[test]

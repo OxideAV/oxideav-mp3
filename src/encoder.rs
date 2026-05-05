@@ -53,13 +53,13 @@ use oxideav_core::{
 };
 
 use crate::analysis::{analyze_granule, AnalysisState};
-use crate::block_type::{BlockType, BlockTypeMachine, TransientDetector};
+use crate::block_type::{should_use_mixed_block, BlockType, BlockTypeMachine, TransientDetector};
 use crate::fft::{hann_window, Fft1024, FFT_N};
 use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A};
-use crate::mdct::{mdct_granule, MdctState};
+use crate::mdct::{mdct_granule_full, MdctState};
 use crate::psy::{global_gain_to_step, vbr_quality_to_mask_ratio, GranuleMask};
 use crate::psy1::{vbr_quality_to_psy1_gain, Psy1Mask};
-use crate::sfband::sfband_short;
+use crate::sfband::{sfband_long, sfband_short};
 use crate::CODEC_ID_STR;
 use oxideav_core::bits::BitWriter;
 use oxideav_core::options::{
@@ -708,7 +708,13 @@ impl Mp3Encoder {
         let mut fft_power: Vec<Vec<[f32; FFT_N / 2 + 1]>> = (0..n_gr)
             .map(|_| (0..n_ch).map(|_| [0.0f32; FFT_N / 2 + 1]).collect())
             .collect();
-        let need_fft = self.rate_control == RateControl::Vbr && self.psy_model == 1;
+        // FFT pre-analysis runs for any VBR mode — psy_model=1 fuses it
+        // into the Annex D Bark spreader (`Psy1Mask::analyze_with_fft`),
+        // psy_model=0 uses it as a per-sfb tonality lift on the simple
+        // mask (`GranuleMask::analyze_with_fft`). Both consume the same
+        // 1024-point Hann-windowed power spectrum + rolling history,
+        // so we always compute it in VBR mode.
+        let need_fft = self.rate_control == RateControl::Vbr;
         if need_fft {
             for gr in 0..n_gr {
                 for ch in 0..n_ch {
@@ -742,6 +748,27 @@ impl Mp3Encoder {
             }
         }
 
+        // Per-(granule, channel) mixed-block decision. Only meaningful
+        // when the block type is Short — mixed bridges a long-block
+        // low-frequency prefix (sfb 0..=7 of the long table) with
+        // short-block high frequencies. The picker (band-split
+        // peak-to-mean ratios on the granule's PCM) fires when LF is
+        // sustained AND HF is transient — typical of a drum hit on
+        // top of a sustained bass note. See [`should_use_mixed_block`]
+        // in `block_type.rs` for the full criterion.
+        let mut mixed_flags: Vec<Vec<bool>> = (0..n_gr).map(|_| vec![false; n_ch]).collect();
+        if self.allow_short_blocks {
+            for gr in 0..n_gr {
+                for ch in 0..n_ch {
+                    if block_types[gr][ch] == BlockType::Short {
+                        let mut pcm_gr = [0.0f32; 576];
+                        pcm_gr.copy_from_slice(&pcm_in[ch][gr * 576..gr * 576 + 576]);
+                        mixed_flags[gr][ch] = should_use_mixed_block(&pcm_gr);
+                    }
+                }
+            }
+        }
+
         // Analysis + MDCT per granule per channel — now block-type aware.
         let mut xr: Vec<Vec<[f32; 576]>> = (0..n_gr)
             .map(|_| (0..n_ch).map(|_| [0.0f32; 576]).collect())
@@ -753,11 +780,12 @@ impl Mp3Encoder {
                 let mut sub = [[0.0f32; 18]; 32];
                 analyze_granule(&mut self.analysis_state[ch], &pcm_gr, &mut sub);
                 let bt = block_types[gr][ch].as_u8();
-                mdct_granule(
+                mdct_granule_full(
                     &sub,
                     &mut xr[gr][ch],
                     &mut self.mdct_state[ch],
                     bt,
+                    mixed_flags[gr][ch],
                     self.sample_rate,
                 );
             }
@@ -895,8 +923,10 @@ impl Mp3Encoder {
                             &xr[gr][ch],
                             target,
                             block_types[gr][ch],
+                            mixed_flags[gr][ch],
                             is_pos_for_ch,
                             is_variant,
+                            self.sample_rate,
                         );
                         bits_used_total += g.total_bits;
                         granule_data[gr].push(g);
@@ -937,17 +967,29 @@ impl Mp3Encoder {
                             // (sfb, window) entry per contiguous
                             // chunk.
                             let mask = if block_types[gr][ch] == BlockType::Short {
-                                // Short-block path: per-window
-                                // partition spreader on each
-                                // 192-coefficient MDCT window. The
-                                // FFT pre-analysis is long-block-only
-                                // (Annex D §D.2.4.1's 1024-pt FFT
-                                // matches the long-block 576-coeff
-                                // span, not the short-block 192
-                                // window) — short blocks rely on the
-                                // per-window Bark spreader for
-                                // tonality.
-                                Psy1Mask::analyze_short(&xr[gr][ch], self.sample_rate, gain)
+                                if mixed_flags[gr][ch] {
+                                    // Mixed block: long-block partition
+                                    // spreader on the LF prefix
+                                    // (sfb 0..=7 of the long table) +
+                                    // per-window 192-coefficient
+                                    // spreader on the HF tail
+                                    // (sfb 3..=12 of the short table ×
+                                    // 3 windows). Output mask is 38
+                                    // entries (8 long + 30 short-window).
+                                    Psy1Mask::analyze_mixed(&xr[gr][ch], self.sample_rate, gain)
+                                } else {
+                                    // Pure short-block path: per-window
+                                    // partition spreader on each
+                                    // 192-coefficient MDCT window. The
+                                    // FFT pre-analysis is long-block-
+                                    // only (Annex D §D.2.4.1's
+                                    // 1024-pt FFT matches the long-
+                                    // block 576-coeff span, not the
+                                    // short-block 192 window) — short
+                                    // blocks rely on the per-window
+                                    // Bark spreader for tonality.
+                                    Psy1Mask::analyze_short(&xr[gr][ch], self.sample_rate, gain)
+                                }
                             } else {
                                 // Long / start / stop blocks fuse the
                                 // MDCT-domain pass with the parallel
@@ -967,20 +1009,38 @@ impl Mp3Encoder {
                                 &xr[gr][ch],
                                 &mask,
                                 block_types[gr][ch],
+                                mixed_flags[gr][ch],
                                 is_pos_for_ch,
                                 is_variant,
                                 self.sample_rate,
                             )
                         } else {
                             let mask_ratio = vbr_quality_to_mask_ratio(self.vbr_quality);
-                            let mask =
-                                GranuleMask::analyze(&xr[gr][ch], self.sample_rate, mask_ratio);
+                            // Long-block granules consume the FFT pre-
+                            // analysis even on the simple-mask path —
+                            // a 3 dB tonality lift on per-sfb threshold
+                            // wherever the FFT spotted a between-bin
+                            // tone. Short / start / stop stay on the
+                            // base mask (the FFT's 1024-point span is
+                            // long-block sized).
+                            let mask = if block_types[gr][ch] == BlockType::Long {
+                                GranuleMask::analyze_with_fft(
+                                    &xr[gr][ch],
+                                    &fft_power[gr][ch],
+                                    self.sample_rate,
+                                    mask_ratio,
+                                )
+                            } else {
+                                GranuleMask::analyze(&xr[gr][ch], self.sample_rate, mask_ratio)
+                            };
                             encode_granule_vbr(
                                 &xr[gr][ch],
                                 &mask,
                                 block_types[gr][ch],
+                                mixed_flags[gr][ch],
                                 is_pos_for_ch,
                                 is_variant,
+                                self.sample_rate,
                             )
                         };
                         total_bits += g.total_bits;
@@ -1203,7 +1263,11 @@ fn emit_window_switching_tail_mpeg1(si_w: &mut BitWriter, g: &GranuleEncoded) {
     } else {
         si_w.write_u32(1, 1); // window_switching_flag = 1
         si_w.write_u32(g.block_type.as_u8() as u32, 2); // block_type
-        si_w.write_u32(0, 1); // mixed_block_flag = 0 (pure short on switch)
+                                                        // mixed_block_flag — 1 for mixed blocks (long prefix +
+                                                        // short tail per §2.4.2.2), 0 for pure-short / start /
+                                                        // stop. Only meaningful when block_type == 2 but the bit
+                                                        // field exists for every window-switching granule.
+        si_w.write_u32(if g.mixed_block_flag { 1 } else { 0 }, 1);
         si_w.write_u32(g.table_select as u32, 5); // table_select[0]
         si_w.write_u32(g.table_select as u32, 5); // table_select[1]
                                                   // 3 × subblock_gain — driven from per-window energies for
@@ -1231,7 +1295,8 @@ fn emit_window_switching_tail_mpeg2(si_w: &mut BitWriter, g: &GranuleEncoded) {
     } else {
         si_w.write_u32(1, 1); // window_switching_flag = 1
         si_w.write_u32(g.block_type.as_u8() as u32, 2);
-        si_w.write_u32(0, 1); // mixed_block_flag = 0
+        // mixed_block_flag — see MPEG-1 emit comment.
+        si_w.write_u32(if g.mixed_block_flag { 1 } else { 0 }, 1);
         si_w.write_u32(g.table_select as u32, 5);
         si_w.write_u32(g.table_select as u32, 5);
         si_w.write_u32(g.subblock_gain[0] as u32 & 0x7, 3);
@@ -1836,6 +1901,17 @@ struct GranuleEncoded {
     /// where the field doesn't apply, and for short blocks where the
     /// encoder picked a flat per-window step.
     subblock_gain: [u8; 3],
+    /// `true` when this granule is a mixed block (`block_type = 2`,
+    /// `mixed_block_flag = 1`): a long-block low-frequency prefix
+    /// (sfb 0..=7 of the long table — 36 coefficients = subbands 0..2
+    /// at 44.1 kHz) followed by 3 short-block windows on the high
+    /// frequencies (sfb 3..=12 of the short table × 3 windows). Per
+    /// ISO/IEC 11172-3 §2.4.2.2 / Annex C this is the window-switching
+    /// configuration for transients sitting on top of a sustained low
+    /// tone — the low region keeps long-block coding efficiency while
+    /// the high region gets short-block time localisation.
+    /// Always `false` for non-short blocks (long / start / stop).
+    mixed_block_flag: bool,
 }
 
 impl GranuleEncoded {
@@ -1856,8 +1932,10 @@ fn encode_granule(
     xr: &[f32; 576],
     bit_target: usize,
     block_type: BlockType,
+    mixed_block_flag: bool,
     is_pos: Option<&[u8; 22]>,
     is_variant: IsVariant,
+    sample_rate: u32,
 ) -> GranuleEncoded {
     // Pick global_gain by binary search to fit `bit_target`. Higher
     // global_gain -> smaller is[] values -> fewer bits.
@@ -1865,12 +1943,26 @@ fn encode_granule(
     // We always end up with bits <= bit_target. If we can't fit even at
     // global_gain = 255 (max), we accept the overflow (decoder will read
     // junk but length is correct).
+    let sr_for_short = if block_type == BlockType::Short {
+        Some(sample_rate)
+    } else {
+        None
+    };
     let mut lo: i32 = 0;
     let mut hi: i32 = 255;
     let mut best: Option<GranuleEncoded> = None;
     while lo <= hi {
         let mid = (lo + hi) / 2;
-        let g = quantize_and_encode(xr, mid as u8, block_type, is_pos, is_variant);
+        let g = quantize_and_encode_full(
+            xr,
+            mid as u8,
+            [0u8; 3],
+            block_type,
+            mixed_block_flag,
+            is_pos,
+            is_variant,
+            sr_for_short,
+        );
         if g.total_bits <= bit_target {
             // This fits — try a smaller gain (more precision).
             best = Some(g);
@@ -1884,7 +1976,16 @@ fn encode_granule(
         return g;
     }
     // Fallback: return the highest-gain (smallest-bits) result.
-    quantize_and_encode(xr, 255, block_type, is_pos, is_variant)
+    quantize_and_encode_full(
+        xr,
+        255,
+        [0u8; 3],
+        block_type,
+        mixed_block_flag,
+        is_pos,
+        is_variant,
+        sr_for_short,
+    )
 }
 
 /// VBR per-granule encode — pick the **largest** global_gain (= fewest
@@ -1901,14 +2002,33 @@ fn encode_granule_vbr(
     xr: &[f32; 576],
     mask: &GranuleMask,
     block_type: BlockType,
+    mixed_block_flag: bool,
     is_pos: Option<&[u8; 22]>,
     is_variant: IsVariant,
+    sample_rate: u32,
 ) -> GranuleEncoded {
+    let sr_for_short = if block_type == BlockType::Short {
+        Some(sample_rate)
+    } else {
+        None
+    };
+    let do_quantize = |gain: u8| -> GranuleEncoded {
+        quantize_and_encode_full(
+            xr,
+            gain,
+            [0u8; 3],
+            block_type,
+            mixed_block_flag,
+            is_pos,
+            is_variant,
+            sr_for_short,
+        )
+    };
     // Energy gate: if every band is essentially silent, skip the
     // search entirely and emit a high-gain (ne ar-zero-bit) granule.
     let any_energy = mask.energy.iter().any(|&e| e > 1.0e-12);
     if !any_energy {
-        return quantize_and_encode(xr, 240, block_type, is_pos, is_variant);
+        return do_quantize(240);
     }
 
     // Step 1: find the smallest gain where NMR <= 0. Walk *upwards*:
@@ -1935,11 +2055,11 @@ fn encode_granule_vbr(
     // Step 2: bit-cap fallback. If the chosen gain exceeds the
     // per-granule bit cap (very loud, very wideband content) we
     // need to raise the gain further. Walk upward until we fit.
-    let mut g = quantize_and_encode(xr, chosen, block_type, is_pos, is_variant);
+    let mut g = do_quantize(chosen);
     let mut gain = chosen;
     while g.total_bits > VBR_PER_GRANULE_BIT_CAP && gain < 255 {
         gain = gain.saturating_add(2);
-        g = quantize_and_encode(xr, gain, block_type, is_pos, is_variant);
+        g = do_quantize(gain);
     }
     g
 }
@@ -1968,6 +2088,7 @@ fn encode_granule_vbr_psy1(
     xr: &[f32; 576],
     mask: &Psy1Mask,
     block_type: BlockType,
+    mixed_block_flag: bool,
     is_pos: Option<&[u8; 22]>,
     is_variant: IsVariant,
     sample_rate: u32,
@@ -1994,6 +2115,7 @@ fn encode_granule_vbr_psy1(
             gain,
             subblock_gain,
             block_type,
+            mixed_block_flag,
             is_pos,
             is_variant,
             sr_for_short,
@@ -2047,6 +2169,7 @@ fn encode_granule_vbr_psy1(
     g
 }
 
+#[cfg(test)]
 fn quantize_and_encode(
     xr: &[f32; 576],
     global_gain: u8,
@@ -2059,6 +2182,7 @@ fn quantize_and_encode(
         global_gain,
         [0u8; 3],
         block_type,
+        false,
         is_pos,
         is_variant,
         None,
@@ -2080,6 +2204,7 @@ fn quantize_and_encode_full(
     global_gain: u8,
     subblock_gain: [u8; 3],
     block_type: BlockType,
+    mixed_block_flag: bool,
     is_pos: Option<&[u8; 22]>,
     is_variant: IsVariant,
     sample_rate_for_short: Option<u32>,
@@ -2101,16 +2226,37 @@ fn quantize_and_encode_full(
         scale * f32_pow2_frac(1.5 * subblock_gain[2] as f32),
     ];
     let coeff_to_window: Option<[u8; 576]> = match (block_type, sample_rate_for_short) {
-        (BlockType::Short, Some(sr)) => Some(build_short_coeff_window_map(sr)),
+        (BlockType::Short, Some(sr)) => {
+            if mixed_block_flag {
+                Some(build_mixed_coeff_window_map(sr))
+            } else {
+                Some(build_short_coeff_window_map(sr))
+            }
+        }
         _ => None,
+    };
+    // Mixed blocks: per-coefficient long-region cutoff. For
+    // i < long_region_end the per-window `subblock_gain` MUST NOT
+    // apply (the long prefix is dequantised with global_gain only —
+    // see decoder requantize.rs `long_sfb_count` branch). Past that
+    // point the short-region gets the per-window scaling.
+    let long_region_end: Option<usize> = if mixed_block_flag && block_type == BlockType::Short {
+        sample_rate_for_short.map(|sr| sfband_long(sr)[8] as usize)
+    } else {
+        None
     };
     let mut is_ = [0i32; 576];
     let mut max_abs = 0i32;
     for i in 0..576 {
         let a = xr[i].abs();
-        let s = match &coeff_to_window {
-            Some(map) => scale_w[map[i] as usize],
-            None => scale,
+        let in_long_prefix = matches!(long_region_end, Some(end) if i < end);
+        let s = if in_long_prefix {
+            scale
+        } else {
+            match &coeff_to_window {
+                Some(map) => scale_w[map[i] as usize],
+                None => scale,
+            }
         };
         let mag = a.powf(0.75) * s;
         let v = (mag + 0.4054).floor() as i32;
@@ -2266,6 +2412,7 @@ fn quantize_and_encode_full(
         sf_writes,
         sf_bits,
         subblock_gain,
+        mixed_block_flag,
     }
 }
 
@@ -2298,14 +2445,27 @@ fn quantize_and_encode_full(
 /// `[0, 0, 0]` — preserves existing behaviour for near-stationary
 /// spectra.
 fn pick_subblock_gain_short(mask: &Psy1Mask) -> [u8; 3] {
-    if mask.n_sfb != 3 * 13 {
-        return [0u8; 3];
-    }
+    // Two layouts share this picker:
+    //   * pure short: n_sfb = 3 × 13 = 39, indices `sfb * 3 + w` for
+    //     sfb 0..13, w 0..3.
+    //   * mixed: n_sfb = 8 + 30 = 38, indices 0..8 are long sfbs (no
+    //     window) and indices 8..38 are short sfbs 3..13 × 3 windows
+    //     (`8 + (sfb - 3) * 3 + w`).
     let mut energy = [0.0f32; 3];
-    for sfb in 0..13 {
-        for w in 0..3 {
-            energy[w] += mask.energy[sfb * 3 + w];
+    if mask.n_sfb == 3 * 13 {
+        for sfb in 0..13 {
+            for w in 0..3 {
+                energy[w] += mask.energy[sfb * 3 + w];
+            }
         }
+    } else if mask.n_sfb == 8 + 30 {
+        for sfb in 0..10 {
+            for w in 0..3 {
+                energy[w] += mask.energy[8 + sfb * 3 + w];
+            }
+        }
+    } else {
+        return [0u8; 3];
     }
     let e_max = energy.iter().copied().fold(0.0f32, f32::max);
     let e_min = energy.iter().copied().fold(f32::INFINITY, f32::min);
@@ -2366,6 +2526,36 @@ fn build_short_coeff_window_map(sample_rate: u32) -> [u8; 576] {
     let mut pos = 0usize;
     for sfb in 0..13 {
         let width = (bounds[sfb + 1] - bounds[sfb]) as usize;
+        for w in 0..3 {
+            for f in 0..width {
+                let idx = pos + w * width + f;
+                if idx < 576 {
+                    map[idx] = w as u8;
+                }
+            }
+        }
+        pos += 3 * width;
+        if pos >= 576 {
+            break;
+        }
+    }
+    map
+}
+
+/// Mixed-block variant of [`build_short_coeff_window_map`]. The long-
+/// prefix region (xr[0..long_bounds[8]]) is left at window 0 in the
+/// returned table; the caller's per-coefficient inner loop must skip
+/// the per-window scaling for those indices (the long part does not
+/// carry `subblock_gain` per ISO/IEC 11172-3 §2.4.3.4). The short tail
+/// starts at `region_start` with sfb 3 of the short table.
+fn build_mixed_coeff_window_map(sample_rate: u32) -> [u8; 576] {
+    let mut map = [0u8; 576];
+    let short_bounds = sfband_short(sample_rate);
+    let long_bounds = sfband_long(sample_rate);
+    let region_start = long_bounds[8] as usize;
+    let mut pos = region_start;
+    for sfb in 3..13 {
+        let width = (short_bounds[sfb + 1] - short_bounds[sfb]) as usize;
         for w in 0..3 {
             for f in 0..width {
                 let idx = pos + w * width + f;
@@ -2764,6 +2954,7 @@ mod tests {
             200,
             [0u8; 3],
             BlockType::Short,
+            false,
             None,
             IsVariant::Mpeg1,
             Some(44_100),
@@ -2773,6 +2964,7 @@ mod tests {
             200,
             [0u8, 0, 3],
             BlockType::Short,
+            false,
             None,
             IsVariant::Mpeg1,
             Some(44_100),

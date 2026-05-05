@@ -652,6 +652,176 @@ impl Psy1Mask {
         }
     }
 
+    /// Run the Psy-1 analysis for a **mixed-block granule** (block_type
+    /// = 2 with `mixed_block_flag = 1`). Per ISO/IEC 11172-3 §2.4.2.2,
+    /// mixed blocks bridge a long-block low-frequency prefix
+    /// (sfb 0..=7 of the long table — 36 coefficients = subbands 0..2
+    /// at 44.1 kHz) with three short-block windows on the high
+    /// frequencies (sfb 3..=12 of the short table × 3 windows). The
+    /// long prefix gets the long-block partition spreader so a
+    /// sustained low tone keeps its tonal SNR offset; the short tail
+    /// gets the per-window 192-coefficient spreader so a transient
+    /// living above the long region stays time-localised within its
+    /// window.
+    ///
+    /// Output mask layout (`n_sfb = 8 + 30 = 38`):
+    ///   * indices 0..8: long sfbs 0..=7 over `xr[0..long_bounds[8]]`
+    ///     (36 samples at 44.1 kHz). Same shape as `analyze`'s long
+    ///     entries — `width`/`start` index into the 576-coefficient
+    ///     granule directly.
+    ///   * indices 8..38: short sfbs 3..=12 × 3 windows in the
+    ///     bit-stream layout the encoder sees AFTER
+    ///     `mdct::unreorder_short_mixed_inplace`. For sfb_idx in 3..13
+    ///     and window w in 0..3, the entry index is
+    ///     `8 + (sfb_idx - 3) * 3 + w` and `start[..]` points at
+    ///     `region_start + accumulated 3 * width + w * width`.
+    ///
+    /// `worst_nmr_db` walks all 38 entries so the encoder's gain
+    /// search budgets bits for the worst (sfb, window) pair across
+    /// both the long prefix and the short tail.
+    pub fn analyze_mixed(xr: &[f32; 576], sample_rate: u32, gain: f32) -> Self {
+        let long_bounds = sfband_long(sample_rate);
+        let short_bounds = sfband_short(sample_rate);
+        let region_start = long_bounds[8] as usize;
+
+        // --- Long prefix (sfb 0..=7) ---
+        // Run the standard long-block partition pass on the entire 576
+        // coefficient view; we only consume per-coefficient thresholds
+        // for indices < region_start. This re-uses the spec-grounded
+        // Bark-partition spreader (any high-frequency MDCT energy in
+        // the short region still shapes per-partition spread, which
+        // matches the spec's intent — the long prefix's threshold sees
+        // the whole spectrum's masking landscape).
+        let coeff_partition = build_coeff_partition(sample_rate);
+        let (per_coeff_thr_long, _, partition_tonality_long, partition_peak_tonality_long) =
+            partition_pass(xr, &coeff_partition, sample_rate, gain);
+
+        let mut energy = Vec::with_capacity(8 + 30);
+        let mut threshold = Vec::with_capacity(8 + 30);
+        let mut width_v = Vec::with_capacity(8 + 30);
+        let mut start_v = Vec::with_capacity(8 + 30);
+        for sfb in 0..8 {
+            let s = (long_bounds[sfb] as usize).min(region_start);
+            let e_idx = (long_bounds[sfb + 1] as usize).min(region_start);
+            let mut e = 0.0f32;
+            let mut thr = 0.0f32;
+            for k in s..e_idx {
+                e += xr[k] * xr[k];
+                thr += per_coeff_thr_long[k];
+            }
+            energy.push(e);
+            threshold.push(thr);
+            width_v.push((e_idx - s) as u16);
+            start_v.push(s as u16);
+        }
+
+        // --- Short tail (sfb 3..=12 × 3 windows) ---
+        // Pull out per-window 192-coefficient frequency-ordered views
+        // for sfbs 3..13 only. sfbs 0..3 of the short table are skipped
+        // (their frequency range overlaps the long prefix). Each
+        // window's own short-block partition spreader runs on the
+        // partial 192-coefficient view; remaining bins (those covered
+        // by the long prefix) are zero, which keeps the spreader's
+        // per-partition energy / tonality math well-defined.
+        let coeff_partition_short = build_coeff_partition_short(sample_rate);
+        let mut windows = [[0.0f32; 192]; 3];
+        let mut pos = region_start;
+        for sfb in 3..13 {
+            let f_off = short_bounds[sfb] as usize;
+            let width = short_bounds[sfb + 1] as usize - f_off;
+            for w in 0..3 {
+                for f in 0..width {
+                    let src = pos + w * width + f;
+                    if src < 576 && f_off + f < 192 {
+                        windows[w][f_off + f] = xr[src];
+                    }
+                }
+            }
+            pos += 3 * width;
+        }
+
+        let mut per_coeff_thr = [[0.0f32; 192]; 3];
+        let mut tonality_sum = [0.0f32; N_BARK_PARTITIONS];
+        let mut peak_tonality_sum = [0.0f32; N_BARK_PARTITIONS];
+        let mut tonality_count = [0u32; N_BARK_PARTITIONS];
+        let mut part_threshold_sum = [0.0f32; N_BARK_PARTITIONS];
+        for w in 0..3 {
+            let (thr_192, part_thr, part_ton, part_peak_ton) =
+                partition_pass_short(&windows[w], &coeff_partition_short, sample_rate, gain);
+            per_coeff_thr[w] = thr_192;
+            for p in 0..N_BARK_PARTITIONS {
+                if part_thr[p] > 0.0 {
+                    part_threshold_sum[p] += part_thr[p];
+                    tonality_sum[p] += part_ton[p];
+                    peak_tonality_sum[p] += part_peak_ton[p];
+                    tonality_count[p] += 1;
+                }
+            }
+        }
+
+        // Re-bin per-window thresholds into the bit-stream layout
+        // (sfb-major, window-major within sfb) for sfb 3..13.
+        let mut pos = region_start;
+        for sfb in 3..13 {
+            let f_off = short_bounds[sfb] as usize;
+            let width = short_bounds[sfb + 1] as usize - f_off;
+            for w in 0..3 {
+                let chunk_start = pos + w * width;
+                let mut e = 0.0f32;
+                let mut thr = 0.0f32;
+                for f in 0..width {
+                    let src = chunk_start + f;
+                    if src < 576 {
+                        let v = xr[src];
+                        e += v * v;
+                    }
+                    if f_off + f < 192 {
+                        thr += per_coeff_thr[w][f_off + f];
+                    }
+                }
+                energy.push(e);
+                threshold.push(thr);
+                width_v.push(width as u16);
+                start_v.push(chunk_start as u16);
+            }
+            pos += 3 * width;
+        }
+
+        // Per-sfb floor across the whole granule to keep silent bands
+        // from breaking the iterator.
+        let global_floor = energy.iter().copied().fold(0.0f32, f32::max) * 1.0e-7 + 1.0e-12;
+        for b in 0..energy.len() {
+            if threshold[b] < global_floor {
+                threshold[b] = global_floor;
+            }
+        }
+
+        // Diagnostic per-partition tonality: average the long-prefix
+        // tonality with the short-tail per-window tonality (where any
+        // window contributed). Same convention as `analyze_short`.
+        let mut partition_tonality = partition_tonality_long;
+        let mut partition_peak_tonality = partition_peak_tonality_long;
+        for p in 0..N_BARK_PARTITIONS {
+            if tonality_count[p] > 0 {
+                let n = tonality_count[p] as f32;
+                partition_tonality[p] = 0.5 * partition_tonality[p] + 0.5 * (tonality_sum[p] / n);
+                partition_peak_tonality[p] =
+                    0.5 * partition_peak_tonality[p] + 0.5 * (peak_tonality_sum[p] / n);
+            }
+        }
+
+        Self {
+            n_sfb: energy.len(),
+            energy,
+            threshold,
+            width: width_v,
+            start: start_v,
+            partition_tonality,
+            partition_peak_tonality,
+            partition_threshold: part_threshold_sum,
+        }
+    }
+
     /// Estimate per-band noise for a uniform quantizer with step `q`.
     /// Mirrors [`crate::psy::GranuleMask::estimate_noise`] so the two
     /// can swap at the encoder's call site.

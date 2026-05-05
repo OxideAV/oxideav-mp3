@@ -20,6 +20,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mixed-block window-switching encoder path.** ISO/IEC 11172-3
+  §2.4.2.2 lets a short-block granule keep its low-frequency prefix
+  (sfb 0..=7 of the long table — 36 coefficients = subbands 0..2 at
+  44.1 kHz) coded as a long block while the high-frequency tail
+  (sfb 3..=12 of the short table × 3 windows) gets the short-block
+  3 × 12-point MDCT. This bridges a sustained low-frequency tone
+  (which would lose spectral compaction under pure-short coding) with
+  a transient riding on top — typical of a drum hit on a sustained
+  bass note. Five wired-up pieces:
+  * `mdct::mdct_granule_full` plus `mdct::unreorder_short_mixed_inplace`
+    drive the per-subband MDCT dispatch (subbands 0..2 use the 36-pt
+    long MDCT with normal sine window; subbands 2..32 use the
+    3 × 12-pt short MDCT) and the post-MDCT reorder for the short tail
+    only — exact inverse of `requantize::reorder_short`'s mixed
+    branch in the decoder.
+  * `psy1::Psy1Mask::analyze_mixed` runs the standard long-block
+    Bark-partition spreader on `xr[0..36]` and the per-window
+    192-coefficient short-block spreader on the high tail; output
+    mask carries 38 entries (8 long + 10 short × 3 windows). The
+    encoder's noise allocator walks all 38 and budgets bits for the
+    worst (sfb, window) pair across both the long prefix and the
+    short tail.
+  * `block_type::should_use_mixed_block` decides per-(granule,
+    channel) when to flip the flag: 3-tap linear-phase LP/HP
+    filter pair splits the granule's PCM at fs/4, then per-sub-frame
+    energy peak-to-mean (LF) and peak-to-min (HF) ratios across the
+    three sub-frames separate "sustained LF + impulse HF" from
+    uniform-spectrum transients. Conservative thresholds
+    (HF ratio > 8×, LF ratio < 2×) — the picker prefers pure-short
+    over a misfire (long-window LF region under a wrong mixed call
+    leaves the LF transient-smeared, worse than pure-short).
+  * `encoder::quantize_and_encode_full` plus
+    `encoder::build_mixed_coeff_window_map` apply the per-window
+    quantizer scale only to the short tail; the long-prefix
+    coefficients use the granule's `global_gain` directly (per
+    decoder's `requantize.rs` `long_sfb_count` branch — long-prefix
+    sfbs don't carry `subblock_gain`).
+  * `encoder::GranuleEncoded` gains a `mixed_block_flag` field; the
+    MPEG-1 and MPEG-2 LSF window-switching side-info tail emit
+    writes the actual flag (previously hard-coded to 0).
+  Six new tests (3 unit cases in `block_type::tests` for the mixed
+  picker; 3 integration cases in `tests/encoder_short_blocks.rs`
+  including a hard-asserted ffmpeg cross-decode):
+  `mixed_picker_silence_returns_false`,
+  `mixed_picker_pure_burst_returns_false`,
+  `mixed_picker_sustained_low_with_burst_returns_true`,
+  `mixed_fixture_engages_mixed_blocks`,
+  `mixed_blocks_roundtrip_decode_cleanly`,
+  `mixed_blocks_decode_via_ffmpeg`. The ffmpeg cross-decode asserts
+  the mixed-block bitstream layout (long-prefix scalefactors at
+  sfb 0..=7 of the long table + short-tail scalefactors at sfb 3..=12
+  × 3 windows of the short table) round-trips cleanly through ffmpeg
+  (no warnings, no garbage samples; ffmpeg's decoded energy matches
+  our own decoder within 1× on the bass+burst fixture).
+- **FFT pre-analysis lift on the simple-mask VBR path.** Previously
+  the 1024-point FFT pre-analysis (Annex D §D.2.4.1) was only
+  consumed by `psy_model = 1`. New `psy::GranuleMask::analyze_with_fft`
+  applies a 3 dB tonality lift to per-sfb mask thresholds wherever
+  the FFT spotted a between-bin tone — partitions whose SFM-derived
+  tonality exceeds zero get the affected sfb's threshold tightened
+  by `10^(-3·t/10)`, where `t ∈ [0, 1]` is the partition tonality.
+  The encoder dispatches long-block granules through the new
+  function under `psy_model = 0` (short / start / stop stay on the
+  base mask — the FFT's 1024-pt span matches the long-block 576-coeff
+  granule, not the short-block 192 window). The lift is conservative
+  (3 dB vs the full Annex D 9 dB delta) because the simple model
+  doesn't have a Bark spreader to re-balance the lift against
+  neighbouring noise partitions. Two new unit cases in `psy::tests`:
+  `fft_lift_tightens_threshold_on_tonal_input` (single-bin tone in
+  the FFT spectrum tightens at least one sfb threshold);
+  `fft_lift_silent_fft_matches_base` (silent FFT input leaves every
+  sfb threshold unchanged — graceful degradation for silent-prefix
+  granules).
 - **FFT-domain pre-analysis for Psy-1 long blocks.** New `fft.rs`
   module with a clean-room 1024-point radix-2 Cooley-Tukey FFT plan
   + Hann window builder. The encoder maintains a per-channel rolling
