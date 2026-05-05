@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-mp3/compare/v0.0.6...v0.0.7) - 2026-05-05
+
+### Other
+
+- add Annex D §D.2.4.1 FFT pre-analysis + per-window subblock_gain
+- fix short-block analyzer to walk encoder's sfb-major layout
+- add per-window Psy-1 short-block path + peak-detection tonality
+- add ISO/IEC 11172-3 Annex D Psy Model 1 (Bark-spread + tonality)
+- wire docs/audio/mp3/fixtures/ corpus into integration suite
+- replace never-match regex with semver_check = false
+
 ### Added
 
 - **FFT-domain pre-analysis for Psy-1 long blocks.** New `fft.rs`
