@@ -20,7 +20,3 @@ oxideav-id3 = "0.0"
 # layers read the same ISO 11172-3 Table 3-B.3, so MP3 re-exports
 # MP1's constant rather than shipping a second copy.
 oxideav-mp1 = "0.0"
-# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
-# via the `oxideav_core::register!` macro. Tiny crate, no transitive
-# deps; works on every target including wasm.
-linkme = "0.3"
