@@ -67,10 +67,8 @@ pub const CODEC_ID_STR: &str = "mp3";
 /// Unified entry point: install every codec and container provided by
 /// `oxideav-mp3` into a [`RuntimeContext`].
 ///
-/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
-/// [`oxideav_core::register!`] macro below so consumers calling
-/// [`oxideav_core::RuntimeContext::with_all_features`] pick MP3 up
-/// without any explicit umbrella plumbing.
+/// Also wired into [`oxideav_meta::register_all`] via the
+/// [`oxideav_core::register!`] macro below.
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
     register_containers(&mut ctx.containers);
