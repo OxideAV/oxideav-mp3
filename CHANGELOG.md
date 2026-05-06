@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-mp3/compare/v0.1.1...v0.1.2) - 2026-05-06
+
+### Other
+
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `linkme` dep
+- add Psy-2 complex-prediction model + RD Huffman selection + mixed-block tuning
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-mp3/pull/502))
+
 ### Added
 
 - **Annex D Psy Model 2 (`psy_model = 2`).** New `psy2` module
