@@ -1,0 +1,55 @@
+[package]
+name = "oxideav-mp3-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only libavcodec interop: the ffmpeg oracle harness
+# `dlopen`s the system-installed shared library at startup. No
+# `ffmpeg-sys` build-script dep, no ffmpeg / libavcodec / libmp3lame /
+# libmpg123 source pulled into the workspace's cargo dep tree. Workspace
+# policy bars consulting libavcodec source — we only inspect the public
+# C headers (<libavcodec/avcodec.h>, <libavcodec/packet.h>) for function
+# signatures + stable struct prefixes.
+#
+# The harness skips silently when no libavcodec shared library is
+# installed (see fuzz/src/lib.rs).
+libloading = "0.8"
+
+[dependencies.oxideav-mp3]
+path = ".."
+
+[lib]
+name = "oxideav_mp3_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "panic_free_decode"
+path = "fuzz_targets/panic_free_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ffmpeg_oracle_decode"
+path = "fuzz_targets/ffmpeg_oracle_decode.rs"
+test = false
+doc = false
