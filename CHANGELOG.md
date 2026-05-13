@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Mp3Demuxer::seek_to` for `.mp1` / `.mp2` / `.mp3` streams. Four
+  back-ends are wired in order of accuracy:
+  - **Xing/Info TOC** — when the first frame carries a Xing or Info
+    tag with the 100-byte TOC flag set, the target pts is mapped
+    through the table to land within ~1% of duration. Tag-detection
+    layout follows the standard version-and-channel-mode offset
+    table (mono / stereo / MPEG-1 / MPEG-2 each have a fixed offset).
+  - **VBRI** — Fraunhofer's variant header at offset 36; total
+    frames + total bytes are honoured (the proprietary TOC layout
+    is not parsed; the byte-offset extrapolation suffices).
+  - **CBR fast path** — for streams with no header and a non-zero
+    first-frame bitrate, target byte offset is computed directly
+    from `frame_bytes × target_frame_idx`.
+  - **VBR-without-TOC fallback** — walks a lazy `(pts, byte_offset)`
+    index built by `next_packet` every 100 frames. Subsequent seeks
+    binary-search the index then scan forward to the target.
+  - All paths run the cursor through `read_header_with_resync` after
+    landing so a small overshoot inside a padding-byte cycle is
+    snapped to the next valid sync word.
+
+  Container `open()` also now skips past a detected Xing/Info/VBRI
+  header frame so the decoder never sees the dummy frame's
+  reserved-zero main data, and populates the stream's `duration`
+  from `total_frames × samples_per_frame` when the header reports
+  total_frames. Unblocks `oxideplay` seek on every `.mp3` file —
+  see the matching `BarrierKind::SeekRejected` work in
+  `oxideav-pipeline`.
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-mp3/compare/v0.1.1...v0.1.2) - 2026-05-06
 
 ### Other

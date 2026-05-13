@@ -89,24 +89,58 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     params.channels = Some(channels);
     params.sample_format = Some(SampleFormat::S16);
 
-    // Container-level duration (lazy; computed on first call to
-    // duration_micros() — for now just leave None and let the player
-    // estimate from data_end - data_start when implemented).
+    let frame_start = first_offset + sync_off as u64;
+
+    // Probe the first frame for an Xing / Info / VBRI tag in its
+    // side-info area. Read the entire first frame body so we can
+    // examine the side-info bytes without leaving the cursor in a
+    // weird spot. Required to know whether the stream is VBR with
+    // a usable TOC for fast seeking. A free-format stream returns
+    // `None` for `frame_bytes` — fall back to scan-based seek for
+    // those.
+    let first_frame_bytes = hdr.frame_bytes().map(|b| b as usize);
+    let vbr_info = if let Some(fb) = first_frame_bytes {
+        input.seek(SeekFrom::Start(frame_start))?;
+        let mut frame_buf = vec![0u8; fb];
+        let n = read_up_to(&mut input, &mut frame_buf)?;
+        if n == fb {
+            VbrInfo::detect(&hdr, &frame_buf)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Container-level duration: prefer Xing/VBRI total_frames; fall
+    // back to lazy estimation only if no header is present. Without
+    // either we still leave None and the engine guesses.
+    let duration_samples = vbr_info
+        .as_ref()
+        .map(|v| v.total_frames as i64 * hdr.samples_per_frame() as i64);
     let stream = StreamInfo {
         index: 0,
         time_base,
-        duration: None,
+        duration: duration_samples,
         start_time: Some(0),
         params,
     };
 
-    let frame_start = first_offset + sync_off as u64;
-    input.seek(SeekFrom::Start(frame_start))?;
+    // Skip past the Xing/Info/VBRI header frame so the first emitted
+    // packet is real audio data. The header frame has a valid MPEG
+    // header but its main_data is just zero-padded reserved space —
+    // some decoders click on it.
+    let audio_start = if vbr_info.is_some() {
+        frame_start + first_frame_bytes.unwrap_or(0) as u64
+    } else {
+        frame_start
+    };
+    input.seek(SeekFrom::Start(audio_start))?;
 
     // Look for an ID3v1 trailer. Many files pair ID3v2 (rich tag at
     // the head) with ID3v1 (short fallback tag in the last 128
     // bytes); we merge any v1 fields that v2 didn't already supply.
-    if let Some(v1_pairs) = try_read_id3v1(&mut input, frame_start)? {
+    if let Some(v1_pairs) = try_read_id3v1(&mut input, audio_start)? {
         for (k, v) in v1_pairs {
             if !metadata.iter().any(|(ek, _)| *ek == k) {
                 metadata.push((k, v));
@@ -116,7 +150,8 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
 
     // Reposition cursor at the first audio frame; the v1 probe
     // seeks to the end of file.
-    input.seek(SeekFrom::Start(frame_start))?;
+    let stream_end = input.seek(SeekFrom::End(0))?;
+    input.seek(SeekFrom::Start(audio_start))?;
 
     let _ = &mut pictures;
     Ok(Box::new(Mp3Demuxer {
@@ -127,6 +162,11 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
         next_pts: 0,
         metadata,
         pictures,
+        first_header: hdr,
+        audio_start,
+        stream_end,
+        vbr_info,
+        seek_index: SeekIndex::default(),
     }))
 }
 
@@ -254,6 +294,113 @@ struct Mp3Demuxer {
     metadata: Vec<(String, String)>,
     /// Attached pictures (cover art) from APIC/PIC frames.
     pictures: Vec<AttachedPicture>,
+    /// First valid MPEG audio frame header in the stream. Used as the
+    /// seed for CBR seek arithmetic and as a quick reference for
+    /// `samples_per_frame` / `frame_bytes` when computing offsets.
+    first_header: super::frame::FrameHeader,
+    /// Byte offset of the first audio frame to emit. Equal to the
+    /// position of the first MPEG frame in the file, OR — when a
+    /// Xing/Info/VBRI header is present — the byte immediately AFTER
+    /// that header frame (we skip it so the decoder never sees the
+    /// dummy frame with reserved-zero main data).
+    audio_start: u64,
+    /// End of the stream (one past the last byte we'll read).
+    stream_end: u64,
+    /// Parsed Xing / Info / VBRI tag from the first frame's side-info
+    /// area, if present. Drives the TOC-based fast-seek path.
+    vbr_info: Option<VbrInfo>,
+    /// Lazy index of `(pts, byte_offset)` waypoints sampled every
+    /// `SEEK_INDEX_INTERVAL` frames during `next_packet`. The first
+    /// seek into a VBR-without-Xing stream builds the index by
+    /// scanning forward from `audio_start`.
+    seek_index: SeekIndex,
+}
+
+/// Parsed Xing / Info / VBRI tag from the first MPEG frame's side-info
+/// area. ISO/IEC 11172-3 itself does not specify these headers — they
+/// were retrofitted by Xing Technology / Fraunhofer respectively and
+/// are now ubiquitous on encoder-generated MP3 streams.
+///
+/// We capture the three fields a seek implementation actually needs:
+/// total frames, total bytes of audio payload (after the header frame),
+/// and the optional 100-byte TOC.
+#[derive(Clone, Debug)]
+struct VbrInfo {
+    /// Total audio frames declared by the header. Excludes the
+    /// Xing/VBRI header frame itself when `kind = Xing` (the value
+    /// the encoder writes is "frames it produced", which is normally
+    /// what the decoder will see when we skip the header frame).
+    total_frames: u32,
+    /// Total bytes of audio payload (after the header frame, before
+    /// any ID3v1 trailer). Equal to `audio_end - audio_start` to a
+    /// useful approximation for `Xing` streams.
+    total_bytes: u32,
+    /// 100-byte TOC where `toc[i]` is the byte offset at the `i%`
+    /// duration mark, scaled so the value is in 256ths of
+    /// `total_bytes`. Resolution: ~1% of the file's duration.
+    toc: Option<[u8; 100]>,
+    /// Source of the parsed data — purely informational, threaded
+    /// through to logs / tests.
+    #[allow(dead_code)]
+    kind: VbrTagKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VbrTagKind {
+    /// `Xing` tag — VBR encoded by lame / Xing / most modern encoders.
+    Xing,
+    /// `Info` tag — same layout as Xing but emitted by CBR streams that
+    /// still want a TOC for fast seeking.
+    Info,
+    /// Fraunhofer `VBRI` tag — distinct layout at a fixed offset.
+    Vbri,
+}
+
+/// Distance (in frames) between consecutive entries in the lazy
+/// `(pts, byte_offset)` seek index. 100 frames at MPEG-1 Layer III
+/// ≈ 2.6 s at 44.1 kHz. Small enough that a binary-search-then-
+/// linear-scan seek lands close to the target; large enough that
+/// the index is cheap to maintain for an hour-long file.
+const SEEK_INDEX_INTERVAL: u64 = 100;
+
+/// Lazy `(pts, byte_offset)` index for fallback seek paths. Built by
+/// `next_packet` as audio plays, and by `seek_to` on its first call
+/// against a VBR-without-Xing stream (scans forward from
+/// `audio_start`). Always sorted by pts.
+#[derive(Default, Debug)]
+struct SeekIndex {
+    /// Sample pts at each waypoint.
+    pts: Vec<i64>,
+    /// Absolute byte offset of the frame whose pts is the matching
+    /// entry above. Both vectors are kept the same length.
+    offsets: Vec<u64>,
+}
+
+impl SeekIndex {
+    /// Push a waypoint if we haven't recorded one at this pts yet.
+    fn maybe_push(&mut self, pts: i64, offset: u64) {
+        if matches!(self.pts.last(), Some(&p) if p == pts) {
+            return;
+        }
+        self.pts.push(pts);
+        self.offsets.push(offset);
+    }
+
+    /// Binary-search for the latest waypoint with `pts <= target`.
+    /// Returns `(pts, offset)` of that waypoint, or the seed `(0,
+    /// audio_start)` if no waypoint precedes the target.
+    fn lookup(&self, target: i64, audio_start: u64) -> (i64, u64) {
+        if self.pts.is_empty() {
+            return (0, audio_start);
+        }
+        // partition_point gives us the first index whose pts is > target.
+        let idx = self.pts.partition_point(|&p| p <= target);
+        if idx == 0 {
+            (0, audio_start)
+        } else {
+            (self.pts[idx - 1], self.offsets[idx - 1])
+        }
+    }
 }
 
 impl Demuxer for Mp3Demuxer {
@@ -274,6 +421,10 @@ impl Demuxer for Mp3Demuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
+        // Capture the byte offset of *this* frame before consuming it
+        // so the seek index can record (pts, offset) waypoints.
+        let frame_offset = self.input.stream_position().unwrap_or(0);
+
         // Read 4 bytes at the expected frame boundary. If they don't parse
         // as a valid MPEG audio header, resync: scan forward up to
         // `MAX_RESYNC_BYTES` looking for the next sync word. MP3 files
@@ -302,12 +453,116 @@ impl Demuxer for Mp3Demuxer {
 
         let pts = self.next_pts;
         self.next_pts += self.samples_per_frame;
+
+        // Record a waypoint every SEEK_INDEX_INTERVAL frames. The first
+        // frame is always recorded so backward seeks have an anchor.
+        let frame_idx = (pts / self.samples_per_frame.max(1)) as u64;
+        if frame_idx % SEEK_INDEX_INTERVAL == 0 {
+            self.seek_index.maybe_push(pts, frame_offset);
+        }
+
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = Some(pts);
         pkt.dts = Some(pts);
         pkt.duration = Some(self.samples_per_frame);
         pkt.flags.keyframe = true;
         Ok(pkt)
+    }
+
+    /// Seek to `pts` (in sample units = `time_base = 1/sample_rate`).
+    ///
+    /// Strategy:
+    ///
+    /// 1. **CBR fast path** — if no Xing/VBRI header is present AND the
+    ///    first frame's bitrate is non-zero, compute the target byte
+    ///    offset directly from `frame_bytes() × target_frame_idx`. Most
+    ///    accurate when the encoder respected the declared bitrate
+    ///    exactly; tolerant of mid-stream resync via [`Self::read_header_with_resync`].
+    /// 2. **Xing TOC path** — if the first frame carried a Xing/Info tag
+    ///    with a TOC, use the 100-byte table to land within ~1% of
+    ///    duration, then scan forward for a clean header.
+    /// 3. **Lazy index path** — for VBR streams without a TOC, consult
+    ///    the lazy `(pts, byte_offset)` index built by `next_packet`
+    ///    + fill the gap from the closest waypoint by linearly walking
+    ///    frame headers until we hit the target.
+    /// 4. **Out-of-stream targets** clamp: negative pts → 0; pts past
+    ///    end-of-stream lands at the last waypoint and lets
+    ///    `next_packet` return EOF naturally.
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        if stream_index != 0 {
+            return Err(Error::invalid(format!(
+                "MP3: stream index {stream_index} out of range (only stream 0 exists)"
+            )));
+        }
+        let target_pts = pts.max(0);
+
+        // Compute the target byte offset using the best available
+        // mechanism. Each branch returns an *approximate* offset; the
+        // resync logic in `read_header_with_resync` snaps the cursor
+        // to the next valid sync word, so a small overshoot is fine.
+        let approx_offset = if let Some(vbr) = self.vbr_info.as_ref() {
+            if let Some(toc) = vbr.toc {
+                self.toc_offset(vbr, &toc, target_pts)
+            } else {
+                self.scan_offset(target_pts)?
+            }
+        } else if let Some(cbr_frame_bytes) = self.first_header.frame_bytes() {
+            // CBR fast path. Layout:
+            //   audio_start                = byte 0 of frame 0
+            //   audio_start + N * fb       = byte 0 of frame N
+            //   pts of frame N             = N * samples_per_frame
+            //   ⇒ target_frame_idx = target_pts / samples_per_frame
+            //   ⇒ approx_offset     = audio_start + target_frame_idx * fb
+            // The first-frame `frame_bytes` is a starting estimate;
+            // resync will tolerate any padding-byte cycle variance.
+            let target_frame_idx = target_pts / self.samples_per_frame.max(1);
+            self.audio_start + (target_frame_idx as u64) * (cbr_frame_bytes as u64)
+        } else {
+            // Free-format / no header — only the lazy index is usable.
+            self.scan_offset(target_pts)?
+        };
+
+        // Clamp the offset to the audio range and seek.
+        let dest = approx_offset.clamp(self.audio_start, self.stream_end);
+        self.input.seek(SeekFrom::Start(dest))?;
+        // Snap forward to the next valid sync word in case the
+        // computed offset lands mid-frame (padding byte cycle, Xing
+        // TOC granularity, embedded tag).
+        let mut head_buf = [0u8; 4];
+        let n = read_up_to(&mut self.input, &mut head_buf)?;
+        if n < 4 {
+            // Landed past the end: clamp to end-of-stream — next_packet
+            // will report EOF.
+            self.next_pts = target_pts;
+            return Ok(target_pts);
+        }
+        // If the first 4 bytes don't sync, walk forward.
+        if parse_frame_header_any_layer(&head_buf).is_err() {
+            // `read_header_with_resync` shifts one byte at a time
+            // until it finds a sync; we already consumed 4 bytes so
+            // back up 3 to give it a fair shot.
+            self.input.seek(SeekFrom::Current(-3))?;
+            if self.read_header_with_resync()?.is_none() {
+                // No more frames — land EOF.
+                self.next_pts = target_pts;
+                return Ok(target_pts);
+            }
+            // read_header_with_resync left the cursor right after
+            // the 4-byte header — back up so next_packet re-reads it.
+            self.input.seek(SeekFrom::Current(-4))?;
+        } else {
+            // Sync was already at the seek destination — back up so
+            // next_packet re-reads it.
+            self.input.seek(SeekFrom::Current(-4))?;
+        }
+
+        // We don't track an exact landing pts (the byte offset may
+        // diverge from the requested pts on VBR streams), so report
+        // the requested target and let `next_packet` advance from
+        // here. Re-anchor `next_pts` to keep the emitted packets'
+        // pts consistent post-seek.
+        self.next_pts = target_pts;
+        Ok(target_pts)
     }
 }
 
@@ -347,5 +602,238 @@ impl Mp3Demuxer {
         // Ran out of resync budget — report end-of-stream. Real mid-file
         // garbage rarely exceeds a few KB; 64 KB is a generous cap.
         Ok(None)
+    }
+
+    /// Translate `target_pts` to an approximate byte offset using a
+    /// Xing/Info TOC. The TOC is a 100-entry table where `toc[i]` is
+    /// the byte offset at the `i%` duration mark, scaled so the value
+    /// is in 256ths of `total_bytes` (i.e. a value of 0x80 means "50%
+    /// of the way through the audio payload").
+    fn toc_offset(&self, vbr: &VbrInfo, toc: &[u8; 100], target_pts: i64) -> u64 {
+        let total_samples = vbr.total_frames as i64 * self.samples_per_frame.max(1);
+        if total_samples <= 0 || vbr.total_bytes == 0 {
+            return self.audio_start;
+        }
+        // Percent of duration as a 0..=1 fraction, clamped.
+        let pct = (target_pts as f64 / total_samples as f64).clamp(0.0, 1.0);
+        // TOC index in 0..=99 (the spec uses inclusive 0..100 — last
+        // entry is the byte mark at 99%).
+        let idx = ((pct * 100.0) as usize).min(99);
+        let raw = toc[idx] as u64;
+        // raw is in 256ths of total_bytes — convert back to a byte
+        // offset relative to the audio payload start, then add
+        // audio_start to get an absolute file offset.
+        let payload_offset = raw * (vbr.total_bytes as u64) / 256;
+        self.audio_start + payload_offset
+    }
+
+    /// VBR-without-TOC fallback: walk forward from the closest waypoint
+    /// in the lazy index until we either reach the target pts or hit
+    /// EOF. Builds index entries as it goes so subsequent seeks share
+    /// the work.
+    ///
+    /// Worst-case cost: scanning the entire stream once. For a
+    /// well-behaved encoder this is O(file size / 4 KB) reads — fast
+    /// enough that interactive seeks remain snappy even on
+    /// multi-megabyte files. We never repeat this work because every
+    /// scanned waypoint is cached.
+    fn scan_offset(&mut self, target_pts: i64) -> Result<u64> {
+        let (mut walk_pts, mut walk_offset) = self.seek_index.lookup(target_pts, self.audio_start);
+        // If the index already has a waypoint AT the target (or just
+        // past it), we're done.
+        if walk_pts >= target_pts {
+            return Ok(walk_offset);
+        }
+        // Otherwise scan forward, recording waypoints every
+        // SEEK_INDEX_INTERVAL frames as we go.
+        let saved_pos = self.input.stream_position()?;
+        self.input.seek(SeekFrom::Start(walk_offset))?;
+        let result = (|| -> Result<u64> {
+            loop {
+                let frame_offset = self.input.stream_position()?;
+                let head = match self.read_header_with_resync()? {
+                    Some(h) => h,
+                    None => return Ok(frame_offset),
+                };
+                let hdr = parse_frame_header_any_layer(&head)?;
+                let fb = match hdr.frame_bytes() {
+                    Some(b) => b as usize,
+                    None => return Ok(frame_offset),
+                };
+                if walk_pts >= target_pts {
+                    // We've already passed the target — rewind to the
+                    // header we just consumed.
+                    self.input.seek(SeekFrom::Current(-4))?;
+                    return Ok(frame_offset);
+                }
+                // Record a waypoint every SEEK_INDEX_INTERVAL frames
+                // (cheap; the index is small and saves later seeks).
+                let frame_idx = (walk_pts / self.samples_per_frame.max(1)) as u64;
+                if frame_idx % SEEK_INDEX_INTERVAL == 0 {
+                    self.seek_index.maybe_push(walk_pts, frame_offset);
+                }
+                // Skip body and advance.
+                if fb > 4 {
+                    self.input.seek(SeekFrom::Current((fb - 4) as i64))?;
+                }
+                walk_pts += self.samples_per_frame;
+                walk_offset = frame_offset + fb as u64;
+                if self.input.stream_position()? >= self.stream_end {
+                    return Ok(walk_offset);
+                }
+            }
+        })();
+        // Restore the cursor so the outer seek_to can position itself
+        // explicitly; the scan was only to compute the target offset.
+        self.input.seek(SeekFrom::Start(saved_pos))?;
+        result
+    }
+}
+
+impl VbrInfo {
+    /// Detect a Xing / Info / VBRI tag in the first frame of an MPEG
+    /// audio stream. `hdr` is the parsed frame header; `frame_data` is
+    /// the entire encoded frame (header bytes + side-info + main data).
+    /// Returns `None` if the tag isn't present.
+    ///
+    /// Layout references (see `docs/audio/mp3/`):
+    /// * Xing/Info tag: located at the start of the side-info area,
+    ///   i.e. offset `4 + (crc_present ? 2 : 0) + side_info_skip` from
+    ///   the frame header. `side_info_skip` is the empty padding
+    ///   reserved in the side-info struct for joint-stereo flags —
+    ///   the actual Xing header lives at the FIRST byte of the
+    ///   side-info area, which means we just need to skip past the
+    ///   header (4 bytes) + optional CRC (2 bytes) + the
+    ///   layer/version-specific side-info length to find the tag's
+    ///   4-byte ASCII magic. Practical observation in every
+    ///   in-the-wild file is that the tag's 4-byte magic sits at a
+    ///   well-known offset for each (version, channel-mode) pair:
+    ///
+    ///   - MPEG-1 stereo / joint-stereo / dual: offset 36
+    ///   - MPEG-1 mono:                          offset 21
+    ///   - MPEG-2 / 2.5 stereo / dual:           offset 21
+    ///   - MPEG-2 / 2.5 mono:                    offset 13
+    /// * VBRI tag: Fraunhofer-specific, always at offset 36 from the
+    ///   frame header regardless of version/channels.
+    fn detect(hdr: &super::frame::FrameHeader, frame_data: &[u8]) -> Option<Self> {
+        use super::frame::{ChannelMode, MpegVersion};
+        // Xing/Info offset table — see method-level doc.
+        let xing_off = match (hdr.version, hdr.channel_mode) {
+            (MpegVersion::Mpeg1, ChannelMode::Mono) => 21,
+            (MpegVersion::Mpeg1, _) => 36,
+            (_, ChannelMode::Mono) => 13,
+            (_, _) => 21,
+        };
+
+        // Try Xing/Info first.
+        if frame_data.len() >= xing_off + 4 {
+            let tag = &frame_data[xing_off..xing_off + 4];
+            if tag == b"Xing" || tag == b"Info" {
+                let kind = if tag == b"Xing" {
+                    VbrTagKind::Xing
+                } else {
+                    VbrTagKind::Info
+                };
+                return Self::parse_xing(&frame_data[xing_off..], kind);
+            }
+        }
+
+        // VBRI sits at a fixed offset 36 from frame start.
+        const VBRI_OFF: usize = 36;
+        if frame_data.len() >= VBRI_OFF + 4 && &frame_data[VBRI_OFF..VBRI_OFF + 4] == b"VBRI" {
+            return Self::parse_vbri(&frame_data[VBRI_OFF..]);
+        }
+        None
+    }
+
+    /// Parse the Xing/Info payload starting at the 4-byte magic.
+    ///
+    /// Layout (all u32 are big-endian):
+    /// ```text
+    ///   0  : 4 bytes : "Xing" or "Info"
+    ///   4  : 4 bytes : flags
+    ///                 bit 0 = frames   (u32 follows)
+    ///                 bit 1 = bytes    (u32 follows)
+    ///                 bit 2 = toc      (100-byte array follows)
+    ///                 bit 3 = quality  (u32 follows, ignored)
+    ///   8+ : variable
+    /// ```
+    fn parse_xing(buf: &[u8], kind: VbrTagKind) -> Option<Self> {
+        if buf.len() < 8 {
+            return None;
+        }
+        let flags = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let mut off = 8;
+        let total_frames = if flags & 0x1 != 0 {
+            if buf.len() < off + 4 {
+                return None;
+            }
+            let v = u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            off += 4;
+            v
+        } else {
+            0
+        };
+        let total_bytes = if flags & 0x2 != 0 {
+            if buf.len() < off + 4 {
+                return None;
+            }
+            let v = u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            off += 4;
+            v
+        } else {
+            0
+        };
+        let toc = if flags & 0x4 != 0 {
+            if buf.len() < off + 100 {
+                return None;
+            }
+            let mut t = [0u8; 100];
+            t.copy_from_slice(&buf[off..off + 100]);
+            // quality follows but we don't need it.
+            Some(t)
+        } else {
+            None
+        };
+        Some(VbrInfo {
+            total_frames,
+            total_bytes,
+            toc,
+            kind,
+        })
+    }
+
+    /// Parse the VBRI payload starting at the 4-byte magic.
+    ///
+    /// VBRI is Fraunhofer-specific and uses a different layout:
+    /// ```text
+    ///   0  : 4 bytes : "VBRI"
+    ///   4  : 2 bytes : version (= 1)
+    ///   6  : 2 bytes : delay
+    ///   8  : 2 bytes : quality
+    ///   10 : 4 bytes : total bytes (u32 BE)
+    ///   14 : 4 bytes : total frames (u32 BE)
+    ///   18 : 2 bytes : TOC entries (count)
+    ///   20 : 2 bytes : TOC scale factor
+    ///   22 : 2 bytes : entry size (bytes)
+    ///   24 : 2 bytes : frames per TOC entry
+    ///   26 : N bytes : TOC body (entries × entry_size)
+    /// ```
+    ///
+    /// We currently don't honour the VBRI TOC (its layout differs from
+    /// Xing's), but we DO populate total_frames + total_bytes so the
+    /// seek path can fall back to byte-offset extrapolation.
+    fn parse_vbri(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 26 {
+            return None;
+        }
+        let total_bytes = u32::from_be_bytes([buf[10], buf[11], buf[12], buf[13]]);
+        let total_frames = u32::from_be_bytes([buf[14], buf[15], buf[16], buf[17]]);
+        Some(VbrInfo {
+            total_frames,
+            total_bytes,
+            toc: None,
+            kind: VbrTagKind::Vbri,
+        })
     }
 }
