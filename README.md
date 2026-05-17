@@ -223,6 +223,17 @@ rate-control modes:
   log2(E[w] / E_min)` clamped to `0..7`. Pre-echo PSNR delta on the
   isolated-transient fixture exceeds 245 dB vs the long-only
   baseline. No CRC. count1 uses table A.
+- **Big-value Huffman regions**: long-block granules pick
+  `region0_count` / `region1_count` (4 + 3 bits in side info per
+  ISO/IEC 11172-3 §2.4.2.7) by enumerating all 128 representable
+  splits and selecting the optimal per-region Huffman table from
+  the 29 non-reserved big-value tables (1-3, 5-13, 15-31). A
+  precomputed per-table (cost, invalid-marker) prefix-sum keeps
+  the search at ~11k subtractions per granule. Short / mixed
+  blocks split at the implicit offset 36 boundary (§2.4.2.7) and
+  pick two distinct tables for the prefix and the tail. Baseline
+  single-table cost bounds the search so the picker never
+  regresses vs the pre-region-split encoder.
 
 Input must be `SampleFormat::S16` interleaved PCM.
 

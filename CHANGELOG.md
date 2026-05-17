@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-region big-value Huffman table selection (ISO/IEC 11172-3
+  §2.4.2.7).** The encoder used to emit `region0_count = 15` /
+  `region1_count = 7` for every long-block granule, collapsing all of
+  `big_values` into region 0 and forcing a single Huffman table for
+  the entire range. The new `pick_region_split_and_tables` enumerates
+  every representable `(region0_count, region1_count)` split — 16 × 8
+  = 128 candidates — and picks the optimal table per region, then
+  emits the winning split through the side-info fields.
+  - High-magnitude low bands (sfb 0..3-ish, where most signal energy
+    sits) get a wide-reach table tuned for their dynamic range.
+  - Mid bands get an intermediate table balancing reach against
+    codeword length.
+  - Sparse high-frequency tails (often mostly zeros after the
+    quantizer thresholds them) get a narrow-reach low-codeword table
+    like table 1 or 2, paying ~1-3 bits per pair instead of the 5-6
+    that a wide-reach single-table choice would cost.
+  - The picker is precomputation-driven: per candidate table we build
+    a (cost, invalid-marker) prefix-sum array over the big-values
+    pair indices, so each subrange query is two subtractions instead
+    of a re-scan over up to 288 pairs. End-to-end cost is ~11k
+    subtractions per granule — well under 1 ms inside the global-gain
+    bisection loop.
+  - Short / mixed blocks split big_values at the implicit offset 36
+    boundary (§2.4.2.7) and pick distinct tables for the prefix
+    (windowed 0..36) vs the tail (36..big_values_end). Side info
+    carries only two `table_select` entries for window-switching
+    blocks; the third slot is ignored on emit per the spec.
+  - Baseline single-table cost is the explicit upper bound on the
+    search: any split that ties or loses is rejected, so we never
+    regress vs the pre-round-73 encoder.
+
 - `Mp3Demuxer::seek_to` for `.mp1` / `.mp2` / `.mp3` streams. Four
   back-ends are wired in order of accuracy:
   - **Xing/Info TOC** — when the first frame carries a Xing or Info

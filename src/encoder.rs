@@ -1326,11 +1326,11 @@ impl Mp3Encoder {
 fn emit_window_switching_tail_mpeg1(si_w: &mut BitWriter, g: &GranuleEncoded) {
     if g.block_type == BlockType::Long {
         si_w.write_u32(0, 1); // window_switching_flag = 0
-        si_w.write_u32(g.table_select as u32, 5);
-        si_w.write_u32(g.table_select as u32, 5);
-        si_w.write_u32(g.table_select as u32, 5);
-        si_w.write_u32(15, 4); // region0_count
-        si_w.write_u32(7, 3); // region1_count
+        si_w.write_u32(g.table_select[0] as u32, 5);
+        si_w.write_u32(g.table_select[1] as u32, 5);
+        si_w.write_u32(g.table_select[2] as u32, 5);
+        si_w.write_u32(g.region0_count as u32 & 0xF, 4);
+        si_w.write_u32(g.region1_count as u32 & 0x7, 3);
     } else {
         si_w.write_u32(1, 1); // window_switching_flag = 1
         si_w.write_u32(g.block_type.as_u8() as u32, 2); // block_type
@@ -1339,10 +1339,14 @@ fn emit_window_switching_tail_mpeg1(si_w: &mut BitWriter, g: &GranuleEncoded) {
                                                         // stop. Only meaningful when block_type == 2 but the bit
                                                         // field exists for every window-switching granule.
         si_w.write_u32(if g.mixed_block_flag { 1 } else { 0 }, 1);
-        si_w.write_u32(g.table_select as u32, 5); // table_select[0]
-        si_w.write_u32(g.table_select as u32, 5); // table_select[1]
-                                                  // 3 × subblock_gain — driven from per-window energies for
-                                                  // short blocks (Annex D pre-echo mitigation), 0 elsewhere.
+        // Window-switching emits ONLY two table_select entries
+        // (region2 vanishes). Short / mixed blocks split big_values
+        // implicitly at offset 36 (§2.4.2.7); we pick distinct tables
+        // for the prefix vs the tail when it shaves bits.
+        si_w.write_u32(g.table_select[0] as u32, 5); // table_select[0]
+        si_w.write_u32(g.table_select[1] as u32, 5); // table_select[1]
+                                                     // 3 × subblock_gain — driven from per-window energies for
+                                                     // short blocks (Annex D pre-echo mitigation), 0 elsewhere.
         si_w.write_u32(g.subblock_gain[0] as u32 & 0x7, 3);
         si_w.write_u32(g.subblock_gain[1] as u32 & 0x7, 3);
         si_w.write_u32(g.subblock_gain[2] as u32 & 0x7, 3);
@@ -1358,18 +1362,18 @@ fn emit_window_switching_tail_mpeg1(si_w: &mut BitWriter, g: &GranuleEncoded) {
 fn emit_window_switching_tail_mpeg2(si_w: &mut BitWriter, g: &GranuleEncoded) {
     if g.block_type == BlockType::Long {
         si_w.write_u32(0, 1); // window_switching_flag = 0
-        si_w.write_u32(g.table_select as u32, 5);
-        si_w.write_u32(g.table_select as u32, 5);
-        si_w.write_u32(g.table_select as u32, 5);
-        si_w.write_u32(15, 4); // region0_count
-        si_w.write_u32(7, 3); // region1_count
+        si_w.write_u32(g.table_select[0] as u32, 5);
+        si_w.write_u32(g.table_select[1] as u32, 5);
+        si_w.write_u32(g.table_select[2] as u32, 5);
+        si_w.write_u32(g.region0_count as u32 & 0xF, 4);
+        si_w.write_u32(g.region1_count as u32 & 0x7, 3);
     } else {
         si_w.write_u32(1, 1); // window_switching_flag = 1
         si_w.write_u32(g.block_type.as_u8() as u32, 2);
         // mixed_block_flag — see MPEG-1 emit comment.
         si_w.write_u32(if g.mixed_block_flag { 1 } else { 0 }, 1);
-        si_w.write_u32(g.table_select as u32, 5);
-        si_w.write_u32(g.table_select as u32, 5);
+        si_w.write_u32(g.table_select[0] as u32, 5);
+        si_w.write_u32(g.table_select[1] as u32, 5);
         si_w.write_u32(g.subblock_gain[0] as u32 & 0x7, 3);
         si_w.write_u32(g.subblock_gain[1] as u32 & 0x7, 3);
         si_w.write_u32(g.subblock_gain[2] as u32 & 0x7, 3);
@@ -1935,7 +1939,40 @@ fn apply_is_rewrite_long_mpeg2(
 struct GranuleEncoded {
     global_gain: u8,
     big_values: u16,
-    table_select: u8,
+    /// Per-region big-value Huffman table indices.
+    ///
+    /// Long blocks use all three entries: the big-values range is split
+    /// into region0 / region1 / region2 at scalefactor-band boundaries
+    /// (encoded in side info as `region0_count` and `region1_count` per
+    /// ISO/IEC 11172-3 §2.4.2.7) and each region picks its own table.
+    /// Real-world spectra concentrate most of the energy in the low and
+    /// mid bands; the high tail typically holds only small-magnitude
+    /// coefficients that fit a narrow-reach Huffman table tightly.
+    /// Using one shared table for the whole spectrum forces every
+    /// region to use the widest-reach table, paying ~25-40% extra bits
+    /// on the high tail.
+    ///
+    /// Window-switching blocks (block_type != Long) only carry TWO
+    /// table_select entries in the side info (region2 vanishes); the
+    /// third slot is ignored on emit. For short / mixed blocks the
+    /// region boundary is implicit at offset 36 per the spec, and we
+    /// pick distinct tables for the prefix (idx 0..36) and the tail
+    /// (idx 36..big_values_end).
+    table_select: [u8; 3],
+    /// Long-block side-info `region0_count` (4 bits, 0..=15). Encodes
+    /// `region0_end_sfb` as `region0_count`: the sfb-bound table at
+    /// index `region0_count + 1` is the inclusive end of region 0.
+    /// Ignored for window-switching blocks (which emit a fixed
+    /// region0_count = 8 / region1_count = anything depending on layout —
+    /// actually MPEG-1 §2.4.2.7 says the field is not transmitted for
+    /// window-switching granules; only the two table_select entries
+    /// matter).
+    region0_count: u8,
+    /// Long-block side-info `region1_count` (3 bits, 0..=7). Ignored
+    /// for window-switching blocks. The decoder sums
+    /// `region0_count + region1_count + 2` to index the sfb-bound
+    /// table for region 1's inclusive end.
+    region1_count: u8,
     /// All Huffman-encoded bytes (big_values + count1) staged as a
     /// list of (code, len) writes.
     main_writes: Vec<(u32, u32)>,
@@ -2014,11 +2051,6 @@ fn encode_granule(
     // We always end up with bits <= bit_target. If we can't fit even at
     // global_gain = 255 (max), we accept the overflow (decoder will read
     // junk but length is correct).
-    let sr_for_short = if block_type == BlockType::Short {
-        Some(sample_rate)
-    } else {
-        None
-    };
     let mut lo: i32 = 0;
     let mut hi: i32 = 255;
     let mut best: Option<GranuleEncoded> = None;
@@ -2032,7 +2064,7 @@ fn encode_granule(
             mixed_block_flag,
             is_pos,
             is_variant,
-            sr_for_short,
+            sample_rate,
         );
         if g.total_bits <= bit_target {
             // This fits — try a smaller gain (more precision).
@@ -2055,7 +2087,7 @@ fn encode_granule(
         mixed_block_flag,
         is_pos,
         is_variant,
-        sr_for_short,
+        sample_rate,
     )
 }
 
@@ -2078,11 +2110,6 @@ fn encode_granule_vbr(
     is_variant: IsVariant,
     sample_rate: u32,
 ) -> GranuleEncoded {
-    let sr_for_short = if block_type == BlockType::Short {
-        Some(sample_rate)
-    } else {
-        None
-    };
     let do_quantize = |gain: u8| -> GranuleEncoded {
         quantize_and_encode_full(
             xr,
@@ -2092,7 +2119,7 @@ fn encode_granule_vbr(
             mixed_block_flag,
             is_pos,
             is_variant,
-            sr_for_short,
+            sample_rate,
         )
     };
     // Energy gate: if every band is essentially silent, skip the
@@ -2175,11 +2202,6 @@ fn encode_granule_vbr_psy1(
     } else {
         [0u8; 3]
     };
-    let sr_for_short = if block_type == BlockType::Short {
-        Some(sample_rate)
-    } else {
-        None
-    };
     let do_quantize = |gain: u8| -> GranuleEncoded {
         quantize_and_encode_full(
             xr,
@@ -2189,7 +2211,7 @@ fn encode_granule_vbr_psy1(
             mixed_block_flag,
             is_pos,
             is_variant,
-            sr_for_short,
+            sample_rate,
         )
     };
 
@@ -2259,11 +2281,6 @@ fn encode_granule_vbr_psy2(
     // meaningful for short blocks (which are routed through Psy-1 in the
     // dispatch loop and never reach here).
     let subblock_gain = [0u8; 3];
-    let sr_for_short = if block_type == BlockType::Short {
-        Some(sample_rate)
-    } else {
-        None
-    };
     let do_quantize = |gain: u8| -> GranuleEncoded {
         quantize_and_encode_full(
             xr,
@@ -2273,7 +2290,7 @@ fn encode_granule_vbr_psy2(
             mixed_block_flag,
             is_pos,
             is_variant,
-            sr_for_short,
+            sample_rate,
         )
     };
 
@@ -2329,7 +2346,7 @@ fn quantize_and_encode(
         false,
         is_pos,
         is_variant,
-        None,
+        44_100,
     )
 }
 
@@ -2351,7 +2368,7 @@ fn quantize_and_encode_full(
     mixed_block_flag: bool,
     is_pos: Option<&[u8; 22]>,
     is_variant: IsVariant,
-    sample_rate_for_short: Option<u32>,
+    sample_rate: u32,
 ) -> GranuleEncoded {
     let g = global_gain as i32;
     let exp = ((210 - g) as f32) * 3.0 / 16.0;
@@ -2369,15 +2386,14 @@ fn quantize_and_encode_full(
         scale * f32_pow2_frac(1.5 * subblock_gain[1] as f32),
         scale * f32_pow2_frac(1.5 * subblock_gain[2] as f32),
     ];
-    let coeff_to_window: Option<[u8; 576]> = match (block_type, sample_rate_for_short) {
-        (BlockType::Short, Some(sr)) => {
-            if mixed_block_flag {
-                Some(build_mixed_coeff_window_map(sr))
-            } else {
-                Some(build_short_coeff_window_map(sr))
-            }
+    let coeff_to_window: Option<[u8; 576]> = if block_type == BlockType::Short {
+        if mixed_block_flag {
+            Some(build_mixed_coeff_window_map(sample_rate))
+        } else {
+            Some(build_short_coeff_window_map(sample_rate))
         }
-        _ => None,
+    } else {
+        None
     };
     // Mixed blocks: per-coefficient long-region cutoff. For
     // i < long_region_end the per-window `subblock_gain` MUST NOT
@@ -2385,7 +2401,7 @@ fn quantize_and_encode_full(
     // see decoder requantize.rs `long_sfb_count` branch). Past that
     // point the short-region gets the per-window scaling.
     let long_region_end: Option<usize> = if mixed_block_flag && block_type == BlockType::Short {
-        sample_rate_for_short.map(|sr| sfband_long(sr)[8] as usize)
+        Some(sfband_long(sample_rate)[8] as usize)
     } else {
         None
     };
@@ -2455,19 +2471,64 @@ fn quantize_and_encode_full(
     let big_values_end = count1_start;
     let big_values_count = big_values_end as u16; // pairs * 2 = sample count
 
-    // Pick a Huffman table that can encode all (x, y) pairs.
-    let table_idx = choose_big_value_table(&is_, big_values_end);
+    // Per-region Huffman table selection.
+    //
+    // Long blocks split big_values into three regions at scalefactor-band
+    // boundaries (encoded as `region0_count` / `region1_count` in side
+    // info per ISO/IEC 11172-3 §2.4.2.7). Each region picks its own
+    // Huffman table. Real spectra concentrate energy in the low and
+    // mid bands; the high tail typically holds only small-magnitude
+    // coefficients that fit a narrow-reach table tightly. One shared
+    // table for the whole spectrum forces every region to use the
+    // widest-reach table, paying ~25-40% extra bits on the high tail.
+    //
+    // Window-switching blocks (short / start / stop) carry only TWO
+    // table_select entries; for short / mixed blocks we split at the
+    // implicit boundary of offset 36 (§2.4.2.7) and pick distinct
+    // tables for the prefix vs the tail.
+    let (table_select, region0_count, region1_count, r0_end_idx, r1_end_idx) =
+        if block_type == BlockType::Long {
+            pick_region_split_and_tables(&is_, big_values_end, sample_rate)
+        } else if block_type == BlockType::Short && big_values_end > 36 {
+            // Short / mixed blocks split big_values at the implicit
+            // offset 36 boundary (ISO 11172-3 §2.4.2.7) and carry only
+            // two table_select entries in side info. Pick the optimal
+            // table for the prefix (idx 0..36) and the tail
+            // (idx 36..big_values_end) independently. The split is the
+            // same for pure-short and mixed blocks — mixed_block_flag
+            // controls the IMDCT / requantization layout but not the
+            // big_values region split (see decoder.rs §2.4.2.7
+            // shortcut for window_switching && block_type == 2).
+            let split = 36usize;
+            let t0 = choose_big_value_table(&is_, split);
+            let t1 = pick_table_for_subrange(&is_, split, big_values_end);
+            ([t0, t1, 0], 0, 0, split, big_values_end)
+        } else {
+            // Start / stop, or short blocks with everything in the prefix:
+            // single table covers the whole big_values range.
+            let t = choose_big_value_table(&is_, big_values_end);
+            ([t, t, 0], 0, 0, big_values_end, big_values_end)
+        };
 
     // Stage Huffman writes.
     let mut writes: Vec<(u32, u32)> =
         Vec::with_capacity(big_values_end / 2 + (576 - big_values_end) / 4);
     let mut total_bits: usize = 0;
 
-    // Big-values pairs.
+    // Big-values pairs, dispatched by region. Pair boundaries (step_by 2)
+    // align with the region boundaries (which are sfb starts — always
+    // even-aligned in the long sfb-bound table; offset 36 is even too).
     for i in (0..big_values_end).step_by(2) {
         let x = is_[i];
         let y = is_.get(i + 1).copied().unwrap_or(0);
-        let bits = emit_big_pair(table_idx, x, y, &mut writes);
+        let t = if i < r0_end_idx {
+            table_select[0]
+        } else if i < r1_end_idx {
+            table_select[1]
+        } else {
+            table_select[2]
+        };
+        let bits = emit_big_pair(t, x, y, &mut writes);
         total_bits += bits;
     }
 
@@ -2546,7 +2607,9 @@ fn quantize_and_encode_full(
     GranuleEncoded {
         global_gain,
         big_values: (big_values_count / 2),
-        table_select: table_idx,
+        table_select,
+        region0_count,
+        region1_count,
         main_writes: writes,
         total_bits,
         part2_3_length,
@@ -2845,6 +2908,345 @@ fn choose_big_value_table(is_: &[i32; 576], big_end: usize) -> u8 {
         }
     }
     best_table
+}
+
+/// Per-table bit cost over the half-open coefficient range `[start, end)`.
+/// Returns `usize::MAX` when the table cannot represent every pair in the
+/// range, otherwise the exact total. Empty ranges return 0 (no pairs, no
+/// bits). Constraint: `start` and `end` must be even (pair boundaries).
+///
+/// Kept around for the standalone `pick_table_for_subrange` path used by
+/// the short / mixed block branch (where the search space is just 29
+/// tables, not enough to justify the pre-computation in
+/// `pick_region_split_and_tables`).
+fn subrange_bit_cost(is_: &[i32; 576], start: usize, end: usize, table_idx: u8) -> usize {
+    if start >= end {
+        return 0;
+    }
+    let bvt = &BIG_VALUE_TABLES[table_idx as usize];
+    if bvt.tab.is_empty() {
+        // Table 0 — every value in range must be zero.
+        for i in start..end {
+            if is_[i] != 0 {
+                return usize::MAX;
+            }
+        }
+        return 0;
+    }
+    let mut total = 0usize;
+    for i in (start..end).step_by(2) {
+        let ax = is_[i].abs();
+        let ay = is_.get(i + 1).copied().unwrap_or(0).abs();
+        let cost = pair_bit_cost(table_idx, ax, ay);
+        if cost == usize::MAX {
+            return usize::MAX;
+        }
+        total += cost;
+    }
+    total
+}
+
+/// Pick the best big-value Huffman table for a half-open coefficient
+/// range `[start, end)`. Mirrors `choose_big_value_table` but scoped
+/// to a subrange rather than `0..big_end`. Returns table 0 for an
+/// all-zero or empty range (table 0 encodes only zero-zero pairs in
+/// 0 bits, so it's the natural choice when present).
+fn pick_table_for_subrange(is_: &[i32; 576], start: usize, end: usize) -> u8 {
+    if start >= end {
+        return 0;
+    }
+    // Range max — needed for the reach check below.
+    let mut max_abs = 0i32;
+    for i in start..end {
+        let a = is_[i].abs();
+        if a > max_abs {
+            max_abs = a;
+        }
+    }
+    // All-zero range ⇒ table 0 (a single (0,0) entry, 0 bits).
+    if max_abs == 0 {
+        return 0;
+    }
+
+    let mut best_table: u8 = 23;
+    let mut best_bits: usize = usize::MAX;
+    for &t in BIG_VALUE_ALL_TABLES {
+        let bvt = &BIG_VALUE_TABLES[t as usize];
+        if bvt.tab.is_empty() {
+            continue;
+        }
+        let max_xy = bvt.tab.iter().map(|e| e.2.max(e.3)).max().unwrap_or(0) as i32;
+        let reach = if bvt.linbits == 0 {
+            max_xy
+        } else {
+            max_xy + (1i32 << bvt.linbits) - 1
+        };
+        if reach < max_abs {
+            continue;
+        }
+        let cost = subrange_bit_cost(is_, start, end, t);
+        if cost < best_bits {
+            best_bits = cost;
+            best_table = t;
+        }
+    }
+    best_table
+}
+
+/// Pick the long-block big-value region split + per-region Huffman tables
+/// that minimise total bit cost.
+///
+/// Returns `(table_select[3], region0_count, region1_count, r0_end_idx,
+/// r1_end_idx)`. The `r0_end_idx` and `r1_end_idx` are coefficient indices
+/// (not sfb indices) — caller uses them as the dispatch cut-offs when
+/// staging Huffman writes.
+///
+/// Per ISO/IEC 11172-3 §2.4.2.7:
+/// - region0 covers sfb 0..=region0_count (i.e. coefficient indices
+///   `0..sfband[region0_count + 1]`)
+/// - region1 covers sfb (region0_count+1)..=(region0_count+region1_count+1)
+/// - region2 covers everything else up to big_values_end
+///
+/// The side-info fields are 4-bit (`region0_count`, 0..=15) and 3-bit
+/// (`region1_count`, 0..=7). The bound table lookup at index
+/// `region0_count + region1_count + 2` must stay inside the 23-entry sfb
+/// table; the decoder uses `.min(22)`, so any over-shoot just clamps to
+/// 576 (region2 is then empty, which is fine). We enumerate all
+/// representable splits where `r0_end_idx <= big_values_end` (region0
+/// is never bigger than big_values), and `r1_end_idx >= r0_end_idx`.
+/// For each split we pick the optimal table per region, sum costs,
+/// and keep the best.
+///
+/// **Performance**: with ~16 × 8 = 128 region splits × 29 candidate
+/// tables × 3 regions × ~288 pairs, a naive loop costs ~3M ops per
+/// granule, multiplied by ~8 gain-bisection iterations × 2 channels ×
+/// 2 granules × ~50 frames per test ⇒ minutes of CPU. To stay tractable
+/// we precompute, for each candidate table:
+///   * per-pair bit cost (`pair_costs[t][i]` for pair index `i`)
+///   * a "validity" prefix sum so we can in O(1) test whether the table
+///     can represent every pair in any half-open `[start_pair, end_pair)`
+///     range (sum of "invalid" markers in that range must be zero).
+///   * a regular prefix sum over the costs so the per-region cost
+///     reduces to a single subtraction.
+/// The split enumeration is then ~16 × 8 × 29 × 3 = ~11k subtractions
+/// per granule — well under 1 ms.
+fn pick_region_split_and_tables(
+    is_: &[i32; 576],
+    big_values_end: usize,
+    sample_rate: u32,
+) -> ([u8; 3], u8, u8, usize, usize) {
+    let bounds = sfband_long(sample_rate);
+    let n_bounds = bounds.len(); // 23
+
+    // Degenerate cases: skip the search.
+    if big_values_end == 0 {
+        return ([0, 0, 0], 0, 0, 0, 0);
+    }
+
+    let n_pairs = big_values_end / 2;
+
+    // Per-table precomputed data.
+    //
+    // We index by the global table id (0..=31), not by position in
+    // `BIG_VALUE_ALL_TABLES`, so subsequent lookups stay O(1). For
+    // tables we deem out-of-scope (empty, or unable to reach a single
+    // pair anywhere in big_values) the vectors stay empty and the
+    // `eligible` flag stays false.
+    const N_TABLES: usize = 32;
+    let mut eligible = [false; N_TABLES];
+    let mut cost_prefix: [Vec<usize>; N_TABLES] = Default::default();
+    let mut invalid_prefix: [Vec<u32>; N_TABLES] = Default::default();
+    let mut any_invalid: [bool; N_TABLES] = [false; N_TABLES];
+
+    // Precompute a (sym_x, sym_y) -> code_len lookup per eligible
+    // table. Symbol indices run 0..=15 (anything >= 15 collapses to
+    // 15 via the linbits escape). Length 0xFF means "not in this
+    // table" — pair_bit_cost would have returned `usize::MAX`.
+    let mut code_len_lookup: [[[u8; 16]; 16]; N_TABLES] = [[[0xFFu8; 16]; 16]; N_TABLES];
+    let mut linbits: [u8; N_TABLES] = [0u8; N_TABLES];
+    for &t in BIG_VALUE_ALL_TABLES {
+        let ti = t as usize;
+        let bvt = &BIG_VALUE_TABLES[ti];
+        if bvt.tab.is_empty() {
+            continue;
+        }
+        linbits[ti] = bvt.linbits;
+        for &(_, len, tx, ty) in bvt.tab {
+            if (tx as usize) < 16 && (ty as usize) < 16 {
+                code_len_lookup[ti][tx as usize][ty as usize] = len;
+            }
+        }
+    }
+
+    // Per-table reach (the maximum |x| or |y| the table can represent
+    // including the linbits residue). pair_bit_cost computes this on
+    // the fly via `max_xy + (1 << linbits) - 1`; we cache it once
+    // since it's identical across every call.
+    let mut table_reach = [0i32; N_TABLES];
+    for &t in BIG_VALUE_ALL_TABLES {
+        let ti = t as usize;
+        let bvt = &BIG_VALUE_TABLES[ti];
+        if bvt.tab.is_empty() {
+            continue;
+        }
+        let max_xy = bvt.tab.iter().map(|e| e.2.max(e.3)).max().unwrap_or(0) as i32;
+        table_reach[ti] = if bvt.linbits == 0 {
+            max_xy
+        } else {
+            max_xy + (1i32 << bvt.linbits) - 1
+        };
+    }
+
+    // Inline fast bit cost lookup: one array indexation + sign / linbits
+    // additions. ~30x faster than the linear-scan `pair_bit_cost`.
+    let fast_cost = |t: usize, ax: i32, ay: i32| -> usize {
+        let lb = linbits[t];
+        if ax > table_reach[t] || ay > table_reach[t] {
+            return usize::MAX;
+        }
+        let (sym_x, has_lin_x) = if lb > 0 && ax >= 15 {
+            (15, true)
+        } else {
+            (ax, false)
+        };
+        let (sym_y, has_lin_y) = if lb > 0 && ay >= 15 {
+            (15, true)
+        } else {
+            (ay, false)
+        };
+        if sym_x > 15 || sym_y > 15 {
+            return usize::MAX;
+        }
+        let l = code_len_lookup[t][sym_x as usize][sym_y as usize];
+        if l == 0xFF {
+            return usize::MAX;
+        }
+        let mut bits = l as usize;
+        if has_lin_x {
+            bits += lb as usize;
+        }
+        if ax != 0 {
+            bits += 1;
+        }
+        if has_lin_y {
+            bits += lb as usize;
+        }
+        if ay != 0 {
+            bits += 1;
+        }
+        bits
+    };
+
+    for &t in BIG_VALUE_ALL_TABLES {
+        let ti = t as usize;
+        let bvt = &BIG_VALUE_TABLES[ti];
+        if bvt.tab.is_empty() {
+            continue;
+        }
+        eligible[ti] = true;
+        let mut cp = Vec::with_capacity(n_pairs + 1);
+        let mut ip = Vec::with_capacity(n_pairs + 1);
+        cp.push(0usize);
+        ip.push(0u32);
+        let mut cum_cost = 0usize;
+        let mut cum_inv = 0u32;
+        for pair_idx in 0..n_pairs {
+            let i = pair_idx * 2;
+            let ax = is_[i].abs();
+            let ay = is_.get(i + 1).copied().unwrap_or(0).abs();
+            let cost = fast_cost(ti, ax, ay);
+            if cost == usize::MAX {
+                cum_inv += 1;
+                any_invalid[ti] = true;
+                // Stash a zero so the prefix-sum subtraction works.
+                // Invalid pairs aren't included in any usable split.
+            } else {
+                cum_cost += cost;
+            }
+            cp.push(cum_cost);
+            ip.push(cum_inv);
+        }
+        cost_prefix[ti] = cp;
+        invalid_prefix[ti] = ip;
+    }
+
+    // Helper: query the best (table, cost) for a pair-range
+    // `[start_pair, end_pair)`. Returns `(table, cost)`; cost is
+    // `usize::MAX` only if every eligible table is invalid in the range
+    // (shouldn't happen because table 23 always reaches with linbits).
+    let pick_in = |start_pair: usize, end_pair: usize| -> (u8, usize) {
+        if start_pair >= end_pair {
+            // Empty region — pick table 0 (encodes a single (0,0) at 0 bits
+            // per the spec's table_select = 0 sentinel; but since the
+            // encoder writes zero pairs the table choice doesn't matter
+            // on-wire). Use a small valid table to keep the side info tidy.
+            return (0, 0);
+        }
+        let mut best_t = 23u8;
+        let mut best_c = usize::MAX;
+        for &t in BIG_VALUE_ALL_TABLES {
+            let ti = t as usize;
+            if !eligible[ti] {
+                continue;
+            }
+            if any_invalid[ti] {
+                let inv_in = invalid_prefix[ti][end_pair] - invalid_prefix[ti][start_pair];
+                if inv_in > 0 {
+                    continue; // can't represent some pair in this range
+                }
+            }
+            let cost = cost_prefix[ti][end_pair] - cost_prefix[ti][start_pair];
+            if cost < best_c {
+                best_c = cost;
+                best_t = t;
+            }
+        }
+        (best_t, best_c)
+    };
+
+    // Baseline: single-table choice for the whole big_values range,
+    // mirroring the pre-region-split emit. Acts as the upper bound on
+    // `best_total` so any candidate split that ties or loses is rejected.
+    let (baseline_table, baseline_cost) = pick_in(0, n_pairs);
+    let mut best_total = baseline_cost;
+    let mut best: ([u8; 3], u8, u8, usize, usize) = (
+        [baseline_table, baseline_table, baseline_table],
+        15,
+        7,
+        big_values_end,
+        big_values_end,
+    );
+
+    for r0c in 0u8..=15u8 {
+        let r0_end_sfb = (r0c as usize + 1).min(n_bounds - 1);
+        let r0_end_idx = (bounds[r0_end_sfb] as usize).min(big_values_end);
+        let r0_end_pair = r0_end_idx / 2;
+        let (t0, c0) = pick_in(0, r0_end_pair);
+        if c0 == usize::MAX {
+            continue;
+        }
+        for r1c in 0u8..=7u8 {
+            let r1_end_sfb = (r0c as usize + r1c as usize + 2).min(n_bounds - 1);
+            let r1_end_idx = (bounds[r1_end_sfb] as usize)
+                .max(r0_end_idx)
+                .min(big_values_end);
+            let r1_end_pair = r1_end_idx / 2;
+            let (t1, c1) = pick_in(r0_end_pair, r1_end_pair);
+            if c1 == usize::MAX {
+                continue;
+            }
+            let (t2, c2) = pick_in(r1_end_pair, n_pairs);
+            if c2 == usize::MAX {
+                continue;
+            }
+            let total = c0 + c1 + c2;
+            if total < best_total {
+                best_total = total;
+                best = ([t0, t1, t2], r0c, r1c, r0_end_idx, r1_end_idx);
+            }
+        }
+    }
+    best
 }
 
 fn emit_big_pair(table_idx: u8, x: i32, y: i32, writes: &mut Vec<(u32, u32)>) -> usize {
@@ -3200,7 +3602,7 @@ mod tests {
             false,
             None,
             IsVariant::Mpeg1,
-            Some(44_100),
+            44_100,
         );
         let g1 = quantize_and_encode_full(
             &xr,
@@ -3210,7 +3612,7 @@ mod tests {
             false,
             None,
             IsVariant::Mpeg1,
-            Some(44_100),
+            44_100,
         );
         assert!(
             g1.total_bits > g0.total_bits,
@@ -3238,5 +3640,124 @@ mod tests {
                 12 + f
             );
         }
+    }
+
+    #[test]
+    fn region_picker_never_loses_to_single_table() {
+        // The split picker treats the single-table choice as its
+        // baseline, so for *any* coefficient layout the chosen split's
+        // total cost must be <= the single-table cost. This is the
+        // invariant that lets us land the picker without regressing the
+        // legacy paths.
+        let mut is_ = [0i32; 576];
+        // High-magnitude low region, sparse tail — the classic case
+        // where region splitting wins.
+        for i in 0..50 {
+            is_[i] = ((i as i32 % 17) - 8) * 12;
+        }
+        for i in 50..150 {
+            is_[i] = ((i as i32 % 5) - 2) * 2;
+        }
+        for i in 150..200 {
+            is_[i] = if i % 3 == 0 { 1 } else { 0 };
+        }
+        let (table_select, _r0, _r1, r0_end, r1_end) =
+            pick_region_split_and_tables(&is_, 200, 44_100);
+        let single = choose_big_value_table(&is_, 200);
+        let single_cost = subrange_bit_cost(&is_, 0, 200, single);
+        let c0 = subrange_bit_cost(&is_, 0, r0_end, table_select[0]);
+        let c1 = subrange_bit_cost(&is_, r0_end, r1_end, table_select[1]);
+        let c2 = subrange_bit_cost(&is_, r1_end, 200, table_select[2]);
+        assert_ne!(
+            c0,
+            usize::MAX,
+            "region 0 cost MAX: table={} range=[0,{r0_end})",
+            table_select[0]
+        );
+        assert_ne!(
+            c1,
+            usize::MAX,
+            "region 1 cost MAX: table={} range=[{r0_end},{r1_end})",
+            table_select[1]
+        );
+        assert_ne!(
+            c2,
+            usize::MAX,
+            "region 2 cost MAX: table={} range=[{r1_end},200)",
+            table_select[2]
+        );
+        assert!(
+            c0 + c1 + c2 <= single_cost,
+            "split picker regressed: split={} single={}",
+            c0 + c1 + c2,
+            single_cost
+        );
+    }
+
+    #[test]
+    fn region_picker_wins_on_sparse_high_tail() {
+        // Loud low band + zero high tail ⇒ region2 should pick the
+        // smallest table that encodes (0, 0) in a short codeword.
+        // Single-table fallback has to use a wide-reach table for the
+        // whole spectrum, paying extra bits on every pair in the tail.
+        let mut is_ = [0i32; 576];
+        for i in 0..80 {
+            is_[i] = if i % 2 == 0 { 9 } else { -7 };
+        }
+        // big_values_end = 80 (no zero tail consumed by count1 here
+        // because we set last_nonzero = 80).
+        let split = pick_region_split_and_tables(&is_, 80, 44_100);
+        // Region2 cost must be 0 (no big-values past 80) since
+        // big_values_end == r1_end == 80.
+        let r1_end = split.4;
+        let c2 = subrange_bit_cost(&is_, r1_end, 80, split.0[2]);
+        assert_eq!(
+            c2, 0,
+            "region2 should be empty when big_values_end fits in r0+r1"
+        );
+    }
+
+    #[test]
+    fn region_picker_empty_input_returns_zero() {
+        let is_ = [0i32; 576];
+        let (tables, r0c, r1c, r0_end, r1_end) = pick_region_split_and_tables(&is_, 0, 44_100);
+        assert_eq!(tables, [0, 0, 0]);
+        assert_eq!(r0c, 0);
+        assert_eq!(r1c, 0);
+        assert_eq!(r0_end, 0);
+        assert_eq!(r1_end, 0);
+    }
+
+    #[test]
+    fn region_picker_split_indices_are_pair_aligned() {
+        // sfb boundaries from the long sfb-bound table are all even
+        // (every entry in SFB_LONG_44100 is a multiple of 2), so the
+        // returned `r0_end_idx` and `r1_end_idx` must also be even.
+        // The Huffman pair loop relies on this to align pair boundaries
+        // with region boundaries.
+        let mut is_ = [0i32; 576];
+        for i in 0..400 {
+            is_[i] = ((i as i32 * 3) % 11) - 5;
+        }
+        let (_, _, _, r0_end, r1_end) = pick_region_split_and_tables(&is_, 400, 44_100);
+        assert_eq!(r0_end % 2, 0, "r0_end {r0_end} must be pair-aligned");
+        assert_eq!(r1_end % 2, 0, "r1_end {r1_end} must be pair-aligned");
+        assert!(r0_end <= r1_end);
+        assert!(r1_end <= 400);
+    }
+
+    #[test]
+    fn region_picker_side_info_fields_fit() {
+        // `region0_count` is 4 bits (0..=15), `region1_count` is 3
+        // bits (0..=7) per ISO 11172-3 §2.4.2.7. The picker must
+        // never return values outside these ranges or the side info
+        // will be wrong on the wire.
+        let mut is_ = [0i32; 576];
+        for i in 0..576 {
+            is_[i] = ((i as i32) % 13) - 6;
+        }
+        let (_, r0c, r1c, _, _) = pick_region_split_and_tables(&is_, 576, 44_100);
+        assert!(r0c <= 15, "region0_count {r0c} exceeds 4-bit field");
+        assert!(r1c <= 7, "region1_count {r1c} exceeds 3-bit field");
     }
 }
