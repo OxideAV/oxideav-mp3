@@ -15,7 +15,10 @@
 //! - Single big-value Huffman table for the whole spectrum (selected
 //!   per granule from a small candidate set). Region splits are
 //!   degenerate (region0 spans everything, region1 / region2 empty).
-//! - count1 region uses table A.
+//! - count1 region picks Table A vs. Table B per granule by pricing
+//!   both under the ISO/IEC 11172-3 Table 3-B.25 / 3-B.26 codebooks
+//!   and emitting the cheaper one (the side-info `count1table_select`
+//!   bit carries the choice, §2.4.2.7).
 //! - Bit reservoir on the encode side: any unused bits roll forward via
 //!   the next frame's `main_data_begin`. MPEG-1's `main_data_begin` is
 //!   9 bits wide (reservoir cap 511 bytes); MPEG-2 LSF's field is only
@@ -55,7 +58,7 @@ use oxideav_core::{
 use crate::analysis::{analyze_granule, AnalysisState};
 use crate::block_type::{should_use_mixed_block, BlockType, BlockTypeMachine, TransientDetector};
 use crate::fft::{hann_window, Fft1024, FFT_N};
-use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A};
+use crate::huffman::{BIG_VALUE_TABLES, COUNT1_A, COUNT1_B};
 use crate::mdct::{mdct_granule_full, MdctState};
 use crate::psy::{global_gain_to_step, vbr_quality_to_mask_ratio, GranuleMask};
 use crate::psy1::{vbr_quality_to_psy1_gain, Psy1Mask};
@@ -1353,7 +1356,9 @@ fn emit_window_switching_tail_mpeg1(si_w: &mut BitWriter, g: &GranuleEncoded) {
     }
     si_w.write_u32(0, 1); // preflag
     si_w.write_u32(0, 1); // scalefac_scale
-    si_w.write_u32(0, 1); // count1table_select = 0 (table A)
+                          // count1table_select (§2.4.2.7): 0 = Table 3-B.25 / A, 1 = Table
+                          // 3-B.26 / B. Picked per granule by [`emit_count1_region_best`].
+    si_w.write_u32(if g.count1table_select { 1 } else { 0 }, 1);
 }
 
 /// MPEG-2 LSF variant of [`emit_window_switching_tail_mpeg1`]. The
@@ -1380,7 +1385,8 @@ fn emit_window_switching_tail_mpeg2(si_w: &mut BitWriter, g: &GranuleEncoded) {
     }
     // MPEG-2 has NO preflag bit in the bitstream.
     si_w.write_u32(0, 1); // scalefac_scale
-    si_w.write_u32(0, 1); // count1table_select = 0 (table A)
+                          // count1table_select (§2.4.2.7): same per-granule bit as MPEG-1.
+    si_w.write_u32(if g.count1table_select { 1 } else { 0 }, 1);
 }
 
 impl Encoder for Mp3Encoder {
@@ -2020,6 +2026,19 @@ struct GranuleEncoded {
     /// the high region gets short-block time localisation.
     /// Always `false` for non-short blocks (long / start / stop).
     mixed_block_flag: bool,
+    /// Selects the count1 Huffman table (`false` = Table A, `true` =
+    /// Table B). Per ISO/IEC 11172-3 §2.4.2.7 + Table 3-B.7, every
+    /// granule emits one bit (`count1table_select`) telling the decoder
+    /// which of the two 4-element Huffman tables to use across the
+    /// count1 region. Table A has a 1-bit entry for the all-zero
+    /// quadruple and up to 6-bit entries elsewhere; Table B is a flat
+    /// 4-bit-per-quad encoding regardless of content. Table A is
+    /// shorter for sparse / quiet count1 regions (many `(0,0,0,0)`
+    /// quads); Table B is shorter when the count1 region is dense with
+    /// non-zero ±1 values whose Table A codes would land on the 5–6 bit
+    /// tail. The encoder prices both tables per granule and picks the
+    /// shorter one.
+    count1table_select: bool,
 }
 
 impl GranuleEncoded {
@@ -2532,17 +2551,19 @@ fn quantize_and_encode_full(
         total_bits += bits;
     }
 
-    // count1 region: groups of 4. Use table A.
+    // count1 region: groups of 4. Per ISO/IEC 11172-3 §2.4.2.7 the
+    // bitstream carries a `count1table_select` bit telling the decoder
+    // which of two 4-element Huffman tables (3-B.25 "A" / 3-B.26 "B")
+    // covers the count1 region. Table A favours sparse-quad content
+    // (`(0,0,0,0)` = 1 bit), table B is a flat 4-bit-per-quad encoding.
+    // Price both, pick the shorter, and remember the choice for the
+    // side-info emitter.
     let count1_end = (last_nonzero + 3) & !3; // round up to multiple of 4
     let count1_end = count1_end.min(576);
-    for i in (big_values_end..count1_end).step_by(4) {
-        let v = is_[i];
-        let w = is_.get(i + 1).copied().unwrap_or(0);
-        let x = is_.get(i + 2).copied().unwrap_or(0);
-        let y = is_.get(i + 3).copied().unwrap_or(0);
-        let bits = emit_count1_quad(v, w, x, y, &mut writes);
-        total_bits += bits;
-    }
+    let (count1_writes, count1_bits, count1table_select) =
+        emit_count1_region_best(&is_, big_values_end, count1_end);
+    writes.extend(count1_writes);
+    total_bits += count1_bits;
 
     // Scalefactor emit (R channel of an IS-active long-block granule).
     //
@@ -2620,6 +2641,7 @@ fn quantize_and_encode_full(
         sf_bits,
         subblock_gain,
         mixed_block_flag,
+        count1table_select,
     }
 }
 
@@ -3343,6 +3365,125 @@ fn emit_count1_quad(v: i32, w: i32, x: i32, y: i32, writes: &mut Vec<(u32, u32)>
     bits
 }
 
+/// Emit one count1 quadruple using ISO/IEC 11172-3 Table 3-B.26
+/// ("table B"). All 16 Huffman codes in table B are fixed at 4 bits
+/// (no compression for the all-zero quad), so the bit cost is always
+/// `4 + popcount(quad)` per group regardless of value distribution.
+fn emit_count1_quad_b(v: i32, w: i32, x: i32, y: i32, writes: &mut Vec<(u32, u32)>) -> usize {
+    let av = v.unsigned_abs().min(1) as u8;
+    let aw = w.unsigned_abs().min(1) as u8;
+    let ax = x.unsigned_abs().min(1) as u8;
+    let ay = y.unsigned_abs().min(1) as u8;
+    let mut bits = 0usize;
+    for &(code, len, tv, tw, tx, ty) in COUNT1_B {
+        if tv == av && tw == aw && tx == ax && ty == ay {
+            writes.push((code, len as u32));
+            bits += len as usize;
+            break;
+        }
+    }
+    if v != 0 {
+        writes.push((if v < 0 { 1 } else { 0 }, 1));
+        bits += 1;
+    }
+    if w != 0 {
+        writes.push((if w < 0 { 1 } else { 0 }, 1));
+        bits += 1;
+    }
+    if x != 0 {
+        writes.push((if x < 0 { 1 } else { 0 }, 1));
+        bits += 1;
+    }
+    if y != 0 {
+        writes.push((if y < 0 { 1 } else { 0 }, 1));
+        bits += 1;
+    }
+    bits
+}
+
+/// Price the count1 region under Table A only — `(0,0,0,0)` costs 1
+/// bit, otherwise look up the code length in `COUNT1_A` and add the
+/// sign bits. Returns the Huffman-code bit count *without* the sign
+/// bits per quad (since sign-bit total is invariant across A vs. B and
+/// we only need the relative comparison).
+///
+/// We could share this with `emit_count1_quad` but inlining the lookup
+/// here keeps the picker hot path zero-allocation.
+fn count1_quad_cost_a(v: i32, w: i32, x: i32, y: i32) -> usize {
+    let av = v.unsigned_abs().min(1) as u8;
+    let aw = w.unsigned_abs().min(1) as u8;
+    let ax = x.unsigned_abs().min(1) as u8;
+    let ay = y.unsigned_abs().min(1) as u8;
+    for &(_code, len, tv, tw, tx, ty) in COUNT1_A {
+        if tv == av && tw == aw && tx == ax && ty == ay {
+            return len as usize;
+        }
+    }
+    // Unreachable — every 4-bit pattern is in the table.
+    0
+}
+
+/// Pick the cheaper count1 Huffman table (A vs. B) for the granule's
+/// count1 region, emit it, and return `(writes, total_bits,
+/// count1table_select)`. The decoder uses `count1table_select` (1
+/// side-info bit per granule, ISO/IEC 11172-3 §2.4.2.7 + Table 3-B.7)
+/// to dispatch to the matching table.
+///
+/// Sign-bit costs cancel between the two pricings — every non-zero
+/// coefficient pays exactly 1 sign bit under either table — so the
+/// pricing only needs to sum the per-quad Huffman code length under
+/// each table. Table B is uniformly 4 bits per quad regardless of
+/// content (16 codes × 4 bits = full 4-bit prefix tree), so the
+/// number of quads in `[big_values_end, count1_end)` is a one-shot
+/// cost upper bound for Table B; Table A is variable.
+fn emit_count1_region_best(
+    is_: &[i32; 576],
+    big_values_end: usize,
+    count1_end: usize,
+) -> (Vec<(u32, u32)>, usize, bool) {
+    // Iteration count matches the `for i in (big..end).step_by(4)`
+    // loop below: ceil((end - big) / 4). The original (pre-round-80)
+    // emit loop rounded `count1_end` up to a multiple of 4 before
+    // calling, so the divide-floor and divide-ceil normally agree —
+    // but a partial trailing quad (e.g. when count1 ends 2 indices
+    // past the last big_value boundary) still pays one quad's worth
+    // of code-length under both tables, since `.get().unwrap_or(0)`
+    // synthesises the trailing zeros. The pricing must match.
+    let n_quads = (count1_end - big_values_end).div_ceil(4);
+
+    // First pass: price A and B without emitting. Each quad's sign-bit
+    // cost is identical under either table so we exclude it from the
+    // comparison.
+    let mut cost_a = 0usize;
+    let cost_b = n_quads * 4;
+    for i in (big_values_end..count1_end).step_by(4) {
+        let v = is_[i];
+        let w = is_.get(i + 1).copied().unwrap_or(0);
+        let x = is_.get(i + 2).copied().unwrap_or(0);
+        let y = is_.get(i + 3).copied().unwrap_or(0);
+        cost_a += count1_quad_cost_a(v, w, x, y);
+    }
+
+    // Tie goes to Table A (the simpler / pre-existing path), matching
+    // the historical encoder behaviour exactly when the two tables are
+    // equally good. Pick B strictly when it saves at least one bit.
+    let use_b = cost_b < cost_a;
+    let mut writes: Vec<(u32, u32)> = Vec::with_capacity(n_quads * 2);
+    let mut bits = 0usize;
+    for i in (big_values_end..count1_end).step_by(4) {
+        let v = is_[i];
+        let w = is_.get(i + 1).copied().unwrap_or(0);
+        let x = is_.get(i + 2).copied().unwrap_or(0);
+        let y = is_.get(i + 3).copied().unwrap_or(0);
+        bits += if use_b {
+            emit_count1_quad_b(v, w, x, y, &mut writes)
+        } else {
+            emit_count1_quad(v, w, x, y, &mut writes)
+        };
+    }
+    (writes, bits, use_b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3759,5 +3900,135 @@ mod tests {
         let (_, r0c, r1c, _, _) = pick_region_split_and_tables(&is_, 576, 44_100);
         assert!(r0c <= 15, "region0_count {r0c} exceeds 4-bit field");
         assert!(r1c <= 7, "region1_count {r1c} exceeds 3-bit field");
+    }
+
+    /// Granule whose count1 region is mostly `(0,0,0,0)`: Table A's
+    /// 1-bit code for the zero-quad wins decisively over Table B's
+    /// flat 4-bit-per-quad layout, so the picker must choose A.
+    #[test]
+    fn count1_picker_picks_table_a_on_sparse_quads() {
+        let mut is_ = [0i32; 576];
+        // Big-values prefix: one non-zero pair at the start so
+        // big_values_end > 0 and the count1 region is well-defined.
+        is_[0] = 5;
+        is_[1] = 3;
+        // count1 region (offsets 4..400): leave entirely zero so
+        // every quad is (0, 0, 0, 0) — Table A code = 1 bit, Table B
+        // code = 4 bits. Align big_values_end and count1_end on
+        // multiples of 4 so the iteration count is unambiguous.
+        let big_end = 4usize;
+        let count1_end = 400usize;
+        let (writes, bits, use_b) = emit_count1_region_best(&is_, big_end, count1_end);
+        assert!(
+            !use_b,
+            "expected Table A for an all-zero count1 region, got B"
+        );
+        // Every quad costs 1 bit under A and there are (count1_end -
+        // big_end) / 4 = 99 quads; no sign bits because every value
+        // is 0.
+        let n_quads = (count1_end - big_end) / 4;
+        assert_eq!(
+            bits, n_quads,
+            "expected {n_quads} bits for {n_quads} all-zero quads under Table A"
+        );
+        assert_eq!(writes.len(), n_quads);
+    }
+
+    /// Granule whose count1 region is fully populated with ±1 values:
+    /// Table A's codes for `(1,1,1,1)` etc. land on the 5–6 bit tail,
+    /// so Table B's flat 4-bit layout shaves bits and the picker
+    /// switches to B.
+    #[test]
+    fn count1_picker_picks_table_b_on_dense_quads() {
+        let mut is_ = [0i32; 576];
+        // Big-values prefix: one non-zero pair at the start.
+        is_[0] = 5;
+        is_[1] = 3;
+        // Populate count1 region with `(1,1,1,1)` quads up to 572 so
+        // the last iteration at i=572 reads is_[572..576] (no OOB).
+        let big_end = 4usize;
+        let count1_end = 576usize;
+        for i in (big_end..count1_end).step_by(4) {
+            is_[i] = 1;
+            is_[i + 1] = 1;
+            is_[i + 2] = 1;
+            is_[i + 3] = 1;
+        }
+        let (_writes, _bits, use_b) = emit_count1_region_best(&is_, big_end, count1_end);
+        assert!(
+            use_b,
+            "expected Table B for an all-(1,1,1,1) count1 region, got A"
+        );
+    }
+
+    /// The picker must never regress vs. the historical pre-round-80
+    /// behaviour (Table A only) — that's the cost of `cost_a` it
+    /// computed internally. Run a random-ish granule and assert the
+    /// emitted cost is `<= count1 cost under Table A alone`.
+    #[test]
+    fn count1_picker_never_regresses_vs_table_a() {
+        let mut is_ = [0i32; 576];
+        // Mixed: a chunk of zero quads, then a stretch of ±1, then
+        // more zeros. Lets the picker make a real choice.
+        is_[0] = 8;
+        is_[1] = 6;
+        is_[2] = 4;
+        is_[3] = 2;
+        let big_end = 4usize;
+        // Stretch of ±1 covering offsets 4..164.
+        for i in (big_end..164).step_by(4) {
+            is_[i] = 1;
+            is_[i + 1] = if i % 8 == 0 { -1 } else { 1 };
+            is_[i + 2] = 0;
+            is_[i + 3] = 1;
+        }
+        // Rest stays zero. Align count1_end on a multiple of 4.
+        let count1_end = 164usize;
+
+        // Cost under Table A alone (no sign bits since we focus on
+        // the codebook comparison — sign bit count is invariant).
+        let mut cost_a = 0usize;
+        for i in (big_end..count1_end).step_by(4) {
+            let v = is_[i];
+            let w = is_[i + 1];
+            let x = is_[i + 2];
+            let y = is_[i + 3];
+            cost_a += count1_quad_cost_a(v, w, x, y);
+        }
+
+        let (_w, bits, use_b) = emit_count1_region_best(&is_, big_end, count1_end);
+        // `bits` includes sign bits. Strip them to compare codebook
+        // costs only.
+        let mut sign_bits = 0usize;
+        for i in big_end..count1_end {
+            if is_[i] != 0 {
+                sign_bits += 1;
+            }
+        }
+        let codebook_bits = bits - sign_bits;
+        let n_quads = (count1_end - big_end) / 4;
+        let cost_b = n_quads * 4;
+        let chosen_cost = if use_b { cost_b } else { cost_a };
+        assert_eq!(
+            codebook_bits, chosen_cost,
+            "emitted codebook bits ({codebook_bits}) must match \
+             the chosen table's quoted cost ({chosen_cost}, use_b={use_b})"
+        );
+        assert!(
+            codebook_bits <= cost_a,
+            "picker regressed: {codebook_bits} > Table-A cost {cost_a}"
+        );
+    }
+
+    /// Empty count1 region (count1_end == big_values_end): the picker
+    /// returns zero writes / zero bits and trivially defaults to Table
+    /// A (tie ⇒ A per spec convention).
+    #[test]
+    fn count1_picker_empty_region_is_table_a() {
+        let is_ = [0i32; 576];
+        let (writes, bits, use_b) = emit_count1_region_best(&is_, 100, 100);
+        assert!(writes.is_empty());
+        assert_eq!(bits, 0);
+        assert!(!use_b);
     }
 }

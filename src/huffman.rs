@@ -1741,7 +1741,7 @@ pub static COUNT1_A: HTab4 = &[
 ];
 
 // Table B (3-B.26). All codes length 4.
-static COUNT1_B: HTab4 = &[
+pub static COUNT1_B: HTab4 = &[
     (0b1111, 4, 0, 0, 0, 0),
     (0b1110, 4, 0, 0, 0, 1),
     (0b1101, 4, 0, 0, 1, 0),

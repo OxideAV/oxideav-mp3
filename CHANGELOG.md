@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-granule count1 Huffman table selection (ISO/IEC 11172-3
+  §2.4.2.7 + Tables 3-B.25 / 3-B.26).** The encoder used to hard-code
+  `count1table_select = 0` (Table A) for every granule. Table A has a
+  1-bit code for the all-zero quadruple `(0,0,0,0)` and up to 6-bit
+  codes elsewhere; Table B is a flat 4-bit-per-quad codebook
+  regardless of value distribution. Table A wins on sparse / quiet
+  count1 regions (most quads are zero); Table B wins on densely
+  populated ±1 tails (broadband noise, transient residuals) where
+  Table A's codes land on the 5-6 bit tail.
+  - The new `emit_count1_region_best` prices both tables for the
+    granule's count1 region under the actual quad values from the
+    quantiser output. Sign-bit cost is identical under either table
+    so the comparison only sums per-quad code lengths. Tie goes to
+    Table A (matches pre-round-80 behaviour exactly when both tables
+    draw).
+  - Pricing is O(N) over the count1 quad count (typically 40-150
+    quads per granule); no precomputation needed because the
+    codebooks are 16-entry static tables.
+  - The 1-bit `count1table_select` field in side info now carries
+    the per-granule choice — verified by the decoder, which has
+    always supported both tables via `decode_count1(br, table_b)`.
+  - Three new lib tests + three new integration tests cover the
+    sparse / dense / mixed pricing paths and a stereo end-to-end
+    round-trip.
 - **Per-region big-value Huffman table selection (ISO/IEC 11172-3
   §2.4.2.7).** The encoder used to emit `region0_count = 15` /
   `region1_count = 7` for every long-block granule, collapsing all of

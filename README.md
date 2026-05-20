@@ -222,7 +222,17 @@ rate-control modes:
   on sub-masker energy. Heuristic slope is `0.25 *
   log2(E[w] / E_min)` clamped to `0..7`. Pre-echo PSNR delta on the
   isolated-transient fixture exceeds 245 dB vs the long-only
-  baseline. No CRC. count1 uses table A.
+  baseline. No CRC.
+- **count1 Huffman table selection**: every granule prices the
+  count1 region under both ISO/IEC 11172-3 Table 3-B.25 ("A": 1-bit
+  code for `(0,0,0,0)`, up to 6-bit tail) and Table 3-B.26 ("B":
+  flat 4-bit-per-quad codebook) and emits the cheaper. The 1-bit
+  `count1table_select` field in side info carries the choice per
+  ISO/IEC 11172-3 §2.4.2.7 + Table 3-B.7. Sparse / quiet count1
+  regions (mostly zero quads) stay on Table A; densely populated ±1
+  tails (broadband noise, transient residuals) switch to Table B and
+  shave 1-2 bits per quad. Tie goes to Table A (matching the
+  pre-round-80 default exactly when the two tables draw).
 - **Big-value Huffman regions**: long-block granules pick
   `region0_count` / `region1_count` (4 + 3 bits in side info per
   ISO/IEC 11172-3 §2.4.2.7) by enumerating all 128 representable
