@@ -2,10 +2,9 @@
 //!
 //! D[] is the literal 512-tap polyphase synthesis window from
 //! ISO/IEC 11172-3:1993 Annex B (informative) Table 3-B.3 / Annex D.1.
-//! These are floating-point values quantised to 1/65536 (`intwinbase[j] /
-//! 65536` in the libmpg123 `tabinit.c` representation). The same numbers
-//! appear in the public-domain `dist10` reference decoder, in libmpg123
-//! and in `puremp3` (MIT).
+//! These are floating-point values quantised in steps of 1/65536; the
+//! same spec-defined table re-appears in every conformant Layer III
+//! decoder.
 //!
 //! Reference indices that are easy to spot-check:
 //!   D[  0] =  0.000000000
@@ -105,10 +104,9 @@ mod tests {
     #[test]
     fn synthesis_window_endpoints_match_iso_table() {
         // Cross-check the known reference values from ISO 11172-3
-        // Table 3-B.3 / libmpg123 intwinbase / puremp3 SYNTH_DTBL.
-        // SYNTH_WINDOW_D is a re-export of oxideav_mp1::window::SYNTHESIS_WINDOW
-        // — this test verifies the re-export still resolves to the
-        // canonical table bits.
+        // Table 3-B.3. SYNTH_WINDOW_D is a re-export of
+        // oxideav_mp1::window::SYNTHESIS_WINDOW — this test verifies
+        // the re-export still resolves to the canonical table bits.
         assert_eq!(SYNTH_WINDOW_D[0], 0.0);
         assert!((SYNTH_WINDOW_D[1] - -0.000015259).abs() < 1e-9);
         assert!((SYNTH_WINDOW_D[64] - 0.003250122).abs() < 1e-9);
