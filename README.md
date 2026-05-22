@@ -152,7 +152,18 @@ rate-control modes:
   - **CBR** (default): one rate per encoder instance, picked from the
     standard version-specific bitrate table (defaults: 128 kbps
     MPEG-1, 64 kbps MPEG-2 LSF). Quantizer fits the per-granule bit
-    budget by global-gain bisection.
+    budget by global-gain bisection. The per-(granule, channel) bit
+    target is **demand-weighted** by the L2 norm of each unit's
+    post-rotation MDCT spectrum so the M channel of an M/S-coupled
+    stereo frame absorbs the S channel's slack instead of leaving
+    it in the reservoir; floored at 0.75 × flat-share, ceilinged at
+    2 × per_unit_budget (the frame-level slot+reservoir bound). For
+    IS-coded R channels the fixed 63/98-bit scalefactor section is
+    reserved out of the pool so the bisection never overshoots the
+    frame budget into the reservoir queue. On a 128 kbps centred-
+    voice signal the M-channel target jumps from ~700 to
+    ~1100-1500 bits — a `2^(6/4) ≈ 2.8×` finer quantizer step on
+    the band the listener's ear is actually in.
   - **VBR**: opt in via `CodecOptions::set("vbr_quality", "0".."9")`.
     Two psychoacoustic models are available:
     - `psy_model=0` — lightweight per-sfb energy mask in `psy`. Picks

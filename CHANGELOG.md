@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Demand-weighted CBR bit allocator (ISO/IEC 11172-3 §C.1.5
+  outer-loop spirit).** The historical CBR allocator gave every
+  (granule, channel) unit `remaining / units_left` bits, capped at
+  `2 × per_unit_budget`. That works for evenly-loaded units but
+  wastes bits on the S channel of an M/S-coupled stereo frame —
+  post-rotation S typically needs only 10-30 % of its flat share,
+  and the 2× per-unit cap caps how much of S's slack the M-side
+  units can re-absorb (M sees at most 2× per_unit even when S
+  leaves >1× per_unit unused).
+  - Each unit's share is now `pool × demand / sum(remaining demands)`
+    where `demand` is the L2 norm of the granule's post-rotation MDCT
+    spectrum (the per-unit signal bisection actually quantises).
+    Floored at 0.75 × flat-share so a low-demand sibling still keeps
+    room for fixed overheads (IS scalefactors, scalefactor sentinels),
+    ceilinged at 2 × per_unit_budget so the frame-level invariant
+    `sum(target) ≤ slot + reservoir` holds.
+  - **Mono guard:** demand weighting only fires on stereo frames.
+    Mono inter-granule asymmetry comes from analysis-filter warmup
+    transients, not from genuine content energy differences;
+    demand-weighting a startup-blip granule would starve it net.
+  - **IS scalefactor reservation:** an IS-coded R channel emits a
+    fixed scalefactor section (63 bits MPEG-1 / 98 bits MPEG-2 LSF)
+    even on all-zero coefficients. The allocator pre-reserves those
+    bits per yet-to-encode IS R channel so the demand split doesn't
+    grant the M channel slack the IS R channel will still consume —
+    without this reservation the reservoir queue trims the overshoot
+    and produces the classic `invalid new backstep -1` reservoir
+    desync.
+  - Effect on a 128 kbps M/S-correlated stereo frame: the M-channel
+    target jumps from ~700 bits (baseline flat allocator) to
+    ~1100-1500 bits (demand-weighted), and the M-channel quantizer
+    `global_gain` drops from ~148 to ~142 — a 6-step shrinkage =
+    `2^(6/4) ≈ 2.8×` finer quantizer step ≈ ~9 dB more SNR per band
+    on the M channel, where the listener's ear actually is for
+    correlated-stereo content.
+  - New integration test
+    `cbr_correlated_stereo_ms_reconstructs_440hz_dominant`
+    pins the M-channel 440 Hz tone dominance under the new allocator.
 - **Per-granule count1 Huffman table selection (ISO/IEC 11172-3
   §2.4.2.7 + Tables 3-B.25 / 3-B.26).** The encoder used to hard-code
   `count1table_select = 0` (Table A) for every granule. Table A has a

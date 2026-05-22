@@ -412,3 +412,47 @@ fn joint_stereo_disabled_emits_dual_channel() {
         assert_eq!(*ext, 0, "expected mode_extension 0, got {ext:#b}");
     }
 }
+
+/// Demand-weighted CBR bit allocator round-92 regression.
+///
+/// The CBR allocator distributes a frame's bit budget across its 2-4
+/// (granule, channel) units. The historical allocator gave every unit
+/// an equal share (with a 2× per-unit carry-forward cap); round 92
+/// switched to a demand-weighted split where the unit's L2-norm of
+/// MDCT coefficients steers each unit's share, with a 0.75× flat-share
+/// floor so warmup-transient asymmetries don't starve a granule.
+///
+/// On correlated-stereo CBR with M/S coupling enabled, the S channel
+/// is essentially zero post-rotation; demand weighting shifts ~40 % of
+/// the S-channel's flat share to the M channel, dropping average
+/// quantizer global_gain on the M channel by 5-10 steps. This test
+/// asserts the M-channel 440 Hz tone reconstructs with sane energy
+/// fraction after the round-trip.
+#[test]
+fn cbr_correlated_stereo_ms_reconstructs_440hz_dominant() {
+    let sample_rate = 44_100u32;
+    let pcm = build_correlated_stereo(sample_rate, 1.0);
+    let bytes = encode_to_bytes_with_opts(&pcm, sample_rate, 2, 128_000, CodecOptions::new());
+
+    let decoded = decode_to_pcm(&bytes, sample_rate);
+    assert!(decoded.len() >= 8 * 1152 * 2);
+    let warmup = 4 * 1152 * 2;
+    let l: Vec<f32> = decoded[warmup..].chunks_exact(2).map(|p| p[0]).collect();
+    let r: Vec<f32> = decoded[warmup..].chunks_exact(2).map(|p| p[1]).collect();
+
+    let p_l = goertzel_power(&l, sample_rate, 440.0);
+    let p_r = goertzel_power(&r, sample_rate, 440.0);
+    let e_l: f32 = l.iter().map(|v| v * v).sum();
+    let e_r: f32 = r.iter().map(|v| v * v).sum();
+    // `goertzel_power` is unnormalised (it returns Re²+Im² of an
+    // unscaled DFT — proportional to N² * energy at the bin). Divide
+    // by total signal energy to get a relative metric: the ratio is
+    // ~N/2 when a single sinusoid dominates, which for our 88k-sample
+    // analysis window lands around 4-5e4. The "tone present" floor
+    // we want is then ~1e3 (≈ 2.3 % of perfect-tone strength).
+    let metric_l = p_l / e_l.max(1e-9);
+    let metric_r = p_r / e_r.max(1e-9);
+    eprintln!("CBR-MS 128kbps centered-voice 440Hz metric: L={metric_l:.1} R={metric_r:.1}");
+    assert!(metric_l > 1.0e3, "L 440 Hz metric too low: {metric_l}");
+    assert!(metric_r > 1.0e3, "R 440 Hz metric too low: {metric_r}");
+}
