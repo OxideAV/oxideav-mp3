@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Free-format stream support (ISO/IEC 11172-3 §2.4.2.3 final
+  paragraph).** The MP3-family demuxer used to reject any frame whose
+  `bitrate_index` field was 0 — the spec's "free format" mode where the
+  frame size is not derivable from the header alone. The container now
+  measures the byte distance from the first sync to the next sync that
+  carries the same `(version, layer, sample-rate-index, mode)`
+  signature at `open()` time and caches the result as the
+  constant-size stream invariant (the spec requires free-format streams
+  to use a fixed frame size). The new `measure_free_format_size()`
+  scans up to `MAX_FREE_FORMAT_SCAN = 32 KiB` from the first frame's
+  position; that's 2× the worst plausible single-frame size
+  (~16 KiB for an extravagant LIII free-format frame) and leaves
+  the resync budget untouched. Single-frame streams without a
+  trailing sync are rejected with `Error::Unsupported` at open
+  rather than silently passing through. `next_packet`, the CBR-fast
+  seek path, and the lazy-scan seek path all now consume
+  `Mp3Demuxer::free_format_size` whenever `FrameHeader::frame_bytes()`
+  returns `None`. New test crate `tests/free_format.rs` walks a
+  hand-crafted 5-frame free-format file end-to-end (FFmpeg's
+  libmp3lame wrapper rejects `-b:a 0` so an in-the-wild fixture is
+  not available; see `docs/audio/mp3/mp3-fixtures-and-traces.md` §6
+  for the gap explanation).
+
 - **Demand-weighted CBR bit allocator (ISO/IEC 11172-3 §C.1.5
   outer-loop spirit).** The historical CBR allocator gave every
   (granule, channel) unit `remaining / units_left` bits, capped at

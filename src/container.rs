@@ -91,14 +91,30 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
 
     let frame_start = first_offset + sync_off as u64;
 
+    // Free-format detection (ISO/IEC 11172-3 §2.4.2.3 final paragraph):
+    // when `bitrate_index == 0`, the header alone does not encode the
+    // frame size. The decoder must measure the byte distance to the
+    // next sync word that carries the same header layout (version,
+    // layer, sample rate, mode) and cache it; free-format streams must
+    // use a constant frame size by spec. We do that probe here so the
+    // `samples_per_frame` / `frame_bytes` / seek paths below can treat
+    // free-format frames identically to bit-rate-table frames.
+    let free_format_size = if hdr.bitrate_index == 0 {
+        input.seek(SeekFrom::Start(frame_start))?;
+        Some(measure_free_format_size(&mut input)?)
+    } else {
+        None
+    };
+
     // Probe the first frame for an Xing / Info / VBRI tag in its
     // side-info area. Read the entire first frame body so we can
     // examine the side-info bytes without leaving the cursor in a
     // weird spot. Required to know whether the stream is VBR with
     // a usable TOC for fast seeking. A free-format stream returns
-    // `None` for `frame_bytes` — fall back to scan-based seek for
-    // those.
-    let first_frame_bytes = hdr.frame_bytes().map(|b| b as usize);
+    // `None` from `frame_bytes()` (the header alone is not enough);
+    // we substitute the measured size from `free_format_size` so
+    // Xing / Info / VBRI probing still happens on free-format streams.
+    let first_frame_bytes = hdr.frame_bytes().map(|b| b as usize).or(free_format_size);
     let vbr_info = if let Some(fb) = first_frame_bytes {
         input.seek(SeekFrom::Start(frame_start))?;
         let mut frame_buf = vec![0u8; fb];
@@ -167,8 +183,84 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
         stream_end,
         vbr_info,
         seek_index: SeekIndex::default(),
+        free_format_size,
     }))
 }
+
+/// Measure the byte size of a free-format frame
+/// (ISO/IEC 11172-3 §2.4.2.3 final paragraph). The input cursor is
+/// expected to be positioned at the first byte of the free-format
+/// frame's 4-byte sync header. On success the cursor is restored to
+/// the entry position and `Ok(size)` is the byte distance from the
+/// frame's first byte to the next sync header that carries the same
+/// (version, layer, sample-rate, mode) signature.
+///
+/// We require the next sync header's signature to match because a
+/// free-format stream cannot legally switch any of those fields
+/// mid-stream — and accidental matches against random bytes are far
+/// more likely when only the 11-bit sync pattern is enforced.
+///
+/// Returns `Error::Unsupported` if no matching second sync is found
+/// within `MAX_FREE_FORMAT_SCAN` bytes; that's a stricter cap than the
+/// resync budget because a legitimate free-format frame at 8 kbps
+/// MPEG-1 Layer III runs ~3 KB, and even a 320 kbps Layer I free-
+/// format frame stays under ~5 KB.
+fn measure_free_format_size(input: &mut Box<dyn ReadSeek>) -> Result<usize> {
+    let entry = input.stream_position()?;
+    // Read up to MAX_FREE_FORMAT_SCAN bytes from `entry` and search for
+    // the second sync header whose top 16 bits match the first frame's
+    // top 16 bits exactly (sync + version + layer + protection match).
+    // We additionally insist that bits [15:0] of the second header
+    // share the same sample-rate-index field (bits 11:10) so we don't
+    // lock onto a sync that points into a different stream segment.
+    let mut buf = vec![0u8; MAX_FREE_FORMAT_SCAN];
+    let n = read_up_to(input, &mut buf)?;
+    input.seek(SeekFrom::Start(entry))?;
+    if n < 8 {
+        return Err(Error::unsupported(
+            "MP3: free-format frame too short to measure (need at least two sync headers)",
+        ));
+    }
+    // First header's signature (top 16 bits + sample-rate-index field).
+    let sig_top = ((buf[0] as u16) << 8) | (buf[1] as u16);
+    let sig_sr = (buf[2] >> 2) & 0x3;
+    let sig_mode = (buf[3] >> 6) & 0x3;
+    // Scan from offset 4 onward — the second sync can't sit inside the
+    // first 4-byte header.
+    let mut i = 4;
+    while i + 4 <= n {
+        if buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0 {
+            let top = ((buf[i] as u16) << 8) | (buf[i + 1] as u16);
+            let sr = (buf[i + 2] >> 2) & 0x3;
+            let mode = (buf[i + 3] >> 6) & 0x3;
+            // Match version + layer + protection (top 16 bits) and
+            // sample-rate + mode fields. Padding bit may differ between
+            // consecutive frames so we mask it out by only matching the
+            // sample-rate index. Free-format streams may NOT vary the
+            // padding bit usefully (padding adds 1 byte to a frame whose
+            // size is supposed to be constant) but tolerating it on the
+            // probe second header keeps us robust against encoders that
+            // wrote padding=1 once.
+            if top == sig_top && sr == sig_sr && mode == sig_mode {
+                let head = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+                if parse_frame_header_any_layer(&head).is_ok() {
+                    return Ok(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    Err(Error::unsupported(
+        "MP3: free-format frame size not measurable (no matching second sync within scan budget)",
+    ))
+}
+
+/// Scan budget for free-format frame-size measurement. Layer I at 448
+/// kbps MPEG-1 / 32 kHz runs ~1.6 KB / frame; Layer III at 320 kbps
+/// MPEG-1 / 32 kHz runs ~1.4 KB. Free-format streams may exceed these
+/// nominal CBR caps (that's the point), but a single frame above 16 KB
+/// is implausible for any realistic stream. 32 KB gives 2× headroom.
+const MAX_FREE_FORMAT_SCAN: usize = 32 * 1024;
 
 /// Read an ID3v2 tag header at offset 0 if present, parse it, and
 /// advance past it. Returns `(metadata_pairs, pictures)`; both will be
@@ -314,6 +406,13 @@ struct Mp3Demuxer {
     /// seek into a VBR-without-Xing stream builds the index by
     /// scanning forward from `audio_start`.
     seek_index: SeekIndex,
+    /// Measured frame size for free-format streams (ISO/IEC 11172-3
+    /// §2.4.2.3 final paragraph). `Some(size)` when the first frame's
+    /// `bitrate_index` is 0 and the inter-sync distance was successfully
+    /// measured at `open()` time; `None` for every standard-bitrate
+    /// stream. Free-format streams must use a constant frame size, so a
+    /// single measurement at open time is sufficient.
+    free_format_size: Option<usize>,
 }
 
 /// Parsed Xing / Info / VBRI tag from the first MPEG frame's side-info
@@ -438,7 +537,17 @@ impl Demuxer for Mp3Demuxer {
         let hdr = parse_frame_header_any_layer(&head)?;
         let frame_bytes = match hdr.frame_bytes() {
             Some(b) => b as usize,
-            None => return Err(Error::unsupported("MP3: free-format streams not supported")),
+            None => match self.free_format_size {
+                // Free-format stream — the size was measured once at
+                // open() time by `measure_free_format_size`; spec
+                // §2.4.2.3 guarantees it's constant across the stream.
+                Some(s) => s,
+                None => {
+                    return Err(Error::unsupported(
+                        "MP3: free-format stream size could not be measured",
+                    ))
+                }
+            },
         };
         if frame_bytes < 4 {
             return Err(Error::invalid("MP3: bogus frame length"));
@@ -506,8 +615,14 @@ impl Demuxer for Mp3Demuxer {
             } else {
                 self.scan_offset(target_pts)?
             }
-        } else if let Some(cbr_frame_bytes) = self.first_header.frame_bytes() {
-            // CBR fast path. Layout:
+        } else if let Some(cbr_frame_bytes) = self
+            .first_header
+            .frame_bytes()
+            .map(|b| b as usize)
+            .or(self.free_format_size)
+        {
+            // CBR fast path (or free-format — a stream with a measured
+            // constant frame size). Layout:
             //   audio_start                = byte 0 of frame 0
             //   audio_start + N * fb       = byte 0 of frame N
             //   pts of frame N             = N * samples_per_frame
@@ -518,7 +633,7 @@ impl Demuxer for Mp3Demuxer {
             let target_frame_idx = target_pts / self.samples_per_frame.max(1);
             self.audio_start + (target_frame_idx as u64) * (cbr_frame_bytes as u64)
         } else {
-            // Free-format / no header — only the lazy index is usable.
+            // No frame size available — only the lazy index is usable.
             self.scan_offset(target_pts)?
         };
 
@@ -658,7 +773,13 @@ impl Mp3Demuxer {
                 let hdr = parse_frame_header_any_layer(&head)?;
                 let fb = match hdr.frame_bytes() {
                     Some(b) => b as usize,
-                    None => return Ok(frame_offset),
+                    // Free-format frame: use the measured size threaded
+                    // from open(). If we don't have one (legacy code
+                    // path), give up at the current position.
+                    None => match self.free_format_size {
+                        Some(s) => s,
+                        None => return Ok(frame_offset),
+                    },
                 };
                 if walk_pts >= target_pts {
                     // We've already passed the target — rewind to the

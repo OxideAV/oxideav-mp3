@@ -106,9 +106,8 @@ while let Ok(pkt) = enc.receive_packet() {
 - **scfsi**: scalefactor reuse across the two granules of an MPEG-1 frame.
 - **Bitrates**: every standard CBR slot in both version tables.
 
-Not implemented: MPEG-2.5 (8 / 11.025 / 12 kHz), intensity stereo,
-CRC-16 verification (CRC bytes are consumed but not checked), free-
-format bitstreams.
+Not implemented: CRC-16 verification (CRC bytes are consumed but not
+checked).
 
 ## Encoder support
 
@@ -273,8 +272,13 @@ The `mp3` demuxer accepts raw `.mp1` / `.mp2` / `.mp3` streams:
 - Merges an ID3v1 trailer (last 128 bytes) if present, filling in
   whatever the v2 tag didn't already carry.
 
-Free-format streams (`bitrate_index == 0`) are rejected since their
-frame length has to be recovered by sync search.
+Free-format streams (`bitrate_index == 0`, ISO/IEC 11172-3 §2.4.2.3
+final paragraph) are supported: the demuxer measures the byte distance
+to the next matching sync header at open time and reuses that constant
+frame size for every subsequent frame (spec guarantees free-format
+streams use a constant size). The measurement scan is capped at 32 KiB —
+plenty for any realistic free-format frame — and rejects the stream if
+no second matching sync is found inside the budget.
 
 ## Codec / container IDs
 
