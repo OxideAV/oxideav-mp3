@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-mp3"
+version = "0.1.2"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-mp3"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust MPEG-1/2 Audio Layer III (MP3) decoder + minimum-viable CBR encoder"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-mp3"
+keywords = ["multimedia", "audio", "mp3", "mpeg", "codec"]
+categories = ["multimedia::encoding", "multimedia::audio"]
+
+[dependencies]
+oxideav-core = "0.1"
