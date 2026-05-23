@@ -271,6 +271,11 @@ The `mp3` demuxer accepts raw `.mp1` / `.mp2` / `.mp3` streams:
   footers, padding) the way mpg123 / ffmpeg / VLC do.
 - Merges an ID3v1 trailer (last 128 bytes) if present, filling in
   whatever the v2 tag didn't already carry.
+- Surfaces the encoder version string from the Xing/Info extension
+  block (the 9-byte ASCII field at its start — `"LAME3.100"`,
+  `"Lavc61.19"`, etc.) as the `encoder` metadata key, behind any ID3v2
+  `TSSE` frame. The extension's gapless delay/padding sub-fields are
+  not surfaced (their byte layout isn't covered by `docs/audio/mp3/`).
 
 Free-format streams (`bitrate_index == 0`, ISO/IEC 11172-3 §2.4.2.3
 final paragraph) are supported: the demuxer measures the byte distance

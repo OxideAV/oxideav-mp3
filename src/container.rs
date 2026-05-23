@@ -128,6 +128,16 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
         None
     };
 
+    // Surface the Xing/Info extension's encoder version string as
+    // container metadata (the trace's `LAME_HEADER version=...`
+    // field). An ID3v2 `encoder` / `TSSE` frame, if present, takes
+    // precedence and is left untouched.
+    if let Some(enc) = vbr_info.as_ref().and_then(|v| v.encoder.clone()) {
+        if !metadata.iter().any(|(k, _)| k == "encoder") {
+            metadata.push(("encoder".to_string(), enc));
+        }
+    }
+
     // Container-level duration: prefer Xing/VBRI total_frames; fall
     // back to lazy estimation only if no header is present. Without
     // either we still leave None and the engine guesses.
@@ -438,6 +448,13 @@ struct VbrInfo {
     /// duration mark, scaled so the value is in 256ths of
     /// `total_bytes`. Resolution: ~1% of the file's duration.
     toc: Option<[u8; 100]>,
+    /// Encoder version string from the optional Xing/Info extension
+    /// area (the trace's `LAME_HEADER version=...` field — see
+    /// `docs/audio/mp3/mp3-fixtures-and-traces.md` §7.2). The 9-byte
+    /// ASCII field at the start of the extension block; `"LAME3.100"`
+    /// for libmp3lame, `"Lavc61.19"` for FFmpeg's native encoder.
+    /// `None` when the extension is absent or unprintable.
+    encoder: Option<String>,
     /// Source of the parsed data — purely informational, threaded
     /// through to logs / tests.
     #[allow(dead_code)]
@@ -877,7 +894,12 @@ impl VbrInfo {
     ///                 bit 1 = bytes    (u32 follows)
     ///                 bit 2 = toc      (100-byte array follows)
     ///                 bit 3 = quality  (u32 follows, ignored)
-    ///   8+ : variable
+    ///   8+ : variable, then an optional extension block whose first
+    ///        9 bytes are an ASCII encoder version string (the trace's
+    ///        `LAME_HEADER version=...` field, §7.2). We surface that
+    ///        string but ignore the rest of the extension — the
+    ///        gapless delay/padding sub-fields are not documented in
+    ///        `docs/audio/mp3/`.
     /// ```
     fn parse_xing(buf: &[u8], kind: VbrTagKind) -> Option<Self> {
         if buf.len() < 8 {
@@ -911,15 +933,26 @@ impl VbrInfo {
             }
             let mut t = [0u8; 100];
             t.copy_from_slice(&buf[off..off + 100]);
-            // quality follows but we don't need it.
+            off += 100;
             Some(t)
         } else {
             None
         };
+        // The quality field (bit 3) precedes the extension block.
+        if flags & 0x8 != 0 {
+            off += 4;
+        }
+        // Optional extension: its first 9 bytes are an ASCII encoder
+        // version string ("LAME3.100", "Lavc61.19", ...). Surface it
+        // only when those bytes form a non-empty printable string;
+        // anything else (a watermark, zero padding, or no extension)
+        // yields None.
+        let encoder = parse_encoder_version(buf.get(off..off + 9));
         Some(VbrInfo {
             total_frames,
             total_bytes,
             toc,
+            encoder,
             kind,
         })
     }
@@ -954,7 +987,30 @@ impl VbrInfo {
             total_frames,
             total_bytes,
             toc: None,
+            // VBRI carries no encoder version string in its layout.
+            encoder: None,
             kind: VbrTagKind::Vbri,
         })
     }
+}
+
+/// Decode the 9-byte ASCII encoder version field at the start of a
+/// Xing/Info extension block (`docs/audio/mp3/mp3-fixtures-and-traces.md`
+/// §7.2). Returns the trimmed string only when the slice exists and is
+/// non-empty printable ASCII; trailing NUL / 0xFF padding and the
+/// numeric extension sub-fields are dropped. Anything non-printable
+/// means there is no extension (or it's a watermark) → `None`.
+fn parse_encoder_version(slice: Option<&[u8]>) -> Option<String> {
+    let bytes = slice?;
+    // Keep only the leading run of printable ASCII (0x20..=0x7e); the
+    // version string is followed by NUL / padding / binary sub-fields.
+    let end = bytes
+        .iter()
+        .position(|&b| !(0x20..=0x7e).contains(&b))
+        .unwrap_or(bytes.len());
+    let s = std::str::from_utf8(&bytes[..end]).ok()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.to_string())
 }

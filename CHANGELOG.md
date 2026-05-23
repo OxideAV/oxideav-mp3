@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encoder version surfaced from the Xing/Info extension
+  (`docs/audio/mp3/mp3-fixtures-and-traces.md` §7.2).** The demuxer
+  already parsed the Xing/Info header for total-frames / total-bytes /
+  TOC; it now also reads the 9-byte ASCII encoder version string at the
+  start of the optional extension block that follows the quality field
+  (the trace's `LAME_HEADER version=...` field — `"LAME3.100"` for
+  libmp3lame, `"Lavc61.19"` for FFmpeg's native encoder) and exposes it
+  as the `encoder` container-metadata key. The string is surfaced only
+  when those bytes are non-empty printable ASCII; trailing NUL / `0xFF`
+  padding and the (undocumented) gapless delay/padding sub-fields are
+  ignored. An ID3v2 `TSSE` frame, if present, still wins the `encoder`
+  key. New `tests/tag_parse.rs` cases cover a synthetic Info+extension
+  frame, an extension with no version string (no key invented), and the
+  real corpus fixtures.
+
 - **Free-format stream support (ISO/IEC 11172-3 §2.4.2.3 final
   paragraph).** The MP3-family demuxer used to reject any frame whose
   `bitrate_index` field was 0 — the spec's "free format" mode where the
