@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-mp3/compare/v0.1.2...v0.1.3) - 2026-05-23
+
+### Other
+
+- per-band scalefactor noise shaping + scfsi reuse (MPEG-1 long blocks)
+- surface Xing/Info encoder version as metadata (docs §7.2)
+- free-format stream support (ISO/IEC 11172-3 §2.4.2.3)
+- demand-weighted CBR bit allocator for M/S-coupled stereo
+- rewrite src/window.rs library-cross-reference comments
+- per-granule count1 Huffman table selection (ISO 11172-3 §2.4.2.7)
+- per-region big-value Huffman table selection (ISO 11172-3 §2.4.2.7)
+- implement Mp3Demuxer::seek_to (Xing/Info TOC, VBRI, CBR, scan-index)
+- add cargo-fuzz scaffolding + ffmpeg-oracle decode harness
+
 ### Added
 
 - **Per-band scalefactor noise shaping + scfsi reuse (ISO/IEC 11172-3
