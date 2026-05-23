@@ -233,6 +233,30 @@ rate-control modes:
   log2(E[w] / E_min)` clamped to `0..7`. Pre-echo PSNR delta on the
   isolated-transient fixture exceeds 245 dB vs the long-only
   baseline. No CRC.
+- **Per-band scalefactor noise shaping (ISO/IEC 11172-3 §2.4.3.4 +
+  §C.1.5.4)**: non-IS long-block granules on the Psy-1 VBR path carry
+  a per-sfb `scalefac_l[sfb]` section (emitted with
+  `scalefac_compress = 15` ⇒ slen1 = 4 / slen2 = 3, Table 3-B.32 — 74
+  bits) that shapes quantization noise toward the per-band masking
+  threshold. Each scalefactor step halves a band's quantizer step on
+  decode (`2^(-0.5·b)`), which is exactly equivalent to lowering
+  `global_gain` by 2 steps *for that band only* — so the noise
+  allocator raises the cheap global step a few notches and recovers the
+  bands the mask still cares about with a closed-form
+  `b = ceil(log2(noise_b / mask_b))` per band (capped at the slen
+  field width), spending SNR precisely where the ear needs it instead
+  of uniformly. The encoder keeps the shaped encoding only when it
+  shrinks the granule's bit count, so shaping never regresses the rate.
+- **scfsi scalefactor reuse (ISO/IEC 11172-3 §2.4.2.7 + Table 3-B.8)**:
+  when both granules of an MPEG-1 channel are non-IS long blocks
+  carrying shaped scalefactors, each of the four scfsi groups (sfb
+  0-5 / 6-10 / 11-15 / 16-20) whose granule-1 values match granule 0's
+  exactly is signalled `scfsi = 1` — granule 1 omits those
+  scalefactors and the decoder reuses granule 0's, with zero
+  reconstruction error. scfsi is forced 0 whenever any granule of the
+  frame is a short/window-switching block (per spec). MPEG-2 LSF has a
+  single granule and no scfsi field. On stationary correlated stereo
+  this reuses a large fraction of the transmitted scalefactor sections.
 - **count1 Huffman table selection**: every granule prices the
   count1 region under both ISO/IEC 11172-3 Table 3-B.25 ("A": 1-bit
   code for `(0,0,0,0)`, up to 6-bit tail) and Table 3-B.26 ("B":

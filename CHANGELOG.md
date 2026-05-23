@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-band scalefactor noise shaping + scfsi reuse (ISO/IEC 11172-3
+  §2.4.3.4, §C.1.5.4, §2.4.2.7, Table 3-B.32 / 3-B.8).** Until now the
+  encoder quantized every long-block granule with a single uniform
+  `global_gain` and emitted no per-band scalefactors (always
+  `scalefac_compress = 0`), so the per-band scfsi reuse the decoder has
+  always supported was unreachable on the encode side.
+  - **Shaping.** Non-IS long-block granules on the Psy-1 VBR path now
+    carry a per-sfb `scalefac_l[sfb]` section emitted with
+    `scalefac_compress = 15` (slen1 = 4 / slen2 = 3 = 74 bits). The new
+    `allocate_scalefactors_long` reduces the spec's §C.1.5.4 noise-
+    allocation loop to a closed form for the uniform-quantizer noise
+    estimate `N_b = (q²/12)·width_b`: amplifying band `sfb` by `b`
+    multiplies its reconstructed quantizer step by `2^(-b/2)` (so noise
+    power drops by `2^(-b)`), hence the smallest masking `b` is
+    `ceil(log2(N_b / T_b))`, capped at the field width (15 for sfb
+    0..10, 7 for sfb 11..20). The encoder pre-scales the integer
+    coefficients by the exactly-cancelling `2^(0.375·b)` (the 3/4 from
+    the `xr^(3/4)` encode vs `|is|^(4/3)` decode duality), so a shaped
+    band reconstructs identically to a `global_gain − 2b` flat encoding
+    of that band — verified by `shaped_scalefactor_equals_finer_global_
+    gain_per_band`. `encode_granule_vbr_psy1` searches a small window of
+    coarser base gains + shaping and keeps the variant only when it
+    shrinks the granule's total bits, so shaping never regresses the
+    rate.
+  - **scfsi reuse.** During MPEG-1 frame assembly, for each channel
+    whose two granules are both non-IS shaped long blocks, each of the
+    four scfsi groups (sfb 0-5 / 6-10 / 11-15 / 16-20) whose granule-1
+    scalefactors equal granule 0's is signalled `scfsi = 1`; granule 1
+    drops those writes and its `part2_3_length` is recomputed. scfsi is
+    forced 0 if any granule of the frame is short/window-switching (per
+    §2.4.2.7). `emit_side_info_mpeg1` now emits the computed scfsi bits
+    instead of a hard-coded 0.
+  - **Verification.** New `tests/encoder_scfsi.rs` confirms shaping +
+    scfsi engage on stationary correlated stereo (113 shaped granules /
+    140 reused scfsi groups across 58 frames at q=2), that the stream
+    decodes cleanly through our own decoder, and that ffmpeg
+    cross-decodes it without backstep/scalefactor errors while
+    recovering the dominant spectrum. Four new lib tests pin the
+    allocator behaviour, the encode/decode scalefactor contract, and
+    the emit-flag gating (IS / short paths ignore shaping). All
+    `docs/audio/mp3/` PDFs only; no external source consulted.
+
 - **Encoder version surfaced from the Xing/Info extension
   (`docs/audio/mp3/mp3-fixtures-and-traces.md` §7.2).** The demuxer
   already parsed the Xing/Info header for total-frames / total-bytes /

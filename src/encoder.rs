@@ -917,7 +917,7 @@ impl Mp3Encoder {
 
         // Per-mode encode of granules and computation of the on-wire
         // bitrate slot / frame bytes.
-        let (granule_data, frame_bytes, padding, frame_br_index) = match self.rate_control {
+        let (mut granule_data, frame_bytes, padding, frame_br_index) = match self.rate_control {
             RateControl::Cbr => {
                 let padding = self.next_padding();
                 let frame_bytes = self.frame_bytes(padding);
@@ -1273,6 +1273,83 @@ impl Mp3Encoder {
         };
         let main_data_slot_bytes = frame_bytes - header_bytes - si_bytes;
 
+        // scfsi scalefactor reuse (MPEG-1 only; ISO/IEC 11172-3
+        // §2.4.2.7 "scfsi" + Table 3-B.8). When both granules of a
+        // channel are non-IS long blocks that carry per-band shaped
+        // scalefactors, each of the four scfsi groups (sfb 0-5 / 6-10 /
+        // 11-15 / 16-20) whose granule-1 scalefactors match granule 0's
+        // exactly can be signalled `scfsi = 1`: the decoder reuses
+        // granule 0's values and granule 1 omits them, saving 4×slen
+        // bits per reused group with zero reconstruction error. scfsi
+        // is forced 0 if either granule of the frame is short
+        // (window_switching) per the spec. MPEG-2 LSF has a single
+        // granule and no scfsi field.
+        let mut scfsi = [[false; 4]; 2];
+        if !self.is_mpeg2 && granule_data.len() == 2 {
+            // Group → (sfb_start, sfb_end_exclusive, write_start,
+            // write_end_exclusive) in the scalefac_compress = 15 layout
+            // (21 entries: sfb 0..21).
+            const GROUPS: [(usize, usize, usize, usize); 4] = [
+                (0, 6, 0, 6),
+                (6, 11, 6, 11),
+                (11, 16, 11, 16),
+                (16, 21, 16, 21),
+            ];
+            // A frame is scfsi-eligible only if NO granule on ANY
+            // channel is a short/window-switching block.
+            let any_short = granule_data
+                .iter()
+                .flatten()
+                .any(|g| g.block_type != BlockType::Long);
+            if !any_short {
+                for ch in 0..n_ch {
+                    let g0 = &granule_data[0][ch];
+                    let g1 = &granule_data[1][ch];
+                    if !(g0.has_shaped_scalefactors && g1.has_shaped_scalefactors) {
+                        continue;
+                    }
+                    for (gi, &(sfb_lo, sfb_hi, _, _)) in GROUPS.iter().enumerate() {
+                        let reuse = (sfb_lo..sfb_hi).all(|s| g0.scalefac_l[s] == g1.scalefac_l[s]);
+                        scfsi[ch][gi] = reuse;
+                    }
+                }
+                // Apply: drop the reused groups' writes from each
+                // granule-1 channel and fix its bit accounting. Build the
+                // surviving sf_writes in sfb order, then recompute
+                // sf_bits / total_bits / part2_3_length.
+                for ch in 0..n_ch {
+                    if !scfsi[ch].iter().any(|&r| r) {
+                        continue;
+                    }
+                    let g1 = &mut granule_data[1][ch];
+                    // Map each surviving sfb-write index back through the
+                    // group mask. The original sf_writes hold exactly 21
+                    // entries (sfb 0..21) for a shaped granule.
+                    if g1.sf_writes.len() != 21 {
+                        // Defensive: only the 21-entry shaped layout is
+                        // scfsi-reusable; leave anything else untouched.
+                        continue;
+                    }
+                    let mut kept: Vec<(u32, u32)> = Vec::with_capacity(21);
+                    let mut kept_bits = 0usize;
+                    for (gi, &(_, _, w_lo, w_hi)) in GROUPS.iter().enumerate() {
+                        if scfsi[ch][gi] {
+                            continue; // reused — omit from granule 1
+                        }
+                        for w in w_lo..w_hi {
+                            kept.push(g1.sf_writes[w]);
+                            kept_bits += g1.sf_writes[w].1 as usize;
+                        }
+                    }
+                    let dropped_bits = g1.sf_bits - kept_bits;
+                    g1.sf_writes = kept;
+                    g1.sf_bits = kept_bits;
+                    g1.total_bits -= dropped_bits;
+                    g1.part2_3_length = g1.total_bits as u16;
+                }
+            }
+        }
+
         // Compose this frame's main-data bytes.
         let mut main_w = BitWriter::with_capacity(main_data_slot_bytes + 16);
         for gr_data in granule_data.iter() {
@@ -1347,7 +1424,7 @@ impl Mp3Encoder {
         if self.is_mpeg2 {
             self.emit_side_info_mpeg2(&mut si_w, main_data_begin, n_ch, &granule_data);
         } else {
-            self.emit_side_info_mpeg1(&mut si_w, main_data_begin, n_ch, &granule_data);
+            self.emit_side_info_mpeg1(&mut si_w, main_data_begin, n_ch, &granule_data, &scfsi);
         }
         si_w.align_to_byte();
         let side = si_w.into_bytes();
@@ -1376,13 +1453,20 @@ impl Mp3Encoder {
         main_data_begin: u16,
         n_ch: usize,
         granule_data: &[Vec<GranuleEncoded>],
+        scfsi: &[[bool; 4]; 2],
     ) {
         si_w.write_u32(main_data_begin as u32, 9);
         // private bits: 5 mono / 3 stereo
         si_w.write_u32(0, if n_ch == 1 { 5 } else { 3 });
-        // scfsi: ch * 4 bits
-        for _ in 0..n_ch {
-            si_w.write_u32(0, 4); // never reuse
+        // scfsi: ch * 4 bits. Each bit signals that the corresponding
+        // scfsi group's scalefactors transmitted in granule 0 are reused
+        // for granule 1 (ISO/IEC 11172-3 §2.4.2.7). Computed by the
+        // caller; 0 for every group unless granule 1's shaped
+        // scalefactors matched granule 0's across the group.
+        for scfsi_row in scfsi.iter().take(n_ch) {
+            for &reuse in scfsi_row.iter() {
+                si_w.write_u32(if reuse { 1 } else { 0 }, 1);
+            }
         }
         for gr_data in granule_data.iter() {
             for g in gr_data.iter() {
@@ -2164,6 +2248,22 @@ struct GranuleEncoded {
     /// tail. The encoder prices both tables per granule and picks the
     /// shorter one.
     count1table_select: bool,
+    /// Per-band scalefactors actually applied to this granule (long
+    /// blocks only, sfb 0..21). For a non-IS long-block granule that
+    /// engaged the noise-allocation pass these carry the chosen
+    /// `scalefac_l[sfb]` values that shape quantization noise toward the
+    /// per-band masking threshold (ISO/IEC 11172-3 §2.4.3.4 +
+    /// §C.1.5.4). `[0; 22]` when no per-band shaping was applied (flat
+    /// global-gain-only quantization) or for IS / short / mixed
+    /// granules whose scalefactor section is governed elsewhere. These
+    /// are kept so the frame assembler can decide scfsi reuse across the
+    /// two MPEG-1 granules of a channel.
+    scalefac_l: [u8; 22],
+    /// `true` when this granule's `sf_writes` carry the per-band
+    /// `scalefac_l` noise-shaping scalefactors (as opposed to the IS
+    /// `is_pos` table, or no scalefactors at all). Only such granules
+    /// are eligible for scfsi reuse against their sibling granule.
+    has_shaped_scalefactors: bool,
 }
 
 impl GranuleEncoded {
@@ -2178,6 +2278,59 @@ impl GranuleEncoded {
             w.write_u32(*code, *len);
         }
     }
+}
+
+/// Number of bits the `scalefac_compress = 15` non-IS long-block
+/// scalefactor section costs (11 sfbs at slen1 = 4 + 10 sfbs at
+/// slen2 = 3 = 74 bits). Pricing the noise-shaping pass against this
+/// fixed overhead lets the caller decide whether shaping is worth it.
+const SHAPED_SF_BITS: usize = 11 * 4 + 10 * 3;
+
+/// Allocate per-band scalefactors (`scalefac_l[sfb]`) for a non-IS
+/// long-block granule, given the per-band masking threshold from a
+/// psychoacoustic mask and the quantizer step the granule will be
+/// encoded at.
+///
+/// This is the ISO/IEC 11172-3 §C.1.5.4 noise-allocation idea reduced
+/// to a closed form for the spec's uniform-quantizer noise estimate
+/// `N_b = (q² / 12) · width_b` (the same model `worst_nmr_db` uses):
+/// amplifying band `sfb` by `scalefac_l[sfb] = b` multiplies the
+/// reconstructed quantizer step of that band by `2^(-b/2)`, so its
+/// noise power drops by `2^(-b)`. The smallest `b` that pushes the
+/// band's noise at or below its mask is therefore
+/// `b = ceil(log2(N_b / T_b))`, evaluated only on bands whose signal
+/// energy is non-trivial and whose noise actually exceeds the mask.
+///
+/// Bands are capped at the `scalefac_compress = 15` field widths
+/// (`b ≤ 15` for sfb 0..10, `b ≤ 7` for sfb 11..20) so the values fit
+/// the emitted bitstream exactly. Returns `[0; 22]` (no shaping) when
+/// every band is already masked at this step — the caller then keeps
+/// the cheaper flat `scalefac_compress = 0` encoding.
+fn allocate_scalefactors_long(
+    threshold: &[f32],
+    energy: &[f32],
+    width: &[u16],
+    step: f32,
+) -> [u8; 22] {
+    let mut sf = [0u8; 22];
+    let var = step * step / 12.0;
+    let n = threshold.len().min(21);
+    for sfb in 0..n {
+        if energy[sfb] <= 1.0e-20 || threshold[sfb] <= 1.0e-30 {
+            continue;
+        }
+        let noise = var * width[sfb] as f32;
+        let ratio = noise / threshold[sfb];
+        if ratio <= 1.0 {
+            continue;
+        }
+        // b = ceil(log2(ratio)); each unit halves the band's quantizer
+        // step (quarters its noise power per 2 units, halves per unit).
+        let b = ratio.log2().ceil().max(0.0) as i32;
+        let cap = if sfb <= 10 { 15 } else { 7 };
+        sf[sfb] = b.clamp(0, cap) as u8;
+    }
+    sf
 }
 
 fn encode_granule(
@@ -2403,6 +2556,53 @@ fn encode_granule_vbr_psy1(
         gain = gain.saturating_add(2);
         g = do_quantize(gain);
     }
+
+    // Per-band scalefactor noise shaping (ISO/IEC 11172-3 §C.1.5.4).
+    // Only non-IS pure long blocks carry a `scalefac_l` section that
+    // the decoder applies per band (IS R channels use the section for
+    // `is_pos`; short / mixed blocks have a different scalefactor
+    // layout). When eligible, try raising the *global* quantizer a few
+    // steps coarser and recovering the now-unmasked bands with cheap
+    // per-band scalefactors. The base global step then only has to
+    // cover the easy bands; the worst bands get extra SNR for ~74 bits
+    // total instead of a uniformly fine global step that over-spends on
+    // every band. Keep the variant only if it actually shrinks the
+    // encoding (`total_bits`), so shaping never regresses the bitrate.
+    if block_type == BlockType::Long && is_pos.is_none() {
+        let base = g;
+        let mut best = base;
+        // Search a small window of coarser base gains; each masked +
+        // shaped candidate either fits cheaper or is discarded.
+        for bump in [2u8, 4, 6, 8] {
+            let cand_gain = chosen.saturating_add(bump);
+            if cand_gain == chosen {
+                continue;
+            }
+            let step = global_gain_to_step(cand_gain);
+            let sf = allocate_scalefactors_long(&mask.threshold, &mask.energy, &mask.width, step);
+            if sf.iter().all(|&v| v == 0) {
+                // Coarser global with no band needing shaping would
+                // raise NMR above the mask — skip.
+                continue;
+            }
+            let cand = quantize_and_encode_full_sf(
+                xr,
+                cand_gain,
+                [0u8; 3],
+                block_type,
+                mixed_block_flag,
+                is_pos,
+                is_variant,
+                sample_rate,
+                Some(&sf),
+            );
+            if cand.total_bits < best.total_bits && cand.total_bits <= VBR_PER_GRANULE_BIT_CAP {
+                best = cand;
+            }
+        }
+        return best;
+    }
+
     g
 }
 
@@ -2514,6 +2714,57 @@ fn quantize_and_encode_full(
     is_variant: IsVariant,
     sample_rate: u32,
 ) -> GranuleEncoded {
+    quantize_and_encode_full_sf(
+        xr,
+        global_gain,
+        subblock_gain,
+        block_type,
+        mixed_block_flag,
+        is_pos,
+        is_variant,
+        sample_rate,
+        None,
+    )
+}
+
+/// `quantize_and_encode_full` plus an optional per-band scalefactor
+/// vector `scalefac_l` (MPEG-1 long-block noise shaping). When `Some`,
+/// each long-block scalefactor band `sfb` is amplified by
+/// `scalefac_l[sfb]` steps: the decoder will scale that band's
+/// dequantized coefficients down by `2^(-0.5 * scalefac_l[sfb])`
+/// (ISO/IEC 11172-3 §2.4.3.4, scalefac_scale = 0), so the encoder
+/// scales the integer coefficients `is[i]` UP by the inverse on its
+/// `xr^(3/4)` mapping (`2^(0.5 * scalefac_l[sfb] * 3/4) =
+/// 2^(0.375 * scalefac_l[sfb])`). One scalefactor step is therefore
+/// exactly equivalent to lowering `global_gain` by 2 steps **for that
+/// band only** — letting the encoder spend SNR precisely where the
+/// per-band masking threshold demands it instead of globally. The
+/// scalefactors are emitted ahead of the Huffman data via
+/// `scalefac_compress` row 15 ((slen1, slen2) = (4, 3); Table 3-B.32),
+/// which covers values 0..=15 in bands 0..10 and 0..=7 in bands 11..20.
+///
+/// `scalefac_l = Some` is only honoured for non-IS pure long blocks;
+/// the IS / short / mixed scalefactor sections are governed by their
+/// own dedicated paths and the parameter is ignored there.
+#[allow(clippy::too_many_arguments)]
+fn quantize_and_encode_full_sf(
+    xr: &[f32; 576],
+    global_gain: u8,
+    subblock_gain: [u8; 3],
+    block_type: BlockType,
+    mixed_block_flag: bool,
+    is_pos: Option<&[u8; 22]>,
+    is_variant: IsVariant,
+    sample_rate: u32,
+    scalefac_l: Option<&[u8; 22]>,
+) -> GranuleEncoded {
+    // Per-band scalefactor amplification only applies to non-IS pure
+    // long blocks. Anywhere else the IS / short / mixed sections own the
+    // scalefactor layout, so the parameter is dropped.
+    let shaped_sf: Option<&[u8; 22]> = match (scalefac_l, is_pos, block_type) {
+        (Some(sf), None, BlockType::Long) => Some(sf),
+        _ => None,
+    };
     let g = global_gain as i32;
     let exp = ((210 - g) as f32) * 3.0 / 16.0;
     let scale = (exp * std::f32::consts::LN_2).exp();
@@ -2549,6 +2800,28 @@ fn quantize_and_encode_full(
     } else {
         None
     };
+    // Per-coefficient scalefactor amplification factor (long-block
+    // noise shaping). `sf_factor[i] = 2^(0.375 * scalefac_l[sfb(i)])`
+    // pre-multiplies the encoder's `xr^(3/4)` magnitude so that, after
+    // the decoder applies its own `2^(-0.5 * scalefac_l[sfb])` step on
+    // the reconstructed `|is|^(4/3)`, the band returns to the same
+    // `xr` it would have had under flat global-gain quantization —
+    // only now quantized on a finer grid (more bits, less noise). The
+    // 0.375 = 0.5 × 3/4 exponent falls out of the `^(3/4)` encode vs
+    // `^(4/3)` decode duality.
+    let sf_factor: Option<[f32; 576]> = shaped_sf.map(|sf| {
+        let bounds = sfband_long(sample_rate);
+        let mut f = [1.0f32; 576];
+        for sfb in 0..21 {
+            let lo = bounds[sfb] as usize;
+            let hi = (bounds[sfb + 1] as usize).min(576);
+            let amp = f32_pow2_frac(0.375 * sf[sfb] as f32);
+            for fi in f.iter_mut().take(hi).skip(lo) {
+                *fi = amp;
+            }
+        }
+        f
+    });
     let mut is_ = [0i32; 576];
     let mut max_abs = 0i32;
     for i in 0..576 {
@@ -2561,6 +2834,10 @@ fn quantize_and_encode_full(
                 Some(map) => scale_w[map[i] as usize],
                 None => scale,
             }
+        };
+        let s = match &sf_factor {
+            Some(f) => s * f[i],
+            None => s,
         };
         let mag = a.powf(0.75) * s;
         let v = (mag + 0.4054).floor() as i32;
@@ -2743,8 +3020,26 @@ fn quantize_and_encode_full(
                 (sf, 7 * 4 + 7 * 5 + 7 * 5, 0u8, MPEG2_IS_SCALEFAC_COMPRESS_9)
             }
         },
+        // Non-IS long block with per-band noise-shaping scalefactors.
+        // Emit them with `scalefac_compress = 15` ⇒ (slen1, slen2) =
+        // (4, 3): sfb 0..10 carry 4-bit values (0..15) and sfb 11..20
+        // carry 3-bit values (0..7), per Table 3-B.32. (The decoder's
+        // scfsi-group split is 0-5/6-10/11-15/16-20, all consistent with
+        // this slen partition.) Total = 11 × 4 + 10 × 3 = 74 bits.
+        None if shaped_sf.is_some() && block_type == BlockType::Long => {
+            let sf_vals = shaped_sf.unwrap();
+            let mut sf: Vec<(u32, u32)> = Vec::with_capacity(21);
+            for &v in sf_vals.iter().take(11) {
+                sf.push(((v as u32) & 0xF, 4));
+            }
+            for &v in sf_vals.iter().skip(11).take(10) {
+                sf.push(((v as u32) & 0x7, 3));
+            }
+            (sf, 11 * 4 + 10 * 3, 15u8, 0u16)
+        }
         _ => (Vec::new(), 0usize, 0u8, 0u16),
     };
+    let emitted_shaped = !sf_writes.is_empty() && is_pos.is_none();
     let total_bits = total_bits + sf_bits;
 
     // part2_3_length = scalefactor bits + huffman bits.
@@ -2767,6 +3062,11 @@ fn quantize_and_encode_full(
         subblock_gain,
         mixed_block_flag,
         count1table_select,
+        scalefac_l: match shaped_sf {
+            Some(sf) if emitted_shaped => *sf,
+            _ => [0u8; 22],
+        },
+        has_shaped_scalefactors: emitted_shaped,
     }
 }
 
@@ -4155,5 +4455,166 @@ mod tests {
         assert!(writes.is_empty());
         assert_eq!(bits, 0);
         assert!(!use_b);
+    }
+
+    /// The scalefactor allocator amplifies exactly the bands whose
+    /// uniform-quantizer noise exceeds the masking threshold, and never
+    /// exceeds the `scalefac_compress = 15` field widths (15 for sfb
+    /// 0..10, 7 for sfb 11..20).
+    #[test]
+    fn scalefactor_allocator_targets_unmasked_bands() {
+        let mut threshold = vec![1.0e9f32; 22]; // huge mask everywhere
+        let energy = vec![1.0e6f32; 22];
+        let width = vec![10u16; 22];
+        let step = 16.0f32; // var = 256/12 ≈ 21.3 per coeff
+                            // All masked ⇒ no shaping.
+        let sf = allocate_scalefactors_long(&threshold, &energy, &width, step);
+        assert!(sf.iter().all(|&v| v == 0), "fully-masked granule shaped");
+        // Now make two bands unmasked: a low band (cap 15) and a high
+        // band (cap 7). Drop their thresholds far below the noise.
+        threshold[2] = 1.0e-3; // noise/thr huge ⇒ should hit cap 15
+        threshold[18] = 1.0e-3; // high band ⇒ cap 7
+        let sf = allocate_scalefactors_long(&threshold, &energy, &width, step);
+        assert_eq!(sf[2], 15, "low unmasked band should hit slen1 cap");
+        assert_eq!(sf[18], 7, "high unmasked band should hit slen2 cap");
+        for (i, &v) in sf.iter().enumerate() {
+            if i != 2 && i != 18 {
+                assert_eq!(v, 0, "band {i} amplified unexpectedly");
+            }
+        }
+    }
+
+    /// Allocator amplifies a mildly-unmasked band by just enough steps,
+    /// not the maximum: noise/threshold = 4 ⇒ b = ceil(log2 4) = 2.
+    #[test]
+    fn scalefactor_allocator_uses_minimal_amplification() {
+        let threshold = vec![1.0e9f32; 22];
+        let energy = vec![1.0e6f32; 22];
+        let width = vec![12u16; 22];
+        let step = 1.0f32; // var = 1/12; noise = width/12 = 1.0 in band
+        let mut thr = threshold.clone();
+        // band 5 noise = 1.0; set threshold so noise/thr = 4 exactly.
+        thr[5] = 0.25;
+        let sf = allocate_scalefactors_long(&thr, &energy, &width, step);
+        assert_eq!(sf[5], 2, "noise/thr=4 ⇒ 2 scalefactor steps");
+    }
+
+    /// Encode/decode scalefactor contract (§2.4.3.4): applying a per-band
+    /// scalefactor `b` at `global_gain = g` is **exactly equivalent** to
+    /// using `global_gain = g - 2b` for that band's coefficients with no
+    /// scalefactor. The encoder pre-multiplies `is` by `2^(0.375 b)` and
+    /// the decoder applies `2^(-0.5 b)`; the round-trip must reconstruct
+    /// the identical float coefficients as the flat finer-gain encoding.
+    #[test]
+    fn shaped_scalefactor_equals_finer_global_gain_per_band() {
+        use crate::requantize::requantize_granule;
+        use crate::scalefactor::ScaleFactors;
+        use crate::sideinfo::GranuleChannel;
+        let mut xr = [0.0f32; 576];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = (i as f32 * 0.05).sin() * 0.3;
+        }
+        let bounds = sfband_long(44_100);
+        // Test band 4 amplified by b = 2 at global_gain 200.
+        let g_base: i32 = 200;
+        let sfb = 4usize;
+        let b = 2u8;
+        // --- Shaped path: gain g_base, scalefac_l[sfb] = b. ---
+        let amp = f32_pow2_frac(0.375 * b as f32);
+        let exp_s = ((210 - g_base) as f32) * 3.0 / 16.0;
+        let base_s = (exp_s * std::f32::consts::LN_2).exp();
+        let mut is_shaped = [0i32; 576];
+        for i in bounds[sfb] as usize..bounds[sfb + 1] as usize {
+            let mag = xr[i].abs().powf(0.75) * base_s * amp;
+            let v = ((mag + 0.4054).floor() as i32).min(8191);
+            is_shaped[i] = if xr[i] < 0.0 { -v } else { v };
+        }
+        let mut sf = ScaleFactors::default();
+        sf.l[sfb] = b;
+        let gc_shaped = GranuleChannel {
+            global_gain: g_base as u8,
+            ..GranuleChannel::default()
+        };
+        let mut out_shaped = [0.0f32; 576];
+        requantize_granule(&is_shaped, &mut out_shaped, &gc_shaped, &sf, 44_100);
+        // --- Flat path: gain g_base - 2b, no scalefactor. ---
+        let g_fine = g_base - 2 * b as i32;
+        let exp_f = ((210 - g_fine) as f32) * 3.0 / 16.0;
+        let base_f = (exp_f * std::f32::consts::LN_2).exp();
+        let mut is_flat = [0i32; 576];
+        for i in bounds[sfb] as usize..bounds[sfb + 1] as usize {
+            let mag = xr[i].abs().powf(0.75) * base_f;
+            let v = ((mag + 0.4054).floor() as i32).min(8191);
+            is_flat[i] = if xr[i] < 0.0 { -v } else { v };
+        }
+        // The integer coefficients must be identical (the amplification
+        // factor 2^(0.375 b) exactly equals the gain delta 2^(0.375·2b)
+        // on the encode-side magnitude).
+        assert_eq!(
+            &is_shaped[bounds[sfb] as usize..bounds[sfb + 1] as usize],
+            &is_flat[bounds[sfb] as usize..bounds[sfb + 1] as usize],
+            "shaped and finer-gain quantization must produce identical is"
+        );
+        let gc_flat = GranuleChannel {
+            global_gain: g_fine as u8,
+            ..GranuleChannel::default()
+        };
+        let sf0 = ScaleFactors::default();
+        let mut out_flat = [0.0f32; 576];
+        requantize_granule(&is_flat, &mut out_flat, &gc_flat, &sf0, 44_100);
+        for i in bounds[sfb] as usize..bounds[sfb + 1] as usize {
+            assert!(
+                (out_shaped[i] - out_flat[i]).abs() < 1e-4,
+                "band {sfb} coeff {i}: shaped {} != flat {}",
+                out_shaped[i],
+                out_flat[i]
+            );
+        }
+    }
+
+    /// The shaped-scalefactor path tags the granule correctly for scfsi
+    /// eligibility and side-info emission.
+    #[test]
+    fn shaped_granule_sets_emit_flags() {
+        let mut xr = [0.0f32; 576];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = (i as f32 * 0.07).sin() * 0.5;
+        }
+        let mut sf_l = [0u8; 22];
+        sf_l[2] = 4;
+        sf_l[15] = 3;
+        let g = quantize_and_encode_full_sf(
+            &xr,
+            160,
+            [0u8; 3],
+            BlockType::Long,
+            false,
+            None,
+            IsVariant::Mpeg1,
+            44_100,
+            Some(&sf_l),
+        );
+        assert!(g.has_shaped_scalefactors);
+        assert_eq!(g.scalefac_compress, 15);
+        assert_eq!(g.scalefac_l, sf_l);
+        // 21 scalefactor writes (11 at slen1=4, 10 at slen2=3 = 74 bits).
+        assert_eq!(g.sf_writes.len(), 21);
+        assert_eq!(g.sf_bits, SHAPED_SF_BITS);
+        // Shaping is dropped for IS R channels (is_pos governs the
+        // section) and for short blocks.
+        let is_pos = [0u8; 22];
+        let g_is = quantize_and_encode_full_sf(
+            &xr,
+            160,
+            [0u8; 3],
+            BlockType::Long,
+            false,
+            Some(&is_pos),
+            IsVariant::Mpeg1,
+            44_100,
+            Some(&sf_l),
+        );
+        assert!(!g_is.has_shaped_scalefactors, "IS path must ignore shaping");
+        assert_eq!(g_is.scalefac_compress, 13, "IS keeps its own compress");
     }
 }
