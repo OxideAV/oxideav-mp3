@@ -6,6 +6,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Clean-room MPEG audio **framing** layer in the new `frame` module,
+  built solely from ISO/IEC 11172-3:1993 (§2.4.1.3 / §2.4.2.3) and
+  ISO/IEC 13818-3:1997 (§2.4.2.3 lower-sampling-frequency
+  redefinitions):
+  - `parse_header` → typed `Mp3FrameHeader` (syncword validation;
+    MPEG-1/MPEG-2 version via the `ID` bit; layer; CRC-protection
+    flag; per-version/per-layer bitrate ladders; sampling frequency;
+    padding; channel mode; mode_extension; copyright/original;
+    emphasis). Reserved/forbidden field values are rejected via a
+    typed `HeaderError`.
+  - Per-frame byte-length computation including the padding slot
+    (`Mp3FrameHeader::frame_len`), with `samples_per_frame` and
+    `channel_count` helpers. Free-format frames report no length.
+  - `FrameWalker`: a self-delimiting frame iterator with mid-stream
+    resynchronisation on bad sync, garbage gaps, and truncated
+    trailing frames.
+  - 22 unit tests built from spec-derived byte patterns.
+- `register()` remains a no-op (no decoder/demuxer wired yet); the
+  decode/encode surface still returns `Error::NotImplemented`.
+
 ### Erased
 
 - Prior master history was force-erased on **2026-05-24** under

@@ -1,20 +1,43 @@
 //! # oxideav-mp3
 //!
-//! **Status:** orphan-rebuild scaffold (reset 2026-05-24).
+//! **Status:** clean-room rebuild in progress (reset 2026-05-24).
 //!
 //! The prior implementation was retired under the workspace clean-room
 //! policy: several of its data tables and decode-loop structures were
 //! documented as having been consulted from external reference
 //! implementations (their source, not the ISO/IEC specification),
 //! which violates the clean-room provenance requirement regardless of
-//! those references' licensing. The crate will be re-implemented from
-//! scratch against the staged ISO/IEC 11172-3 / 13818-3 Layer III
-//! specification (numeric tables read only from the standard) in a
-//! future clean-room round.
+//! those references' licensing. The crate is being re-implemented from
+//! scratch against ISO/IEC 11172-3:1993 and ISO/IEC 13818-3:1997
+//! (numeric tables read only from those standards).
 //!
-//! Every public API currently returns [`Error::NotImplemented`].
+//! ## What is implemented
+//!
+//! The [`frame`] module provides the MPEG audio **framing** layer:
+//! the four-byte frame-header parser ([`frame::parse_header`] →
+//! [`frame::Mp3FrameHeader`]), per-frame byte-length computation
+//! including the padding slot, and a self-delimiting
+//! [`frame::FrameWalker`] that iterates frames over a byte buffer with
+//! mid-stream resynchronisation on bad sync.
+//!
+//! ## What is not implemented yet
+//!
+//! No Layer III audio decode (side-info parser, Huffman, requantise,
+//! IMDCT, synthesis filterbank) and no encoder. [`register`] is a
+//! no-op until a [`Decoder`]/[`Demuxer`] is wired up, so the public
+//! decode/encode surface still returns [`Error::NotImplemented`].
+//!
+//! [`Decoder`]: oxideav_core::Decoder
+//! [`Demuxer`]: oxideav_core::Demuxer
 
 #![warn(missing_debug_implementations)]
+
+pub mod frame;
+
+pub use frame::{
+    parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
+    Mp3FrameHeader, MpegVersion,
+};
 
 use oxideav_core::RuntimeContext;
 
