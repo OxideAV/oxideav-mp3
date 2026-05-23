@@ -20,12 +20,21 @@
 //! [`frame::FrameWalker`] that iterates frames over a byte buffer with
 //! mid-stream resynchronisation on bad sync.
 //!
+//! The [`side_info`] module parses the MPEG-1 Layer III
+//! **side-information** block (ISO/IEC 11172-3 §2.4.1.7 / §2.4.2.7):
+//! [`side_info::parse_side_info`] → [`side_info::SideInfo`], covering
+//! `main_data_begin`, `private_bits`, `scfsi`, and the full
+//! per-granule-per-channel [`side_info::GranuleChannel`] record for
+//! both the long-block and window-switching branches.
+//!
 //! ## What is not implemented yet
 //!
-//! No Layer III audio decode (side-info parser, Huffman, requantise,
-//! IMDCT, synthesis filterbank) and no encoder. [`register`] is a
-//! no-op until a [`Decoder`]/[`Demuxer`] is wired up, so the public
-//! decode/encode surface still returns [`Error::NotImplemented`].
+//! No Layer III main-data decode (scalefactor reader, Huffman,
+//! requantise, IMDCT, synthesis filterbank) and no encoder; the
+//! MPEG-2 / MPEG-2.5 single-granule side-info variant is also out of
+//! scope. [`register`] is a no-op until a [`Decoder`]/[`Demuxer`] is
+//! wired up, so the public decode/encode surface still returns
+//! [`Error::NotImplemented`].
 //!
 //! [`Decoder`]: oxideav_core::Decoder
 //! [`Demuxer`]: oxideav_core::Demuxer
@@ -33,10 +42,15 @@
 #![warn(missing_debug_implementations)]
 
 pub mod frame;
+pub mod side_info;
 
 pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
     Mp3FrameHeader, MpegVersion,
+};
+pub use side_info::{
+    parse_side_info, BlockType, GranuleChannel, SideInfo, SideInfoError, GRANULES,
+    SIDE_INFO_BYTES_MONO, SIDE_INFO_BYTES_STEREO,
 };
 
 use oxideav_core::RuntimeContext;

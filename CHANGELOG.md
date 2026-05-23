@@ -25,6 +25,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     resynchronisation on bad sync, garbage gaps, and truncated
     trailing frames.
   - 22 unit tests built from spec-derived byte patterns.
+- Clean-room MPEG-1 Layer III **side-information** parser in the new
+  `side_info` module, built solely from ISO/IEC 11172-3:1993 §2.4.1.7
+  (syntax) and §2.4.2.7 (semantics):
+  - `parse_side_info` → typed `SideInfo` over the fixed-size block
+    (17 bytes mono / 32 bytes stereo): `main_data_begin` (9 bits),
+    `private_bits` (5-bit mono / 3-bit stereo), and `scfsi[ch][band]`
+    (4 bands/channel).
+  - Per-granule (×2) per-channel `GranuleChannel`: `part2_3_length`,
+    `big_values`, `global_gain`, `scalefac_compress`,
+    `window_switching_flag`, the window-switching branch
+    (`block_type` via a typed `BlockType`, `mixed_block_flag`,
+    `table_select`, `subblock_gain`, plus the §2.4.2.7 default
+    `region0_count` / `region1_count`) versus the long-block branch
+    (`table_select[3]`, `region0_count`, `region1_count`), and
+    `preflag` / `scalefac_scale` / `count1table_select`.
+  - Non-MPEG-1 and non-Layer-III headers, and short slices, are
+    rejected via a typed `SideInfoError`. (The MPEG-2 / MPEG-2.5
+    single-granule variant is out of scope this round.)
+  - 10 unit tests built from spec-derived byte patterns (mono +
+    stereo, long-block + window-switching, short/start/end blocks,
+    max-field saturation).
 - `register()` remains a no-op (no decoder/demuxer wired yet); the
   decode/encode surface still returns `Error::NotImplemented`.
 
