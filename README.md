@@ -156,7 +156,8 @@ float frequency lines `xr[576]` for one granule-channel:
   is the LSF (MPEG-2 / MPEG-2.5) variant, which shares the identical
   §2.4.3.4 formula (ISO/IEC 13818-3 defers to ISO/IEC 11172-3 here).
   Short-block lines stay in their native `(sfb, window, freqline)`
-  interleave; the §2.4.3.4.8 reorder is a later stage.
+  interleave; the §2.4.3.4.8 reorder is the next stage (`reorder` module
+  below).
 - Band→scalefactor mapping uses the Table B.8 long- and short-block
   start indices for 32 / 44.1 / 48 kHz (LSF reuses the long layouts
   this round; LSF-specific band tables are deferred). 19 unit tests
@@ -166,13 +167,37 @@ float frequency lines `xr[576]` for one granule-channel:
   interleave, the mixed-block split, the LSF path, sign preservation,
   and a large-magnitude finiteness check.
 
+The `reorder` module covers the Layer III **short-block reordering**
+stage (ISO/IEC 11172-3:1993 §2.4.3.4.8) — the step between
+requantization and the IMDCT that rearranges short-block coefficients
+into frequency (subband) order:
+
+- `reorder` rewrites the requantized short-block lines from their native
+  `(scf_band, window, freqline)` Huffman interleave (§2.4.2.7) into
+  subband order `xr[subband][window][freqline]`. For a short band with
+  per-window start `s` and width `w`, the native span `[3·s, 3·(s+w))`
+  laid out as three runs `[win0][win1][win2]` becomes
+  `out[3·s + 3·k + win] = in[3·s + win·w + k]`, so each consecutive run
+  of 18 output lines forms one polyphase subband (6 frequency lines × 3
+  windows) — the unit the §2.4.3.4.10 synthesis filterbank consumes.
+- Long / start / end blocks (`block_type != 2`) pass through unchanged
+  (already increasing-frequency-ordered). A **mixed** block reorders
+  only its short region (short bands 3..12, interleaved lines 36..)
+  while its long region (lines 0..36) passes through. Band boundaries
+  reuse the same Table B.8 short-block start indices as `requantize`.
+- 11 unit tests cover long pass-through, the band-0 / band-6 three-window
+  interleave, the first-18-line subband structure, bijection checks at
+  44.1 / 48 / 32 kHz, mixed-block long-region preservation and
+  short-region reorder from band 3, above-highest-band pass-through, and
+  start/end pass-through.
+
 ### Not yet implemented
 
-Short-block reordering (§2.4.3.4.8), stereo processing (MS / intensity,
-§2.4.3.4.9), the IMDCT, and the synthesis filterbank, plus any encoder.
-`register()` is a no-op until a decoder/demuxer is wired up. The
-remaining big-values codebooks (15, 16, 24 and their 17..=23 / 25..=31
-`linbits` aliases) are still a pending main-data sub-stage.
+Stereo processing (MS / intensity, §2.4.3.4.9), alias reduction
+(§2.4.3.4.10.1), the IMDCT, and the synthesis filterbank, plus any
+encoder. `register()` is a no-op until a decoder/demuxer is wired up.
+The remaining big-values codebooks (15, 16, 24 and their 17..=23 /
+25..=31 `linbits` aliases) are still a pending main-data sub-stage.
 
 ## License
 

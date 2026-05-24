@@ -106,7 +106,10 @@ fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usiz
 /// active sampling rate (Table B.8, short-block "index of start"). Entry
 /// `i` is the first per-window line of band `i`; entry 12 is one past
 /// band 11 so a band's per-window width is `starts[sfb + 1] - starts[sfb]`.
-fn short_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 13] {
+///
+/// Shared with the §2.4.3.4.8 [`crate::reorder`] stage, which maps the
+/// same native band layout into subband order.
+pub(crate) fn short_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 13] {
     let _ = version;
     match sample_rate_hz {
         32000 | 16000 | 8000 => &SHORT_STARTS_32,

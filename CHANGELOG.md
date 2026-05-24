@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Clean-room Layer III **short-block reordering** stage in the new
+  `reorder` module, built solely from ISO/IEC 11172-3:1993 §2.4.3.4.8
+  (the reorder requirement), §2.4.2.7 (the native Huffman
+  `(scf_band, window, freqline)` interleave), and the Table B.8
+  short-block band-start indices:
+  - `reorder` → fresh `[f32; 576]` `xr` in subband order. For a short
+    band with per-window start `s` and width `w`, the native span
+    `[3·s, 3·(s+w))` laid out as `[win0][win1][win2]` is rewritten to
+    `out[3·s + 3·k + win] = in[3·s + win·w + k]`, so each consecutive
+    run of 18 lines forms one polyphase subband (6 frequency lines × 3
+    windows) for the §2.4.3.4.10 IMDCT.
+  - Long / start / end blocks (`block_type != 2`) pass through
+    unchanged (already in increasing-frequency order, §2.4.2.7); a
+    mixed block reorders only its short region (short bands 3..12,
+    interleaved lines 36..) while its long region (lines 0..36) passes
+    through.
+  - Shares the Table B.8 short-block band-start table with the
+    `requantize` stage (`short_band_starts` is now `pub(crate)`).
+  - 11 reorder unit tests from spec-derived patterns: long pass-through,
+    band-0/band-6 three-window interleave, the first-18-line subband
+    structure, bijection (permutation) checks at 44.1/48/32 kHz,
+    mixed-block long-region preservation + short-region reorder from
+    band 3, above-highest-band pass-through, and start/end pass-through.
 - Clean-room Layer III **requantization** stage in the new
   `requantize` module, built solely from ISO/IEC 11172-3:1993
   §2.4.3.4.7.1 (the requantization formula), Table B.6 (the `pretab`

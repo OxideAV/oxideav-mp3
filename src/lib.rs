@@ -67,9 +67,19 @@
 //! split (long bands 0..8 / lines 0..36, then short bands 3..12), and
 //! the LSF variant (which shares the same §2.4.3.4 formula).
 //!
+//! The [`reorder`] module implements the Layer III **short-block
+//! reordering** stage — ISO/IEC 11172-3:1993 §2.4.3.4.8 — which rewrites
+//! the requantized short-block lines from their native
+//! `(scf_band, window, freqline)` Huffman interleave into subband order
+//! `xr[subband][window][freqline]`, so each consecutive run of 18 lines
+//! forms one polyphase subband (6 frequency lines × 3 windows) for the
+//! IMDCT. [`reorder::reorder`] reorders pure short blocks and the short
+//! region of mixed blocks (short bands 3..12, lines 36..) while leaving
+//! long blocks and the mixed-block long region (lines 0..36) unchanged.
+//!
 //! ## What is not implemented yet
 //!
-//! No reordering, stereo processing (MS / intensity), IMDCT, or
+//! No stereo processing (MS / intensity), alias reduction, IMDCT, or
 //! synthesis filterbank, and no encoder.
 //! The Huffman stage covers Table 3-B.7 entries 0..=13 (the quad
 //! tables plus the small/medium big-values tables); the large 16×16
@@ -86,6 +96,7 @@
 
 pub mod frame;
 pub mod huffman;
+pub mod reorder;
 pub mod requantize;
 pub mod scalefactors;
 pub mod side_info;
@@ -95,6 +106,7 @@ pub use frame::{
     Mp3FrameHeader, MpegVersion,
 };
 pub use huffman::{decode_huffman, HuffmanError, NUM_LINES};
+pub use reorder::reorder;
 pub use requantize::{requantize, scalefac_multiplier, PRETAB};
 pub use scalefactors::{
     decode_scalefactors, lsf_scale_params, FrameScaleFactors, LsfScaleParams, MainDataReader,
