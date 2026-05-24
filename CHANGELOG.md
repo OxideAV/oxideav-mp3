@@ -40,12 +40,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     `region0_count` / `region1_count`) versus the long-block branch
     (`table_select[3]`, `region0_count`, `region1_count`), and
     `preflag` / `scalefac_scale` / `count1table_select`.
-  - Non-MPEG-1 and non-Layer-III headers, and short slices, are
-    rejected via a typed `SideInfoError`. (The MPEG-2 / MPEG-2.5
-    single-granule variant is out of scope this round.)
-  - 10 unit tests built from spec-derived byte patterns (mono +
-    stereo, long-block + window-switching, short/start/end blocks,
-    max-field saturation).
+  - Non-Layer-III headers and short slices are rejected via a typed
+    `SideInfoError` (`NotLayer3` / `TooShort`).
+- MPEG-2 / MPEG-2.5 **LSF (lower-sampling-frequency) side-info**
+  variant in `side_info`, built solely from ISO/IEC 13818-3:1997
+  §2.4.1.7 (syntax) and §2.4.2.7 (semantics). `parse_side_info` now
+  dispatches on `Mp3FrameHeader::version`:
+  - LSF form decodes a fixed-size block (9 bytes mono / 17 bytes
+    stereo, matching the §2.4.2.4 CRC bit ranges) with an 8-bit
+    `main_data_begin`, `private_bits` (1-bit mono / 2-bit stereo),
+    **no** `scfsi`, and a **single** granule.
+  - Per-channel `scalefac_compress` widens to 9 bits; `preflag` is
+    not transmitted in LSF (§2.4.2.7 derives it from
+    `scalefac_compress`), so the parser leaves it `false`.
+  - `GranuleChannel::scalefac_compress` widened `u8` → `u16`;
+    `SideInfo` gains `lsf` and `granule_count` markers and a
+    layout-aware `byte_len()`; new `GRANULES_LSF`,
+    `SIDE_INFO_BYTES_LSF_MONO`, `SIDE_INFO_BYTES_LSF_STEREO`
+    constants. `SideInfoError::NotMpeg1` renamed `NotLayer3` (both
+    MPEG-1 and MPEG-2 Layer III are now parsed).
+  - 16 side-info unit tests total (was 10) from spec-derived byte
+    patterns: MPEG-1 mono/stereo long + window-switching +
+    saturation, plus LSF mono/stereo long, LSF window-switched short,
+    LSF max-field saturation, LSF too-short, and LSF trailing-byte
+    cases.
 - `register()` remains a no-op (no decoder/demuxer wired yet); the
   decode/encode surface still returns `Error::NotImplemented`.
 

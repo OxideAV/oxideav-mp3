@@ -41,14 +41,24 @@ field redefinitions of ISO/IEC 13818-3 §2.4.2.3):
   resynchronises mid-stream on bad sync, garbage gaps, or a truncated
   trailing frame.
 
-The `side_info` module covers the **MPEG-1 Layer III side-information**
-block that follows the header (and optional CRC), per ISO/IEC 11172-3
-§2.4.1.7 (syntax) and §2.4.2.7 (semantics):
+The `side_info` module covers the **Layer III side-information** block
+that follows the header (and optional CRC), for both layouts:
+MPEG-1 (ISO/IEC 11172-3 §2.4.1.7 syntax, §2.4.2.7 semantics) and
+MPEG-2 / MPEG-2.5 lower-sampling-frequency (ISO/IEC 13818-3 §2.4.1.7
+/ §2.4.2.7). `parse_side_info` dispatches on the header's MPEG version:
 
-- `parse_side_info` decodes the fixed-size block (17 bytes mono /
-  32 bytes stereo) into a typed `SideInfo`: `main_data_begin`,
-  `private_bits` (5-bit mono / 3-bit stereo), and `scfsi[ch][band]`.
-- Per granule (×2) per channel, a `GranuleChannel` carries
+- **MPEG-1**: fixed-size block (17 bytes mono / 32 bytes stereo) →
+  typed `SideInfo` with `main_data_begin` (9-bit), `private_bits`
+  (5-bit mono / 3-bit stereo), `scfsi[ch][band]`, and two granules.
+- **MPEG-2 / MPEG-2.5 LSF**: fixed-size block (9 bytes mono / 17 bytes
+  stereo) with `main_data_begin` (8-bit), `private_bits` (1-bit mono /
+  2-bit stereo), **no** `scfsi`, and a single granule. Per-channel
+  `scalefac_compress` widens to 9 bits, and `preflag` is **not**
+  transmitted (the §2.4.2.7 LSF procedure derives it from
+  `scalefac_compress` at scalefactor-decode time, so the parser leaves
+  it `false`). `SideInfo` exposes `lsf` and `granule_count` markers,
+  and `byte_len()` is layout-aware.
+- Per granule per channel, a `GranuleChannel` carries
   `part2_3_length`, `big_values`, `global_gain`, `scalefac_compress`,
   `window_switching_flag`, and its branch — `block_type` /
   `mixed_block_flag` / two `table_select` / three `subblock_gain` when
@@ -57,18 +67,18 @@ block that follows the header (and optional CRC), per ISO/IEC 11172-3
   `region1_count` for a long block — plus `preflag`, `scalefac_scale`,
   and `count1table_select`. Mono and stereo, long-block and
   window-switching cases are unit-tested from spec-derived byte
-  patterns.
+  patterns for both MPEG-1 and LSF.
 
 ### Not yet implemented
 
 Layer III **main-data** decode (scalefactor reader, Huffman,
-requantisation, IMDCT, synthesis filterbank) and any encoder. The
-MPEG-2 / MPEG-2.5 single-granule side-info variant (8-bit
-`main_data_begin`, no `scfsi`) is out of scope for the current parser;
-`parse_side_info` rejects non-MPEG-1 headers. `register()` is a no-op
-until a decoder/demuxer is wired up. MPEG-2.5 (8/11.025/12 kHz) is not
-defined by either ISO standard and is therefore out of scope until a
-clean-room reference for it is staged.
+requantisation, IMDCT, synthesis filterbank) and any encoder.
+`register()` is a no-op until a decoder/demuxer is wired up. The LSF
+scalefactor stage (deriving `slen1`..`slen4`, the `nr_of_sfb*`
+partition sizes, and `preflag` from the 9-bit `scalefac_compress` per
+ISO/IEC 13818-3 §2.4.2.7) is deferred to the scalefactor round; the
+Huffman codebook tables themselves are a known docs gap (the staged
+ISO body ends mid-§2.4.3.4).
 
 ## License
 

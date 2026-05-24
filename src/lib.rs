@@ -20,20 +20,23 @@
 //! [`frame::FrameWalker`] that iterates frames over a byte buffer with
 //! mid-stream resynchronisation on bad sync.
 //!
-//! The [`side_info`] module parses the MPEG-1 Layer III
-//! **side-information** block (ISO/IEC 11172-3 §2.4.1.7 / §2.4.2.7):
-//! [`side_info::parse_side_info`] → [`side_info::SideInfo`], covering
-//! `main_data_begin`, `private_bits`, `scfsi`, and the full
-//! per-granule-per-channel [`side_info::GranuleChannel`] record for
-//! both the long-block and window-switching branches.
+//! The [`side_info`] module parses the Layer III **side-information**
+//! block for both layouts: MPEG-1 (ISO/IEC 11172-3 §2.4.1.7 /
+//! §2.4.2.7) and MPEG-2 / MPEG-2.5 lower-sampling-frequency (ISO/IEC
+//! 13818-3 §2.4.1.7 / §2.4.2.7). [`side_info::parse_side_info`] →
+//! [`side_info::SideInfo`] dispatches on the header's
+//! [`MpegVersion`], covering `main_data_begin`,
+//! `private_bits`, MPEG-1 `scfsi`, and the full per-granule-per-channel
+//! [`side_info::GranuleChannel`] record for both the long-block and
+//! window-switching branches. The LSF form has one granule, an 8-bit
+//! `main_data_begin`, a 9-bit `scalefac_compress`, and no `scfsi`.
 //!
 //! ## What is not implemented yet
 //!
 //! No Layer III main-data decode (scalefactor reader, Huffman,
-//! requantise, IMDCT, synthesis filterbank) and no encoder; the
-//! MPEG-2 / MPEG-2.5 single-granule side-info variant is also out of
-//! scope. [`register`] is a no-op until a [`Decoder`]/[`Demuxer`] is
-//! wired up, so the public decode/encode surface still returns
+//! requantise, IMDCT, synthesis filterbank) and no encoder.
+//! [`register`] is a no-op until a [`Decoder`]/[`Demuxer`] is wired up,
+//! so the public decode/encode surface still returns
 //! [`Error::NotImplemented`].
 //!
 //! [`Decoder`]: oxideav_core::Decoder
@@ -49,8 +52,9 @@ pub use frame::{
     Mp3FrameHeader, MpegVersion,
 };
 pub use side_info::{
-    parse_side_info, BlockType, GranuleChannel, SideInfo, SideInfoError, GRANULES,
-    SIDE_INFO_BYTES_MONO, SIDE_INFO_BYTES_STEREO,
+    parse_side_info, BlockType, GranuleChannel, SideInfo, SideInfoError, GRANULES, GRANULES_LSF,
+    SIDE_INFO_BYTES_LSF_MONO, SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO,
+    SIDE_INFO_BYTES_STEREO,
 };
 
 use oxideav_core::RuntimeContext;
