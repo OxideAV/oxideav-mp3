@@ -254,10 +254,60 @@ and immediately before the IMDCT:
   butterfly, original-input cross terms, all-31-boundary coverage, and
   the absence of a boundary below subband 0.
 
+The `imdct` module covers the Layer III **IMDCT, windowing, overlap-add
+and frequency inversion** stages (ISO/IEC 11172-3:1993 §2.4.3.4.10.2 /
+§2.4.3.4.10.3 / §2.4.3.4.10.4 / §2.4.3.4.10.5) — the per-subband
+transform stack that runs after alias reduction and produces the 32×18
+subband-domain time samples consumed by the polyphase synthesis
+filterbank (next stage):
+
+- `imdct(xk, n)` evaluates the spec formula
+  `x[i] = Σ_{k=0..n/2-1} X[k]·cos((π/(2n))·(2i+1+n/2)·(2k+1))` for
+  `i = 0..n-1`, with `n = 36` for long blocks and `n = 12` for short
+  blocks (a short block runs three independent 12-point IMDCTs over its
+  three 6-line windows, which the reorder stage has already interleaved
+  as `lines[3·k + j]` = freq-line `k` of window `j`).
+- Windowing (§2.4.3.4.10.3) applies the four block-type window shapes:
+  the normal sine window `sin((π/36)(i+½))` for block-type 0; the start
+  block (long half-window 0..17, pass-through 18..23, short half-window
+  24..29, zero 30..35); the stop block (zero 0..5, short half-window
+  6..11, pass-through 12..17, long half-window 18..35); and the short
+  block (each 12-point IMDCT windowed with `sin((π/12)(i+½))` then the
+  three windowed sub-blocks overlapped/concatenated per the §2.4.3.4.10.3
+  table — `y₀` in 6..17, `y₀+y₁` in 12..17, `y₁+y₂` in 18..23, `y₂` in
+  24..29, zeros in 0..5 and 30..35). A **mixed** block's two lowest
+  subbands (0, 1) use the long IMDCT + normal window per §2.4.2.7; the
+  remaining 30 subbands use the short path.
+- `ImdctState` carries the per-subband saved second-half overlap across
+  granules. `imdct_granule(xr, gc, &mut state)` runs the full §2.4.3.4.10
+  pipeline for one granule-channel: per subband, IMDCT → window → overlap
+  the first 18 samples with the saved second half from the previous
+  granule (`result[i] = z[i] + s_prev[i]`) and save the new second half
+  (`s_next[i] = z[i+18]`). Finally §2.4.3.4.10.5 frequency inversion
+  negates every odd time sample of every odd subband to compensate for
+  the polyphase filterbank's frequency inversion (next stage).
+- 22 unit tests cover the IMDCT closed-form impulse response (n=12),
+  hand-computed all-ones reference values (n=12 and n=36), linearity,
+  byte-exact long and short window tables (with symmetry and Σw²=18
+  cross-checks), the normal / start / stop window shape per spec, the
+  short-block concatenation table (including the mid-block sum of two
+  adjacent windowed sub-blocks), zero-input zero-output, overlap state
+  initial zeroness, first-granule output equals z[0..17] when s_prev=0,
+  second-granule output adds the saved overlap from granule 1,
+  per-subband overlap isolation, frequency inversion of odd subbands'
+  odd time samples (with even subbands unaffected), short-block
+  three-sub-IMDCT dispatch in subband 0, mixed-block long-window
+  dispatch in subbands 0 and 1 (with the §2.4.3.4.10.5 sign-flip on
+  subband 1), start-block tail-zero through `imdct_granule`, and
+  stop-block head-zero through `imdct_granule`.
+
 ### Not yet implemented
 
-The IMDCT, windowing/overlap-add, and synthesis filterbank, plus any
-encoder. `register()` is a no-op until a decoder/demuxer is wired up.
+The polyphase synthesis (subband) filter (§2.4.3.4.10's Figure A.2:
+the 1024-value `V[]` shift register, the 64×32 cosine matrix, the
+512-coefficient `D[]` window, and the 15-tap summation that produces
+32 PCM samples per subband-frame), plus any encoder. `register()` is a
+no-op until a decoder/demuxer is wired up.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

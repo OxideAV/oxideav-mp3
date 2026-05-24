@@ -104,13 +104,26 @@
 //! (short or mixed) pass through unchanged per the spec's literal
 //! `block_type`-only test.
 //!
+//! The [`imdct`] module implements the Layer III **IMDCT, windowing,
+//! overlap-add and frequency inversion** — ISO/IEC 11172-3:1993
+//! §2.4.3.4.10.2 / §2.4.3.4.10.3 / §2.4.3.4.10.4 / §2.4.3.4.10.5 — the
+//! per-subband transform stack that runs after alias reduction and
+//! produces the 32×18 subband-domain time samples consumed by the
+//! polyphase synthesis filterbank (a later stage). [`imdct::imdct_granule`]
+//! runs the 36-point or three-12-point IMDCT, applies the
+//! [`side_info::BlockType`]-specific window
+//! (normal / start / short(3×) / stop, including a mixed block's two
+//! lowest long subbands), overlap-adds the saved second half of the
+//! previous granule via [`imdct::ImdctState`], saves the new second
+//! half, and negates every odd time sample of every odd subband.
+//!
 //! ## What is not implemented yet
 //!
-//! No IMDCT, windowing, overlap-add, or synthesis filterbank, and no
-//! encoder. The Huffman stage now covers **all** Table 3-B.7 codebooks
-//! (0..=31 minus the unused 4 and 14). [`register`] is a no-op until a
-//! [`Decoder`]/[`Demuxer`] is wired up, so the public decode/encode
-//! surface still returns [`Error::NotImplemented`].
+//! No synthesis subband (polyphase) filter and no encoder. The Huffman
+//! stage now covers **all** Table 3-B.7 codebooks (0..=31 minus the
+//! unused 4 and 14). [`register`] is a no-op until a [`Decoder`]/
+//! [`Demuxer`] is wired up, so the public decode/encode surface still
+//! returns [`Error::NotImplemented`].
 //!
 //! [`Decoder`]: oxideav_core::Decoder
 //! [`Demuxer`]: oxideav_core::Demuxer
@@ -120,6 +133,7 @@
 pub mod alias;
 pub mod frame;
 pub mod huffman;
+pub mod imdct;
 pub mod reorder;
 pub mod requantize;
 pub mod scalefactors;
@@ -132,6 +146,7 @@ pub use frame::{
     Mp3FrameHeader, MpegVersion,
 };
 pub use huffman::{decode_huffman, HuffmanError, NUM_LINES};
+pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
 pub use reorder::reorder;
 pub use requantize::{requantize, scalefac_multiplier, PRETAB};
 pub use scalefactors::{

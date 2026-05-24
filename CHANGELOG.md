@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Clean-room Layer III **IMDCT, windowing, overlap-add and frequency
+  inversion** stages in the new `imdct` module, built solely from
+  ISO/IEC 11172-3:1993 §2.4.3.4.10.2 (IMDCT formula), §2.4.3.4.10.3
+  (the four block-type window shapes and the short-block concatenation
+  table), §2.4.3.4.10.4 (overlap-add with the previous granule's saved
+  second half), and §2.4.3.4.10.5 (polyphase-filterbank frequency
+  inversion):
+  - `imdct(xk, n)` evaluates
+    `x[i] = Σ_{k=0..n/2-1} X[k]·cos((π/(2n))·(2i+1+n/2)·(2k+1))` for
+    `i = 0..n-1`, with `n = 36` for long blocks and `n = 12` for short.
+  - `ImdctState` carries the per-subband saved second-half overlap
+    across granules (stream-start state is all zeros).
+  - `imdct_granule(xr, gc, &mut state)` runs the full §2.4.3.4.10
+    pipeline for one granule-channel: per subband — single 36-point
+    IMDCT + per-block-type window (long block-types 0/1/3, with a mixed
+    block's two lowest subbands using the long path) or three 12-point
+    IMDCTs + short window + concatenation (short block, and the upper
+    30 subbands of a mixed block); overlap-add the first 18 samples
+    with `s_prev`; save the second 18 into the state; negate every odd
+    time sample of every odd subband.
+  - 22 new `imdct` tests: closed-form impulse response for n=12
+    (`x[i] = cos((π/24)(2i+7))`), hand-computed all-ones reference
+    values (n=12 and n=36), linearity, byte-exact long and short window
+    tables (with symmetry and Σw²=18 cross-checks), the normal / start /
+    stop window shapes per spec, the short-block concatenation table
+    (including the `y₀+y₁` and `y₁+y₂` overlap), zero-input zero-output,
+    overlap state initial zeroness, first-granule equals `z[0..17]` when
+    `s_prev = 0`, second-granule output adds the saved overlap from
+    granule 1, per-subband overlap isolation, frequency inversion on
+    odd subbands' odd time samples with even subbands unaffected,
+    short-block three-sub-IMDCT dispatch, mixed-block long-window
+    dispatch in subbands 0 and 1 (with the §2.4.3.4.10.5 sign-flip on
+    subband 1), start-block tail-zero through `imdct_granule`, and
+    stop-block head-zero through `imdct_granule`.
 - Completed the Layer III **Huffman big-values codebooks**: the large
   16×16 tables 15, 16 and 24, plus the linbits aliases 17..=23 (which
   reuse table 16's `(x, y)` codes) and 25..=31 (table 24's codes). With
