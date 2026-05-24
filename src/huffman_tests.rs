@@ -206,17 +206,101 @@ mod tests {
         assert_eq!(err, HuffmanError::UnusedTable(14));
     }
 
+    // ----- large 16x16 tables 15, 16, 24 + linbits aliases -----
+
     #[test]
-    fn large_tables_flagged_as_not_yet_transcribed() {
-        // Tables 15, 16, 24 (and the 17..=23, 25..=31 linbits aliases)
-        // are sized 16x16 and pending a follow-up transcription round.
-        let bytes = pack(&[(0, 8)]);
-        for t in [15u8, 16, 17, 23, 24, 25, 31] {
-            let mut rd = MainDataReader::new(&bytes);
-            let gc = mk_gc(1, [t, 0, 0], 20, 0, false);
-            let err = decode_huffman(&mut rd, &gc, 16, 44100, MpegVersion::Mpeg1).unwrap_err();
-            assert_eq!(err, HuffmanError::TableNotYetTranscribed(t));
-        }
+    fn table15_zero_pair() {
+        // Table 15 (linbits=0) entry (0,0) is hlen=3 hcod=111. Both values
+        // are zero, so no sign bits follow.
+        let bytes = pack(&[(0b111, 3)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [15, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 3, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], 0);
+        assert_eq!(is[1], 0);
+    }
+
+    #[test]
+    fn table15_nonzero_signed_pair() {
+        // Table 15 entry (1,2) is hlen=5 hcod=10000 → (x=1, y=2); sign
+        // bits 1 (negative x) and 0 (positive y). linbits=0, no ESC.
+        let bytes = pack(&[(0b10000, 5), (1, 1), (0, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [15, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 7, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], -1);
+        assert_eq!(is[1], 2);
+    }
+
+    #[test]
+    fn table16_linbits_escape_on_15() {
+        // Table 16 (linbits=1) entry (15,15) is hlen=8 hcod=00000011. Both
+        // magnitudes are 15 → each reads a 1-bit linbits field and adds it
+        // to 15, then a sign bit. Sequence: code, linbitsx=1 (→16),
+        // signx=1 (→ -16), linbitsy=0 (→15), signy=0 (→ +15).
+        let bytes = pack(&[(0b00000011, 8), (1, 1), (1, 1), (0, 1), (0, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [16, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 12, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], -16);
+        assert_eq!(is[1], 15);
+    }
+
+    #[test]
+    fn table16_small_value_no_escape() {
+        // Table 16 entry (0,0) is hlen=1 hcod=1 → (0,0), no signs, no ESC.
+        let bytes = pack(&[(0b1, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [16, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 1, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], 0);
+        assert_eq!(is[1], 0);
+    }
+
+    #[test]
+    fn table17_alias_uses_table16_codes_wider_linbits() {
+        // Table 17 = table 16 codes but linbits=2. Decode (15,15) via the
+        // same hcod 00000011, with linbitsx=0b11 (→ 15+3 = 18), signx=0,
+        // linbitsy=0b00 (→15), signy=0.
+        let bytes = pack(&[(0b00000011, 8), (0b11, 2), (0, 1), (0b00, 2), (0, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [17, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 14, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], 18);
+        assert_eq!(is[1], 15);
+    }
+
+    #[test]
+    fn table24_zero_and_escape() {
+        // Table 24 (linbits=4) entry (0,0) is hlen=4 hcod=1111 → (0,0).
+        let bytes = pack(&[(0b1111, 4)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [24, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 4, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], 0);
+        assert_eq!(is[1], 0);
+
+        // Table 24 entry (15,0) is hlen=8 hcod=00101011. x=15 → linbits(4)
+        // ESC. linbitsx=0b1010 (→ 15+10 = 25), signx=1 (→ -25); y=0 → no
+        // sign.
+        let bytes = pack(&[(0b00101011, 8), (0b1010, 4), (1, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [24, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 13, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], -25);
+        assert_eq!(is[1], 0);
+    }
+
+    #[test]
+    fn table25_alias_uses_table24_codes_linbits5() {
+        // Table 25 = table 24 codes but linbits=5. (15,0) hcod 00101011,
+        // linbitsx=0b11111 (→ 15+31 = 46), signx=0.
+        let bytes = pack(&[(0b00101011, 8), (0b11111, 5), (0, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [25, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 14, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], 46);
+        assert_eq!(is[1], 0);
     }
 
     // ----- band-table sanity (Table 3-B.8 transcribed widths) -----
@@ -353,6 +437,9 @@ mod tests {
             ("11", &TABLE11),
             ("12", &TABLE12),
             ("13", &TABLE13),
+            ("15", &TABLE15),
+            ("16", &TABLE16),
+            ("24", &TABLE24),
         ] {
             let sum: f64 = table
                 .entries
@@ -363,6 +450,43 @@ mod tests {
             assert!(
                 (0.25..=1.0 + 1e-9).contains(&sum),
                 "table {name} Kraft sum {sum} out of range",
+            );
+        }
+    }
+
+    /// The three 16×16 codebooks must be prefix-free: no codeword is a
+    /// prefix of any other (a wrong transcription would break this, and
+    /// the unique-decode property the matcher relies on). A complete
+    /// 256-symbol code also has a Kraft sum very close to 1.
+    #[test]
+    fn large_tables_prefix_free_and_complete() {
+        for (name, table) in &[("15", &TABLE15), ("16", &TABLE16), ("24", &TABLE24)] {
+            // 256 entries, all present (no unused corners in these tables).
+            assert_eq!(table.entries.len(), 256, "table {name} entry count");
+            // Prefix-free: for every ordered pair (a, b) with len(a) <=
+            // len(b), the high len(a) bits of b's code must differ from a.
+            for (i, a) in table.entries.iter().enumerate() {
+                for (j, b) in table.entries.iter().enumerate() {
+                    if i == j || a.len > b.len {
+                        continue;
+                    }
+                    let shift = b.len - a.len;
+                    assert_ne!(
+                        u32::from(b.code) >> shift,
+                        u32::from(a.code),
+                        "table {name}: entry {j} has entry {i} as a prefix",
+                    );
+                }
+            }
+            // Complete 256-symbol code: Kraft sum ≈ 1.
+            let sum: f64 = table
+                .entries
+                .iter()
+                .map(|e| 2.0f64.powi(-i32::from(e.len)))
+                .sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-6,
+                "table {name} Kraft sum {sum} != 1",
             );
         }
     }

@@ -87,10 +87,12 @@ pub enum HuffmanError {
     UnusedTable(u8),
     /// `big_values * 2` exceeded the 576-line granule capacity.
     BigValuesTooLarge,
-    /// `table_select` named a Table 3-B.7 codebook that has not yet
-    /// been transcribed in this crate (the large 16×16 tables 15, 16,
-    /// 24 and their linbits aliases 17..=23, 25..=31). Tracked as a
-    /// follow-up round.
+    /// **Deprecated / no longer produced.** Earlier rounds returned this
+    /// for the large 16×16 codebooks 15, 16, 24 and their linbits aliases
+    /// 17..=23 / 25..=31 before they were transcribed. All of Table 3-B.7
+    /// (0..=31 minus the unused 4 / 14) is now implemented, so the decoder
+    /// never constructs this variant; it is retained only for API
+    /// stability.
     TableNotYetTranscribed(u8),
 }
 
@@ -397,7 +399,23 @@ fn big_table(idx: u8) -> Result<&'static BigTable, HuffmanError> {
         11 => Ok(&TABLE11),
         12 => Ok(&TABLE12),
         13 => Ok(&TABLE13),
-        15..=31 => Err(HuffmanError::TableNotYetTranscribed(idx)),
+        15 => Ok(&TABLE15),
+        16 => Ok(&TABLE16),
+        17 => Ok(&TABLE17),
+        18 => Ok(&TABLE18),
+        19 => Ok(&TABLE19),
+        20 => Ok(&TABLE20),
+        21 => Ok(&TABLE21),
+        22 => Ok(&TABLE22),
+        23 => Ok(&TABLE23),
+        24 => Ok(&TABLE24),
+        25 => Ok(&TABLE25),
+        26 => Ok(&TABLE26),
+        27 => Ok(&TABLE27),
+        28 => Ok(&TABLE28),
+        29 => Ok(&TABLE29),
+        30 => Ok(&TABLE30),
+        31 => Ok(&TABLE31),
         _ => Err(HuffmanError::UnusedTable(idx)),
     }
 }

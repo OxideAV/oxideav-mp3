@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Completed the Layer III **Huffman big-values codebooks**: the large
+  16×16 tables 15, 16 and 24, plus the linbits aliases 17..=23 (which
+  reuse table 16's `(x, y)` codes) and 25..=31 (table 24's codes). With
+  these the Huffman stage now covers **all** of ISO/IEC 11172-3:1993
+  Annex B Table 3-B.7 (codebooks 0..=31, excluding the "not used" 4 and
+  14). Every code/length value was hand-transcribed from the Table 3-B.7
+  pages of the ISO/IEC 11172-3:1993 PDF; the alias linbits widths come
+  from the "same as table N, but linbits=L" notes on the same pages.
+  - `decode_huffman` resolves `table_select` 15..=31 to the new tables;
+    `HuffmanError::TableNotYetTranscribed` is retained for API stability
+    but is no longer produced.
+  - 8 new Huffman tests: zero / signed pairs from table 15, table 16's
+    1-bit linbits ESC on magnitude-15 (and the small no-ESC path), the
+    table 17 alias at linbits=2, table 24's 4-bit ESC, and the table 25
+    alias at linbits=5. A `large_tables_prefix_free_and_complete` test
+    proves all three 16×16 codebooks are prefix-free with a Kraft sum of
+    exactly 1 (256 symbols each) — a strong transcription cross-check.
+- Clean-room Layer III **alias reduction** stage in the new `alias`
+  module, built solely from ISO/IEC 11172-3:1993 §2.4.3.4.10.1 (the
+  butterfly pseudo code) and Annex B Table 3-B.9 (the coefficients):
+  - `alias_reduce` applies the eight per-boundary butterflies across all
+    31 subband boundaries of a granule-channel's reordered `xr[576]`:
+    `xar[18·sb-1-i] = xr[18·sb-1-i]·cs[i] − xr[18·sb+i]·ca[i]` and
+    `xar[18·sb+i] = xr[18·sb+i]·cs[i] + xr[18·sb-1-i]·ca[i]`, computing
+    both outputs from the original inputs. Granules with `block_type == 2`
+    (short or mixed) pass through unchanged per the spec's literal
+    `block_type`-only scope.
+  - Table 3-B.9 raw coefficients `ALIAS_C = [−0.6, −0.535, −0.33, −0.185,
+    −0.095, −0.041, −0.0142, −0.0037]` with the derived butterfly
+    multipliers `alias_cs()` = `1/√(1+c²)` and `alias_ca()` = `c/√(1+c²)`.
+  - 9 alias unit tests: Table B.9 verbatim coefficients, the
+    `cs²+ca² == 1` / `ca/cs == c` derivation identities, known `cs0`/`ca0`
+    values, short- and mixed-block pass-through, the first-boundary
+    butterfly, original-input cross terms, all-31-boundaries coverage, and
+    the absence of a boundary below subband 0.
 - Clean-room Layer III **stereo processing** stage in the new `stereo`
   module, built solely from ISO/IEC 11172-3:1993 §2.4.3.4.9 (the MS
   matrix and the intensity-stereo steps), §2.4.2.3 (the `mode_extension`

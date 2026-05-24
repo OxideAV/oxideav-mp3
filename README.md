@@ -122,17 +122,20 @@ lines `is[0..576]` of one granule-channel:
   (the spec's "until all bits are spent" rule).
 - Remaining lines up to index 576 are zero-filled.
 
-Codebook coverage so far: tables 0..=13 (the quad tables A/B plus the
-small/medium big-values tables — 1×1, 2×2, 3×3, 4×4, 6×6, 8×8, and
-the 16×16 table 13) transcribed by hand from the Annex B render of
-ISO/IEC 11172-3:1993 (PDF pages 54..=57 rendered with `pdftoppm`).
-Tables 4 and 14 are spec-marked "not used" and are rejected. The
-16×16 codebooks 15, 16, 24 and the `linbits` aliases 17..=23,
-25..=31 are pending a follow-up transcription round; calling them
-returns `HuffmanError::TableNotYetTranscribed`. Twenty-seven
-huffman-stage unit tests cover spec-derived bitstreams plus per-table
-prefix-freeness + Kraft-inequality self-checks on every transcribed
-codebook.
+Codebook coverage: **all** of Table 3-B.7 — codebooks 0..=31 minus the
+spec-marked "not used" tables 4 and 14, which are rejected. The quad
+tables A/B and the small/medium big-values tables (1×1 … 8×8, plus the
+16×16 table 13) and the three large 16×16 codebooks 15, 16 and 24 were
+transcribed by hand from the Annex B render of ISO/IEC 11172-3:1993
+(rendered with `pdftoppm`). The `linbits` aliases 17..=23 reuse table
+16's codes (with `linbits` 2/3/4/6/8/10/13) and 25..=31 reuse table
+24's codes (`linbits` 5/6/7/8/9/11/13), per the "same as table N, but
+linbits=L" notes in the Annex. `HuffmanError::TableNotYetTranscribed`
+is retained for API stability but is no longer produced. Thirty-four
+huffman-stage unit tests cover spec-derived bitstreams (including the
+new tables' zero/signed/ESC paths and two alias families) plus
+per-table prefix-freeness + Kraft-inequality self-checks, and a
+256-symbol prefix-free / Kraft-sum-equals-1 proof on each 16×16 table.
 
 The `requantize` module covers the Layer III **requantization** stage
 (ISO/IEC 11172-3:1993 §2.4.3.4.7.1) — the step that turns the 576
@@ -227,13 +230,42 @@ mid/side and intensity-position representations:
   split, the LSF power-law factors for both `intensity_scale` values and
   both `is_pos` parities, and short-block per-window intensity bounds.
 
+The `alias` module covers the Layer III **alias reduction** stage
+(ISO/IEC 11172-3:1993 §2.4.3.4.10.1) — the eight-butterfly
+decorrelation across each subband boundary that runs after the reorder
+and immediately before the IMDCT:
+
+- `alias_reduce` applies the spec's pseudo code over all 31 subband
+  boundaries (`sb = 1..32`) of a granule-channel's reordered `xr[576]`:
+  `xar[18·sb-1-i] = xr[18·sb-1-i]·cs[i] − xr[18·sb+i]·ca[i]` and
+  `xar[18·sb+i] = xr[18·sb+i]·cs[i] + xr[18·sb-1-i]·ca[i]` for
+  `i = 0..8`, with both outputs of each butterfly computed from the
+  original inputs.
+- The butterfly multipliers derive from Table 3-B.9's raw coefficients
+  `ALIAS_C = [−0.6, −0.535, −0.33, −0.185, −0.095, −0.041, −0.0142,
+  −0.0037]`: `alias_cs()` = `1/√(1+c²)`, `alias_ca()` = `c/√(1+c²)`.
+- Granules with `block_type == 2` (short or mixed) pass through
+  unchanged — the spec scopes the stage on `block_type` alone ("not
+  applied for granules with block-type == 2"), so a mixed block is
+  excluded too (see the spec gap below).
+- 9 unit tests cover the verbatim Table B.9 coefficients, the
+  `cs²+ca² == 1` / `ca/cs == c` derivation identities, known `cs0`/`ca0`
+  values, short- and mixed-block pass-through, the first-boundary
+  butterfly, original-input cross terms, all-31-boundary coverage, and
+  the absence of a boundary below subband 0.
+
 ### Not yet implemented
 
-Alias reduction (§2.4.3.4.10.1), the IMDCT, and the synthesis
-filterbank, plus any encoder. `register()` is a no-op until a
-decoder/demuxer is wired up.
-The remaining big-values codebooks (15, 16, 24 and their 17..=23 /
-25..=31 `linbits` aliases) are still a pending main-data sub-stage.
+The IMDCT, windowing/overlap-add, and synthesis filterbank, plus any
+encoder. `register()` is a no-op until a decoder/demuxer is wired up.
+
+**Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
+stage purely on `block_type` ("block-type != 2" applies; "block-type ==
+2 (short block)" does not). A *mixed* block is `block_type == 2` but
+codes its two lowest subbands long; the standard gives no separate rule
+for that long region, so this crate follows the literal text and does
+not alias-reduce mixed blocks. A clarifying note in §2.4.3.4.10.1 on the
+mixed-block long region would remove the ambiguity.
 
 ## License
 

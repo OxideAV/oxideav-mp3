@@ -50,8 +50,11 @@
 //! granule-channel from the three-region big-values partition
 //! (region boundaries derived from `region0_count` / `region1_count`
 //! and Table 3-B.8 long-block band-start indices, with codebook
-//! selection per `table_select` over Table 3-B.7 entries 0..=13),
-//! followed by the count1 quadruple partition (table A or B per
+//! selection per `table_select` over **all** Table 3-B.7 entries
+//! 0..=31 — the small/medium tables 0..=13, the large 16×16 tables 15,
+//! 16 and 24, and the linbits aliases 17..=23 (table 16 codes) and
+//! 25..=31 (table 24 codes); tables 4 and 14 are "not used"), followed
+//! by the count1 quadruple partition (table A or B per
 //! `count1table_select`) decoded until the granule's part-3 bit
 //! budget is exhausted; the remaining lines are zero-filled.
 //!
@@ -90,22 +93,31 @@
 //! covering the MPEG-1 `tan(is_pos·π/12)` formula plus the LSF power-law
 //! `i0` factors selected by `intensity_scale`.
 //!
+//! The [`alias`] module implements the Layer III **alias reduction**
+//! stage — ISO/IEC 11172-3:1993 §2.4.3.4.10.1 — the eight-butterfly
+//! decorrelation across each subband boundary that precedes the IMDCT.
+//! [`alias::alias_reduce`] applies the §2.4.3.4.10.1 pseudo code over the
+//! 31 subband boundaries of a granule-channel's reordered `xr[576]`,
+//! using the butterfly coefficients `cs[i] = 1/√(1+c[i]²)` and
+//! `ca[i] = c[i]/√(1+c[i]²)` derived from the Table 3-B.9 raw
+//! coefficients ([`alias::ALIAS_C`]); granules with `block_type == 2`
+//! (short or mixed) pass through unchanged per the spec's literal
+//! `block_type`-only test.
+//!
 //! ## What is not implemented yet
 //!
-//! No alias reduction, IMDCT, or synthesis filterbank, and no encoder.
-//! The Huffman stage covers Table 3-B.7 entries 0..=13 (the quad
-//! tables plus the small/medium big-values tables); the large 16×16
-//! tables 15, 16, 24 and the linbits aliases 17..=23, 25..=31 are
-//! pending a follow-up transcription round and are reported via
-//! [`huffman::HuffmanError::TableNotYetTranscribed`]. [`register`] is
-//! a no-op until a [`Decoder`]/[`Demuxer`] is wired up, so the public
-//! decode/encode surface still returns [`Error::NotImplemented`].
+//! No IMDCT, windowing, overlap-add, or synthesis filterbank, and no
+//! encoder. The Huffman stage now covers **all** Table 3-B.7 codebooks
+//! (0..=31 minus the unused 4 and 14). [`register`] is a no-op until a
+//! [`Decoder`]/[`Demuxer`] is wired up, so the public decode/encode
+//! surface still returns [`Error::NotImplemented`].
 //!
 //! [`Decoder`]: oxideav_core::Decoder
 //! [`Demuxer`]: oxideav_core::Demuxer
 
 #![warn(missing_debug_implementations)]
 
+pub mod alias;
 pub mod frame;
 pub mod huffman;
 pub mod reorder;
@@ -114,6 +126,7 @@ pub mod scalefactors;
 pub mod side_info;
 pub mod stereo;
 
+pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
 pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
     Mp3FrameHeader, MpegVersion,
