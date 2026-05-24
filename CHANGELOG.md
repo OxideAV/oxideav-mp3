@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Clean-room Layer III **stereo processing** stage in the new `stereo`
+  module, built solely from ISO/IEC 11172-3:1993 §2.4.3.4.9 (the MS
+  matrix and the intensity-stereo steps), §2.4.2.3 (the `mode_extension`
+  table), and ISO/IEC 13818-3:1997 §2.4.3.2 (the LSF intensity step 4/5
+  replacement and the `intensity_scale` factor):
+  - `process_stereo` reconstructs a joint-stereo granule's left/right
+    channels in place from the transmitted mid/side and intensity-position
+    forms, dispatching on the two `mode_extension` bits: `'00'`
+    pass-through, `'10'` whole-spectrum MS, `'01'`/`'11'` intensity (MS
+    applying below the intensity bound when `'11'`).
+  - MS matrix `L = (M+S)/√2`, `R = (M−S)/√2` (§2.4.3.4.9.2). Intensity
+    stereo above the bound: MPEG-1 `is_ratio = tan(is_pos·π/12)` →
+    `L = L·is_ratio/(1+is_ratio)`, `R = L/(1+is_ratio)`; LSF power-law
+    factor `i0` (`1/√2` or `1/√√2` by `intensity_scale`) with `R = L·kr`,
+    `L = L·kl` (§2.4.3.4.9.3 / ISO/IEC 13818-3 §2.4.3.2). `is_pos == 7`
+    marks an illegal (non-intensity) band → MS fallback if MS is enabled,
+    else independent channels.
+  - The intensity bound is the band of the last non-zero right-channel
+    line (§2.4.3.4.9.1), computed per window for short blocks (ISO/IEC
+    13818-3 §2.4.3.2); mixed blocks process their long region with the
+    long-band layout. `long_band_starts` is now `pub(crate)` (shared with
+    `requantize` / `reorder`'s Table B.8 tables).
+  - 16 stereo unit tests from spec-derived patterns: `'00'` no-op, MS
+    matrix (whole-spectrum + orientation), MPEG-1 intensity (`is_pos`
+    0 / mid / illegal, with/without MS fallback), MS-below / intensity-
+    above split, LSF factors (both `intensity_scale`, both parities), and
+    short-block per-window intensity bounds.
 - Clean-room Layer III **short-block reordering** stage in the new
   `reorder` module, built solely from ISO/IEC 11172-3:1993 §2.4.3.4.8
   (the reorder requirement), §2.4.2.7 (the native Huffman

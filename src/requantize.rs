@@ -90,7 +90,11 @@ pub fn scalefac_multiplier(scalefac_scale: bool) -> f32 {
 /// rate (Table B.8, "index of start" column). Entry `i` is the first
 /// line of band `i`; entry 21 is one past the last line of band 20 so a
 /// band's line range is `starts[sfb]..starts[sfb + 1]`.
-fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 22] {
+///
+/// Shared with the §2.4.3.4.9 [`crate::stereo`] stage, which maps the
+/// same long-block band layout when applying per-band MS / intensity
+/// processing.
+pub(crate) fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 22] {
     // MPEG-1 (ISO/IEC 11172-3 Table B.8a/b/c). LSF (13818-3) reuses
     // these long-block layouts for the band→scalefactor mapping this
     // round; the LSF-specific band tables are deferred (see report).

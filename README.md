@@ -191,11 +191,47 @@ into frequency (subband) order:
   short-region reorder from band 3, above-highest-band pass-through, and
   start/end pass-through.
 
+The `stereo` module covers the Layer III **stereo processing** stage
+(ISO/IEC 11172-3:1993 §2.4.3.4.9, with the ISO/IEC 13818-3:1997
+§2.4.3.2 intensity modifications for MPEG-2 / MPEG-2.5 LSF) — the step
+between short-block reorder and alias reduction that reconstructs a
+joint-stereo granule's left/right channels from the transmitted
+mid/side and intensity-position representations:
+
+- `process_stereo` reconstructs both channels in place per the two
+  `mode_extension` header bits (§2.4.2.3): `'00'` (neither) passes
+  through; `'10'` (MS only) decodes the **entire** spectrum with the MS
+  matrix; `'01'` / `'11'` enable intensity stereo (with MS applying
+  below the intensity bound when `'11'`).
+- **MS matrix** (§2.4.3.4.9.2): `L = (M+S)/√2`, `R = (M−S)/√2`, with the
+  mid signal in the left channel and the side signal in the right.
+- **Intensity stereo** (§2.4.3.4.9.3): above the intensity bound the
+  right channel's per-band scalefactor is reused as the stereo position
+  `is_pos`. MPEG-1 uses `is_ratio = tan(is_pos·π/12)` →
+  `L = L·is_ratio/(1+is_ratio)`, `R = L/(1+is_ratio)` (with `is_pos == 7`
+  the illegal-position marker). LSF (ISO/IEC 13818-3 §2.4.3.2 step 4/5
+  replacement) uses a power-law factor `i0` (`1/√2` when
+  `intensity_scale == 1`, else `1/√√2`): `R = L·kr`, `L = L·kl` where
+  `kl`/`kr` derive from `is_pos` parity. An illegal position falls back
+  to the MS matrix when MS is enabled, or leaves the channels
+  independent otherwise.
+- The intensity bound is derived from the last non-zero right-channel
+  line (§2.4.3.4.9.1), computed **per window** for short blocks (ISO/IEC
+  13818-3 §2.4.3.2). Mixed blocks handle their long region (lines 0..36)
+  with the long-band layout. Band boundaries reuse the Table B.8 long-
+  and short-block start tables from `requantize` (`long_band_starts` is
+  now `pub(crate)`).
+- 16 unit tests cover the no-op `'00'` case, the MS matrix (whole-spectrum
+  and orientation), MPEG-1 intensity (`is_pos` 0 / mid / illegal, with
+  and without the MS fallback), the combined MS-below / intensity-above
+  split, the LSF power-law factors for both `intensity_scale` values and
+  both `is_pos` parities, and short-block per-window intensity bounds.
+
 ### Not yet implemented
 
-Stereo processing (MS / intensity, §2.4.3.4.9), alias reduction
-(§2.4.3.4.10.1), the IMDCT, and the synthesis filterbank, plus any
-encoder. `register()` is a no-op until a decoder/demuxer is wired up.
+Alias reduction (§2.4.3.4.10.1), the IMDCT, and the synthesis
+filterbank, plus any encoder. `register()` is a no-op until a
+decoder/demuxer is wired up.
 The remaining big-values codebooks (15, 16, 24 and their 17..=23 /
 25..=31 `linbits` aliases) are still a pending main-data sub-stage.
 

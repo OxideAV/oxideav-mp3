@@ -77,10 +77,22 @@
 //! region of mixed blocks (short bands 3..12, lines 36..) while leaving
 //! long blocks and the mixed-block long region (lines 0..36) unchanged.
 //!
+//! The [`stereo`] module implements the Layer III **stereo processing**
+//! stage — ISO/IEC 11172-3:1993 §2.4.3.4.9 (with the ISO/IEC 13818-3:1997
+//! §2.4.3.2 intensity modifications for MPEG-2 / MPEG-2.5 LSF) — which
+//! reconstructs the left/right channels of a joint-stereo granule from the
+//! transmitted mid/side and intensity-position representations.
+//! [`stereo::process_stereo`] applies the MS matrix
+//! (`L = (M+S)/√2`, `R = (M-S)/√2`) and/or intensity stereo (per-band
+//! `is_pos` taken from the right channel's scalefactors) per the
+//! `mode_extension` header bits, deriving the intensity bound from the
+//! last non-zero right-channel line (per window for short blocks) and
+//! covering the MPEG-1 `tan(is_pos·π/12)` formula plus the LSF power-law
+//! `i0` factors selected by `intensity_scale`.
+//!
 //! ## What is not implemented yet
 //!
-//! No stereo processing (MS / intensity), alias reduction, IMDCT, or
-//! synthesis filterbank, and no encoder.
+//! No alias reduction, IMDCT, or synthesis filterbank, and no encoder.
 //! The Huffman stage covers Table 3-B.7 entries 0..=13 (the quad
 //! tables plus the small/medium big-values tables); the large 16×16
 //! tables 15, 16, 24 and the linbits aliases 17..=23, 25..=31 are
@@ -100,6 +112,7 @@ pub mod reorder;
 pub mod requantize;
 pub mod scalefactors;
 pub mod side_info;
+pub mod stereo;
 
 pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
@@ -117,6 +130,7 @@ pub use side_info::{
     SIDE_INFO_BYTES_LSF_MONO, SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO,
     SIDE_INFO_BYTES_STEREO,
 };
+pub use stereo::process_stereo;
 
 use oxideav_core::RuntimeContext;
 
