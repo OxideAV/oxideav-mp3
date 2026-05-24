@@ -42,11 +42,28 @@
 //! 13818-3 §2.4.3.4, deriving `slen1..slen4` + `nr_of_sfb` + `preflag`
 //! + `intensity_scale` from the 9-bit `scalefac_compress`).
 //!
+//! The [`huffman`] module decodes the Layer III main-data
+//! **Huffman** stage — the `huffmancodebits()` syntax of ISO/IEC
+//! 11172-3:1993 §2.4.1.7 (`Huffmancodebits()` on p.18) with the
+//! semantics of §2.4.2.7 (p.26–28). [`huffman::decode_huffman`]
+//! produces the 576 quantized frequency lines `is[0..576]` of one
+//! granule-channel from the three-region big-values partition
+//! (region boundaries derived from `region0_count` / `region1_count`
+//! and Table 3-B.8 long-block band-start indices, with codebook
+//! selection per `table_select` over Table 3-B.7 entries 0..=13),
+//! followed by the count1 quadruple partition (table A or B per
+//! `count1table_select`) decoded until the granule's part-3 bit
+//! budget is exhausted; the remaining lines are zero-filled.
+//!
 //! ## What is not implemented yet
 //!
-//! No Layer III Huffman big-values/count1 decode, requantisation,
-//! IMDCT, or synthesis filterbank, and no encoder. [`register`] is a
-//! no-op until a [`Decoder`]/[`Demuxer`] is wired up, so the public
+//! No requantisation, IMDCT, or synthesis filterbank, and no encoder.
+//! The Huffman stage covers Table 3-B.7 entries 0..=13 (the quad
+//! tables plus the small/medium big-values tables); the large 16×16
+//! tables 15, 16, 24 and the linbits aliases 17..=23, 25..=31 are
+//! pending a follow-up transcription round and are reported via
+//! [`huffman::HuffmanError::TableNotYetTranscribed`]. [`register`] is
+//! a no-op until a [`Decoder`]/[`Demuxer`] is wired up, so the public
 //! decode/encode surface still returns [`Error::NotImplemented`].
 //!
 //! [`Decoder`]: oxideav_core::Decoder
@@ -55,6 +72,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod frame;
+pub mod huffman;
 pub mod scalefactors;
 pub mod side_info;
 
@@ -62,6 +80,7 @@ pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
     Mp3FrameHeader, MpegVersion,
 };
+pub use huffman::{decode_huffman, HuffmanError, NUM_LINES};
 pub use scalefactors::{
     decode_scalefactors, lsf_scale_params, FrameScaleFactors, LsfScaleParams, MainDataReader,
     Reservoir, ScaleFactorError, ScaleFactors, LONG_SFB, MPEG1_SLEN, SHORT_SFB, SHORT_WINDOWS,

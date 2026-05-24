@@ -99,12 +99,47 @@ decode:
   the `part2_length` formulas as a bit-count cross-check, and reservoir
   back-references / underflow.
 
+The `huffman` module covers the Layer III main-data **Huffman decode**
+stage — the `Huffmancodebits()` syntax of ISO/IEC 11172-3 §2.4.1.7
+with the semantics of §2.4.2.7, producing the 576 quantized frequency
+lines `is[0..576]` of one granule-channel:
+
+- **big_values** partition (§2.4.2.7, "table_select" / "region0_count"):
+  the `big_values` value-pairs are split into three regions by
+  `region0_count` / `region1_count`, each region selecting one of the
+  Annex B Table 3-B.7 codebooks via `table_select`. Region boundaries
+  come from Table 3-B.8 long-block band-start indices (all three
+  sampling rates transcribed). Each pair is decoded as
+  `hcod[|x|][|y|]` (variable-length Huffman), optionally followed by
+  `linbits` ESC extension fields on magnitude-15 symbols, then sign
+  bits for non-zero values. Window-switched short blocks fall back to
+  the spec's fixed 36-line region-0 / rest-region-1 split.
+- **count1** partition (§2.4.2.7, "count1table_select"): quadruples
+  `(v, w, x, y)` of magnitude ≤ 1 are decoded via Table A (variable-
+  length Huffman) or Table B (the trivial 4-bit code) per
+  `count1table_select`, with sign bits on non-zero values. The loop
+  terminates the moment the granule's part-3 bit budget is exhausted
+  (the spec's "until all bits are spent" rule).
+- Remaining lines up to index 576 are zero-filled.
+
+Codebook coverage so far: tables 0..=13 (the quad tables A/B plus the
+small/medium big-values tables — 1×1, 2×2, 3×3, 4×4, 6×6, 8×8, and
+the 16×16 table 13) transcribed by hand from the Annex B render of
+ISO/IEC 11172-3:1993 (PDF pages 54..=57 rendered with `pdftoppm`).
+Tables 4 and 14 are spec-marked "not used" and are rejected. The
+16×16 codebooks 15, 16, 24 and the `linbits` aliases 17..=23,
+25..=31 are pending a follow-up transcription round; calling them
+returns `HuffmanError::TableNotYetTranscribed`. Twenty-seven
+huffman-stage unit tests cover spec-derived bitstreams plus per-table
+prefix-freeness + Kraft-inequality self-checks on every transcribed
+codebook.
+
 ### Not yet implemented
 
-Layer III Huffman big-values/count1 decode, requantisation, IMDCT,
-and synthesis filterbank, and any encoder. `register()` is a no-op
-until a decoder/demuxer is wired up. The Huffman codebook tables
-(ISO/IEC 11172-3 Annex B Table B.7) are the next main-data stage.
+Requantisation, IMDCT, and synthesis filterbank, plus any encoder.
+`register()` is a no-op until a decoder/demuxer is wired up. The
+remaining big-values codebooks (15, 16, 24 and their 17..=23 / 25..=31
+`linbits` aliases) are the next main-data sub-stage.
 
 ## License
 

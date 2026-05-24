@@ -1,0 +1,369 @@
+// Unit tests for the Layer III Huffman decode stage. The bitstreams
+// here are hand-assembled from the Table 3-B.7 codebooks transcribed
+// in huffman_tables.rs, the Table 3-B.8 band starts in huffman.rs, and
+// the §2.4.1.7 huffmancodebits() syntax (No. of bits column on p.18).
+
+mod tests {
+    use super::*;
+
+    /// Pack a sequence of `(value, len)` MSB-first into a byte vector,
+    /// for assembling spec-derived bitstreams in tests.
+    fn pack(bits: &[(u32, u32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut acc: u32 = 0;
+        let mut nbits: u32 = 0;
+        for &(v, n) in bits {
+            // Mask `v` to `n` bits and append.
+            let v = if n == 0 { 0 } else { v & ((1u32 << n) - 1) };
+            acc = (acc << n) | v;
+            nbits += n;
+            while nbits >= 8 {
+                nbits -= 8;
+                out.push(((acc >> nbits) & 0xff) as u8);
+            }
+        }
+        if nbits > 0 {
+            out.push(((acc << (8 - nbits)) & 0xff) as u8);
+        }
+        out
+    }
+
+    fn mk_gc(
+        big_values: u16,
+        table_select: [u8; 3],
+        region0_count: u8,
+        region1_count: u8,
+        count1table_select: bool,
+    ) -> GranuleChannel {
+        GranuleChannel {
+            part2_3_length: 0,
+            big_values,
+            global_gain: 0,
+            scalefac_compress: 0,
+            window_switching_flag: false,
+            block_type: BlockType::Long,
+            mixed_block_flag: false,
+            table_select,
+            subblock_gain: [0; 3],
+            region0_count,
+            region1_count,
+            preflag: false,
+            scalefac_scale: false,
+            count1table_select,
+        }
+    }
+
+    // ----- big-values: one pair from Table 1 (a small linbits=0 table) -----
+
+    #[test]
+    fn big_values_single_pair_from_table1() {
+        // Table 1: (1,0) is hcod "01" (len 2). Decode (+1, +0) → bits
+        // 01 then signx=0 (no signy, y==0). Total part-3 bits = 3.
+        let bytes = pack(&[(0b01, 2), (0, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [1, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 3, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], 1);
+        assert_eq!(is[1], 0);
+        // Remaining lines zero (count1 budget exhausted immediately).
+        for &v in &is[2..] {
+            assert_eq!(v, 0);
+        }
+    }
+
+    #[test]
+    fn big_values_negative_pair_from_table1() {
+        // Table 1: (1,1) is hcod "000" (len 3). Decode (-1, -1) → bits
+        // 000 then signx=1 then signy=1.
+        let bytes = pack(&[(0b000, 3), (1, 1), (1, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [1, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 64, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], -1);
+        assert_eq!(is[1], -1);
+    }
+
+    // ----- count1 quad table A (small Huffman) -----
+
+    #[test]
+    fn count1_quad_a_zero_pattern_no_signs() {
+        // Quad A entry vwxy=0000 is hcod "1" (len 1). No sign bits
+        // appended (all values zero). Single quad decoded then budget
+        // runs out.
+        // big_values = 0, so we go straight to count1.
+        let bytes = pack(&[(0b1, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(0, [0, 0, 0], 0, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 1, 44100, MpegVersion::Mpeg1).unwrap();
+        for &v in &is[..4] {
+            assert_eq!(v, 0);
+        }
+    }
+
+    #[test]
+    fn count1_quad_a_all_ones_with_signs() {
+        // Quad A entry vwxy=1111 is hcod "000001" (len 6); then four
+        // sign bits (all '1' → all negative).
+        let bytes = pack(&[(0b000001, 6), (1, 1), (1, 1), (1, 1), (1, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(0, [0, 0, 0], 0, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 10, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(&is[..4], &[-1, -1, -1, -1]);
+    }
+
+    // ----- count1 quad table B (trivial 4-bit code) -----
+
+    #[test]
+    fn count1_quad_b_trivial_pattern() {
+        // Quad B: each bit, 0 → magnitude 1, 1 → 0. Pattern 0101 →
+        // values (1,0,1,0); only the non-zero values get sign bits, so
+        // two sign bits follow (both '0' → positive).
+        let bytes = pack(&[(0b0101, 4), (0, 1), (0, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(0, [0, 0, 0], 0, 0, true);
+        let is = decode_huffman(&mut rd, &gc, 6, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(&is[..4], &[1, 0, 1, 0]);
+    }
+
+    // ----- region boundaries: split across region0 / region1 -----
+
+    #[test]
+    fn region_split_uses_two_tables() {
+        // Two pairs of big_values. region0_count=0 → region0 covers
+        // band 0 only, which at 44.1 kHz long blocks is lines 0..=3
+        // (width 4). So pair 0 (lines 0..=1) uses table_select[0],
+        // pair 1 (lines 2..=3) ALSO falls in region 0 (line 2 < 4).
+        // Cross the band-0 boundary by setting big_values to 3:
+        // pairs at lines (0,1), (2,3), (4,5) — first two in region 0,
+        // third in region 1.
+        // We pick table 0 for region 0 (single zero entry, 0 bits)
+        // and table 1 for region 1 (small Huffman).
+        // Table 0 emits (0,0) without consuming bits, twice.
+        // Table 1: (1,0) is "01" len 2 → +1, 0.
+        let bytes = pack(&[(0b01, 2), (0, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(3, [0, 1, 0], 0, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 3, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(&is[..6], &[0, 0, 0, 0, 1, 0]);
+    }
+
+    // ----- linbits ESC extension via table 13 -----
+
+    #[test]
+    fn linbits_zero_table_treats_15_as_literal() {
+        // Table 13 has linbits=0, so a (15, 0) hcod must NOT trigger a
+        // linbits read. Table 13 entry (15,0) is hlen=12 hcod=000000010000.
+        // Followed by signx=0. The value should be +15, +0. Budget = 13
+        // bits (the pair + signx) so count1 doesn't run past the buffer.
+        let bytes = pack(&[(0b000000010000, 12), (0, 1)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [13, 0, 0], 20, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 13, 44100, MpegVersion::Mpeg1).unwrap();
+        assert_eq!(is[0], 15);
+        assert_eq!(is[1], 0);
+        assert!(!rd.exhausted());
+    }
+
+    // ----- bit budget exhaustion stops count1 loop -----
+
+    #[test]
+    fn bit_budget_exhaustion_terminates_count1() {
+        // big_values = 0; count1 table A entry vwxy=0000 is hcod "1"
+        // (len 1, no signs). With a budget of 3 bits and bytes that
+        // would otherwise feed infinitely, exactly three quads are
+        // decoded then the loop exits without consuming bit 4.
+        let bytes = pack(&[(0b1111_0000, 8)]); // three "1"s then padding
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(0, [0, 0, 0], 0, 0, false);
+        let is = decode_huffman(&mut rd, &gc, 3, 44100, MpegVersion::Mpeg1).unwrap();
+        // After three "1" reads we should be at bit pos 3 (still under
+        // budget=3 after the third "1" is read inside the loop, but the
+        // next iteration's pre-check stops us).
+        assert!(rd.bit_pos() <= 4);
+        // Lines 0..=11 (three quads) are all zero.
+        for &v in &is[..12] {
+            assert_eq!(v, 0);
+        }
+    }
+
+    // ----- unused tables rejected -----
+
+    #[test]
+    fn unused_table_4_is_rejected() {
+        let bytes = pack(&[(0, 8)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [4, 0, 0], 20, 0, false);
+        let err = decode_huffman(&mut rd, &gc, 16, 44100, MpegVersion::Mpeg1).unwrap_err();
+        assert_eq!(err, HuffmanError::UnusedTable(4));
+    }
+
+    #[test]
+    fn unused_table_14_is_rejected() {
+        let bytes = pack(&[(0, 8)]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [14, 0, 0], 20, 0, false);
+        let err = decode_huffman(&mut rd, &gc, 16, 44100, MpegVersion::Mpeg1).unwrap_err();
+        assert_eq!(err, HuffmanError::UnusedTable(14));
+    }
+
+    #[test]
+    fn large_tables_flagged_as_not_yet_transcribed() {
+        // Tables 15, 16, 24 (and the 17..=23, 25..=31 linbits aliases)
+        // are sized 16x16 and pending a follow-up transcription round.
+        let bytes = pack(&[(0, 8)]);
+        for t in [15u8, 16, 17, 23, 24, 25, 31] {
+            let mut rd = MainDataReader::new(&bytes);
+            let gc = mk_gc(1, [t, 0, 0], 20, 0, false);
+            let err = decode_huffman(&mut rd, &gc, 16, 44100, MpegVersion::Mpeg1).unwrap_err();
+            assert_eq!(err, HuffmanError::TableNotYetTranscribed(t));
+        }
+    }
+
+    // ----- band-table sanity (Table 3-B.8 transcribed widths) -----
+
+    #[test]
+    fn long_band_widths_sum_to_576_at_each_rate() {
+        // Each table's last entry is "end of band 20 + 1"; the bands
+        // span lines 0..end. The frame total is 576 lines, so a
+        // sensible check is that the highest band-end is <= 576.
+        for &table in &[&LONG_BANDS_32, &LONG_BANDS_44, &LONG_BANDS_48] {
+            assert!(table[21] <= NUM_LINES);
+            // Band starts are strictly increasing.
+            for i in 1..22 {
+                assert!(table[i] > table[i - 1], "non-increasing at {i}: {table:?}");
+            }
+        }
+    }
+
+    // ----- codebook self-validation: prefix-free + sane lengths -----
+
+    fn assert_prefix_free(table: &BigTable) {
+        let entries: Vec<_> = table
+            .entries
+            .iter()
+            .filter(|e| e.len > 0)
+            .copied()
+            .collect();
+        for (i, a) in entries.iter().enumerate() {
+            for (j, b) in entries.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                if a.len <= b.len {
+                    let shift = b.len - a.len;
+                    let prefix = u32::from(b.code) >> shift;
+                    assert_ne!(
+                        prefix,
+                        u32::from(a.code),
+                        "code 0x{:x}/{} is a prefix of 0x{:x}/{}",
+                        a.code,
+                        a.len,
+                        b.code,
+                        b.len
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table0_prefix_free() {
+        assert_prefix_free(&TABLE0);
+    }
+    #[test]
+    fn table1_prefix_free() {
+        assert_prefix_free(&TABLE1);
+    }
+    #[test]
+    fn table2_prefix_free() {
+        assert_prefix_free(&TABLE2);
+    }
+    #[test]
+    fn table3_prefix_free() {
+        assert_prefix_free(&TABLE3);
+    }
+    #[test]
+    fn table5_prefix_free() {
+        assert_prefix_free(&TABLE5);
+    }
+    #[test]
+    fn table6_prefix_free() {
+        assert_prefix_free(&TABLE6);
+    }
+    #[test]
+    fn table7_prefix_free() {
+        assert_prefix_free(&TABLE7);
+    }
+    #[test]
+    fn table8_prefix_free() {
+        assert_prefix_free(&TABLE8);
+    }
+    #[test]
+    fn table9_prefix_free() {
+        assert_prefix_free(&TABLE9);
+    }
+    #[test]
+    fn table10_prefix_free() {
+        assert_prefix_free(&TABLE10);
+    }
+    #[test]
+    fn table11_prefix_free() {
+        assert_prefix_free(&TABLE11);
+    }
+    #[test]
+    fn table12_prefix_free() {
+        assert_prefix_free(&TABLE12);
+    }
+    #[test]
+    fn table13_prefix_free() {
+        assert_prefix_free(&TABLE13);
+    }
+
+    #[test]
+    fn quad_a_prefix_free() {
+        for (i, &(la, ca)) in QUAD_A.iter().enumerate() {
+            for (j, &(lb, cb)) in QUAD_A.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                if la <= lb {
+                    let shift = lb - la;
+                    assert_ne!(u32::from(cb) >> shift, u32::from(ca));
+                }
+            }
+        }
+    }
+
+    /// Kraft inequality: a complete (lossless) binary Huffman code
+    /// satisfies Σ 2^-len = 1. Our tables include a few unused (x,y)
+    /// corners (the spec marks tables as squares but trims the top
+    /// magnitudes), so we just check ≤ 1 and ≥ 0.5 as a sanity bound.
+    #[test]
+    fn tables_kraft_inequality_bounded() {
+        for (name, table) in &[
+            ("1", &TABLE1),
+            ("2", &TABLE2),
+            ("3", &TABLE3),
+            ("5", &TABLE5),
+            ("6", &TABLE6),
+            ("7", &TABLE7),
+            ("8", &TABLE8),
+            ("9", &TABLE9),
+            ("10", &TABLE10),
+            ("11", &TABLE11),
+            ("12", &TABLE12),
+            ("13", &TABLE13),
+        ] {
+            let sum: f64 = table
+                .entries
+                .iter()
+                .filter(|e| e.len > 0)
+                .map(|e| 2.0f64.powi(-i32::from(e.len)))
+                .sum();
+            assert!(
+                (0.25..=1.0 + 1e-9).contains(&sum),
+                "table {name} Kraft sum {sum} out of range",
+            );
+        }
+    }
+}

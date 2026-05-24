@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Clean-room Layer III main-data **Huffman decode** stage in the new
+  `huffman` module, built solely from ISO/IEC 11172-3:1993 §2.4.1.7
+  (`Huffmancodebits()` syntax), §2.4.2.7 (semantics), Table 3-B.7
+  (Huffman codebooks), and Table 3-B.8 (scalefactor-band start
+  indices); codebook entries transcribed by hand from the Annex B
+  render of the 157-page PDF (rendered with `pdftoppm`):
+  - `decode_huffman` → `[i32; 576]` quantized-line buffer for one
+    granule-channel, covering the three-region big_values partition
+    (region split aligned to the long-block scalefactor-band start
+    indices for 32 / 44.1 / 48 kHz from Table 3-B.8), the count1
+    quadruple partition (Table A variable-length Huffman or Table B
+    trivial 4-bit code per `count1table_select`), bit-budget
+    termination, and zero-fill of the remainder. Sign bits and the
+    `linbits` ESC mechanism are wired per the §2.4.1.7
+    `Huffmancodebits()` `No. of bits` table on p.18.
+  - Codebook coverage: Table 3-B.7 tables 0..=13 (quad A/B + the
+    small/medium big-values tables, including the 16×16 table 13)
+    fully transcribed. Tables 4 and 14 are spec-marked "not used" and
+    are rejected with `HuffmanError::UnusedTable`. The large 16×16
+    tables 15, 16, 24 and the `linbits` aliases 17..=23, 25..=31 are
+    deferred to a follow-up round and surface as
+    `HuffmanError::TableNotYetTranscribed` when requested.
+  - 27 huffman-stage unit tests including a Table 1 big-values pair
+    with sign, a Table 13 magnitude-15 literal (linbits=0), count1
+    quad A and B decode paths, a region-boundary split, a bit-budget
+    exhaustion case, and per-table prefix-freeness + Kraft-inequality
+    self-checks on every transcribed codebook.
 - Clean-room MPEG audio **framing** layer in the new `frame` module,
   built solely from ISO/IEC 11172-3:1993 (§2.4.1.3 / §2.4.2.3) and
   ISO/IEC 13818-3:1997 (§2.4.2.3 lower-sampling-frequency
