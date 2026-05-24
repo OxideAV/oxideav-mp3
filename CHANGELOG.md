@@ -64,6 +64,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     saturation, plus LSF mono/stereo long, LSF window-switched short,
     LSF max-field saturation, LSF too-short, and LSF trailing-byte
     cases.
+- Clean-room Layer III **scalefactor decode** stage in the new
+  `scalefactors` module, built solely from ISO/IEC 11172-3:1993
+  (§2.4.1.7 main_data syntax, §2.4.2.7 semantics, §2.4.3.4.5) and
+  ISO/IEC 13818-3:1997 (§2.4.1.7 / §2.4.3.4):
+  - A main-data **bit reservoir**: `Reservoir::assemble` reconstructs a
+    frame's contiguous main-data run from its `main_data_begin`
+    back-pointer plus the frame's own bytes, with bounded retention
+    (512-byte trailing window) and a `ReservoirUnderflow` error.
+    `MainDataReader` is the MSB-first bit reader over that run.
+  - **MPEG-1**: the `MPEG1_SLEN` `scalefac_compress → (slen1, slen2)`
+    table; `decode_scalefactors` reads long blocks across the four
+    `scfsi` band groups (`[0,6) [6,11) [11,16) [16,21)`), reusing
+    granule 0's values into granule 1 where `scfsi[ch][group]` is set,
+    and reads pure-short / mixed-short blocks per window (mixed reads
+    the 8-band long-window portion first).
+  - **MPEG-2 / MPEG-2.5 LSF**: `lsf_scale_params` derives
+    `slen1..slen4`, `nr_of_sfb1..4`, `preflag`, and `intensity_scale`
+    from the 9-bit `scalefac_compress` across all six §2.4.3.4 ranges
+    (incl. the right-channel intensity-stereo `int_scalefac_compress`
+    branch); the four partitions are read consecutively into long /
+    short / mixed-short layouts. One granule, no `scfsi`.
+  - Typed `FrameScaleFactors` / `ScaleFactors` output indexed
+    `[granule][channel]`; `ScaleFactorError` for reservoir underflow
+    and main-data exhaustion. 24 unit tests from spec-derived bit
+    patterns, including `scfsi` reuse, the `part2_length` formulas as a
+    bit-count cross-check, LSF four-partition / intensity / short
+    layouts, and reservoir back-reference / underflow / trim cases.
 - `register()` remains a no-op (no decoder/demuxer wired yet); the
   decode/encode surface still returns `Error::NotImplemented`.
 

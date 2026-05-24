@@ -31,13 +31,23 @@
 //! window-switching branches. The LSF form has one granule, an 8-bit
 //! `main_data_begin`, a 9-bit `scalefac_compress`, and no `scfsi`.
 //!
+//! The [`scalefactors`] module implements the Layer III **scalefactor
+//! decode** stage — the main-data step between side-information parsing
+//! and Huffman decode. It models the main-data bit reservoir
+//! ([`scalefactors::Reservoir`] / [`scalefactors::MainDataReader`]) and
+//! reads the per-granule-per-channel scalefactors via
+//! [`scalefactors::decode_scalefactors`] for both MPEG-1 (ISO/IEC
+//! 11172-3 §2.4.2.7, with `slen1`/`slen2` from `scalefac_compress` and
+//! `scfsi` reuse across granules) and MPEG-2 / MPEG-2.5 LSF (ISO/IEC
+//! 13818-3 §2.4.3.4, deriving `slen1..slen4` + `nr_of_sfb` + `preflag`
+//! + `intensity_scale` from the 9-bit `scalefac_compress`).
+//!
 //! ## What is not implemented yet
 //!
-//! No Layer III main-data decode (scalefactor reader, Huffman,
-//! requantise, IMDCT, synthesis filterbank) and no encoder.
-//! [`register`] is a no-op until a [`Decoder`]/[`Demuxer`] is wired up,
-//! so the public decode/encode surface still returns
-//! [`Error::NotImplemented`].
+//! No Layer III Huffman big-values/count1 decode, requantisation,
+//! IMDCT, or synthesis filterbank, and no encoder. [`register`] is a
+//! no-op until a [`Decoder`]/[`Demuxer`] is wired up, so the public
+//! decode/encode surface still returns [`Error::NotImplemented`].
 //!
 //! [`Decoder`]: oxideav_core::Decoder
 //! [`Demuxer`]: oxideav_core::Demuxer
@@ -45,11 +55,16 @@
 #![warn(missing_debug_implementations)]
 
 pub mod frame;
+pub mod scalefactors;
 pub mod side_info;
 
 pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
     Mp3FrameHeader, MpegVersion,
+};
+pub use scalefactors::{
+    decode_scalefactors, lsf_scale_params, FrameScaleFactors, LsfScaleParams, MainDataReader,
+    Reservoir, ScaleFactorError, ScaleFactors, LONG_SFB, MPEG1_SLEN, SHORT_SFB, SHORT_WINDOWS,
 };
 pub use side_info::{
     parse_side_info, BlockType, GranuleChannel, SideInfo, SideInfoError, GRANULES, GRANULES_LSF,

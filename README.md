@@ -69,16 +69,42 @@ MPEG-2 / MPEG-2.5 lower-sampling-frequency (ISO/IEC 13818-3 §2.4.1.7
   window-switching cases are unit-tested from spec-derived byte
   patterns for both MPEG-1 and LSF.
 
+The `scalefactors` module covers the Layer III **scalefactor decode**
+stage — the main-data step between side-info parsing and Huffman
+decode:
+
+- A main-data **bit reservoir** (`Reservoir`) that assembles each
+  frame's contiguous main-data run from its `main_data_begin`
+  back-pointer plus the frame's own main-data bytes (ISO/IEC 11172-3
+  §2.4.2.7), with bounded retention and an underflow error for
+  back-references that precede the buffered history. `MainDataReader`
+  reads it MSB-first.
+- **MPEG-1** (ISO/IEC 11172-3 §2.4.2.7 / §2.4.3.4.5): `slen1`/`slen2`
+  from the 4-bit `scalefac_compress` via the `MPEG1_SLEN` table; long
+  blocks read 21 bands across four `scfsi` band groups, reusing
+  granule 0's scalefactors into granule 1 where `scfsi[ch][group]` is
+  set; pure-short and mixed-short blocks read per-window scalefactors
+  (mixed populates the long-window portion first). `preflag` is the
+  transmitted side-info bit (never set for short blocks).
+- **MPEG-2 / MPEG-2.5 LSF** (ISO/IEC 13818-3 §2.4.3.4): `lsf_scale_params`
+  derives `slen1..slen4`, the `nr_of_sfb1..4` partition sizes,
+  `preflag`, and `intensity_scale` from the 9-bit `scalefac_compress`
+  (and, for the right channel of an intensity-stereo frame, from
+  `int_scalefac_compress = scalefac_compress >> 1`). The four
+  partitions are read consecutively into long / short / mixed-short
+  layouts. There is one granule, so no `scfsi` reuse.
+- `decode_scalefactors` produces a typed `FrameScaleFactors`
+  (`[granule][channel]` of `ScaleFactors`). All cases above are
+  unit-tested from spec-derived bit patterns, including `scfsi` reuse,
+  the `part2_length` formulas as a bit-count cross-check, and reservoir
+  back-references / underflow.
+
 ### Not yet implemented
 
-Layer III **main-data** decode (scalefactor reader, Huffman,
-requantisation, IMDCT, synthesis filterbank) and any encoder.
-`register()` is a no-op until a decoder/demuxer is wired up. The LSF
-scalefactor stage (deriving `slen1`..`slen4`, the `nr_of_sfb*`
-partition sizes, and `preflag` from the 9-bit `scalefac_compress` per
-ISO/IEC 13818-3 §2.4.2.7) is deferred to the scalefactor round; the
-Huffman codebook tables themselves are a known docs gap (the staged
-ISO body ends mid-§2.4.3.4).
+Layer III Huffman big-values/count1 decode, requantisation, IMDCT,
+and synthesis filterbank, and any encoder. `register()` is a no-op
+until a decoder/demuxer is wired up. The Huffman codebook tables
+(ISO/IEC 11172-3 Annex B Table B.7) are the next main-data stage.
 
 ## License
 
