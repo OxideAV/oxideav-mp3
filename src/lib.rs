@@ -143,17 +143,38 @@
 //! and proportional byte-offset arithmetic otherwise (CBR
 //! `bytes/(bitrate/8)`).
 //!
+//! The [`encoder`] module begins the **Layer III encoder** with its
+//! Phase 1 bitstream-formatting half — the part that needs no
+//! psychoacoustic model. [`encoder::write_header`] writes the four-byte
+//! frame header (ISO/IEC 11172-3 §2.4.1.3 / §2.4.2.3), and
+//! [`encoder::write_side_info`] writes the Layer III side-information
+//! block (ISO/IEC 11172-3 §2.4.1.7 for MPEG-1, ISO/IEC 13818-3 §2.4.1.7
+//! for MPEG-2 / MPEG-2.5 LSF); each is the exact byte-for-byte inverse of
+//! the matching parser in [`frame`] / [`side_info`].
+//! [`encoder::encode_silent_frame`] produces a complete, self-delimiting
+//! all-zero-quantization Layer III frame (`part2_3_length == 0`,
+//! `big_values == 0` for every granule-channel, no CRC, zero-filled main
+//! data) sized to [`frame::Mp3FrameHeader::frame_len`] — a structurally
+//! valid MP3 frame a conformant decoder reconstructs to silence.
+//! [`encoder::make_silent_header`] is a CBR convenience constructor that
+//! resolves a bitrate / sample-rate / channel-mode triple to the raw
+//! header indices.
+//!
 //! ## What is not implemented yet
 //!
-//! No frame-driver / decoder API and no encoder. The PCM-producing
-//! pipeline (Huffman → requantize → reorder → stereo → alias → IMDCT →
-//! synthesis) is now complete end-to-end at the granule level: feed an
+//! No frame-driver / decoder API, and no *audio* encoder (the encoder so
+//! far is framing-only — Phase 1). The PCM-producing decode pipeline
+//! (Huffman → requantize → reorder → stereo → alias → IMDCT →
+//! synthesis) is complete end-to-end at the granule level: feed an
 //! [`huffman::decode_huffman`]-produced `[i32; 576]` through the stack
 //! and out comes a `[f32; 576]` PCM run. The Huffman stage covers
 //! **all** Table 3-B.7 codebooks (0..=31 minus the unused 4 and 14).
-//! [`register`] now installs the container demuxer; the codec
-//! `Decoder` and `Encoder` surfaces remain stubs that return
-//! [`Error::NotImplemented`].
+//! The encoder side still lacks the forward (analysis) signal path:
+//! the MDCT analysis filterbank, the psychoacoustic model, bit
+//! allocation, scalefactor estimation, and Huffman *encoding* of
+//! non-zero spectral lines (a later round). [`register`] installs the
+//! container demuxer; the codec `Decoder` and `Encoder` trait surfaces
+//! remain stubs that return [`Error::NotImplemented`].
 //!
 //! [`Read`]: std::io::Read
 //! [`Seek`]: std::io::Seek
@@ -164,6 +185,7 @@
 
 pub mod alias;
 pub mod demuxer;
+pub mod encoder;
 pub mod frame;
 pub mod huffman;
 pub mod imdct;
@@ -178,6 +200,10 @@ pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
 pub use demuxer::{
     open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer, Mp3Tags, XingTag,
     XingTagId, CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,
+};
+pub use encoder::{
+    encode_silent_frame, make_silent_header, silent_side_info, write_header, write_side_info,
+    EncodeError,
 };
 pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,

@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- New `encoder` module — Layer III encoder **Phase 1**
+  (bitstream-formatting half, no psychoacoustic model):
+  - `write_header` writes the four-byte frame header
+    (ISO/IEC 11172-3 §2.4.1.3 / §2.4.2.3), the exact byte-for-byte
+    inverse of `frame::parse_header`.
+  - `write_side_info` writes the Layer III side-information block
+    (ISO/IEC 11172-3 §2.4.1.7 MPEG-1, ISO/IEC 13818-3 §2.4.1.7
+    MPEG-2 / MPEG-2.5 LSF), the exact inverse of
+    `side_info::parse_side_info` for both layouts — `main_data_begin`,
+    `private_bits`, `scfsi`, and the full per-granule-per-channel
+    record across both window branches.
+  - `encode_silent_frame` emits a complete, self-delimiting
+    all-zero-quantization Layer III frame (`part2_3_length == 0`,
+    `big_values == 0`, no CRC, zero-filled main data) sized to
+    `Mp3FrameHeader::frame_len`; reconstructs to silence.
+    `make_silent_header` resolves a bitrate / sample-rate /
+    channel-mode triple to the raw header indices; `silent_side_info`
+    builds the matching empty side info.
+  - Validated: the emitted frame round-trips through this crate's own
+    `parse_header` / `parse_side_info` / `FrameWalker` / `Mp3Demuxer`,
+    and a black-box `ffmpeg` decode of a 50-frame stream yields PCM
+    that is bit-exact silence (max |sample| = 0). The encoder still
+    lacks the forward analysis path (MDCT / psychoacoustics / bit
+    allocation / Huffman encode) — a later round.
 - New `demuxer` module wrapping the framing layer in an
   `oxideav_core::Demuxer`:
   - `Mp3Demuxer::open` reads the input head and tail to skip the

@@ -417,15 +417,45 @@ offset of the first audio frame matches the trace. MPEG-2.5
 in `docs/audio/mp3/MPEG-2.5-GAP.md`; Layer II fixtures are excluded
 because the round-121 brief explicitly scopes to Layer III.
 
+The `encoder` module begins the Layer III **encoder** with its Phase 1
+**bitstream-formatting** half (the part that needs no psychoacoustic
+model):
+
+- `write_header` writes the four-byte frame header
+  (ISO/IEC 11172-3 §2.4.1.3 / §2.4.2.3) — the exact byte-for-byte
+  inverse of `parse_header`.
+- `write_side_info` writes the Layer III side-information block
+  (ISO/IEC 11172-3 §2.4.1.7 for MPEG-1, ISO/IEC 13818-3 §2.4.1.7 for
+  MPEG-2 / MPEG-2.5 LSF): `main_data_begin`, `private_bits`, `scfsi`,
+  and the per-granule-per-channel record (`part2_3_length`,
+  `big_values`, `global_gain`, `scalefac_compress`,
+  `window_switching_flag`, both window branches, `region*_count`,
+  `preflag`, `scalefac_scale`, `count1table_select`) — the exact
+  inverse of `parse_side_info` for both layouts.
+- `encode_silent_frame` produces a complete, self-delimiting
+  all-zero-quantization Layer III frame (`part2_3_length == 0`,
+  `big_values == 0` for every granule-channel, no CRC, zero-filled main
+  data) sized to `Mp3FrameHeader::frame_len`. The frame round-trips
+  through this crate's own `parse_header` / `parse_side_info` /
+  `FrameWalker` / `Mp3Demuxer`, and a black-box `ffmpeg` decode of a
+  multi-frame stream reconstructs pure silence (every sample 0).
+  `make_silent_header` is a CBR convenience constructor that resolves a
+  bitrate / sample-rate / channel-mode triple to the raw header
+  indices.
+
 ### Not yet implemented
 
 No frame-driver / `Decoder` plumbing yet (the granule-level chain is
 complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
-emits a contiguous PCM buffer to the runtime context). No encoder.
-`register()` now installs the container demuxer; the codec `Decoder` /
-`Encoder` surfaces remain stubs.
+emits a contiguous PCM buffer to the runtime context). The encoder is
+framing-only (Phase 1) — it still lacks the forward (analysis) signal
+path: the MDCT analysis filterbank, the psychoacoustic model, bit
+allocation, scalefactor estimation, and Huffman *encoding* of non-zero
+spectral lines, plus the bit-reservoir scheduling that those need.
+`register()` installs the container demuxer; the codec `Decoder` /
+`Encoder` trait surfaces remain stubs.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
