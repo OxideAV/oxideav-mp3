@@ -134,12 +134,45 @@ huffman-stage unit tests cover spec-derived bitstreams plus per-table
 prefix-freeness + Kraft-inequality self-checks on every transcribed
 codebook.
 
+The `requantize` module covers the Layer III **requantization** stage
+(ISO/IEC 11172-3:1993 §2.4.3.4.7.1) — the step that turns the 576
+quantized integer lines `is[576]` from the Huffman decode into 576
+float frequency lines `xr[576]` for one granule-channel:
+
+- `requantize` evaluates `xr_i = sign(is_i)·|is_i|^(4/3)·2^gain·2^sf`,
+  where the gain term is `2^((global_gain − 210)/4)` for long blocks and
+  `2^((global_gain − 210 − 8·subblock_gain[window])/4)` for short
+  blocks, and the scalefactor term is `2^(−(scalefac_multiplier·
+  (scalefac + preflag·pretab)))`. The `scalefac_multiplier` is `0.5`
+  (`scalefac_scale == 0`) or `1.0` (`scalefac_scale == 1`) per the
+  §2.4.2.7 table; `210` is the §2.4.3.4.7.1 system constant scaling the
+  output into `[−1.0, +1.0]`.
+- `PRETAB` is the 21-entry Annex B Table B.6 preemphasis table; it is
+  added to the long-block scalefactors only when the effective
+  `preflag` is set (never for short blocks, §2.4.2.7).
+- Long, pure-short (with per-window `subblock_gain` / `scalefac_s`), and
+  **mixed** blocks (lowest 36 lines / long bands 0..8 use the long
+  formula, short bands 3..12 use the short formula) are all handled, as
+  is the LSF (MPEG-2 / MPEG-2.5) variant, which shares the identical
+  §2.4.3.4 formula (ISO/IEC 13818-3 defers to ISO/IEC 11172-3 here).
+  Short-block lines stay in their native `(sfb, window, freqline)`
+  interleave; the §2.4.3.4.8 reorder is a later stage.
+- Band→scalefactor mapping uses the Table B.8 long- and short-block
+  start indices for 32 / 44.1 / 48 kHz (LSF reuses the long layouts
+  this round; LSF-specific band tables are deferred). 19 unit tests
+  cover long-block unit-gain identity, the global-gain 4-step doubling,
+  the scalefactor and `scalefac_scale` terms, the preflag/pretab effect
+  (on and off), per-window `subblock_gain` and `scalefac_s`, short-band
+  interleave, the mixed-block split, the LSF path, sign preservation,
+  and a large-magnitude finiteness check.
+
 ### Not yet implemented
 
-Requantisation, IMDCT, and synthesis filterbank, plus any encoder.
+Short-block reordering (§2.4.3.4.8), stereo processing (MS / intensity,
+§2.4.3.4.9), the IMDCT, and the synthesis filterbank, plus any encoder.
 `register()` is a no-op until a decoder/demuxer is wired up. The
 remaining big-values codebooks (15, 16, 24 and their 17..=23 / 25..=31
-`linbits` aliases) are the next main-data sub-stage.
+`linbits` aliases) are still a pending main-data sub-stage.
 
 ## License
 

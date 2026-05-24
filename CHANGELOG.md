@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Clean-room Layer III **requantization** stage in the new
+  `requantize` module, built solely from ISO/IEC 11172-3:1993
+  §2.4.3.4.7.1 (the requantization formula), Table B.6 (the `pretab`
+  preemphasis table), and Table B.8 (scalefactor-band start indices);
+  ISO/IEC 13818-3:1997 defers the LSF formula to §2.4.3.4, so the LSF
+  path is the identical equation. Numeric constants transcribed by hand
+  from the PDF pages rendered with `pdftoppm` (formula p.34–35, Table
+  B.6 p.53, Table B.8 p.62–64):
+  - `requantize` → `[f32; 576]` `xr` buffer for one granule-channel:
+    `sign(is)·|is|^(4/3)·2^((global_gain − 210 [− 8·subblock_gain])/4)·
+    2^(−(scalefac_multiplier·(scalefac + preflag·pretab)))`. Covers the
+    long-block formula, the short-block per-window form (with
+    `subblock_gain` in the gain exponent and `scalefac_s[sfb][window]`),
+    the mixed-block split (lowest 36 lines / long bands 0..8 long, short
+    bands 3..12 short), and the LSF (MPEG-2 / MPEG-2.5) variant.
+  - `PRETAB` (Annex B Table B.6, 21 entries) and `scalefac_multiplier`
+    (`0.5` / `1.0` per `scalefac_scale`, §2.4.2.7) exported. The system
+    constant `210` scales the output into `[−1.0, +1.0]`.
+  - Short-block lines remain in native `(sfb, window, freqline)`
+    interleave; the §2.4.3.4.8 reorder and §2.4.3.4.9 stereo processing
+    are deferred to later rounds.
+  - 19 requantize unit tests from spec-derived patterns: long-block
+    unit-gain identity, global-gain 4-step doubling, scalefactor and
+    `scalefac_scale` terms, preflag/pretab on and off, per-window
+    `subblock_gain` / `scalefac_s`, short-band interleave, mixed-block
+    long-then-short split, the LSF path, sign preservation, and a
+    large-magnitude finiteness check.
 - Clean-room Layer III main-data **Huffman decode** stage in the new
   `huffman` module, built solely from ISO/IEC 11172-3:1993 §2.4.1.7
   (`Huffmancodebits()` syntax), §2.4.2.7 (semantics), Table 3-B.7

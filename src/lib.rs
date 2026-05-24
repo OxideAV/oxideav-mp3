@@ -55,9 +55,22 @@
 //! `count1table_select`) decoded until the granule's part-3 bit
 //! budget is exhausted; the remaining lines are zero-filled.
 //!
+//! The [`requantize`] module implements the Layer III
+//! **requantization** stage — ISO/IEC 11172-3:1993 §2.4.3.4.7.1 — which
+//! turns the 576 quantized integer lines `is[576]` of one
+//! granule-channel into 576 float frequency lines `xr[576]`.
+//! [`requantize::requantize`] applies the power-law `|is|^(4/3)`, the
+//! `global_gain`/`subblock_gain` exponential, and the per-scalefactor-band
+//! scalefactor (with the [`requantize::PRETAB`] preemphasis table from
+//! Annex B.6 when `preflag` is set), covering the long-block formula,
+//! the short-block per-window form with `subblock_gain`, the mixed-block
+//! split (long bands 0..8 / lines 0..36, then short bands 3..12), and
+//! the LSF variant (which shares the same §2.4.3.4 formula).
+//!
 //! ## What is not implemented yet
 //!
-//! No requantisation, IMDCT, or synthesis filterbank, and no encoder.
+//! No reordering, stereo processing (MS / intensity), IMDCT, or
+//! synthesis filterbank, and no encoder.
 //! The Huffman stage covers Table 3-B.7 entries 0..=13 (the quad
 //! tables plus the small/medium big-values tables); the large 16×16
 //! tables 15, 16, 24 and the linbits aliases 17..=23, 25..=31 are
@@ -73,6 +86,7 @@
 
 pub mod frame;
 pub mod huffman;
+pub mod requantize;
 pub mod scalefactors;
 pub mod side_info;
 
@@ -81,6 +95,7 @@ pub use frame::{
     Mp3FrameHeader, MpegVersion,
 };
 pub use huffman::{decode_huffman, HuffmanError, NUM_LINES};
+pub use requantize::{requantize, scalefac_multiplier, PRETAB};
 pub use scalefactors::{
     decode_scalefactors, lsf_scale_params, FrameScaleFactors, LsfScaleParams, MainDataReader,
     Reservoir, ScaleFactorError, ScaleFactors, LONG_SFB, MPEG1_SLEN, SHORT_SFB, SHORT_WINDOWS,
