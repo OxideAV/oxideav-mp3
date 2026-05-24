@@ -8,6 +8,77 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- New `demuxer` module wrapping the framing layer in an
+  `oxideav_core::Demuxer`:
+  - `Mp3Demuxer::open` reads the input head and tail to skip the
+    optional ID3v2 tag (10-byte header + synchsafe-sized body +
+    optional v2.4 footer per `docs/container/id3/id3v2.3.0.html` +
+    `id3v2.4.0-structure.html`) and the optional ID3v1 trailer
+    (last 128 bytes whose first three are `TAG`, layout per
+    `docs/audio/mp3/datavoyage-mpgscript-mpeghdr.html` §"MPEG
+    Audio Tag ID3v1").
+  - `parse_xing_info` detects a Xing / Info VBR-info frame at
+    `4 + crc_bytes + side_info_bytes` past the first audio
+    frame's syncword and decodes the four prompt-enumerated
+    fields (`frames`, `bytes`, 100-byte `toc`, `quality`) gated
+    by the low four bits of a big-endian 32-bit flag word.
+    Layout verified byte-for-byte against
+    `docs/audio/mp3/fixtures/layer3-with-xing-vbri-tag/input.mp3`
+    and `.../layer3-with-id3v2-tag/input.mp3` + their
+    `trace.txt`. Pending a canonical Xing/Info doc under
+    `docs/audio/mp3/`.
+  - `next_packet` emits one MPEG audio frame per call with
+    monotonic per-packet PTS in the stream's `1/sample_rate`
+    time base, `keyframe = true`, and `duration =
+    samples_per_frame`. Resyncs on bad / overrun /
+    sample-rate-changing headers per the same one-byte-step
+    pattern as the existing `FrameWalker`. Returns
+    `Error::Eof` past the audio region (`total_len - 128` when
+    an ID3v1 trailer was detected).
+  - `seek_to(pts)` uses the Xing TOC's 100 percentile entries
+    (VBR) or proportional byte-offset arithmetic
+    (`pts × bitrate / 8 / sample_rate`, CBR) and snaps to the
+    next valid frame sync via an 8 KB look-ahead.
+  - `duration_micros` returns the duration computed from
+    `frames × samples_per_frame / sample_rate` (VBR with Xing
+    `frames`) or `audio_bytes × 8 / bitrate × sample_rate`
+    (CBR). Δ vs `ffprobe -show_entries format=duration` for
+    the four fixtures (CBR-320 / VBR-q5 / ID3v2-tagged /
+    Xing-tagged) is ~+4.5% (35.9 ms over an 800 ms file) —
+    the LAME encoder-delay/padding consumes 1152 PCM samples
+    at the head + tail and lives in the bytes after the four
+    Xing fields parsed at this layer.
+  - `probe` content-scores `ID3v2 + Layer III sync` and bare
+    Layer III sync candidates (100 / 75 + extension-tied 100).
+  - `register()` is now non-trivial: it installs the demuxer
+    under format name `"mp3"` with the `.mp3` / `.mp2` / `.mp1`
+    extensions and the content probe.
+  - 13 unit tests under `demuxer::tests` cover the synchsafe
+    decoder, the ID3v2 total-length computation, a synthetic
+    CBR walk (PTS monotonicity + frame count + EOF idempotency),
+    an ID3v2 + ID3v1-wrapped CBR walk asserting the demuxer's
+    `first_audio_frame_offset` matches the trace's
+    `total=85`, four Xing/Info parse permutations (all-flags +
+    Info-magic + mono side-info offset + no-magic), a
+    `side_info_len` matrix across MPEG-1/2 × mono/stereo, the
+    probe-scoring matrix, the CBR `duration_micros` formula,
+    and a CBR seek round-trip (`seek_to(5_760) → packet.pts
+    matches actual`).
+  - 5 docs/audio/mp3/fixtures/ integration tests
+    (`tests/docs_corpus.rs`) walk the on-disk corpus — CBR-320,
+    VBR-q5, ID3v2-tagged, Xing-tagged, and a broad pass over
+    the 15 Layer III fixtures — and assert the demuxed frame
+    count, ID3v2 size, Xing-tag fields, and first-frame byte
+    offset all match the trace file byte-for-byte. MPEG-2.5
+    fixtures are excluded pending the frame-parser extension
+    tracked in `docs/audio/mp3/MPEG-2.5-GAP.md`; Layer II
+    fixtures are excluded per the round-121 brief.
+  - 1 `tests/duration_comparison.rs` integration test prints
+    the demuxer's `duration_micros` next to ffprobe's reported
+    duration for the four fixtures (CBR-320 / VBR-q5 /
+    ID3v2-tagged / Xing-tagged) so the duration delta is
+    visible in CI output.
+
 - Clean-room Layer III **polyphase synthesis subband filterbank** — the
   last decode stage — in the new `synth` module, built solely from
   ISO/IEC 11172-3:1993 §2.4.3.2 / Figure A.2 ("Synthesis subband filter

@@ -127,6 +127,22 @@
 //! `N[i,k] = cos((16+i)·(2k+1)·π/64)`, the [`synth::D_TABLE`]
 //! 512-coefficient window, and the 16-tap summation.
 //!
+//! The [`demuxer`] module wraps [`frame::FrameWalker`] in an
+//! [`oxideav_core::Demuxer`] implementation. [`demuxer::Mp3Demuxer`]
+//! opens an MP3 stream over a [`Read`] + [`Seek`] source, skips an
+//! optional ID3v2 tag at the head (10-byte header + synchsafe-sized
+//! body + optional v2.4 footer; layouts per `docs/container/id3/`)
+//! and an optional ID3v1 trailer at the tail (128 bytes whose first
+//! three are `TAG`; layout per `docs/audio/mp3/datavoyage-mpgscript-
+//! mpeghdr.html` §"MPEG Audio Tag ID3v1"), detects a Xing / Info
+//! VBR-info frame after the side-info bytes of the first MPEG audio
+//! frame ([`demuxer::parse_xing_info`]), and emits one
+//! [`oxideav_core::Packet`] per MPEG audio frame thereafter, with
+//! per-packet PTS in the stream's `1/sample_rate` time base. Duration
+//! and seeking use the Xing TOC when present (VBR percentile lookup)
+//! and proportional byte-offset arithmetic otherwise (CBR
+//! `bytes/(bitrate/8)`).
+//!
 //! ## What is not implemented yet
 //!
 //! No frame-driver / decoder API and no encoder. The PCM-producing
@@ -135,16 +151,19 @@
 //! [`huffman::decode_huffman`]-produced `[i32; 576]` through the stack
 //! and out comes a `[f32; 576]` PCM run. The Huffman stage covers
 //! **all** Table 3-B.7 codebooks (0..=31 minus the unused 4 and 14).
-//! [`register`] is a no-op until a [`Decoder`]/[`Demuxer`] is wired up,
-//! so the public decode/encode surface still returns
+//! [`register`] now installs the container demuxer; the codec
+//! `Decoder` and `Encoder` surfaces remain stubs that return
 //! [`Error::NotImplemented`].
 //!
+//! [`Read`]: std::io::Read
+//! [`Seek`]: std::io::Seek
 //! [`Decoder`]: oxideav_core::Decoder
 //! [`Demuxer`]: oxideav_core::Demuxer
 
 #![warn(missing_debug_implementations)]
 
 pub mod alias;
+pub mod demuxer;
 pub mod frame;
 pub mod huffman;
 pub mod imdct;
@@ -156,6 +175,10 @@ pub mod stereo;
 pub mod synth;
 
 pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
+pub use demuxer::{
+    open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer, Mp3Tags, XingTag,
+    XingTagId, CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,
+};
 pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
     Mp3FrameHeader, MpegVersion,
@@ -198,8 +221,15 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// No-op codec registration — the orphan-rebuild scaffold registers
-/// nothing into the runtime context.
-pub fn register(_ctx: &mut RuntimeContext) {}
+/// Install the MP3 container demuxer (and its `.mp3`/`.mp2`/`.mp1`
+/// extension + probe entries) into the runtime context's
+/// container registry. The codec [`Decoder`] / [`Encoder`] surface is
+/// not yet wired up — see [`Error::NotImplemented`].
+///
+/// [`Decoder`]: oxideav_core::Decoder
+/// [`Encoder`]: oxideav_core::Encoder
+pub fn register(ctx: &mut RuntimeContext) {
+    demuxer::register_container(&mut ctx.containers);
+}
 
 oxideav_core::register!("mp3", register);

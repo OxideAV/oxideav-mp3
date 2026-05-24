@@ -348,6 +348,75 @@ IMDCT → polyphase synthesis → PCM):
   PCM zeros, and an end-to-end synthetic frame with `xr[0] = 1.0` (DC
   in subband 0) producing 576 finite, partially-non-zero PCM samples.
 
+The `demuxer` module wires the framing layer into an
+`oxideav_core::Demuxer` so a pipeline can consume MP3 files end-to-end
+at the container level. `Mp3Demuxer::open` is the entry point:
+
+- **ID3v2 frontmatter skip.** When the file begins with the `ID3`
+  three-byte magic, the 10-byte tag header is parsed for its
+  synchsafe-encoded body size (per `docs/container/id3/id3v2.3.0.html`
+  + `id3v2.4.0-structure.html`: `size = (b[0]<<21) | (b[1]<<14) |
+  (b[2]<<7) | b[3]`) and the read cursor is advanced past the tag —
+  including the optional v2.4 10-byte footer when flag bit `0x10` is
+  set. The tag's content is not parsed; only its on-disk length is
+  needed to find the first MPEG audio frame.
+- **ID3v1 trailer skip.** The last 128 bytes of the file are
+  inspected; when the first three are the `TAG` magic
+  (datavoyage-mpgscript §"MPEG Audio Tag ID3v1": positions 0..=127,
+  fixed 128-byte layout) the audio region ends 128 bytes before the
+  file's end so the demuxer never tries to interpret the trailer as
+  another frame.
+- **Xing / Info VBR-info-frame detection.** After locating the first
+  MPEG audio frame the demuxer reads its full payload and checks for
+  the `Xing` (true VBR) or `Info` (LAME-CBR convention) four-byte
+  magic immediately after the Layer III side-info bytes — 17 bytes
+  for MPEG-1 mono, 32 bytes for MPEG-1 stereo, 9 bytes for MPEG-2 LSF
+  mono, 17 bytes for MPEG-2 LSF stereo (per `crate::side_info`). The
+  four optional fields (`frames`, `bytes`, 100-byte `toc`, `quality`)
+  are decoded from a four-bit flag word; when the info frame is
+  present it is consumed as a metadata carrier and packet emission
+  starts at the next audio frame. **The Xing / Info wire layout is
+  not yet staged in `docs/audio/mp3/`** — every numeric field
+  offset / width is verified byte-for-byte against the two on-disk
+  fixtures `docs/audio/mp3/fixtures/layer3-with-xing-vbri-tag/` and
+  `docs/audio/mp3/fixtures/layer3-with-id3v2-tag/` and their
+  companion `trace.txt`. A canonical layout doc (e.g. a Xing
+  programming guide) would close the residual provenance gap.
+- **Duration estimation.** VBR streams with a Xing `frames` field
+  report `frames × samples_per_frame / sample_rate`; CBR streams
+  use `audio_bytes × 8 / bitrate × sample_rate`. The four-fixture
+  reference (CBR-320, VBR-q5, ID3v2-tagged, Xing-tagged) all report
+  ~835.9 ms vs ffprobe's 800.0 ms (`Δ = +4.5%`); the residual is the
+  LAME encoder-delay/padding that lives in the bytes after the
+  prompt-enumerated four Xing fields and is not consumed here.
+- **Packet emission.** Each call to `next_packet` reads one MPEG
+  audio frame at the current cursor (resyncing on bad / overrun /
+  sample-rate-mismatched headers), stamps it with a monotonic PTS in
+  the stream's `1/sample_rate` time base, sets `keyframe = true`
+  (every Layer III frame is a self-contained random-access point at
+  the codec level — the bit-reservoir back-reference is the only
+  cross-frame dependency, and decoders handle that internally), and
+  returns. EOF returns `Error::Eof`.
+- **Seek.** VBR streams with a Xing TOC look up the requested
+  percentile in the `toc[100]` table and snap to the next valid
+  frame sync; CBR streams use proportional byte-offset arithmetic
+  (`pts × bitrate / 8 / sample_rate`). Both then resync over the
+  next ~8 KB.
+- **Probe + registration.** `register()` installs the demuxer +
+  the `.mp3` / `.mp2` / `.mp1` extensions + a content probe that
+  scores `ID3v2 + frame sync` and `bare frame sync` candidates
+  (100 / 75 / extension-tied 100) into the runtime context.
+
+A 5-test docs/audio/mp3/fixtures/ integration harness drives the
+demuxer through the on-disk corpus (CBR-320 / VBR-q5 / ID3v2-tagged /
+Xing-tagged + a broad walk over the 15 Layer-III fixtures) and
+asserts the demuxed frame count matches the trace, the Xing fields
+match the trace, the ID3v2 size matches the trace, and the byte
+offset of the first audio frame matches the trace. MPEG-2.5
+(`0xFFE3..` sync) is excluded pending the parser extension tracked
+in `docs/audio/mp3/MPEG-2.5-GAP.md`; Layer II fixtures are excluded
+because the round-121 brief explicitly scopes to Layer III.
+
 ### Not yet implemented
 
 No frame-driver / `Decoder` plumbing yet (the granule-level chain is
@@ -355,7 +424,8 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). No encoder.
-`register()` remains a no-op until that wiring lands.
+`register()` now installs the container demuxer; the codec `Decoder` /
+`Encoder` surfaces remain stubs.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
