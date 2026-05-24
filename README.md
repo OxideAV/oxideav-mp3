@@ -301,13 +301,61 @@ filterbank (next stage):
   subband 1), start-block tail-zero through `imdct_granule`, and
   stop-block head-zero through `imdct_granule`.
 
+The `synth` module covers the Layer III **polyphase synthesis subband
+filterbank** (ISO/IEC 11172-3:1993 §2.4.3.2 / Figure A.2; the same
+filter as Layer I §2.4.3.2.2 and Layer II §2.4.3.3.5) — the **last**
+decode stage. With this in place the granule-level decode chain is now
+complete end-to-end (Huffman → requantize → reorder → stereo → alias →
+IMDCT → polyphase synthesis → PCM):
+
+- `synth_row(s, &mut state)` runs one pass of the Figure A.2 flow chart
+  over 32 input subband samples `S[0..32]` and produces 32 PCM samples:
+  the 1024-value shift register `V[]` is moved up 64 places, the 64×32
+  matrixing operation `V[i] = Σ_{k=0..32} N[i,k]·S[k]` writes 64 fresh
+  values with the §2.4.3.2.2 coefficient
+  `N[i,k] = cos((16+i)·(2k+1)·π/64)`, the 512-element vector `U[]` is
+  built from `V` via the spec's `U[64i+j] = V[128i+j]` /
+  `U[64i+32+j] = V[128i+96+j]` index map, multiplied entrywise by the
+  Annex B Table B.3 window `D[]`, and summed in 16-tap groups
+  (`S_out[j] = Σ_{i=0..16} U[j+32i]·D[j+32i]`).
+- `D_TABLE` is the 512-value Table B.3 window: every coefficient was
+  hand-transcribed from the ISO/IEC 11172-3:1993 PDF (annex pages 50–52
+  of the body; rendered PNGs are staged at
+  `docs/audio/mp3/annex-b-renders/Table-B.3-coefficients-Di-p5{6,7,8}.png`),
+  with the unique global maximum `D[256] = +1.144989014` and the unique
+  global minimum `D[255] = −1.144287109` from the prototype filter's
+  centre.
+- `SynthState` is the per-channel shift register; Figure A.2's
+  footnote 1 ("V to be initialised with zeroes during startup") makes
+  `SynthState::default()` the correct stream-start state.
+- `synth_granule(subband_time, &mut state)` runs the per-row filter 18
+  times over the 32×18 IMDCT output of one granule-channel, producing
+  the 576 PCM samples in playback order (time-row 0 of all 32 subbands
+  → time-row 1 → … → time-row 17). The shift register persists across
+  rows and across granules.
+- 19 synth unit tests, all derived directly from the spec formulas: D[]
+  length / boundary values (D[0], D[1], D[255], D[256], D[257], D[511]
+  match Table B.3 byte-for-byte), D[256] is the unique global maximum
+  and D[255] the unique global minimum, the inner |D[256±k]| symmetry
+  pairs match the printed values, `N[i,k]` matches `cos(π/4)`, `cos(π)`
+  and `cos(π/2)` at the four corner / midpoint cases, a hand-computed
+  known vector derivation (`S[k0]=1`, all-zero V → `S_out[j] = N[j,k0]·D[j]`)
+  for both k0=0 and k0=5 covering steps 2-5 byte-exactly, linearity of
+  the whole filter, the shift register propagating an impulse across
+  iterations (V[64..128] picks up the previous V[0..64]), `synth_granule`
+  agreeing with a manual `synth_row` on the first time-row, an
+  end-to-end zero through `imdct_granule → synth_granule` yielding 576
+  PCM zeros, and an end-to-end synthetic frame with `xr[0] = 1.0` (DC
+  in subband 0) producing 576 finite, partially-non-zero PCM samples.
+
 ### Not yet implemented
 
-The polyphase synthesis (subband) filter (§2.4.3.4.10's Figure A.2:
-the 1024-value `V[]` shift register, the 64×32 cosine matrix, the
-512-coefficient `D[]` window, and the 15-tap summation that produces
-32 PCM samples per subband-frame), plus any encoder. `register()` is a
-no-op until a decoder/demuxer is wired up.
+No frame-driver / `Decoder` plumbing yet (the granule-level chain is
+complete; what's missing is the per-frame iteration that consumes
+[`FrameWalker`] frames, parses header + side-info + scalefactors,
+Huffman-decodes both granules per channel, runs the full pipeline, and
+emits a contiguous PCM buffer to the runtime context). No encoder.
+`register()` remains a no-op until that wiring lands.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

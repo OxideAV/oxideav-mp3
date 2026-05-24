@@ -8,6 +8,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Clean-room Layer III **polyphase synthesis subband filterbank** — the
+  last decode stage — in the new `synth` module, built solely from
+  ISO/IEC 11172-3:1993 §2.4.3.2 / Figure A.2 ("Synthesis subband filter
+  flow chart" on p.39), the §2.4.3.2.2 coefficient formula
+  `N[i,k] = cos((16+i)·(2k+1)·π/64)`, and Annex B Table B.3
+  (the 512 `D[]` window coefficients, pages 50–52 of the body):
+  - `synth_row(s, &mut state)` runs one Figure A.2 pass — Shifting
+    (`V[i] = V[i-64]` for i = 1023..64), Matrixing (`V[i] = Σ_k N[i,k]·S[k]`
+    for i = 0..64), Build U (`U[64i+j] = V[128i+j]`, `U[64i+32+j] =
+    V[128i+96+j]`), Window (`W[i] = U[i]·D[i]`), and the 16-tap
+    summation `S_out[j] = Σ_{i=0..16} W[j+32i]` — to turn 32 input
+    subband samples into 32 PCM samples.
+  - `synth_granule(subband_time, &mut state)` chains 18 `synth_row`
+    calls over the 32×18 IMDCT output of one granule-channel, yielding
+    576 PCM samples in playback order.
+  - `SynthState` carries the per-channel 1024-value shift register
+    `V[]`; Figure A.2 footnote 1 ("V to be initialised with zeroes
+    during startup") makes `SynthState::default()` the correct
+    stream-start state.
+  - `D_TABLE` is the 512-value Table B.3 window: every coefficient was
+    hand-transcribed from the staged ISO/IEC 11172-3:1993 PDF (Annex B
+    pages 50–52 of the body; rendered PNGs at
+    `docs/audio/mp3/annex-b-renders/Table-B.3-coefficients-Di-p5{6,7,8}.png`),
+    with OCR cross-checks for every text-extraction-suspect character.
+  - `n_coefficient(i, k)` exposes the §2.4.3.2.2 matrix coefficient
+    formula directly for use in tests and external derivations.
+  - 19 synth unit tests: `D[]` length is 512, the four boundary values
+    `D[0] / D[1] / D[255] / D[256] / D[257] / D[511]` match Table B.3
+    byte-for-byte, `D[256] = +1.144989014` is the unique global maximum
+    and `D[255] = -1.144287109` the unique global minimum, the
+    `|D[256±k]|` mirror pairs match the printed values, `N[i,k]` matches
+    `cos(π/4)`, `cos(π/2)` and `cos(π)` at the four corner / midpoint
+    cases, a hand-computed known vector derivation (`S[k0]=1`, all-zero
+    V → `S_out[j] = N[j,k0]·D[j]`) for both k0=0 and k0=5 covering
+    steps 2–5 of Figure A.2 byte-exactly, linearity of the whole
+    filter, the shift register propagating an impulse from V[0..64]
+    into V[64..128] on the next iteration, `synth_granule` agreeing
+    with a manual `synth_row` on time-row 0, an end-to-end zero through
+    `imdct_granule → synth_granule` yielding 576 PCM zeros, and an
+    end-to-end synthetic frame with `xr[0] = 1.0` (DC in subband 0)
+    through `imdct_granule → synth_granule` producing 576 finite,
+    partially non-zero PCM samples.
+  - This completes the granule-level decode chain end-to-end: a
+    decoded `[i32; 576]` from `decode_huffman` → `requantize` →
+    `reorder` → `process_stereo` → `alias_reduce` → `imdct_granule` →
+    `synth_granule` now yields `[f32; 576]` PCM. The remaining
+    decoder work is the frame-driver / `Decoder` trait wiring that
+    iterates `FrameWalker` frames and feeds each through the chain.
 - Clean-room Layer III **IMDCT, windowing, overlap-add and frequency
   inversion** stages in the new `imdct` module, built solely from
   ISO/IEC 11172-3:1993 §2.4.3.4.10.2 (IMDCT formula), §2.4.3.4.10.3

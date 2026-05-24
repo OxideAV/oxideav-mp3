@@ -117,13 +117,27 @@
 //! previous granule via [`imdct::ImdctState`], saves the new second
 //! half, and negates every odd time sample of every odd subband.
 //!
+//! The [`synth`] module implements the **polyphase synthesis subband
+//! filterbank** — ISO/IEC 11172-3:1993 §2.4.3.2 / Figure A.2 — the last
+//! decode stage. [`synth::synth_granule`] consumes one granule-channel's
+//! 32×18 subband-time block (the output of [`imdct::imdct_granule`]) and
+//! emits 576 PCM samples per granule per channel, running 18 sequential
+//! [`synth::synth_row`] passes over the 1024-value [`synth::SynthState`]
+//! shift register, the 64×32 matrixing
+//! `N[i,k] = cos((16+i)·(2k+1)·π/64)`, the [`synth::D_TABLE`]
+//! 512-coefficient window, and the 16-tap summation.
+//!
 //! ## What is not implemented yet
 //!
-//! No synthesis subband (polyphase) filter and no encoder. The Huffman
-//! stage now covers **all** Table 3-B.7 codebooks (0..=31 minus the
-//! unused 4 and 14). [`register`] is a no-op until a [`Decoder`]/
-//! [`Demuxer`] is wired up, so the public decode/encode surface still
-//! returns [`Error::NotImplemented`].
+//! No frame-driver / decoder API and no encoder. The PCM-producing
+//! pipeline (Huffman → requantize → reorder → stereo → alias → IMDCT →
+//! synthesis) is now complete end-to-end at the granule level: feed an
+//! [`huffman::decode_huffman`]-produced `[i32; 576]` through the stack
+//! and out comes a `[f32; 576]` PCM run. The Huffman stage covers
+//! **all** Table 3-B.7 codebooks (0..=31 minus the unused 4 and 14).
+//! [`register`] is a no-op until a [`Decoder`]/[`Demuxer`] is wired up,
+//! so the public decode/encode surface still returns
+//! [`Error::NotImplemented`].
 //!
 //! [`Decoder`]: oxideav_core::Decoder
 //! [`Demuxer`]: oxideav_core::Demuxer
@@ -139,6 +153,7 @@ pub mod requantize;
 pub mod scalefactors;
 pub mod side_info;
 pub mod stereo;
+pub mod synth;
 
 pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
 pub use frame::{
@@ -159,6 +174,7 @@ pub use side_info::{
     SIDE_INFO_BYTES_STEREO,
 };
 pub use stereo::process_stereo;
+pub use synth::{n_coefficient, synth_granule, synth_row, SynthState, D_TABLE, PCM_PER_GRANULE};
 
 use oxideav_core::RuntimeContext;
 
