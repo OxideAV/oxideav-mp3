@@ -6,6 +6,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-mp3/releases/tag/v0.1.2) - 2026-05-25
+
+### Other
+
+- §C.1.5.4.4 inner-loop global-gain search (Phase 2 step 5)
+- §2.4.3.4.7 quantization primitive (Phase 2 step 4)
+- scrub external-name disclaimer (clean-room hygiene)
+- §C.1.3 / Figure C.4 polyphase analysis subband filterbank — encoder Phase 2 step 3
+- §2.4.3.4.10.3/4 analysis windowing + forward overlap split — encoder Phase 2 step 2
+- §2.4.3.4.10.2 forward MDCT — encoder Phase 2 step 1
+- §2.4.1.3/§2.4.1.7 Layer III encoder Phase 1 (framing + silent frame)
+- standalone-CI: don't assert fixture presence in docs_corpus
+- oxideav_core::Demuxer impl with ID3v2 / ID3v1 / Xing-Info / seek
+- §2.4.3.2 / Figure A.2 polyphase synthesis subband filterbank
+- §2.4.3.4.10 IMDCT + windowing + overlap-add + frequency inversion
+- complete Table 3-B.7 codebooks + §2.4.3.4.10.1 alias reduction
+- clean-room §2.4.3.4.9 stereo processing (MS + intensity)
+- add §2.4.3.4.8 short-block reorder stage
+- §2.4.3.4.7 main-data requantization stage
+- Layer III Huffman decode stage (clean-room, tables 0..=13)
+- Layer III scalefactor decode stage (clean-room)
+- add MPEG-2 / MPEG-2.5 LSF single-granule variant
+- clean-room MPEG-1 Layer III side-information parser
+- clean-room MPEG audio framing layer (header + frame-walk)
+- drop fuzz workflow (no fuzz targets in scaffold)
+- orphan rebuild — clean-room reset 2026-05-24
+
 ### Added
 
 - `gain_search` module **Phase 2 step 5** — the **inner-loop global-gain
