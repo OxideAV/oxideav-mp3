@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `outer_loop` module **Phase 2 step 11** — the §C.1.5.4.3
+  distortion-control iteration loop that wraps the §C.1.5.4.4 inner-loop
+  global-gain search of the r135 `inner_loop` module. Per ISO/IEC
+  11172-3:1993 Annex C Figure C.9.b, `outer_loop_search_long` iterates:
+  (a) runs the inner loop to pick the smallest `global_gain` whose
+  Huffman bit count fits the per-granule-channel budget AND whose
+  `max|is| ≤ 8191`; (b) computes the per-band §C.1.5.4.3.3 colored-domain
+  distortion `xfsf(sb)` against the decoder's reconstruction;
+  (c) amplifies every band with `xfsf(sb) > xmin(sb)` by
+  `scalefac_l[sb] += 1`; (d) terminates on the §C.1.5.4.3.6 conditions
+  (no band over threshold, every band already amplified, or the next
+  amplification would exceed the per-band cap — 15 for `sfb ∈ [0,10]`,
+  7 for `[11,20]` — restoring the last-good state).
+- `Mp3Encoder::new_with_outer_loop` constructor — routes the Phase 2
+  step 10 stream encoder through the outer loop with a uniform `xmin[sb]`
+  threshold supplied by the caller (a per-band psychoacoustic threshold
+  is deferred; this round uses a constant per the round mandate). Writes
+  `scalefac_compress = 15` (slen1=4, slen2=3) so the chosen per-band
+  scalefactors fit in part2. The fixed-gain `Mp3Encoder::new` path is
+  preserved for reference / debug.
+- `decode_scalefactors` is now spec-correct for non-zero
+  `scalefac_compress`: it skips each granule-channel's part3 (Huffman)
+  before reading the next gc's part2, per §2.4.1.7 `main_data()`'s
+  `part2 part3` interleave. The earlier-round implementation only
+  handled `scalefac_compress = 0` (where part2 collapses to zero bits and
+  the interleave is degenerate); raising the encoder to the outer-loop
+  path with `scalefac_compress = 15` exposed the latent bug.
+- New `tests/outer_loop_roundtrip.rs` integration suite:
+  - `outer_loop_sine_self_decode_psnr_above_floor` — single 440 Hz sine,
+    confirms the outer-loop path still round-trips at PSNR > 20 dB
+    (~86 dB observed, matching the fixed-gain baseline within ~0.02 dB).
+  - `outer_loop_strictly_higher_psnr_than_fixed_gain_on_multi_tone` —
+    six-tone fixture (110/440/880/1760/3520/7040 Hz). At 128 kbit/s mono,
+    outer-loop PSNR is strictly greater than fixed-gain PSNR (typical
+    delta +0.28 dB).
+  - `outer_loop_silence_decodes_to_near_zero` — all-zero PCM produces
+    a near-silent decode.
+  - `fixed_gain_sine_decodes_through_new_decode_path` — confirms the
+    test file's part2-aware decode harness works on the fixed-gain
+    encode too.
+
 - `stream_encoder` module **Phase 2 step 10** — the top-level
   **`Mp3Encoder`** that wires the Phase 2 primitives (analysis
   filterbank + forward MDCT overlap + inverse alias reduction +

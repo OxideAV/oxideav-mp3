@@ -310,6 +310,20 @@ impl<'a> MainDataReader<'a> {
         self.exhausted
     }
 
+    /// Total number of bits in the underlying byte buffer.
+    #[must_use]
+    pub fn bytes_len_bits(&self) -> usize {
+        self.bytes.len() * 8
+    }
+
+    /// Clear the `exhausted` flag — used by [`decode_scalefactors`] to
+    /// drop the soft EOF triggered by a cap-clipped skip that walks past
+    /// the buffer's last part3-Huffman byte without affecting any
+    /// subsequent part2 read.
+    pub fn clear_exhausted(&mut self) {
+        self.exhausted = false;
+    }
+
     /// Read `n` bits (`0 ≤ n ≤ 32`) MSB-first as an unsigned integer.
     ///
     /// Reading zero bits returns `0`. Reading past the end yields the
@@ -902,6 +916,18 @@ pub fn decode_scalefactors(
     let ngr = side_info.granule_count as usize;
     let intensity = is_intensity_stereo(header);
 
+    // The §2.4.1.7 `main_data()` interleaves per granule/channel as
+    // `part2 then part3` — the decoder must skip each gc's part3 (Huffman
+    // codewords) before reading the next gc's part2. The part3 length
+    // for each gc is `gc.part2_3_length - part2_length`, where
+    // part2_length is the bit count actually consumed by the part2 read.
+    // (For `scalefac_compress = 0` part2_length is zero so this skip
+    // collapses to nothing, the historical case the earlier-round
+    // implementation handled.)
+    //
+    // OutOfData is reported only when a part2 read itself runs out of
+    // bytes — the cap-clipped skip past the buffer end is benign (the
+    // [`MainDataReader`]'s `exhausted` flag is reset around it).
     match header.version {
         MpegVersion::Mpeg1 => {
             for gr in 0..ngr {
@@ -912,6 +938,7 @@ pub fn decode_scalefactors(
                     } else {
                         None
                     };
+                    let start_bit = r.bit_pos();
                     let sf = read_mpeg1_granule_channel(
                         &mut r,
                         gc,
@@ -920,6 +947,12 @@ pub fn decode_scalefactors(
                         prev.as_ref(),
                     );
                     out.granules[gr][ch] = sf;
+                    if r.exhausted() {
+                        return Err(ScaleFactorError::OutOfData);
+                    }
+                    let part2_bits = r.bit_pos() - start_bit;
+                    let part3_skip = (gc.part2_3_length as usize).saturating_sub(part2_bits);
+                    skip_bits(&mut r, part3_skip);
                 }
             }
         }
@@ -928,17 +961,47 @@ pub fn decode_scalefactors(
             for ch in 0..nch {
                 let gc = &side_info.granules[0][ch];
                 let is_intensity_right = intensity && ch == 1;
+                let start_bit = r.bit_pos();
                 let sf = read_lsf_channel(&mut r, gc, is_intensity_right);
                 out.granules[0][ch] = sf;
+                if r.exhausted() {
+                    return Err(ScaleFactorError::OutOfData);
+                }
+                let part2_bits = r.bit_pos() - start_bit;
+                let part3_skip = (gc.part2_3_length as usize).saturating_sub(part2_bits);
+                skip_bits(&mut r, part3_skip);
             }
         }
     }
 
-    if r.exhausted() {
-        return Err(ScaleFactorError::OutOfData);
-    }
-
     Ok(out)
+}
+
+/// Advance `r` by `n` bits without consuming bytes past the buffer end
+/// — used to skip a granule-channel's part3 Huffman codeword stream
+/// when only its scalefactors are needed. The skip is capped at the
+/// remaining buffer so pre-spec-compliant fixture buffers that only
+/// carry part2 bytes (no part3) are tolerated, and the [`MainDataReader`]'s
+/// `exhausted` flag is preserved across the call so the spec's "ran out
+/// of part2 data" diagnostic still fires only for real part2 underruns.
+fn skip_bits(r: &mut MainDataReader<'_>, n: usize) {
+    let pre_exhausted = r.exhausted();
+    let total_bits = r.bytes_len_bits();
+    let cur = r.bit_pos();
+    let max_skip = total_bits.saturating_sub(cur);
+    let mut to_skip = n.min(max_skip);
+    while to_skip >= 32 {
+        let _ = r.read(32);
+        to_skip -= 32;
+    }
+    if to_skip > 0 {
+        let _ = r.read(to_skip as u32);
+    }
+    // Restore the pre-skip exhausted flag — a deliberate cap-clipped
+    // skip is not a part2 OutOfData event.
+    if !pre_exhausted {
+        r.clear_exhausted();
+    }
 }
 
 /// `true` when the frame uses intensity stereo, i.e. joint-stereo mode
@@ -1092,6 +1155,12 @@ mod tests {
     /// Build an MPEG-1 mono side-info block (long blocks) with the given
     /// scalefac_compress per granule and scfsi pattern, returning the
     /// parsed SideInfo plus header. Helper for the scalefactor tests.
+    ///
+    /// The fixtures these tests build carry only part2 bytes (no part3),
+    /// so the returned `SideInfo` is post-processed to set each gc's
+    /// `part2_3_length` to the **actual** part2 bit count — that way
+    /// [`decode_scalefactors`]'s spec-correct part3 skip collapses to
+    /// zero on each gc and the buffer-end never trips OutOfData.
     #[allow(clippy::too_many_arguments)]
     fn mpeg1_mono_long_sideinfo(
         sc0: u32,
@@ -1106,7 +1175,7 @@ mod tests {
             w.put_bool(b);
         }
         for sc in [sc0, sc1] {
-            w.put(200, 12); // part2_3_length
+            w.put(200, 12); // part2_3_length — overwritten below per gc
             w.put(50, 9); // big_values
             w.put(180, 8); // global_gain
             w.put(sc, 4); // scalefac_compress
@@ -1121,7 +1190,23 @@ mod tests {
             w.put_bool(false); // count1table_select
         }
         let bytes = w.finish();
-        let si = parse_side_info(&hdr, &bytes).unwrap();
+        let mut si = parse_side_info(&hdr, &bytes).unwrap();
+        // Long-block part2 cost per gr (mono): scfsi-reused groups skipped
+        // on gr 1; otherwise 6 slen1 + 5 slen1 + 5 slen2 + 5 slen2 bits.
+        for (gr, sc) in [sc0, sc1].into_iter().enumerate() {
+            let (slen1, slen2) = MPEG1_SLEN[(sc & 0xF) as usize];
+            // Group widths (long block): (0..6, slen1), (6..11, slen1),
+            // (11..16, slen2), (16..21, slen2). Reused groups skipped on gr 1.
+            let group_widths = [(6u32, slen1), (5, slen1), (5, slen2), (5, slen2)];
+            let mut bits = 0u32;
+            for (g, (count, slen)) in group_widths.iter().enumerate() {
+                let reuse = gr == 1 && scfsi[g];
+                if !reuse {
+                    bits += count * u32::from(*slen);
+                }
+            }
+            si.granules[gr][0].part2_3_length = bits as u16;
+        }
         (hdr, si)
     }
 
@@ -1252,9 +1337,15 @@ mod tests {
             w.put_bool(false); // scalefac_scale
             w.put_bool(false); // count1table_select
         }
-        let si = parse_side_info(&hdr, &w.finish()).unwrap();
+        let mut si = parse_side_info(&hdr, &w.finish()).unwrap();
         assert!(si.granules[0][0].window_switching_flag);
         assert_eq!(si.granules[0][0].block_type, BlockType::Short);
+        // Set part2_3_length per gc to the actual part2 byte count so
+        // decode_scalefactors's spec-correct part3 skip collapses to 0:
+        // pure short (mixed=0) costs 6·3·slen1 + 6·3·slen2 = 18+54 = 72
+        // bits per gr with (slen1,slen2)=(1,3).
+        si.granules[0][0].part2_3_length = 72;
+        si.granules[1][0].part2_3_length = 72;
 
         // main data: per granule, sfb 0..6 (1-bit) × 3 win, sfb 6..12
         // (3-bit) × 3 win. Use value = window+1 in slen1 part, value=4
@@ -1319,8 +1410,13 @@ mod tests {
             w.put_bool(false);
             w.put_bool(false);
         }
-        let si = parse_side_info(&hdr, &w.finish()).unwrap();
+        let mut si = parse_side_info(&hdr, &w.finish()).unwrap();
         assert!(si.granules[0][0].mixed_block_flag);
+        // Mixed-block part2 cost with (slen1,slen2)=(1,1): 8 long
+        // bands·slen1 + 3 short bands·3 win·slen1 + 6 short bands·3 win·slen2
+        // = 8 + 9 + 18 = 35 bits per gr.
+        si.granules[0][0].part2_3_length = 35;
+        si.granules[1][0].part2_3_length = 35;
 
         // main data per granule: 8 long-window scalefactors (1-bit),
         // then 9 short bands (3..12) × 3 windows (1-bit each) = 8 + 27
@@ -1450,13 +1546,17 @@ mod tests {
     // ---- LSF scalefactor read ----
 
     /// Build an LSF mono side-info block (long block) with a given
-    /// scalefac_compress, parse it, and return header + SideInfo.
+    /// scalefac_compress, parse it, and return header + SideInfo. The
+    /// returned `SideInfo` is post-processed to set `part2_3_length` to
+    /// the actual part2 bit count (the LSF derived `slen` and
+    /// `nr_of_sfb` tables) — the fixture buffer carries no part3, so
+    /// [`decode_scalefactors`]'s spec-correct part3 skip collapses to 0.
     fn lsf_mono_long_sideinfo(sc: u32) -> (Mp3FrameHeader, SideInfo) {
         let hdr = parse_header(&lsf_header(0b11, 0)).unwrap();
         let mut w = BitWriter::new();
         w.put(0, 8); // main_data_begin (8 bit LSF)
         w.put_bool(false); // private_bits (1 bit mono)
-        w.put(200, 12); // part2_3_length
+        w.put(200, 12); // part2_3_length — overwritten below
         w.put(50, 9); // big_values
         w.put(180, 8); // global_gain
         w.put(sc, 9); // scalefac_compress (9 bit)
@@ -1469,7 +1569,15 @@ mod tests {
         // no preflag bit in LSF
         w.put_bool(false); // scalefac_scale
         w.put_bool(false); // count1table_select
-        let si = parse_side_info(&hdr, &w.finish()).unwrap();
+        let mut si = parse_side_info(&hdr, &w.finish()).unwrap();
+        let params = lsf_scale_params(sc as u16, BlockType::Long, false, false);
+        let bits: u32 = params
+            .slen
+            .iter()
+            .zip(params.nr_of_sfb.iter())
+            .map(|(&s, &n)| u32::from(s) * u32::from(n))
+            .sum();
+        si.granules[0][0].part2_3_length = bits as u16;
         (hdr, si)
     }
 
@@ -1575,7 +1683,10 @@ mod tests {
             w.put_bool(false);
             w.put_bool(false);
         }
-        let si = parse_side_info(&hdr, &w.finish()).unwrap();
+        let mut si = parse_side_info(&hdr, &w.finish()).unwrap();
+        // Both channels carry zero part2 bits (slen all 0).
+        si.granules[0][0].part2_3_length = 0;
+        si.granules[0][1].part2_3_length = 0;
         // With slen all zero, no main-data bits are consumed for either
         // channel; an empty (but non-exhausted-on-read) buffer works.
         let md = [0u8; 4];
@@ -1618,7 +1729,9 @@ mod tests {
         w2.put(0, 3);
         w2.put_bool(false);
         w2.put_bool(false);
-        let si2 = parse_side_info(&hdr, &w2.finish()).unwrap();
+        let mut si2 = parse_side_info(&hdr, &w2.finish()).unwrap();
+        si2.granules[0][0].part2_3_length = 0;
+        si2.granules[0][1].part2_3_length = 0;
         let fsf2 = decode_scalefactors(&hdr, &si2, &md).unwrap();
         assert!(fsf2.granules[0][1].intensity_scale);
     }
@@ -1647,10 +1760,12 @@ mod tests {
         }
         w.put_bool(false);
         w.put_bool(false);
-        let si = parse_side_info(&hdr, &w.finish()).unwrap();
+        let mut si = parse_side_info(&hdr, &w.finish()).unwrap();
         let p = lsf_scale_params(110, BlockType::Short, false, false);
         assert_eq!(p.nr_of_sfb, [9, 9, 9, 9]);
         assert_eq!(p.slen, [1, 1, 3, 2]);
+        // Part2 cost: 9·1 + 9·1 + 9·3 + 9·2 = 9 + 9 + 27 + 18 = 63 bits.
+        si.granules[0][0].part2_3_length = 63;
 
         // main data: 9 entries @1, 9 @1(=0), 9 @3(=5), 9 @2(=3). These
         // map (sfb,window) in order: entries 0..36 => sfb=e/3, win=e%3.

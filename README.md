@@ -721,11 +721,37 @@ filterbank 481-sample prototype delay + 576-sample lapped-MDCT 1-granule
 overlap). Stereo / LSF / VBR / Xing tag / outer-loop noise shaping /
 psychoacoustic model are deferred.
 
-The remaining Phase 2 work — the psychoacoustic model, the §C.1.5.4.3
-outer (distortion-control) loop, scalefactor estimation, short / mixed
-block-type switching, stereo / LSF, and the runtime-context
-`Encoder::encode` trait wiring on top of `Mp3Encoder` — is still a
-later round.
+**Phase 2 step 11 (outer (distortion-control) iteration loop)** wraps
+the inner-loop global-gain search of step 5 in the §C.1.5.4.3 noise
+shaping iteration (`outer_loop` module, `outer_loop_search_long`). Per
+ISO/IEC 11172-3:1993 Annex C Figure C.9.b the loop: (a) runs the inner
+loop to pick the smallest `global_gain` whose Huffman count fits the
+budget AND keeps `max|is| ≤ 8191`, (b) computes the per-band
+§C.1.5.4.3.3 colored-domain distortion `xfsf(sb)` against the decoder's
+reconstruction, (c) amplifies every band with `xfsf(sb) > xmin(sb)` by
+`scalefac_l[sb] += 1`, and (d) terminates on the §C.1.5.4.3.6 conditions
+(no band over threshold / every band already amplified / next
+amplification would exceed the per-band cap — 15 for `sfb ∈ [0,10]`,
+7 for `[11,20]`), restoring the last-good state. The stream encoder
+gains `Mp3Encoder::new_with_outer_loop(bitrate, sample_rate, mode,
+uniform_threshold)` to route every per-granule-channel quantization
+through this loop with `scalefac_compress = 15` (slen1=4, slen2=3) so
+the chosen per-band scalefactors fit in part2. Threshold derivation is
+the psychoacoustic model's job (Annex D, deferred); this round uses a
+caller-supplied uniform constant. Validated by
+`tests/outer_loop_roundtrip.rs`: a 6-tone multi-tone fixture at
+128 kbit/s mono / 44.1 kHz produces **strictly-higher self-decode PSNR
+than the fixed-gain path at the same bitrate** (typical +0.28 dB,
+fixed-gain 73.7 dB → outer-loop 74.0 dB); the single-tone sine
+roundtrips at ~86 dB matching the fixed-gain baseline. The fixed-gain
+`Mp3Encoder::new` path is preserved as the debug / reference route.
+
+The remaining Phase 2 work — a real per-band psychoacoustic threshold
+(so the loop can spectrally redistribute bits without a hand-tuned
+constant), preemphasis (§C.1.5.4.3.4) and `scalefac_scale = 1`
+escalation, short / mixed block-type switching, stereo / LSF, and the
+runtime-context `Encoder::encode` trait wiring on top of `Mp3Encoder` —
+is still a later round.
 
 ### Not yet implemented
 
@@ -734,14 +760,17 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 steps 1–9 (forward MDCT primitive +
+**Phase 1 framing + Phase 2 steps 1–11 (forward MDCT primitive +
 analysis windowing + forward overlap split + polyphase analysis
 subband filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
 count + §2.4.1.7 Huffman bit emission + §2.4.1.7 main-data assembly +
 §2.4.2.7 cross-frame bit-reservoir scheduling with
-`main_data_begin > 0`)** — it still lacks the psychoacoustic model, the
-§C.1.5.4.3 outer loop, scalefactor estimation, and the stream-level
+`main_data_begin > 0` + stream-level PCM → MP3 driver + §C.1.5.4.3
+outer (distortion-control) loop)** — it still lacks the psychoacoustic
+model (so the outer loop's `xmin(sb)` is a uniform constant rather than
+per-band masking-aware), preemphasis / `scalefac_scale = 1` escalation,
+short / mixed block-type switching, stereo / LSF, and the stream-level
 `Encoder::encode` driver that would tie the scheduler into a CBR file
 emitter. `register()` installs the container demuxer; the codec
 `Decoder` / `Encoder` trait surfaces remain stubs.

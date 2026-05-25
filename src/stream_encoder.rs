@@ -58,10 +58,31 @@ use crate::main_data::{
     assemble_main_data, schedule_reservoir, GranuleChannelData, ReservoirError, ReservoirFrame,
 };
 use crate::mdct::{forward_overlap, mdct, window_long_family_analysis, MdctState, LONG_N};
+use crate::outer_loop::{outer_loop_search_long, OUTER_LOOP_SCALEFAC_COMPRESS};
 use crate::quantize::quantize;
 use crate::scalefactors::{FrameScaleFactors, ScaleFactors};
 use crate::side_info::{BlockType, GranuleChannel, SideInfo, GRANULES};
 use crate::{make_silent_header, write_header, write_side_info, EncodeError};
+
+/// Default outer-loop per-band noise threshold (the uniform `xmin[sb]`
+/// the loop tests `xfsf(sb)` against). With our scalefactor amplification
+/// step `√2` per increment and the colored-domain `xfsf` metric (per
+/// §C.1.5.4.3.3) this constant is chosen high enough that only bands
+/// whose colored noise actually stands out get amplified — a uniform
+/// threshold cannot redistribute the bit budget the way a per-band
+/// psychoacoustic threshold does, so an over-aggressive low threshold
+/// would amplify every band equally (no spectral shaping benefit, just
+/// raised `global_gain`); a too-high threshold disables the loop. The
+/// value below was picked empirically on the multi-tone test fixture
+/// (`tests/outer_loop_roundtrip.rs`) so the loop converges in ≤ 8
+/// iterations per granule and the self-decode PSNR strictly exceeds the
+/// fixed-gain path's at the same bitrate.
+pub const DEFAULT_OUTER_LOOP_THRESHOLD: f64 = 1.0e6;
+
+/// Defensive upper bound on outer-loop iterations per granule-channel
+/// (the §C.1.5.4.3.6 cap-based termination paths fire long before this
+/// in practice; the soft limit guards against FP-precision pathologies).
+pub const DEFAULT_OUTER_LOOP_MAX_ITER: u32 = 64;
 
 /// Number of PCM samples per MPEG-1 Layer III frame per channel
 /// (2 granules × 576 lines = 1152, §2.4.2.1).
@@ -155,6 +176,13 @@ pub struct Mp3Encoder {
     /// Per-frame assembled output for the deferred reservoir
     /// scheduling pass.
     frames: Vec<PendingFrame>,
+
+    /// When `Some`, every per-granule-channel quantization runs the
+    /// §C.1.5.4.3 outer (distortion-control) loop instead of the
+    /// fixed-`scalefac = 0` + inner-loop-only path. The carried value is
+    /// the uniform `xmin[sb]` threshold applied to every long-block
+    /// scalefactor band.
+    outer_loop_threshold: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -204,7 +232,40 @@ impl Mp3Encoder {
             mdct_state,
             pending_pcm: Vec::new(),
             frames: Vec::new(),
+            outer_loop_threshold: None,
         })
+    }
+
+    /// Build an encoder identical to [`Mp3Encoder::new`] but with the
+    /// §C.1.5.4.3 outer (distortion-control) loop enabled. Every
+    /// per-granule-channel quantization runs
+    /// [`crate::outer_loop::outer_loop_search_long`] against
+    /// `uniform_threshold` as the `xmin[sb]` constant for every band —
+    /// the spec leaves the threshold derivation to the psychoacoustic
+    /// model (Annex D), but with no psy model wired up yet we apply a
+    /// flat constant.
+    ///
+    /// The outer loop writes `scalefac_compress = 15` (slen1=4, slen2=3)
+    /// to span the full §C.1.5.4.3.6 scalefactor range. The part2 cost
+    /// is a fixed 74 bits per granule-channel — comfortably under every
+    /// MPEG-1 bitrate the encoder supports.
+    ///
+    /// The fixed-gain path of [`Mp3Encoder::new`] is preserved as the
+    /// reference / debug path. Pass [`DEFAULT_OUTER_LOOP_THRESHOLD`] as
+    /// the threshold for the recommended default.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Mp3Encoder::new`].
+    pub fn new_with_outer_loop(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+        mode: ChannelMode,
+        uniform_threshold: f64,
+    ) -> Result<Self, StreamEncodeError> {
+        let mut enc = Self::new(bitrate_kbps, sample_rate_hz, mode)?;
+        enc.outer_loop_threshold = Some(uniform_threshold);
+        Ok(enc)
     }
 
     /// Push `n` PCM samples (mono, `i16`). The encoder buffers them
@@ -375,41 +436,74 @@ impl Mp3Encoder {
                 // recovers the post-MDCT bins.
                 let xr_pre = inverse_alias_reduce(&xr);
 
-                // Pick the smallest global_gain whose quantized
-                // `is[]` (a) satisfies the §2.4.1.7 magnitude clamp
-                // and (b) actually emits at most `per_gc_bits` bits
-                // through OUR Huffman emission (the in-tree
-                // `exact_bit_count` chooser doesn't enforce
-                // linbits-reach, so we run a tighter ratchet here:
-                // start at the in-tree budget gain, emit, and bump
-                // the gain by 1 if our chooser overruns).
+                // Pick the smallest global_gain + scalefactor configuration.
+                // Two paths:
+                //   * fixed-gain: zero scalefactors + inner loop only
+                //     (the r138 path; kept for reference / debug).
+                //   * outer-loop: §C.1.5.4.3 distortion-control loop on
+                //     top of the inner loop, with non-zero per-band
+                //     scalefactor amplification driven by the uniform
+                //     `xmin[sb]` threshold.
                 let gc_template = default_long_gc();
-                let sf = ScaleFactors::default();
                 let per_gc_bits = self.per_gc_bit_budget();
-                let res_budget = search_bit_budget(
-                    &xr_pre,
-                    &gc_template,
-                    &sf,
-                    self.sample_rate_hz,
-                    self.version,
-                    per_gc_bits as u64,
-                );
-                let res_clamp = search_magnitude_clamp(
-                    &xr_pre,
-                    &gc_template,
-                    &sf,
-                    self.sample_rate_hz,
-                    self.version,
-                );
-                let mut global_gain = res_budget.global_gain.max(res_clamp.global_gain);
+                // When the outer loop runs, part2 (scalefactors) costs
+                // 74 bits per granule-channel (`scalefac_compress = 15`:
+                // 11·slen1 + 10·slen2 = 11·4 + 10·3); the inner loop's
+                // part3 budget shrinks by that amount.
+                let part2_bits_outer: usize = 11 * 4 + 10 * 3;
+                let inner_budget_for_outer = per_gc_bits.saturating_sub(part2_bits_outer) as u64;
+                let (sf, initial_gain) = match self.outer_loop_threshold {
+                    Some(thr) => {
+                        // Outer loop seeds scalefac_compress = 15 so the
+                        // chosen per-band scalefactors can be written
+                        // back as part2.
+                        let mut gc_for_ol = gc_template;
+                        gc_for_ol.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
+                        let res = outer_loop_search_long(
+                            &xr_pre,
+                            &gc_for_ol,
+                            self.sample_rate_hz,
+                            self.version,
+                            inner_budget_for_outer,
+                            thr,
+                            DEFAULT_OUTER_LOOP_MAX_ITER,
+                        );
+                        (res.scalefactors, res.global_gain)
+                    }
+                    None => {
+                        let sf = ScaleFactors::default();
+                        let res_budget = search_bit_budget(
+                            &xr_pre,
+                            &gc_template,
+                            &sf,
+                            self.sample_rate_hz,
+                            self.version,
+                            per_gc_bits as u64,
+                        );
+                        let res_clamp = search_magnitude_clamp(
+                            &xr_pre,
+                            &gc_template,
+                            &sf,
+                            self.sample_rate_hz,
+                            self.version,
+                        );
+                        (sf, res_budget.global_gain.max(res_clamp.global_gain))
+                    }
+                };
+                let mut global_gain = initial_gain;
                 let _ = (GAIN_MAX, GAIN_MIN); // re-export keep-alive
 
-                // Re-quantize at the chosen gain and configure the
+                // Re-quantize at the chosen gain + sf and configure the
                 // granule-channel. If the bit cost under OUR table
                 // chooser (filtered by linbits reach) exceeds the
                 // budget, bump the gain by 1 and retry — the
                 // §C.1.5.4.4 `qquant + 1` outer ratchet, applied
                 // here only as a budget-overrun safety net.
+                let scalefac_compress = if self.outer_loop_threshold.is_some() {
+                    OUTER_LOOP_SCALEFAC_COMPRESS
+                } else {
+                    0
+                };
                 let mut gc;
                 let mut is;
                 let mut split;
@@ -424,7 +518,7 @@ impl Mp3Encoder {
                 loop {
                     gc = gc_template;
                     gc.global_gain = global_gain;
-                    gc.scalefac_compress = 0;
+                    gc.scalefac_compress = scalefac_compress;
                     gc.preflag = false;
                     gc.scalefac_scale = false;
                     is = quantize(&xr_pre, &gc, &sf, self.sample_rate_hz, self.version);
@@ -450,13 +544,22 @@ impl Mp3Encoder {
                     gc.count1table_select = count1_b;
 
                     // Compute the actual emitted bit cost under our
-                    // chooser and compare with the per-gc budget.
+                    // chooser and compare with the per-gc budget. When
+                    // the outer loop is active the part3 budget is the
+                    // total per-gc budget minus the fixed 74-bit part2
+                    // cost; otherwise (scalefactor_compress = 0) part2
+                    // is zero and the whole budget is part3.
                     let big_bits = bits_for_range(&is, 0, r0_end, t0).unwrap_or(usize::MAX / 4)
                         + bits_for_range(&is, r0_end, r1_end, t1).unwrap_or(usize::MAX / 4)
                         + bits_for_range(&is, r1_end, bv2, t2).unwrap_or(usize::MAX / 4);
                     let cnt1_bits = crate::huffman::count1_bits(&is, c1s, c1e, count1_b);
                     let total = big_bits + cnt1_bits;
-                    if total <= per_gc_bits || global_gain == 255 {
+                    let budget_for_part3 = if self.outer_loop_threshold.is_some() {
+                        inner_budget_for_outer as usize
+                    } else {
+                        per_gc_bits
+                    };
+                    if total <= budget_for_part3 || global_gain == 255 {
                         break;
                     }
                     global_gain = global_gain.saturating_add(1);

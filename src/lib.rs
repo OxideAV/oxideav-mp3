@@ -243,11 +243,29 @@
 //! and asserts PSNR > 20 dB (achieves ~86 dB) after accounting for
 //! the chain's 1057-sample group delay.
 //!
-//! The remaining Phase 2 work — the psychoacoustic model, the
-//! §C.1.5.4.3 outer (distortion-control) loop, scalefactor
-//! estimation, short / mixed block-type switching, stereo / LSF /
-//! VBR, and the runtime-context [`Encoder`] trait wiring on top of
-//! [`Mp3Encoder`] — is still a later round. [`register`] installs
+//! The [`outer_loop`] module adds the **§C.1.5.4.3 outer
+//! (distortion-control) loop** — Phase 2 step 11. Wrapping the
+//! [`inner_loop`] global-gain search, [`outer_loop::outer_loop_search_long`]
+//! iterates per ISO/IEC 11172-3:1993 Annex C Figure C.9.b: for each
+//! pass it runs the inner loop, computes the per-band §C.1.5.4.3.3
+//! distortion `xfsf[sb]` against the decoder's reconstruction, amplifies
+//! every band whose distortion exceeds the supplied `xmin[sb]`
+//! threshold by `scalefac_l[sb] += 1`, and re-enters the inner loop;
+//! it terminates on the §C.1.5.4.3.6 conditions (no band over
+//! threshold, every band already amplified, or the next amplification
+//! would exceed the §C.1.5.4.3.6 per-band cap — 15 for `sfb ∈ [0,10]`,
+//! 7 for `[11,20]` — restoring the last-good state). The threshold
+//! vector is supplied by the caller; this round uses a uniform constant
+//! ("psychoacoustic model deferred"). [`Mp3Encoder::new_with_outer_loop`]
+//! routes the stream encoder through the outer loop with the
+//! corresponding fixed `scalefac_compress = 15` (`slen1=4`, `slen2=3`).
+//!
+//! The remaining Phase 2 work — the psychoacoustic model (so the
+//! threshold is per-band tonality-aware), scalefactor estimation
+//! (preemphasis / `scalefac_scale = 1` escalation), short / mixed
+//! block-type switching, stereo / LSF / VBR, and the runtime-context
+//! [`Encoder`] trait wiring on top of [`Mp3Encoder`] — is still a later
+//! round. [`register`] installs
 //! the container demuxer; the codec [`Decoder`] / [`Encoder`] trait
 //! surfaces remain stubs that return [`Error::NotImplemented`].
 //!
@@ -270,6 +288,7 @@ pub mod imdct;
 pub mod inner_loop;
 pub mod main_data;
 pub mod mdct;
+pub mod outer_loop;
 pub mod quantize;
 pub mod reorder;
 pub mod requantize;
@@ -311,6 +330,10 @@ pub use main_data::{
 pub use mdct::{
     analysis_long_window, analysis_short_window, forward_overlap, mdct,
     window_long_family_analysis, window_short_analysis, MdctState,
+};
+pub use outer_loop::{
+    band_distortion_long, outer_loop_search_long, scalefac_long_upper_limit, OuterLoopResult,
+    OuterLoopStats, OUTER_LOOP_SCALEFAC_COMPRESS, SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW,
 };
 pub use quantize::quantize;
 pub use reorder::reorder;
