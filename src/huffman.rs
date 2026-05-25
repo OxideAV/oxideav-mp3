@@ -420,6 +420,327 @@ fn big_table(idx: u8) -> Result<&'static BigTable, HuffmanError> {
     }
 }
 
+// =====================================================================
+// Forward Huffman **bit count** — the §C.1.5.4.4.5 / §C.1.5.4.4.8 count
+// the encoder's inner iteration loop needs to decide whether a quantized
+// `is[]` fits the available bit budget. This is the exact inverse of the
+// decode path above: it reports how many bits `decode_huffman` would have
+// consumed for a given `is[]`, region split and table selection.
+//
+// The decoder's `BigTable.len` / `QUAD_A.0` store the **codeword length
+// only** (no sign or `linbits` bits), whereas the spec's `bitz` /
+// `countltable` length tables "have to include the number of bits
+// necessary to encode the sign bits" (§C.1.5.4.4.5, §C.1.5.4.4.8 notes).
+// We therefore add the sign bits (one per non-zero value) and the
+// `linbits` ESC field explicitly, exactly mirroring `decode_big_pair` /
+// `decode_count1_quad`, so the count is bit-for-bit identical to what a
+// round-trip through `decode_huffman` would read.
+// =====================================================================
+
+/// Cost in bits of coding one big-values `(x, y)` pair with `table`, per
+/// §C.1.5.4.4.8: the Huffman codeword length `bitz[min(15,|x|)][min(15,|y|)]`,
+/// plus one `linbits` ESC field for each component whose magnitude is
+/// `≥ 15` (`s(ix - 15)`), plus one sign bit per non-zero component.
+///
+/// Returns `None` if the `(min(15,|x|), min(15,|y|))` cell is an unused
+/// corner (`len == 0` with both indices non-zero) of the chosen table —
+/// i.e. the pair cannot be coded by that codebook. Table 0's single
+/// `(0, 0)` zero-length entry is the one legitimate `len == 0` cell and
+/// costs `0` bits (no sign, no codeword) for an all-zero pair.
+fn big_pair_bits(table: &BigTable, x: i32, y: i32) -> Option<usize> {
+    let xl = usize::from(table.xlen);
+    let ax = x.unsigned_abs();
+    let ay = y.unsigned_abs();
+    // Huffman symbol index is the magnitude clamped to 15 (the ESC code).
+    let xi = ax.min(15) as usize;
+    let yi = ay.min(15) as usize;
+    if xi >= xl || yi >= xl {
+        // Magnitude exceeds this codebook's index range without an ESC
+        // path (small tables, linbits == 0) — not codable here.
+        return None;
+    }
+    let ent = table.entries[xi * xl + yi];
+    if ent.len == 0 && (xi != 0 || yi != 0) {
+        // Unused rectangular corner: this pair is not in the codebook.
+        return None;
+    }
+    let linbits = usize::from(table.linbits);
+    let mut bits = usize::from(ent.len);
+    // §C.1.5.4.4.8 step function s(ix - 15): a linbits ESC field is
+    // appended whenever the *original* magnitude reaches 15.
+    if ax >= 15 {
+        bits += linbits;
+    }
+    if ay >= 15 {
+        bits += linbits;
+    }
+    // Sign bits: one per non-zero value (mirrors decode_big_pair).
+    if x != 0 {
+        bits += 1;
+    }
+    if y != 0 {
+        bits += 1;
+    }
+    Some(bits)
+}
+
+/// Cost in bits of coding all pairs of `is[start..end]` (a half-open line
+/// range, `end - start` even) with codebook `table_idx`, per
+/// §C.1.5.4.4.8. Returns `None` if any pair is not codable by the chosen
+/// table (magnitude out of range / unused corner) or if `table_idx` is an
+/// unused/out-of-range codebook.
+fn region_bits_with_table(
+    is: &[i32; NUM_LINES],
+    start: usize,
+    end: usize,
+    table_idx: u8,
+) -> Option<usize> {
+    let table = big_table(table_idx).ok()?;
+    let mut bits = 0usize;
+    let mut k = start;
+    // Pairs step by two; need both k and k+1 inside the range.
+    while k + 1 < end && k + 1 < NUM_LINES {
+        bits += big_pair_bits(table, is[k], is[k + 1])?;
+        k += 2;
+    }
+    Some(bits)
+}
+
+/// The set of Table 3-B.7 big-values codebook indices that may be chosen
+/// for a region, in ascending order. Tables 4 and 14 are "not used"
+/// (§B.7) and are omitted; every other index 0..=31 is selectable.
+pub const SELECTABLE_BIG_TABLES: [u8; 30] = [
+    0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    28, 29, 30, 31,
+];
+
+/// §C.1.5.4.4.7 — choose the big-values codebook that codes the line
+/// range `is[start..end]` in the **fewest** bits, per §C.1.5.4.4.8.
+///
+/// Mirrors the spec's "trying all of these tables" strategy: every
+/// selectable codebook (0..=31 minus the unused 4 / 14) is costed and the
+/// minimum-bit table is returned as `(table_select, bits)`. Tables that
+/// cannot code a value in the range (magnitude out of the codebook's
+/// reach with no `linbits` escape) are skipped. An empty range
+/// (`start >= end`) is coded by table 0 at `0` bits.
+///
+/// Returns `None` only if **no** codebook can code the range — impossible
+/// in practice because the ESC tables 16..=31 reach any magnitude up to
+/// the §C.1.5.4.4.2 clamp via their `linbits` field, so this is reserved
+/// for a corrupt input range.
+#[must_use]
+pub fn choose_best_table_for_region(
+    is: &[i32; NUM_LINES],
+    start: usize,
+    end: usize,
+) -> Option<(u8, usize)> {
+    if start >= end {
+        // An empty region costs nothing and is nominally table 0.
+        return Some((0, 0));
+    }
+    let mut best: Option<(u8, usize)> = None;
+    for &idx in SELECTABLE_BIG_TABLES.iter() {
+        if let Some(bits) = region_bits_with_table(is, start, end, idx) {
+            match best {
+                Some((_, b)) if bits >= b => {}
+                _ => best = Some((idx, bits)),
+            }
+        }
+    }
+    best
+}
+
+/// Cost in bits of one count1 quadruple `(v, w, x, y)` (each magnitude
+/// `≤ 1`) under quad table A or B, per §C.1.5.4.4.5. The codeword length
+/// (Table 3-B.7-A for `table_b == false`, the trivial 4-bit code for
+/// `table_b == true`) plus one sign bit per non-zero value (the length
+/// tables "include the number of bits necessary to encode the sign
+/// bits"). Indexing mirrors `decode_count1_quad` exactly: the quad
+/// pattern is `(|v|<<3)|(|w|<<2)|(|x|<<1)|(|y|)`.
+fn count1_quad_bits(v: i32, w: i32, x: i32, y: i32, table_b: bool) -> usize {
+    let nz = |c: i32| usize::from(c != 0);
+    let signs = nz(v) + nz(w) + nz(x) + nz(y);
+    if table_b {
+        // Table B: a flat 4-bit code (one bit per value) + sign bits.
+        4 + signs
+    } else {
+        let pat = (nz(v) << 3) | (nz(w) << 2) | (nz(x) << 1) | nz(y);
+        usize::from(QUAD_A[pat].0) + signs
+    }
+}
+
+/// §C.1.5.4.4.5 — bits to code the count1 partition `is[start..end]`
+/// (a half-open line range, `end - start` a multiple of 4) with the
+/// chosen quad table. Mirrors the `bitsum_tableX` sum: one Huffman code
+/// word per quadruple, sign bits included.
+#[must_use]
+pub fn count1_bits(is: &[i32; NUM_LINES], start: usize, end: usize, table_b: bool) -> usize {
+    let mut bits = 0usize;
+    let mut k = start;
+    while k + 4 <= end && k + 4 <= NUM_LINES {
+        bits += count1_quad_bits(is[k], is[k + 1], is[k + 2], is[k + 3], table_b);
+        k += 4;
+    }
+    bits
+}
+
+/// §C.1.5.4.4.5 — bits for the count1 partition under the **better** of
+/// the two quad tables, `min(bitsum_tableA, bitsum_tableB)`. Returns
+/// `(count1table_select, bits)` where `count1table_select` is `false` for
+/// table A or `true` for table B (the §2.4.2.7 `count1table_select`
+/// field semantics: 0 → A, 1 → B).
+#[must_use]
+pub fn choose_best_count1_table(is: &[i32; NUM_LINES], start: usize, end: usize) -> (bool, usize) {
+    let bits_a = count1_bits(is, start, end, false);
+    let bits_b = count1_bits(is, start, end, true);
+    if bits_b < bits_a {
+        (true, bits_b)
+    } else {
+        (false, bits_a)
+    }
+}
+
+/// Big-values / count1 partition split of a quantized `is[]`, derived the
+/// way the §C.1.5.4.4.3 / §C.1.5.4.4.4 run-length steps prescribe:
+///
+/// * **`big_pairs`** — pairs in the big-values partition. Following
+///   §C.1.5.4.4.3 ("run length of zeros at the upper end") and
+///   §C.1.5.4.4.4 ("run length of values `≤ 1` … following the rzero
+///   pairs"), the trailing all-zero pairs are dropped, then the trailing
+///   run of `≤ 1`-magnitude quadruples is assigned to count1; everything
+///   below that is big-values. `big_pairs * 2` is the big-values line
+///   count.
+/// * **`count1_quads`** — count1 quadruples between the big-values
+///   partition and the trailing zero run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionSplit {
+    /// Number of `(x, y)` pairs in the big-values partition.
+    pub big_pairs: usize,
+    /// Number of `(v, w, x, y)` quadruples in the count1 partition.
+    pub count1_quads: usize,
+}
+
+/// Compute the §C.1.5.4.4.3 / .4 partition split of `is[]`: trailing zero
+/// pairs are dropped (r_zero), the trailing run of `≤ 1`-magnitude
+/// quadruples becomes count1, and everything below it is big-values (whole
+/// pairs). No non-zero line is ever dropped: the count1 upper edge is
+/// rounded **up** to a quadruple boundary so any leftover trailing lines
+/// are captured by the count1 run (they are `≤ 1` by construction since
+/// they sit above the last `≥ 2`-magnitude line) rather than discarded.
+#[must_use]
+pub fn partition_split(is: &[i32; NUM_LINES]) -> PartitionSplit {
+    // §C.1.5.4.4.3: r_zero — locate the last non-zero line.
+    let mut last_nonzero: isize = -1;
+    for (i, &v) in is.iter().enumerate() {
+        if v != 0 {
+            last_nonzero = i as isize;
+        }
+    }
+    if last_nonzero < 0 {
+        return PartitionSplit {
+            big_pairs: 0,
+            count1_quads: 0,
+        };
+    }
+    let nonzero_lines = (last_nonzero + 1) as usize;
+
+    // §C.1.5.4.4.4: count1 — the trailing run of quadruples whose four
+    // magnitudes are all ≤ 1, scanning *down* from the end of the
+    // non-zero region. Round the upper edge UP to a multiple of 4 so the
+    // final partial quad (whose trailing lines are zero, hence ≤ 1) is
+    // included — this keeps every non-zero line inside a partition.
+    let mut count1_end = nonzero_lines.div_ceil(4) * 4;
+    if count1_end > NUM_LINES {
+        count1_end = NUM_LINES;
+    }
+    let mut count1_start = count1_end;
+    let mut q = count1_end;
+    while q >= 4 {
+        let s = q - 4;
+        if is[s..s + 4].iter().all(|&v| v.abs() <= 1) {
+            count1_start = s;
+            q -= 4;
+        } else {
+            break;
+        }
+    }
+
+    let count1_quads = (count1_end - count1_start) / 4;
+    // Big-values covers lines 0..count1_start, as whole pairs. count1_start
+    // is a multiple of 4 (hence even), so this is exact.
+    let big_pairs = count1_start / 2;
+    PartitionSplit {
+        big_pairs,
+        count1_quads,
+    }
+}
+
+/// Region line-index boundaries for an encoder-side big-values count:
+/// the public wrapper over the decoder's `region_boundaries`, clamped to
+/// the big-values line count `big_pairs * 2`.
+///
+/// Returns `(region0_end, region1_end)` line indices; region 2 runs from
+/// `region1_end` to `big_pairs * 2`.
+#[must_use]
+pub fn encoder_region_boundaries(
+    gc: &GranuleChannel,
+    big_pairs: usize,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) -> (usize, usize) {
+    let bv2 = big_pairs * 2;
+    let (r0, r1) = region_boundaries(gc, sample_rate_hz, version);
+    (r0.min(bv2), r1.min(bv2))
+}
+
+/// **Exact** §C.1.5.4.4.5 + §C.1.5.4.4.8 Huffman bit count for a quantized
+/// `is[]`, with explicit region boundaries and table selections — the
+/// `count_bits` the inner iteration loop uses to test the rate budget.
+///
+/// Inputs:
+/// * `is` — the 576 quantized lines.
+/// * `big_pairs` — big-values pair count (lines `0..big_pairs*2`).
+/// * `region_ends` — `(region0_end, region1_end)` line indices splitting
+///   the big-values partition into three sub-regions (§C.1.5.4.4.6).
+///   Region 0 is `0..region0_end`, region 1 `region0_end..region1_end`,
+///   region 2 `region1_end..big_pairs*2`. Each is clamped to the
+///   big-values range.
+/// * `table_select` — the three big-values codebook indices (one per
+///   sub-region).
+/// * `count1_quads` — count1 quadruple count (lines
+///   `big_pairs*2 .. big_pairs*2 + count1_quads*4`).
+/// * `count1table_b` — `false` for quad table A, `true` for table B.
+///
+/// Returns the total big-values + count1 bit count (the zero partition
+/// costs nothing), or `None` if a big-values pair is not codable by the
+/// table chosen for its region (magnitude out of range / unused corner).
+#[must_use]
+pub fn count_huffman_bits(
+    is: &[i32; NUM_LINES],
+    big_pairs: usize,
+    region_ends: (usize, usize),
+    table_select: [u8; 3],
+    count1_quads: usize,
+    count1table_b: bool,
+) -> Option<usize> {
+    let bv2 = (big_pairs * 2).min(NUM_LINES);
+    let r0 = region_ends.0.min(bv2);
+    let r1 = region_ends.1.max(r0).min(bv2);
+
+    let mut bits = 0usize;
+    // Three big-values sub-regions (§C.1.5.4.4.8).
+    bits += region_bits_with_table(is, 0, r0, table_select[0])?;
+    bits += region_bits_with_table(is, r0, r1, table_select[1])?;
+    bits += region_bits_with_table(is, r1, bv2, table_select[2])?;
+
+    // count1 partition (§C.1.5.4.4.5).
+    let c1_start = bv2;
+    let c1_end = (c1_start + count1_quads * 4).min(NUM_LINES);
+    bits += count1_bits(is, c1_start, c1_end, count1table_b);
+
+    Some(bits)
+}
+
 include!("huffman_tables.rs");
 
 #[cfg(test)]

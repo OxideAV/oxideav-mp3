@@ -22,19 +22,23 @@
 //!   (`qquant = qquant + 1`, i.e. raises `global_gain`) until the
 //!   maximum is within range; we binary-search the threshold instead.
 //!
-//! * **Bit budget** ([`search_bit_budget`]) — §C.1.5.4.4 in spirit
+//! * **Bit budget** ([`search_bit_budget`]) — §C.1.5.4.4
 //!   ("increases the quantizer step size until the output vector can be
 //!   coded with the available number of bits"): the smallest
-//!   `global_gain` whose **coarse** bit estimate fits a supplied budget.
-//!   The estimate here is an order-of-magnitude placeholder
-//!   ([`coarse_bit_estimate`]); the exact §C.1.5.4.4.5 / §C.1.5.4.4.8
-//!   Huffman bit count (count1 + big-values codebook lengths) is a
-//!   later step and is **not** computed this round.
+//!   `global_gain` whose **exact** §C.1.5.4.4.5 + §C.1.5.4.4.8 Huffman
+//!   bit count ([`exact_bit_count`]) fits a supplied budget. The count
+//!   partitions `is[]` (§C.1.5.4.4.3 / .4), SUBDIVIDEs the big-values
+//!   range into three sub-regions (§C.1.5.4.4.6), picks the minimum-bit
+//!   codebook per region and the better count1 quad table
+//!   (§C.1.5.4.4.7), then sums Table 3-B.7 codeword lengths plus the
+//!   `linbits` ESC fields and the sign bits. The legacy
+//!   [`coarse_bit_estimate`] placeholder of the r133 search is retained
+//!   only for reference / comparison.
 //!
 //! This file does **not** implement the psychoacoustic model, the
-//! §C.1.5.4.3 outer (distortion-control) loop, scalefactor estimation,
-//! or the exact Huffman count. It only searches the one scalar
-//! (`global_gain`) that the inner loop varies.
+//! §C.1.5.4.3 outer (distortion-control) loop, or scalefactor
+//! estimation. It searches the one scalar (`global_gain`) the inner loop
+//! varies and now computes the exact Huffman count that gates it.
 //!
 //! # Why binary search is valid
 //!
@@ -54,10 +58,14 @@
 //! the ISO/IEC 11172-3:1993 §C.1.5.4 / §2.4.1.7 / §2.4.3.4.7 text.
 
 use crate::frame::MpegVersion;
+use crate::huffman::{
+    choose_best_count1_table, choose_best_table_for_region, count_huffman_bits, partition_split,
+    PartitionSplit,
+};
 use crate::quantize::quantize;
 use crate::requantize::NUM_LINES;
 use crate::scalefactors::ScaleFactors;
-use crate::side_info::GranuleChannel;
+use crate::side_info::{BlockType, GranuleChannel};
 
 /// The maximum absolute quantized value the big-values partition may
 /// carry, from the §2.4.1.7 `big_values` definition: *"The maximum
@@ -114,6 +122,104 @@ pub fn coarse_bit_estimate(is: &[i32; NUM_LINES]) -> u64 {
         }
     }
     bits
+}
+
+/// A SUBDIVIDE of the big-values partition into three sub-regions
+/// (§C.1.5.4.4.6) plus the chosen best codebook per region, plus the
+/// count1 partition's best quad table — the full table/region decision
+/// the inner loop makes before counting bits, returned alongside the
+/// **exact** §C.1.5.4.4.5 + §C.1.5.4.4.8 bit total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExactBitCount {
+    /// The §C.1.5.4.4.3 / .4 big-values / count1 partition split.
+    pub split: PartitionSplit,
+    /// Big-values sub-region end line indices `(region0_end, region1_end)`;
+    /// region 2 runs to `split.big_pairs * 2`.
+    pub region_ends: (usize, usize),
+    /// Best big-values codebook per sub-region (§C.1.5.4.4.7).
+    pub table_select: [u8; 3],
+    /// Best count1 quad table: `false` for table A, `true` for table B.
+    pub count1table_b: bool,
+    /// Total exact Huffman bit count (big-values + count1; zero partition
+    /// is free).
+    pub bits: usize,
+}
+
+/// SUBDIVIDE the big-values pair count into three sub-region **line**
+/// boundaries, per the §C.1.5.4.4.6 "simple strategy" the spec offers
+/// (assign ~1/3 of the range to region 0 and ~1/4 to region 2). For
+/// block-split (short) blocks the spec uses only two sub-regions with
+/// region 2 empty; we mirror that by collapsing region 2.
+///
+/// Returns `(region0_end, region1_end)` line indices within `0..bv2`
+/// where `bv2 = big_pairs * 2`.
+fn subdivide(gc: &GranuleChannel, big_pairs: usize) -> (usize, usize) {
+    let bv2 = big_pairs * 2;
+    if bv2 == 0 {
+        return (0, 0);
+    }
+    if gc.window_switching_flag && gc.block_type == BlockType::Short {
+        // Two sub-regions only (§C.1.5.4.4.6): split the big-values pairs
+        // in two, region 2 empty.
+        let r0_pairs = big_pairs / 2;
+        let r0 = (r0_pairs * 2).min(bv2);
+        return (r0, bv2);
+    }
+    // ~1/3 to region 0, ~1/4 to region 2 (so ~1/3, ~5/12, ~1/4). Work in
+    // whole pairs and align region ends to a pair boundary.
+    let r0_pairs = big_pairs / 3;
+    let r2_pairs = big_pairs / 4;
+    let r1_pairs = big_pairs.saturating_sub(r0_pairs + r2_pairs);
+    let r0 = (r0_pairs * 2).min(bv2);
+    let r1 = ((r0_pairs + r1_pairs) * 2).min(bv2);
+    (r0, r1)
+}
+
+/// **Exact** §C.1.5.4.4.5 + §C.1.5.4.4.8 Huffman bit count for a
+/// quantized `is[]`: partition it (§C.1.5.4.4.3 / .4), SUBDIVIDE the
+/// big-values range (§C.1.5.4.4.6), choose the minimum-bit codebook per
+/// sub-region and the better count1 quad table (§C.1.5.4.4.7), and sum
+/// the codeword lengths via [`count_huffman_bits`]. This is the real
+/// `count_bits` the rate-control loop tests — it replaces
+/// [`coarse_bit_estimate`].
+///
+/// `gc` supplies only the block-type / window-switching flags that steer
+/// SUBDIVIDE; its `region0_count` / `region1_count` are **not** used (the
+/// region split is chosen here). Returns `None` only on a corrupt range
+/// no codebook can code (see [`choose_best_table_for_region`]).
+#[must_use]
+pub fn exact_bit_count(is: &[i32; NUM_LINES], gc: &GranuleChannel) -> Option<ExactBitCount> {
+    let split = partition_split(is);
+    let bv2 = split.big_pairs * 2;
+    let region_ends = subdivide(gc, split.big_pairs);
+
+    // Best codebook per big-values sub-region (§C.1.5.4.4.7 / .8).
+    let (t0, _) = choose_best_table_for_region(is, 0, region_ends.0)?;
+    let (t1, _) = choose_best_table_for_region(is, region_ends.0, region_ends.1)?;
+    let (t2, _) = choose_best_table_for_region(is, region_ends.1, bv2)?;
+    let table_select = [t0, t1, t2];
+
+    // Best count1 quad table (§C.1.5.4.4.5).
+    let c1_start = bv2;
+    let c1_end = c1_start + split.count1_quads * 4;
+    let (count1table_b, _) = choose_best_count1_table(is, c1_start, c1_end);
+
+    let bits = count_huffman_bits(
+        is,
+        split.big_pairs,
+        region_ends,
+        table_select,
+        split.count1_quads,
+        count1table_b,
+    )?;
+
+    Some(ExactBitCount {
+        split,
+        region_ends,
+        table_select,
+        count1table_b,
+        bits,
+    })
 }
 
 /// Quantize `xr` at the given `global_gain` (everything else in
@@ -192,6 +298,54 @@ where
     }
 }
 
+/// Linear upward scan for the smallest `global_gain` in
+/// `[GAIN_MIN, GAIN_MAX]` whose quantized `is[]` satisfies `predicate`,
+/// for a predicate that is **not** monotone in `global_gain`.
+///
+/// The exact §C.1.5.4.4 Huffman bit count is *not* monotone in the gain:
+/// raising the gain shrinks every `|is_i|`, but Huffman codeword lengths
+/// are not monotone in magnitude and the optimal codebook per region
+/// changes, so a coarser quantization can occasionally cost a few more
+/// bits than a finer one. The spec's inner loop therefore does not binary
+/// search — it steps `qquant = qquant + 1` (§C.1.5.4.4) and stops at the
+/// first gain whose count fits. This helper mirrors that: it scans gains
+/// upward and returns the first satisfying one (the smallest gain that
+/// fits), making no monotonicity assumption.
+fn search_linear<F>(
+    xr: &[f32; NUM_LINES],
+    gc_template: &GranuleChannel,
+    sf: &ScaleFactors,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    predicate: F,
+) -> InnerLoopResult
+where
+    F: Fn(&[i32; NUM_LINES]) -> bool,
+{
+    let quant = |gain: u8| quantize_at(xr, gc_template, sf, sample_rate_hz, version, gain);
+    for g in u16::from(GAIN_MIN)..=u16::from(GAIN_MAX) {
+        let is = quant(g as u8);
+        if predicate(&is) {
+            let m = max_abs(&is);
+            return InnerLoopResult {
+                global_gain: g as u8,
+                is,
+                max_abs: m,
+                satisfied: true,
+            };
+        }
+    }
+    // No gain satisfies the predicate; report the coarsest one.
+    let is = quant(GAIN_MAX);
+    let m = max_abs(&is);
+    InnerLoopResult {
+        global_gain: GAIN_MAX,
+        is,
+        max_abs: m,
+        satisfied: false,
+    }
+}
+
 /// §C.1.5.4.4.2 magnitude-clamp inner loop: find the smallest
 /// `global_gain` whose quantized `is[]` keeps `max|is| ≤`
 /// [`BIG_VALUES_LIMIT`].
@@ -225,21 +379,25 @@ pub fn search_magnitude_clamp(
 }
 
 /// §C.1.5.4.4 bit-budget inner loop: find the smallest `global_gain`
-/// whose [`coarse_bit_estimate`] of the quantized `is[]` is `≤ budget`.
+/// whose **exact** §C.1.5.4.4.5 + §C.1.5.4.4.8 Huffman bit count
+/// ([`exact_bit_count`]) of the quantized `is[]` is `≤ budget`.
 ///
 /// As with [`search_magnitude_clamp`], `gc_template.global_gain` is the
-/// searched field and all other fields plus `sf` are held fixed. If no
-/// gain in `[GAIN_MIN, GAIN_MAX]` fits the budget (a budget smaller
-/// than the all-zero cost of `0`, which is impossible, or — more
-/// realistically — never, since [`GAIN_MAX`] drives `is[]` to all-zero
-/// at cost `0`), the result carries `satisfied == false`. In practice a
-/// budget `≥ 0` is always met by the all-zero quantization at the
-/// coarsest gain, so `satisfied` is true whenever `budget` is reachable
-/// before that point.
+/// searched field and all other fields plus `sf` are held fixed.
+/// `gc_template`'s block-type / window-switching flags steer the
+/// §C.1.5.4.4.6 SUBDIVIDE; the codebook per sub-region and the count1
+/// quad table are chosen to minimise bits (§C.1.5.4.4.7). If no gain in
+/// `[GAIN_MIN, GAIN_MAX]` fits the budget the result carries
+/// `satisfied == false`; in practice a budget `≥ 0` is always met by the
+/// all-zero quantization at the coarsest gain (cost `0`).
 ///
-/// The bit estimate is a coarse placeholder, not the exact
-/// §C.1.5.4.4.5 / §C.1.5.4.4.8 Huffman count — see
-/// [`coarse_bit_estimate`].
+/// This is the exact codebook-length count, not the
+/// [`coarse_bit_estimate`] placeholder of the r133 search. Unlike the
+/// coarse estimate, the exact count is **not** monotone in `global_gain`
+/// (Huffman codeword lengths are not monotone in magnitude and the
+/// best codebook per region shifts as values shrink), so this search uses
+/// the spec's upward `qquant + 1` scan ([`search_linear`]) rather than a
+/// binary search, returning the smallest gain whose count fits.
 #[must_use]
 pub fn search_bit_budget(
     xr: &[f32; NUM_LINES],
@@ -249,8 +407,10 @@ pub fn search_bit_budget(
     version: MpegVersion,
     budget: u64,
 ) -> InnerLoopResult {
-    search(xr, gc_template, sf, sample_rate_hz, version, |is| {
-        coarse_bit_estimate(is) <= budget
+    search_linear(xr, gc_template, sf, sample_rate_hz, version, |is| {
+        // A range no codebook can code (corrupt input) is treated as
+        // over-budget so the search raises the gain.
+        exact_bit_count(is, gc_template).is_some_and(|c| c.bits as u64 <= budget)
     })
 }
 

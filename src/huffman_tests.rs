@@ -418,6 +418,77 @@ mod tests {
         }
     }
 
+    // ----- forward bit count ⇄ decoder round-trip -----
+
+    /// The §C.1.5.4.4.5 / .8 forward count must equal the exact number of
+    /// bits `decode_huffman` consumes for the same `is[]`, region split
+    /// and table selection. We assemble a spec-derived bitstream from the
+    /// Table 3-B.7 codewords, decode it (recording the consumed bits via
+    /// `bit_pos`), then `count_huffman_bits` of the decoded `is[]` must
+    /// match the consumed-bit delta exactly.
+    #[test]
+    fn count_matches_decoder_consumption_big_and_count1() {
+        // Two big-values pairs in region 0 under table 1:
+        //   (1,0) → "01"  (len 2) + signx(0)            = 3 bits
+        //   (1,1) → "000" (len 3) + signx(1) + signy(1) = 5 bits
+        // One count1 quad under table A:
+        //   (1,1,1,1) → "000001" (len 6) + 4 signs      = 10 bits
+        let bytes = pack(&[
+            (0b01, 2),
+            (0, 1), // pair 0: (1,0), signx=0
+            (0b000, 3),
+            (1, 1),
+            (1, 1), // pair 1: (-1,-1)
+            (0b000001, 6),
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            (1, 1), // count1 quad: (-1,-1,-1,-1)
+        ]);
+        let mut rd = MainDataReader::new(&bytes);
+        // big_values=2, table_select[0]=1, region0 spans all big-values.
+        let gc = mk_gc(2, [1, 0, 0], 20, 0, false);
+        let part3 = 3 + 5 + 10;
+        let start = rd.bit_pos();
+        let is = decode_huffman(&mut rd, &gc, part3, 44100, MpegVersion::Mpeg1).unwrap();
+        let consumed = rd.bit_pos() - start;
+        assert_eq!(consumed, 18, "decoder consumed an unexpected bit count");
+
+        // Forward count of the decoded is[]: 2 big-values pairs (region 0
+        // = lines 0..4, table 1), 1 count1 quad (table A).
+        let counted =
+            count_huffman_bits(&is, 2, (4, 4), [1, 0, 0], 1, false).expect("codable");
+        assert_eq!(
+            counted, consumed,
+            "forward count {counted} != decoder consumption {consumed}"
+        );
+    }
+
+    /// Same round-trip across a linbits ESC pair: table 16 (linbits=1),
+    /// a pair (16, 0) → symbol 15 + 1 linbits + 1 sign.
+    #[test]
+    fn count_matches_decoder_consumption_linbits() {
+        // Table 16 (16x16, linbits=1). Look up the (15,0) codeword.
+        let ent = TABLE16_E[15 * 16];
+        // Stream: codeword(15,0), linbits(1)=1 → magnitude 15+1=16, signx=0.
+        let bytes = pack(&[
+            (u32::from(ent.code), u32::from(ent.len)),
+            (1, 1), // linbits field (value 1) → magnitude 16
+            (0, 1), // signx = 0 (positive)
+        ]);
+        let mut rd = MainDataReader::new(&bytes);
+        let gc = mk_gc(1, [16, 0, 0], 20, 0, false);
+        let part3 = u32::from(ent.len) + 1 + 1;
+        let start = rd.bit_pos();
+        let is = decode_huffman(&mut rd, &gc, part3, 44100, MpegVersion::Mpeg1).unwrap();
+        let consumed = rd.bit_pos() - start;
+        assert_eq!(is[0], 16);
+        assert_eq!(is[1], 0);
+        let counted = count_huffman_bits(&is, 1, (2, 2), [16, 0, 0], 0, false).expect("codable");
+        assert_eq!(counted, consumed);
+        assert_eq!(counted, usize::from(ent.len) + 1 + 1);
+    }
+
     /// Kraft inequality: a complete (lossless) binary Huffman code
     /// satisfies Σ 2^-len = 1. Our tables include a few unused (x,y)
     /// corners (the spec marks tables as squares but trims the top

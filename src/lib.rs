@@ -274,11 +274,15 @@ pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
     Mp3FrameHeader, MpegVersion,
 };
-pub use huffman::{decode_huffman, HuffmanError, NUM_LINES};
+pub use huffman::{
+    choose_best_count1_table, choose_best_table_for_region, count1_bits, count_huffman_bits,
+    decode_huffman, encoder_region_boundaries, partition_split, HuffmanError, PartitionSplit,
+    NUM_LINES, SELECTABLE_BIG_TABLES,
+};
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
 pub use inner_loop::{
-    coarse_bit_estimate, max_abs, search_bit_budget, search_magnitude_clamp, InnerLoopResult,
-    BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
+    coarse_bit_estimate, exact_bit_count, max_abs, search_bit_budget, search_magnitude_clamp,
+    ExactBitCount, InnerLoopResult, BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
 };
 pub use mdct::{
     analysis_long_window, analysis_short_window, forward_overlap, mdct,

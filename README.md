@@ -595,22 +595,40 @@ function over `[0, 255]`.
   gain alone; the result then reports `satisfied == false` and carries
   the `GAIN_MAX` fallback (the outer loop / scalefactors, not in scope,
   would extend the range).
-- `search_bit_budget` finds the smallest gain whose `coarse_bit_estimate`
-  fits a supplied budget. That estimate (`bits(|is_i|) + 1` summed over
-  non-zero lines) is an **order-of-magnitude placeholder** — the exact
-  §C.1.5.4.4.5 / §C.1.5.4.4.8 Huffman count is a later step.
+- `search_bit_budget` finds the smallest gain whose **exact**
+  §C.1.5.4.4.5 + §C.1.5.4.4.8 Huffman bit count fits a supplied budget
+  (Phase 2 step 6, below). The legacy `coarse_bit_estimate`
+  (`bits(|is_i|) + 1` summed over non-zero lines) is kept only for
+  reference.
 
-Verified: `max|is|` and the coarse bit count are monotone across all 256
-gains; the chosen gain is minimal (gain−1 violates) and keeps
-`max|is| ≤ 8191`; louder targets pick coarser-or-equal gains across a
-6-decade sweep; tighter budgets pick coarser gains; and
-`requantize(is)` at the chosen gain reproduces the target to within the
-quantizer-grid bound.
+**Phase 2 step 6 (exact Huffman bit count)** replaces that placeholder
+with the real §C.1.5.4.4.5 / §C.1.5.4.4.8 `count_bits`.
+`count_huffman_bits` partitions `is[576]` (§C.1.5.4.4.3 r_zero /
+§C.1.5.4.4.4 count1 run-lengths via `partition_split`), splits the
+big-values range into three sub-regions (§C.1.5.4.4.6 SUBDIVIDE), and
+sums Table 3-B.7 codeword lengths: per big-values pair the
+`bitz[min(15,|x|)][min(15,|y|)]` codeword plus a `linbits` ESC field for
+each component of magnitude ≥ 15 and a sign bit per non-zero component;
+per count1 quad the table-A/B code length plus its sign bits.
+`choose_best_table_for_region` / `choose_best_count1_table` pick the
+minimum-bit codebook (§C.1.5.4.4.7). The count is **bit-for-bit
+identical** to what `decode_huffman` consumes — verified by a
+forward-count ⇄ decoder round-trip on hand-assembled big-values + count1
++ linbits bitstreams. Because Huffman codeword lengths are *not* monotone
+in magnitude (and the best codebook shifts as values shrink), the exact
+count is not monotone in `global_gain`, so the budget search uses the
+spec's upward `qquant + 1` scan rather than a bisection.
+
+Verified: per-pair / per-quad / linbits / multi-region counts equal the
+hand-summed codeword lengths; table selection returns the true minimum;
+the count matches decoder consumption exactly; `max|is|` is monotone and
+the chosen clamp gain is minimal; and `requantize(is)` reproduces the
+target to within the quantizer-grid bound.
 
 The remaining Phase 2 work — the psychoacoustic model, the §C.1.5.4.3
-outer (distortion-control) loop, scalefactor estimation, the exact
-Huffman bit count, and Huffman *encoding* of non-zero spectral lines —
-is still a later round.
+outer (distortion-control) loop, scalefactor estimation, and Huffman
+*encoding* (bit emission) of non-zero spectral lines — is still a later
+round.
 
 ### Not yet implemented
 
@@ -619,13 +637,14 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 steps 1–5 (forward MDCT primitive +
+**Phase 1 framing + Phase 2 steps 1–6 (forward MDCT primitive +
 analysis windowing + forward overlap split + polyphase analysis
 subband filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
-inner-loop `global_gain` search)** — it still lacks the psychoacoustic
-model, the §C.1.5.4.3 outer loop, scalefactor estimation, the exact
-Huffman bit count, and Huffman *encoding* of non-zero spectral lines,
-plus the bit-reservoir scheduling that those need. `register()` installs the
+inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
+count)** — it still lacks the psychoacoustic model, the §C.1.5.4.3 outer
+loop, scalefactor estimation, and Huffman *encoding* (bit emission) of
+non-zero spectral lines, plus the bit-reservoir scheduling that those
+need. `register()` installs the
 container demuxer; the codec `Decoder` / `Encoder` trait surfaces
 remain stubs.
 
