@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- New `mdct` module — Layer III encoder **Phase 2 step 1**: the
+  §2.4.3.4.10.2 **forward MDCT** primitive (`mdct(xn, n)`), the
+  analysis companion of the synthesis-side `imdct::imdct`. Implements
+  the 36-point (long block) and 12-point (short sub-block) transforms
+  using the same `cos((π / (2·n)) · (2·i + 1 + n/2) · (2·k + 1))`
+  kernel as the IMDCT but summed over the `n` time samples for each of
+  the `n / 2` output bins. With the spec normalisation the analysis
+  transform is the left inverse of the synthesis transform on the
+  bin space: `mdct(imdct(X), n)[k] = (n/2) · X[k]`. Unit tests cover
+  per-bin impulse closed forms, arbitrary spec-sum re-evaluation,
+  linearity, output-length contract, and exact frequency-domain
+  round-trip against the shipped IMDCT for both n = 36 and n = 12. No
+  analysis windowing, no forward overlap split, no psychoacoustic
+  model, no Huffman encode — those are subsequent Phase 2 rounds.
 - New `encoder` module — Layer III encoder **Phase 1**
   (bitstream-formatting half, no psychoacoustic model):
   - `write_header` writes the four-byte frame header

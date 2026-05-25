@@ -443,6 +443,30 @@ model):
   bitrate / sample-rate / channel-mode triple to the raw header
   indices.
 
+The `mdct` module begins the Layer III **encoder Phase 2** analysis
+filterbank with the §2.4.3.4.10.2 **forward MDCT** primitive — the
+encoder-side companion of `imdct::imdct`:
+
+- `mdct(xn, n)` transforms `n` time samples into `n / 2` frequency bins
+  using the same cosine kernel
+  `cos((π / (2·n)) · (2·i + 1 + n/2) · (2·k + 1))` summed transposed
+  (over `i` rather than `k`). `n = 36` for long blocks; `n = 12` for
+  each of the three short sub-blocks.
+- Exact round-trip against the existing IMDCT, derivable from the
+  spec orthogonality of the cosine kernel:
+  `mdct(imdct(X), n)[k] = (n / 2) · X[k]`. Verified on impulse,
+  multi-bin spectrum, and arbitrary mixed-frequency inputs for both
+  `n = 36` and `n = 12`.
+- Linearity, output-length contract, and per-bin closed-form impulse
+  responses are all unit-tested by recomputing the §2.4.3.4.10.2 sum
+  inside the test, so the test text mirrors the spec rather than the
+  implementation.
+
+The remaining Phase 2 work — analysis windowing (the mirror of
+§2.4.3.4.10.3), the forward overlap split, the psychoacoustic model,
+bit allocation, scalefactor estimation, and Huffman *encoding* of
+non-zero spectral lines — is still a later round.
+
 ### Not yet implemented
 
 No frame-driver / `Decoder` plumbing yet (the granule-level chain is
@@ -450,12 +474,12 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-framing-only (Phase 1) — it still lacks the forward (analysis) signal
-path: the MDCT analysis filterbank, the psychoacoustic model, bit
-allocation, scalefactor estimation, and Huffman *encoding* of non-zero
-spectral lines, plus the bit-reservoir scheduling that those need.
-`register()` installs the container demuxer; the codec `Decoder` /
-`Encoder` trait surfaces remain stubs.
+**Phase 1 framing + Phase 2 step 1 (forward MDCT primitive only)** —
+it still lacks the analysis windowing, the forward overlap split, the
+psychoacoustic model, bit allocation, scalefactor estimation, and
+Huffman *encoding* of non-zero spectral lines, plus the bit-reservoir
+scheduling that those need. `register()` installs the container
+demuxer; the codec `Decoder` / `Encoder` trait surfaces remain stubs.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
