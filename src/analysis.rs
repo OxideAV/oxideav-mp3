@@ -76,8 +76,7 @@
 //! coefficients and the `M[i,k]` matrixing formula — was transcribed
 //! from the staged ISO/IEC 11172-3:1993 PDF (Annex C Table C.1 pages
 //! 67–69 of the body, and the Figure C.4 pseudo code on pages 77–78).
-//! No external implementation (FFmpeg, libmad, mpg123, LAME, minimp3,
-//! libmpg123, …) was consulted for any reason.
+//! No external implementation was consulted.
 //!
 //! The literal PDF text of Table C.1 carries OCR-grade typography
 //! artefacts in several entries (the rendered PDF intermixes the
