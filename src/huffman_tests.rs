@@ -561,4 +561,283 @@ mod tests {
             );
         }
     }
+
+    // ----- forward emission ⇄ decoder round-trip -----
+
+    /// Decode the payload of an `encode_huffman` result and assert it
+    /// recovers `is[0 .. big_pairs*2 + count1_quads*4]` exactly, that the
+    /// decoder consumes precisely `bit_len` bits, and that `bit_len`
+    /// equals the matching `count_huffman_bits`.
+    ///
+    /// `region0_count` / `region1_count` are the side-info fields the
+    /// decoder uses to recompute its own region boundaries (long block,
+    /// 44.1 kHz); they MUST reproduce `region_ends` via
+    /// `encoder_region_boundaries`, which the helper asserts so the decode
+    /// split lands identically to the one the emitter used.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_roundtrip(
+        is: &[i32; NUM_LINES],
+        big_pairs: usize,
+        region_ends: (usize, usize),
+        table_select: [u8; 3],
+        count1_quads: usize,
+        count1table_b: bool,
+        region0_count: u8,
+        region1_count: u8,
+    ) {
+        let data = encode_huffman(
+            is,
+            big_pairs,
+            region_ends,
+            table_select,
+            count1_quads,
+            count1table_b,
+        )
+        .expect("codable");
+
+        // Emitted bit length must equal the r134 exact count.
+        let counted = count_huffman_bits(
+            is,
+            big_pairs,
+            region_ends,
+            table_select,
+            count1_quads,
+            count1table_b,
+        )
+        .expect("codable");
+        assert_eq!(
+            data.bit_len, counted,
+            "emitted bit length {} != count_huffman_bits {}",
+            data.bit_len, counted,
+        );
+
+        // Build a gc whose own region split (from region0/1_count)
+        // reproduces region_ends, so the decoder picks the same per-region
+        // table_select the emitter used.
+        let gc = mk_gc(
+            big_pairs as u16,
+            table_select,
+            region0_count,
+            region1_count,
+            count1table_b,
+        );
+        assert_eq!(
+            encoder_region_boundaries(&gc, big_pairs, 44100, MpegVersion::Mpeg1),
+            region_ends,
+            "region0/1_count must reproduce region_ends",
+        );
+        let mut rd = MainDataReader::new(&data.bytes);
+        let start = rd.bit_pos();
+        let decoded =
+            decode_huffman(&mut rd, &gc, data.bit_len as u32, 44100, MpegVersion::Mpeg1).unwrap();
+        let consumed = rd.bit_pos() - start;
+        assert_eq!(
+            consumed, data.bit_len,
+            "decoder consumed {consumed} bits, emitter wrote {}",
+            data.bit_len,
+        );
+        let nlines = big_pairs * 2 + count1_quads * 4;
+        for i in 0..nlines {
+            assert_eq!(decoded[i], is[i], "line {i} mismatch after round-trip");
+        }
+        for (i, &v) in decoded.iter().enumerate().skip(nlines) {
+            assert_eq!(v, 0, "line {i} should be zero past the partitions");
+        }
+    }
+
+    /// Round-trip a mixed big-values + count1 granule through the emitter:
+    /// two pairs in region 0 (table 1) and one count1 quad (table A). The
+    /// big-values span lines 0..4 so region 0 (the whole big-values range)
+    /// matches the decoder's own split.
+    #[test]
+    fn encode_roundtrip_big_and_count1() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 1;
+        is[1] = 0; // pair (1, 0)
+        is[2] = -1;
+        is[3] = -1; // pair (-1, -1)
+        is[4] = -1;
+        is[5] = -1;
+        is[6] = -1;
+        is[7] = -1; // count1 quad (-1,-1,-1,-1)
+        // region0_count=0 → region0 ends at band 1 (line 4) = bv2, so all
+        // big-values land in region 0.
+        assert_roundtrip(&is, 2, (4, 4), [1, 0, 0], 1, false, 0, 0);
+    }
+
+    /// Round-trip a linbits ESC pair (table 16, linbits=1): magnitude 16
+    /// is symbol 15 + a 1-bit linbits field + a sign. big_values spans
+    /// lines 0..2 (one pair) in region 0.
+    #[test]
+    fn encode_roundtrip_linbits_escape() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 16; // → symbol 15, linbits=1, sign 0
+        is[1] = 0;
+        assert_roundtrip(&is, 1, (2, 2), [16, 0, 0], 0, false, 0, 0);
+    }
+
+    /// Round-trip a larger linbits magnitude with a negative sign under
+    /// table 24 (linbits=4): |x| = 20 → symbol 15 + linbits 5 + sign 1.
+    #[test]
+    fn encode_roundtrip_linbits_negative_table24() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = -20; // 15 + 5, negative
+        is[1] = 3; // small positive, no escape
+        assert_roundtrip(&is, 1, (2, 2), [24, 0, 0], 0, false, 0, 0);
+    }
+
+    /// Round-trip the count1 partition under quad table B (the trivial
+    /// 4-bit code): a quad of mixed magnitudes and signs.
+    #[test]
+    fn encode_roundtrip_count1_table_b() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 1;
+        is[1] = -1;
+        is[2] = 0;
+        is[3] = 1; // (1,-1,0,1) under table B
+        assert_roundtrip(&is, 0, (0, 0), [0, 0, 0], 1, true, 0, 0);
+    }
+
+    /// Round-trip a granule that uses all three big-values regions with
+    /// different tables, aligned to the 44.1 kHz long-block band split so
+    /// the decoder reproduces the same region boundaries. region0_count=3
+    /// → region0 ends at band 4 start = line 16; region1_count=2 → region1
+    /// ends at band 7 start = line 30.
+    #[test]
+    fn encode_roundtrip_three_regions() {
+        // Band starts at 44.1 kHz: 0,4,8,12,16,20,24,30,...
+        // region0 = lines 0..16 (tables small), region1 = 16..30, region2
+        // = 30..big_values*2.
+        let mut is = [0i32; NUM_LINES];
+        // Fill region 0 (lines 0..16) with small magnitudes.
+        for v in is.iter_mut().take(16) {
+            *v = 1;
+        }
+        // Region 1 (lines 16..30) with magnitude-2 values.
+        for v in is.iter_mut().take(30).skip(16) {
+            *v = 2;
+        }
+        // Region 2 (lines 30..40) with a couple of larger values.
+        for v in is.iter_mut().take(40).skip(30) {
+            *v = 5;
+        }
+        let big_pairs = 20; // lines 0..40
+        let region_ends = (16, 30);
+        // Choose minimum-bit tables per region via the r134 chooser, so
+        // the round-trip also exercises the encoder's table selection.
+        let (t0, _) = choose_best_table_for_region(&is, 0, 16).unwrap();
+        let (t1, _) = choose_best_table_for_region(&is, 16, 30).unwrap();
+        let (t2, _) = choose_best_table_for_region(&is, 30, big_pairs * 2).unwrap();
+        // Build a gc whose region split matches region_ends: region0_count
+        // = 3 (band 4 start = 16), region1_count = 2 (band 7 start = 30).
+        let gc = mk_gc(big_pairs as u16, [t0, t1, t2], 3, 2, false);
+        let (r0, r1) = encoder_region_boundaries(&gc, big_pairs, 44100, MpegVersion::Mpeg1);
+        assert_eq!((r0, r1), region_ends, "band-aligned region split");
+        assert_roundtrip(&is, big_pairs, region_ends, [t0, t1, t2], 0, false, 3, 2);
+    }
+
+    /// End-to-end encoder-side round-trip: derive the partition split and
+    /// per-region tables the way the inner loop will, emit, and decode
+    /// back. Exercises `partition_split` → `choose_best_*` → `encode_huffman`
+    /// → `decode_huffman` as a pipeline over a synthetic spectrum.
+    #[test]
+    fn encode_roundtrip_full_pipeline_derived_params() {
+        // A deterministic pseudo-spectrum: decaying magnitudes with mixed
+        // signs, trailing zeros (so r_zero trims), and a ≤1 tail (count1).
+        let mut is = [0i32; NUM_LINES];
+        let mut state: u32 = 0x1234_5678;
+        let mut next = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (state >> 16) & 0x7fff
+        };
+        // Lines 0..64: magnitudes 0..~12 with random sign.
+        for v in is.iter_mut().take(64) {
+            let mag = (next() % 13) as i32;
+            *v = if next() & 1 == 1 { -mag } else { mag };
+        }
+        // Lines 64..96: a ≤1 tail to feed the count1 partition.
+        for v in is.iter_mut().take(96).skip(64) {
+            let mag = (next() % 2) as i32;
+            *v = if next() & 1 == 1 { -mag } else { mag };
+        }
+        // Lines 96.. remain zero (trailing zero run).
+
+        let split = partition_split(&is);
+        let bv2 = split.big_pairs * 2;
+        // Choose a long-block region split: put region0_count / region1_count
+        // so the decoder reproduces region_ends. Use the whole big-values
+        // range as region 0 for simplicity (region0_count large enough to
+        // cover bv2), so the chooser-derived single table codes all pairs.
+        // To stay band-aligned, pick the band whose start is >= bv2 as the
+        // region0 end (region1/region2 empty).
+        let starts_44 = [
+            0usize, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288,
+            342, 418,
+        ];
+        // region0_count chosen so band (region0_count+1) start >= bv2.
+        let mut r0_band = 0usize;
+        for (b, &s) in starts_44.iter().enumerate() {
+            if s >= bv2 {
+                r0_band = b;
+                break;
+            }
+        }
+        if r0_band == 0 {
+            r0_band = starts_44.len() - 1;
+        }
+        let region0_count = (r0_band.saturating_sub(1)) as u8;
+        let gc = mk_gc(split.big_pairs as u16, [0, 0, 0], region0_count, 0, false);
+        let region_ends = encoder_region_boundaries(&gc, split.big_pairs, 44100, MpegVersion::Mpeg1);
+        // region0 covers all big-values; region1/2 empty (region1_count=0
+        // and region0 already reaches bv2).
+        assert_eq!(region_ends.0, bv2, "region0 should cover all big-values");
+        assert_eq!(region_ends.1, bv2, "region1/2 should be empty");
+        let (t0, _) = choose_best_table_for_region(&is, 0, region_ends.0).unwrap();
+        let (t1, _) = choose_best_table_for_region(&is, region_ends.0, region_ends.1).unwrap();
+        let (t2, _) = choose_best_table_for_region(&is, region_ends.1, bv2).unwrap();
+        let (c1_b, _) = choose_best_count1_table(
+            &is,
+            bv2,
+            bv2 + split.count1_quads * 4,
+        );
+        assert_roundtrip(
+            &is,
+            split.big_pairs,
+            region_ends,
+            [t0, t1, t2],
+            split.count1_quads,
+            c1_b,
+            region0_count,
+            0,
+        );
+    }
+
+    /// A pair not codable by the chosen table is rejected (magnitude out
+    /// of a small table's range with no linbits escape).
+    #[test]
+    fn encode_rejects_uncodable_pair() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 100; // far out of table 1's 0..=1 range, no linbits
+        is[1] = 0;
+        let err = encode_huffman(&is, 1, (2, 2), [1, 0, 0], 0, false).unwrap_err();
+        assert_eq!(err, HuffmanEncodeError::PairNotCodable(1));
+    }
+
+    /// An unused codebook index (4 / 14) is rejected.
+    #[test]
+    fn encode_rejects_unused_table() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 1;
+        is[1] = 1;
+        let err = encode_huffman(&is, 1, (2, 2), [4, 0, 0], 0, false).unwrap_err();
+        assert_eq!(err, HuffmanEncodeError::UnusedTable(4));
+    }
+
+    /// big_pairs*2 past the granule capacity is rejected.
+    #[test]
+    fn encode_rejects_oversized_big_values() {
+        let is = [0i32; NUM_LINES];
+        let err = encode_huffman(&is, 289, (0, 0), [0, 0, 0], 0, false).unwrap_err();
+        assert_eq!(err, HuffmanEncodeError::BigValuesTooLarge);
+    }
 }

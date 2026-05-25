@@ -741,6 +741,295 @@ pub fn count_huffman_bits(
     Some(bits)
 }
 
+// =====================================================================
+// Forward Huffman **bit emission** — the §2.4.1.7 `huffmancodebits()`
+// encoder counterpart to `decode_huffman` above. Given a quantized
+// `is[]`, the region split, and the chosen table-selects (from
+// `choose_best_table_for_region` / `choose_best_count1_table`), this
+// writes the actual codewords + linbits ESC fields + sign bits, in the
+// exact order `decode_huffman` reads them, into a bit buffer. The result
+// is byte-aligned and reads back through `MainDataReader` bit-for-bit, so
+// `encode_huffman` → `decode_huffman` recovers the original `is[]`.
+//
+// The emitted bit length (before the trailing byte-padding) equals the
+// §C.1.5.4.4.5 / .8 `count_huffman_bits` for the same inputs: the writer
+// emits exactly the codeword (`HEntry.len` / `QUAD_A.0` bits), one
+// `linbits` field per magnitude-≥-15 component, and one sign bit per
+// non-zero value — the same three terms `big_pair_bits` /
+// `count1_quad_bits` sum.
+// =====================================================================
+
+/// An MSB-first bit sink whose byte output is read back identically by
+/// [`MainDataReader`]: bits pack into the current byte from bit 7 down,
+/// a completed byte is flushed, and [`HuffmanBitWriter::finish`]
+/// zero-pads the trailing partial byte to a byte boundary. `bit_len`
+/// tracks the number of payload bits written (excluding the final pad),
+/// so the caller can compare it against `count_huffman_bits`.
+struct HuffmanBitWriter {
+    bytes: Vec<u8>,
+    cur: u8,
+    nbits: u8,
+    bit_len: usize,
+}
+
+impl HuffmanBitWriter {
+    fn new() -> Self {
+        HuffmanBitWriter {
+            bytes: Vec::new(),
+            cur: 0,
+            nbits: 0,
+            bit_len: 0,
+        }
+    }
+
+    /// Write the low `n` bits of `value` (`0 ≤ n ≤ 32`), MSB-first. This
+    /// is the exact inverse of [`MainDataReader::read`].
+    fn write(&mut self, value: u32, n: u32) {
+        for i in (0..n).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            self.cur = (self.cur << 1) | bit;
+            self.nbits += 1;
+            if self.nbits == 8 {
+                self.bytes.push(self.cur);
+                self.cur = 0;
+                self.nbits = 0;
+            }
+        }
+        self.bit_len += n as usize;
+    }
+
+    /// Flush the trailing partial byte (zero-padded) and return the
+    /// packed bytes. The pad bits are NOT counted in `bit_len`.
+    fn finish(mut self) -> Vec<u8> {
+        if self.nbits > 0 {
+            self.cur <<= 8 - self.nbits;
+            self.bytes.push(self.cur);
+            self.cur = 0;
+            self.nbits = 0;
+        }
+        self.bytes
+    }
+}
+
+/// Error from the Huffman **encode** stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HuffmanEncodeError {
+    /// A big-values `(x, y)` pair could not be coded by the `table_select`
+    /// chosen for its region: the magnitude is out of the codebook's index
+    /// range (small table, no `linbits` escape) or lands on an unused
+    /// rectangular corner. Carries the region's `table_select` index.
+    PairNotCodable(u8),
+    /// `table_select` named a codebook index that is "not used" in
+    /// Table 3-B.7 (4 or 14) or is out of the 0..=31 range.
+    UnusedTable(u8),
+    /// `big_pairs * 2` exceeded the 576-line granule capacity.
+    BigValuesTooLarge,
+}
+
+impl core::fmt::Display for HuffmanEncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            HuffmanEncodeError::PairNotCodable(t) => {
+                write!(f, "big-values pair not codable by table_select {t}")
+            }
+            HuffmanEncodeError::UnusedTable(t) => {
+                write!(f, "Huffman table_select {t} is unused (Table 3-B.7)")
+            }
+            HuffmanEncodeError::BigValuesTooLarge => {
+                write!(f, "big_pairs*2 exceeds the 576-line granule capacity")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HuffmanEncodeError {}
+
+/// The Huffman main-data payload of one granule-channel: the packed
+/// codeword bytes plus the exact number of payload bits written (the
+/// trailing byte-pad of [`Mp3HuffmanData::bytes`] is excluded from
+/// `bit_len`). `bit_len` equals the matching [`count_huffman_bits`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mp3HuffmanData {
+    /// Byte-aligned codeword payload (last byte zero-padded). Readable by
+    /// [`MainDataReader`] bit-for-bit.
+    pub bytes: Vec<u8>,
+    /// Number of payload bits (excluding the trailing byte-pad).
+    pub bit_len: usize,
+}
+
+/// Emit one big-values `(x, y)` pair into `w` with `table`, the exact
+/// inverse of [`decode_big_pair`]: the Huffman codeword for the
+/// magnitude-clamped `(min(15,|x|), min(15,|y|))` cell, then — when a
+/// component's *original* magnitude is `≥ 15` and `linbits > 0` — the
+/// `linbits` ESC field carrying `|v| - 15`, then the sign bit (`1` for
+/// negative) for each non-zero component. The §2.4.1.7 order is
+/// codeword → linbits_x → sign_x → linbits_y → sign_y.
+fn emit_big_pair(
+    w: &mut HuffmanBitWriter,
+    table: &BigTable,
+    x: i32,
+    y: i32,
+    table_idx: u8,
+) -> Result<(), HuffmanEncodeError> {
+    let xl = usize::from(table.xlen);
+    let ax = x.unsigned_abs();
+    let ay = y.unsigned_abs();
+    let xi = ax.min(15) as usize;
+    let yi = ay.min(15) as usize;
+    if xi >= xl || yi >= xl {
+        return Err(HuffmanEncodeError::PairNotCodable(table_idx));
+    }
+    let ent = table.entries[xi * xl + yi];
+    if ent.len == 0 && (xi != 0 || yi != 0) {
+        return Err(HuffmanEncodeError::PairNotCodable(table_idx));
+    }
+    let linbits = u32::from(table.linbits);
+    // Codeword (zero-length entry for an all-zero pair writes nothing).
+    w.write(u32::from(ent.code), u32::from(ent.len));
+    // linbits ESC for x, then sign for x.
+    if ax >= 15 && linbits > 0 {
+        w.write(ax - 15, linbits);
+    }
+    if x != 0 {
+        w.write_sign(x);
+    }
+    // linbits ESC for y, then sign for y.
+    if ay >= 15 && linbits > 0 {
+        w.write(ay - 15, linbits);
+    }
+    if y != 0 {
+        w.write_sign(y);
+    }
+    Ok(())
+}
+
+impl HuffmanBitWriter {
+    /// Write the sign bit for a non-zero value: `1` if negative, `0` if
+    /// positive (mirrors `decode_big_pair`'s `read(1) == 1` negation).
+    fn write_sign(&mut self, v: i32) {
+        self.write(u32::from(v < 0), 1);
+    }
+}
+
+/// Emit the big-values pairs of `is[start..end]` with codebook
+/// `table_idx`, the inverse of the region loop in `decode_huffman`.
+fn emit_region(
+    w: &mut HuffmanBitWriter,
+    is: &[i32; NUM_LINES],
+    start: usize,
+    end: usize,
+    table_idx: u8,
+) -> Result<(), HuffmanEncodeError> {
+    let table = big_table(table_idx).map_err(|_| HuffmanEncodeError::UnusedTable(table_idx))?;
+    let mut k = start;
+    while k + 1 < end && k + 1 < NUM_LINES {
+        emit_big_pair(w, table, is[k], is[k + 1], table_idx)?;
+        k += 2;
+    }
+    Ok(())
+}
+
+/// Emit one count1 `(v, w, x, y)` quadruple into `bw`, the exact inverse
+/// of [`decode_count1_quad`]. Quad table B writes the trivial 4-bit code
+/// (`0` → magnitude 1, `1` → 0, MSB = v); table A writes the variable
+/// `QUAD_A` codeword for the `(|v|<<3)|(|w|<<2)|(|x|<<1)|(|y|)` pattern.
+/// Sign bits (`1` for negative) follow each non-zero value in v, w, x, y
+/// order.
+fn emit_count1_quad(bw: &mut HuffmanBitWriter, v: i32, w: i32, x: i32, y: i32, table_b: bool) {
+    let nz = |c: i32| u32::from(c != 0);
+    if table_b {
+        // Table B: one bit per value, 0 → magnitude 1, 1 → 0. The
+        // decoder reads 4 bits MSB-first and XORs with 1, so the wire bit
+        // is `0` for a non-zero magnitude.
+        let bits = ((nz(v) ^ 1) << 3) | ((nz(w) ^ 1) << 2) | ((nz(x) ^ 1) << 1) | (nz(y) ^ 1);
+        bw.write(bits, 4);
+    } else {
+        let pat = ((nz(v) << 3) | (nz(w) << 2) | (nz(x) << 1) | nz(y)) as usize;
+        let (clen, code) = QUAD_A[pat];
+        bw.write(u32::from(code), u32::from(clen));
+    }
+    if v != 0 {
+        bw.write_sign(v);
+    }
+    if w != 0 {
+        bw.write_sign(w);
+    }
+    if x != 0 {
+        bw.write_sign(x);
+    }
+    if y != 0 {
+        bw.write_sign(y);
+    }
+}
+
+/// **Emit** the §2.4.1.7 `huffmancodebits()` payload for one
+/// granule-channel — the forward counterpart to [`decode_huffman`] and
+/// the byte-producing sibling of [`count_huffman_bits`].
+///
+/// Inputs mirror [`count_huffman_bits`] exactly:
+/// * `is` — the 576 quantized lines.
+/// * `big_pairs` — big-values pair count (lines `0..big_pairs*2`).
+/// * `region_ends` — `(region0_end, region1_end)` line indices splitting
+///   the big-values partition into three sub-regions. Region 0 is
+///   `0..region0_end`, region 1 `region0_end..region1_end`, region 2
+///   `region1_end..big_pairs*2`. Each is clamped to the big-values range.
+/// * `table_select` — the three big-values codebook indices.
+/// * `count1_quads` — count1 quadruple count.
+/// * `count1table_b` — `false` for quad table A, `true` for table B.
+///
+/// Returns the byte-aligned codeword payload and its exact payload bit
+/// length (which equals `count_huffman_bits` of the same inputs). Errors
+/// if a big-values pair is not codable by the table chosen for its
+/// region, or if a `table_select` names an unused/out-of-range codebook.
+///
+/// The codewords are written in `decode_huffman`'s read order, so
+/// `decode_huffman(MainDataReader::new(&data.bytes), gc, data.bit_len, …)`
+/// recovers `is[0 .. big_pairs*2 + count1_quads*4]` bit-exactly (the
+/// remaining lines decode as the zero partition).
+pub fn encode_huffman(
+    is: &[i32; NUM_LINES],
+    big_pairs: usize,
+    region_ends: (usize, usize),
+    table_select: [u8; 3],
+    count1_quads: usize,
+    count1table_b: bool,
+) -> Result<Mp3HuffmanData, HuffmanEncodeError> {
+    if big_pairs * 2 > NUM_LINES {
+        return Err(HuffmanEncodeError::BigValuesTooLarge);
+    }
+    let bv2 = (big_pairs * 2).min(NUM_LINES);
+    let r0 = region_ends.0.min(bv2);
+    let r1 = region_ends.1.max(r0).min(bv2);
+
+    let mut w = HuffmanBitWriter::new();
+    // Three big-values sub-regions, in line order (§2.4.1.7).
+    emit_region(&mut w, is, 0, r0, table_select[0])?;
+    emit_region(&mut w, is, r0, r1, table_select[1])?;
+    emit_region(&mut w, is, r1, bv2, table_select[2])?;
+
+    // count1 partition: whole quadruples above the big-values lines.
+    let c1_start = bv2;
+    let c1_end = (c1_start + count1_quads * 4).min(NUM_LINES);
+    let mut k = c1_start;
+    while k + 4 <= c1_end {
+        emit_count1_quad(
+            &mut w,
+            is[k],
+            is[k + 1],
+            is[k + 2],
+            is[k + 3],
+            count1table_b,
+        );
+        k += 4;
+    }
+
+    let bit_len = w.bit_len;
+    Ok(Mp3HuffmanData {
+        bytes: w.finish(),
+        bit_len,
+    })
+}
+
 include!("huffman_tables.rs");
 
 #[cfg(test)]

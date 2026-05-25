@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `huffman` module **Phase 2 step 7** — the **§2.4.1.7
+  `huffmancodebits()` bit EMISSION**, the forward encoder counterpart to
+  `decode_huffman`. Given a quantized `is[576]`, the big-values region
+  split (`region_ends`), and the per-region `table_select` (from the
+  step-6 `choose_best_table_for_region` / `choose_best_count1_table`),
+  `encode_huffman` writes the actual Layer III main-data Huffman payload:
+  - **big_values** three regions — the Table 3-B.7 codeword for the
+    magnitude-clamped `(min(15,|x|), min(15,|y|))` cell, a `linbits` ESC
+    field carrying `|v| - 15` for each component of magnitude `≥ 15`, and
+    a sign bit per non-zero component, in the §2.4.1.7 order
+    codeword → linbits_x → sign_x → linbits_y → sign_y — the exact
+    inverse of `decode_big_pair`.
+  - **count1** quadruples — quad table A (`QUAD_A`) or the trivial 4-bit
+    table B code, plus a sign bit per non-zero value, inverting
+    `decode_count1_quad`.
+  - Output is byte-aligned (trailing partial byte zero-padded) and reads
+    back through `MainDataReader` bit-for-bit. `Mp3HuffmanData` carries
+    the packed `bytes` plus the exact `bit_len` (excluding the pad),
+    which equals the step-6 `count_huffman_bits` for the same inputs.
+  - `HuffmanEncodeError` reports a non-codable pair
+    (`PairNotCodable(table)`), an unused/out-of-range codebook
+    (`UnusedTable`), or `big_pairs*2 > 576` (`BigValuesTooLarge`).
+
+  9 new unit tests in `src/huffman_tests.rs` verify the round-trip
+  `encode_huffman` → `decode_huffman` recovers the original `is[]`
+  bit-exactly with `bit_len == count_huffman_bits` and the decoder
+  consuming exactly `bit_len` bits: a mixed big-values + count1 granule,
+  a `linbits` ESC pair (table 16) and a larger negative escape
+  (table 24), the count1 table-B path, a three-region split aligned to
+  the 44.1 kHz long-block bands, and an end-to-end pipeline that derives
+  the partition split + per-region tables via the step-6 choosers before
+  emitting. Error paths cover the uncodable pair, unused table, and
+  oversized big_values. No bit reservoir, side-info packing, or
+  full-frame assembly this round — just the codeword emitter.
+
 - `inner_loop` module **Phase 2 step 5** — the **§C.1.5.4.4 inner-loop
   `global_gain` search** wrapping the §2.4.3.4.7 `quantize` primitive.
   Holding a chosen scalefactor configuration fixed, it binary-searches

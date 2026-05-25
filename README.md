@@ -625,10 +625,31 @@ the count matches decoder consumption exactly; `max|is|` is monotone and
 the chosen clamp gain is minimal; and `requantize(is)` reproduces the
 target to within the quantizer-grid bound.
 
+**Phase 2 step 7 (Huffman bit emission)** turns the step-6 count into
+actual codewords. `encode_huffman` is the forward counterpart to
+`decode_huffman`: given `is[576]`, the big-values `region_ends`, the
+per-region `table_select` (from the step-6 choosers), the `count1_quads`
+count and `count1table_select`, it emits the §2.4.1.7 `huffmancodebits()`
+payload. Each big-values pair writes the Table 3-B.7 codeword for the
+clamped `(min(15,|x|), min(15,|y|))` cell, then a `linbits` ESC field
+(`|v| - 15`) for any magnitude-≥-15 component, then a sign bit per
+non-zero component — in the order codeword → linbits_x → sign_x →
+linbits_y → sign_y, the exact inverse of `decode_big_pair`. Each count1
+quad writes the table-A/B code plus its sign bits. The result
+(`Mp3HuffmanData`) is byte-aligned and reads back through `MainDataReader`
+bit-for-bit; its `bit_len` equals the step-6 `count_huffman_bits` for the
+same inputs. Verified by a `encode_huffman` ⇄ `decode_huffman` round-trip
+that recovers the original `is[]` exactly with `bit_len ==
+count_huffman_bits`, across mixed big-values + count1, `linbits` escapes
+(tables 16 / 24), table-B count1, a band-aligned three-region split, and
+an end-to-end pipeline that derives the split + tables via the step-6
+choosers. No bit reservoir, side-info packing, or full-frame assembly
+yet — just the codeword emitter.
+
 The remaining Phase 2 work — the psychoacoustic model, the §C.1.5.4.3
-outer (distortion-control) loop, scalefactor estimation, and Huffman
-*encoding* (bit emission) of non-zero spectral lines — is still a later
-round.
+outer (distortion-control) loop, scalefactor estimation, and the
+bit-reservoir scheduling + full-frame main-data assembly that bind the
+emitted Huffman payload into a stream — is still a later round.
 
 ### Not yet implemented
 
@@ -637,14 +658,14 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 steps 1–6 (forward MDCT primitive +
+**Phase 1 framing + Phase 2 steps 1–7 (forward MDCT primitive +
 analysis windowing + forward overlap split + polyphase analysis
 subband filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
-count)** — it still lacks the psychoacoustic model, the §C.1.5.4.3 outer
-loop, scalefactor estimation, and Huffman *encoding* (bit emission) of
-non-zero spectral lines, plus the bit-reservoir scheduling that those
-need. `register()` installs the
+count + §2.4.1.7 Huffman bit emission)** — it still lacks the
+psychoacoustic model, the §C.1.5.4.3 outer loop, scalefactor estimation,
+and the bit-reservoir scheduling + full-frame main-data assembly that
+bind the emitted Huffman payload into a stream. `register()` installs the
 container demuxer; the codec `Decoder` / `Encoder` trait surfaces
 remain stubs.
 

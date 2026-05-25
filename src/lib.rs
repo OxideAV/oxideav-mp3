@@ -276,8 +276,8 @@ pub use frame::{
 };
 pub use huffman::{
     choose_best_count1_table, choose_best_table_for_region, count1_bits, count_huffman_bits,
-    decode_huffman, encoder_region_boundaries, partition_split, HuffmanError, PartitionSplit,
-    NUM_LINES, SELECTABLE_BIG_TABLES,
+    decode_huffman, encode_huffman, encoder_region_boundaries, partition_split, HuffmanEncodeError,
+    HuffmanError, Mp3HuffmanData, PartitionSplit, NUM_LINES, SELECTABLE_BIG_TABLES,
 };
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
 pub use inner_loop::{
