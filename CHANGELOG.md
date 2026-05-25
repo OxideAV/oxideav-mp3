@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `codec_encoder` module **Phase 2 step 12** — the runtime-context
+  `oxideav_core::Encoder` trait wiring on top of the r138/r139
+  `Mp3Encoder` stream encoder. `Mp3CoreEncoder` is a frame-to-packet
+  adaptor: `send_frame(AudioFrame)` pushes mono `S16` PCM through the
+  underlying `Mp3Encoder::push_samples`, and `flush()` runs
+  `Mp3Encoder::finish` then slices the emitted CBR byte stream into one
+  `Packet` per MP3 frame via the crate's own `FrameWalker`.
+  `receive_packet()` returns `Error::NeedMore` before flush (the
+  reservoir scheduler needs every frame's main-data up front) and
+  drains the per-frame packet queue after. Per-packet PTS and duration
+  are stamped in `1 / sample_rate` units.
+- `codec_encoder::make_encoder` / `make_encoder_with_outer_loop` —
+  direct-API factories matching the `oxideav-core` `EncoderFactory`
+  signature. Both delegate into `Mp3CoreEncoder`; the outer-loop
+  variant is the registry-wired equivalent of `Mp3Encoder::new_with_outer_loop`.
+  This is the dual-API convention preserved alongside the historical
+  direct `Mp3Encoder` entry point.
+- `codec_encoder::register_codecs` — codec-registry installer. Claims
+  WAVE format tag `0x0055` (MPEG Layer III) and Matroska codec id
+  `A_MPEG/L3`, attaches the fixed-gain `make_encoder` factory, and is
+  invoked from `crate::register` so a single `register(&mut ctx)` call
+  now installs both the container demuxer and the codec encoder.
+- `tests/encoder_trait_roundtrip.rs` integration suite:
+  - `registry_encoder_emits_valid_mp3_frames` — drives 200 ms of sine
+    through the registered `oxideav_core::Encoder` trait API, confirms
+    every emitted packet starts with the 0xFFF MP3 sync, carries the
+    per-frame duration `1152`, and stamps a monotonic PTS.
+  - `registry_encoder_self_decode_psnr` — 1 s 440 Hz sine driven
+    through the trait API only, packets re-concatenated, demuxed via
+    `Mp3Demuxer`, self-decoded through `decode_huffman` → `requantize`
+    → `alias_reduce` → `imdct_granule` → `synth_granule`. Achieves
+    **86.17 dB PSNR**, matching the direct-API
+    `stream_encoder_roundtrip` baseline.
 - `outer_loop` module **Phase 2 step 11** — the §C.1.5.4.3
   distortion-control iteration loop that wraps the §C.1.5.4.4 inner-loop
   global-gain search of the r135 `inner_loop` module. Per ISO/IEC

@@ -260,14 +260,26 @@
 //! routes the stream encoder through the outer loop with the
 //! corresponding fixed `scalefac_compress = 15` (`slen1=4`, `slen2=3`).
 //!
+//! The [`codec_encoder`] module adds Phase 2 step 12: the
+//! runtime-context [`Encoder`] trait wiring on top of [`Mp3Encoder`].
+//! [`codec_encoder::Mp3CoreEncoder`] implements
+//! [`oxideav_core::Encoder`], converting incoming
+//! [`AudioFrame`](oxideav_core::AudioFrame) PCM batches into one
+//! [`Packet`](oxideav_core::Packet) per emitted MP3 frame on
+//! [`Encoder::flush`]. The dual-API convention is honoured: the direct
+//! [`Mp3Encoder`] factory remains the historical streaming entry
+//! point, and [`codec_encoder::make_encoder`] /
+//! [`codec_encoder::make_encoder_with_outer_loop`] expose the
+//! `oxideav-core` factory shape. [`register`] now installs both the
+//! container demuxer and this encoder factory in one call.
+//!
 //! The remaining Phase 2 work — the psychoacoustic model (so the
 //! threshold is per-band tonality-aware), scalefactor estimation
 //! (preemphasis / `scalefac_scale = 1` escalation), short / mixed
-//! block-type switching, stereo / LSF / VBR, and the runtime-context
-//! [`Encoder`] trait wiring on top of [`Mp3Encoder`] — is still a later
-//! round. [`register`] installs
-//! the container demuxer; the codec [`Decoder`] / [`Encoder`] trait
-//! surfaces remain stubs that return [`Error::NotImplemented`].
+//! block-type switching, stereo / LSF / VBR, and the
+//! [`Decoder`] trait wiring — is still a later round. The codec
+//! [`Decoder`] surface remains a stub that returns
+//! [`Error::NotImplemented`].
 //!
 //! [`Encoder`]: oxideav_core::Encoder
 //!
@@ -280,6 +292,7 @@
 
 pub mod alias;
 pub mod analysis;
+pub mod codec_encoder;
 pub mod demuxer;
 pub mod encoder;
 pub mod frame;
@@ -300,6 +313,9 @@ pub mod synth;
 
 pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
 pub use analysis::{analyze_granule, analyze_row, m_coefficient, AnalysisState, C_TABLE, X_LEN};
+pub use codec_encoder::{
+    make_encoder, make_encoder_with_outer_loop, register_codecs, Mp3CoreEncoder,
+};
 pub use demuxer::{
     open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer, Mp3Tags, XingTag,
     XingTagId, CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,
@@ -378,13 +394,17 @@ impl std::error::Error for Error {}
 
 /// Install the MP3 container demuxer (and its `.mp3`/`.mp2`/`.mp1`
 /// extension + probe entries) into the runtime context's
-/// container registry. The codec [`Decoder`] / [`Encoder`] surface is
-/// not yet wired up — see [`Error::NotImplemented`].
+/// container registry, **and** the Layer III [`Encoder`] factory
+/// (`oxideav-mp3` mono CBR MPEG-1) into the codec registry.
+///
+/// The codec [`Decoder`] surface remains a stub — see
+/// [`Error::NotImplemented`].
 ///
 /// [`Decoder`]: oxideav_core::Decoder
 /// [`Encoder`]: oxideav_core::Encoder
 pub fn register(ctx: &mut RuntimeContext) {
     demuxer::register_container(&mut ctx.containers);
+    codec_encoder::register_codecs(&mut ctx.codecs);
 }
 
 oxideav_core::register!("mp3", register);

@@ -746,11 +746,27 @@ fixed-gain 73.7 dB → outer-loop 74.0 dB); the single-tone sine
 roundtrips at ~86 dB matching the fixed-gain baseline. The fixed-gain
 `Mp3Encoder::new` path is preserved as the debug / reference route.
 
+The `codec_encoder` module ships **Phase 2 step 12** — the
+runtime-context `oxideav_core::Encoder` trait wiring on top of
+`Mp3Encoder`. `Mp3CoreEncoder` is a frame-to-packet adaptor:
+`send_frame` accepts mono S16 PCM, `flush()` runs the bit-reservoir
+schedule, and `receive_packet` drains one MP3 frame at a time (PTS and
+duration stamped in `1 / sample_rate` units). Two direct factories —
+`codec_encoder::make_encoder` (fixed-gain) and
+`codec_encoder::make_encoder_with_outer_loop` (distortion-control
+loop) — match the `oxideav-core` `EncoderFactory` signature, and
+`crate::register` now installs both the container demuxer and the
+encoder factory in one call (codec id `"mp3"`, WAVE tag `0x0055`,
+Matroska `A_MPEG/L3`). Validated by `tests/encoder_trait_roundtrip.rs`:
+the registered encoder, driven through the trait API only, round-trips
+a 1 s 440 Hz sine at **86.17 dB PSNR** — matching the direct-API
+baseline, confirming the adapter introduces no PSNR loss.
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), preemphasis (§C.1.5.4.3.4) and `scalefac_scale = 1`
 escalation, short / mixed block-type switching, stereo / LSF, and the
-runtime-context `Encoder::encode` trait wiring on top of `Mp3Encoder` —
+`Decoder` trait wiring on top of the existing decode chain —
 is still a later round.
 
 ### Not yet implemented
@@ -767,13 +783,13 @@ inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
 count + §2.4.1.7 Huffman bit emission + §2.4.1.7 main-data assembly +
 §2.4.2.7 cross-frame bit-reservoir scheduling with
 `main_data_begin > 0` + stream-level PCM → MP3 driver + §C.1.5.4.3
-outer (distortion-control) loop)** — it still lacks the psychoacoustic
-model (so the outer loop's `xmin(sb)` is a uniform constant rather than
-per-band masking-aware), preemphasis / `scalefac_scale = 1` escalation,
-short / mixed block-type switching, stereo / LSF, and the stream-level
-`Encoder::encode` driver that would tie the scheduler into a CBR file
-emitter. `register()` installs the container demuxer; the codec
-`Decoder` / `Encoder` trait surfaces remain stubs.
+outer (distortion-control) loop + `oxideav_core::Encoder` trait
+wiring)** — it still lacks the psychoacoustic model (so the outer
+loop's `xmin(sb)` is a uniform constant rather than per-band
+masking-aware), preemphasis / `scalefac_scale = 1` escalation, short /
+mixed block-type switching, and stereo / LSF / VBR. `register()` now
+installs the container demuxer **and** the codec `Encoder` factory in
+one call; the codec `Decoder` trait surface remains a stub.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
