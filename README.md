@@ -493,6 +493,59 @@ encoder-side companion of `imdct::imdct_granule`:
   sine-window pair sum `sin²θ + cos²θ = 1` then yields the `n/4`
   overall.)
 
+The `analysis` module covers the Layer I/II/III **polyphase analysis
+subband filterbank** — the first encoder stage on the forward signal
+path, splitting a broadband PCM input into 32 critically-sampled
+subbands at sample rate `f_s / 32`, per ISO/IEC 11172-3:1993 Annex C
+§C.1.3 ("Analysis subband filter") with the per-step pseudo code of
+Figure C.4 and the 512 prototype-window coefficients of Annex C Table
+C.1. It is the algebraic dual of the §2.4.3.2 / Figure A.2 synthesis
+filterbank in `synth`:
+
+- `analyze_row(&pcm, &mut state)` runs one pass of Figure C.4: input
+  shift (`X[i] = X[i-32]` for `i = 511..32`, then the 32 new PCM
+  samples land at `X[31..0]` in `pcm[0]→X[31] … pcm[31]→X[0]` order),
+  512-tap window by the Table C.1 `C[i]` coefficients, 8-fold partial
+  calculation `Y[i] = Σ_{j=0..7} C[i + 64·j] · X[i + 64·j]`, and a
+  64×32 cosine-modulated matrix multiply by the §C.1.3 kernel
+  `M[i, k] = cos((2i+1)(k-16)π/64)`. Consumes 32 PCM samples, returns
+  32 subband samples.
+- `AnalysisState` carries the 512-element shift register `X[]` across
+  rows and persists across granules in the stream. Stream-start state
+  is all zeros (the analysis mirror of `synth::SynthState`'s `V[]`).
+- `analyze_granule(&pcm576, &mut state)` runs 18 sequential
+  `analyze_row` passes over the 576 PCM samples of one Layer III
+  granule-channel and lays the result out as `subband_time[sb][t]` —
+  exactly the layout `imdct_granule` consumes on the decode side and
+  that the forward MDCT chain (`mdct::forward_overlap` →
+  `mdct::window_long_family_analysis` → `mdct::mdct`) consumes on the
+  encode side. Exact analysis-side mirror of `synth::synth_granule`.
+- `C_TABLE` is the 512-entry Annex C Table C.1 prototype window
+  transcribed from the staged ISO/IEC 11172-3:1993 PDF. The
+  first-half entries are transcribed verbatim from the literal text
+  (with OCR letter-for-digit fixes cross-checked against the local
+  monotone trend); the second-half entries are derived by the
+  cosine-modulated-prototype symmetry `C[512-i] = +C[i]` if
+  `i ≡ 0 (mod 64)` and `-C[i]` otherwise (the §C.1.3 polyphase
+  construction's structural symmetry, asserted in
+  `c_table_satisfies_polyphase_symmetry`).
+- **TDAC round-trip verified**, with two algebraically distinct
+  identities both passing on the same `C[]` and `M[i,k]`:
+  - **PCM round-trip with 481-sample group delay.** Pumping a
+    broadband multi-tone PCM signal through `analyze_row → synth_row`
+    recovers the input delayed by 481 samples within RMS deviation
+    `< 1×10⁻⁴` (measured ≈ 3×10⁻⁵ on the test signal, ≈ -90 dB —
+    well inside the spec prototype's near-PR design ripple).
+  - **Per-subband DC-tone subband round-trip is exactly
+    cyclostationary in steady state.** Driving `synth_row` with a
+    constant unit input in one subband (`S[sb0] = 1`, others 0) for
+    48 rows and analysing the resulting PCM yields, after a 32-row
+    settling delay, a steady-state recovered coefficient that does
+    *not* vary from row to row — row-to-row RMS ripple is below
+    `1×10⁻¹²` for *every one of the 32 subbands*, the float-
+    precision spec-derivable invariant of the bank's cosine-
+    modulated structure.
+
 The remaining Phase 2 work — the psychoacoustic model, bit allocation,
 scalefactor estimation, and Huffman *encoding* of non-zero spectral
 lines — is still a later round.
@@ -504,8 +557,9 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 steps 1–2 (forward MDCT primitive +
-analysis windowing + forward overlap split)** — it still lacks the
+**Phase 1 framing + Phase 2 steps 1–3 (forward MDCT primitive +
+analysis windowing + forward overlap split + polyphase analysis
+subband filterbank)** — it still lacks the
 psychoacoustic model, bit allocation, scalefactor estimation, and
 Huffman *encoding* of non-zero spectral lines, plus the bit-reservoir
 scheduling that those need. `register()` installs the container

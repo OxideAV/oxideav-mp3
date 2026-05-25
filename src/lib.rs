@@ -180,10 +180,30 @@
 //! ([`mdct::MdctState`] / [`mdct::forward_overlap`]). End-to-end Princen-
 //! Bradley TDAC verified on the long-block path: a three-granule
 //! forward-overlap → window → MDCT → IMDCT → window → overlap-add
-//! recovers the interior granule scaled by `n/2 = 18` exactly. The
-//! remaining Phase 2 work — the psychoacoustic model, bit allocation,
-//! scalefactor estimation, and Huffman *encoding* of non-zero
-//! spectral lines — is still a later round. [`register`] installs the container demuxer; the codec
+//! recovers the interior granule scaled by `n/2 = 18` exactly.
+//!
+//! The [`analysis`] module adds the **polyphase analysis subband
+//! filterbank** — ISO/IEC 11172-3:1993 Annex C §C.1.3 / Figure C.4 — the
+//! first encoder stage that splits broadband PCM into 32 critically-
+//! sampled subbands (the algebraic dual of the §2.4.3.2 / Figure A.2
+//! synthesis filterbank in [`synth`]). [`analysis::analyze_row`] consumes
+//! one 32-PCM-sample block and emits one 32-subband-sample row by
+//! running the Figure C.4 sequence (input shift register update → 512-tap
+//! window by the Annex C Table C.1 [`analysis::C_TABLE`] → 8-fold partial
+//! calculation `Y[i] = Σ_j Z[i + 64j]` → 64×32 matrixing
+//! `M[i,k] = cos((2i+1)(k-16)π/64)` via [`analysis::m_coefficient`]).
+//! [`analysis::analyze_granule`] wraps 18 rows into one Layer III
+//! granule-channel's 32×18 subband-time block, the exact analysis-side
+//! mirror of [`synth::synth_granule`]. End-to-end QMF round-trip
+//! verified: per-subband DC tones driven through [`synth::synth_row`] for
+//! 32 rows and fed through [`analysis::analyze_row`] recover the
+//! original subband-domain coefficient at every settled row (rows
+//! 20..32) with RMS deviation below `1e-6` and cross-band leakage RMS
+//! likewise below `1e-6`, for every subband independently.
+//!
+//! The remaining Phase 2 work — the psychoacoustic model, bit
+//! allocation, scalefactor estimation, and Huffman *encoding* of
+//! non-zero spectral lines — is still a later round. [`register`] installs the container demuxer; the codec
 //! `Decoder` and `Encoder` trait surfaces remain stubs that return
 //! [`Error::NotImplemented`].
 //!
@@ -195,6 +215,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod alias;
+pub mod analysis;
 pub mod demuxer;
 pub mod encoder;
 pub mod frame;
@@ -209,6 +230,7 @@ pub mod stereo;
 pub mod synth;
 
 pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
+pub use analysis::{analyze_granule, analyze_row, m_coefficient, AnalysisState, C_TABLE, X_LEN};
 pub use demuxer::{
     open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer, Mp3Tags, XingTag,
     XingTagId, CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,

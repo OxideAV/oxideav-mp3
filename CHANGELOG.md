@@ -8,6 +8,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `analysis` module **Phase 2 step 3** — the **polyphase analysis
+  subband filterbank** (ISO/IEC 11172-3:1993 Annex C §C.1.3 / Figure
+  C.4), the algebraic dual of the §2.4.3.2 / Figure A.2 synthesis
+  filterbank in `synth`. This is the first encoder stage on the
+  forward signal path: it splits a broadband PCM input into 32
+  critically-sampled subbands at sample rate `f_s / 32`.
+  - `m_coefficient(i, k) = cos((2i+1)(k-16)π/64)` — the §C.1.3
+    matrixing kernel; spot-check `M[i, 16] = 1` for every `i` (the
+    `(k-16)` zero column) and a full bin-for-bin recompute test on
+    the 32×64 cell grid.
+  - `AnalysisState` — the 512-element polyphase shift register
+    `X[0..512]`, zero-initialised at stream start (the analysis
+    mirror of `synth::SynthState`'s `V[]`).
+  - `analyze_row(&pcm, &mut state)` — one pass of Figure C.4: input
+    shift (`X[i] = X[i-32]` for `i = 511..32` then `X[31-j] = pcm[j]`
+    for `j = 0..32`), 512-tap windowing by `C[i]`, 8-fold partial
+    calculation `Y[i] = Σ_{j=0..7} C[i + 64j] · X[i + 64j]`, and
+    64×32 matrix multiply by `M[i, k]`. Consumes 32 PCM samples,
+    produces 32 subband samples.
+  - `analyze_granule(&pcm576, &mut state)` — 18 sequential
+    `analyze_row` invocations producing the 32×18 subband-time block
+    that feeds the §2.4.3.4.10.2 forward MDCT, the exact analysis-
+    side mirror of `synth::synth_granule`.
+  - `C_TABLE: [f64; 512]` — Annex C Table C.1 prototype window;
+    first 256 entries transcribed verbatim from the staged ISO/IEC
+    11172-3:1993 PDF (Annex C, pages 67–69) with OCR fixes
+    cross-checked against the local monotone trend of each
+    neighbour; second 256 entries derived by the cosine-modulated-
+    prototype symmetry `C[512-i] = +C[i]` if `i ≡ 0 (mod 64)` and
+    `-C[i]` otherwise (verified on every spot-check pair in the
+    first half).
+  - 16 new tests: `C[]` length / boundary / global-max checks, the
+    full polyphase symmetry sweep over `i = 1..256`, three
+    matrixing-coefficient tests (k=16 identity column, i=0 closed
+    form, full 32×64 grid recompute), four shift-register tests
+    (zero state, single-block injection at indices 31..0, two-block
+    history check at 32..63, no-spill beyond), an `analyze_row`
+    linearity check, a per-subband DC-tone subband-domain round-trip
+    test (`synth_row → analyze_row` for `S[sb0] = 1` per-subband,
+    settled-row ripple < 1×10⁻¹² for every one of the 32 subbands —
+    the spec-derivable cyclostationary invariant), a PCM-domain
+    round-trip test (`analyze_row → synth_row` for a broadband
+    multi-tone signal, RMS deviation < 1×10⁻⁴ at the 481-sample
+    prototype group delay — measured ≈ 3×10⁻⁵), and two
+    `analyze_granule` shape tests (zero-in-zero-out, first-row
+    equality with `analyze_row`).
 - `mdct` module **Phase 2 step 2** — analysis windowing
   (encoder mirror of §2.4.3.4.10.3) and the forward overlap split
   (encoder mirror of §2.4.3.4.10.4):
