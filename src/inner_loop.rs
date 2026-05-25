@@ -40,19 +40,25 @@
 //! estimation. It searches the one scalar (`global_gain`) the inner loop
 //! varies and now computes the exact Huffman count that gates it.
 //!
-//! # Why binary search is valid
+//! # Search strategy: bisection vs. linear scan
 //!
 //! The §2.4.3.4.7.1 requantization gain is
 //! `2^((global_gain - 210)/4) · …`, so the per-line quantizer
 //! `|is_i| = round((|xr_i| / factor)^(3/4))` is **monotone
 //! non-increasing** in `global_gain`: a larger `global_gain` multiplies
-//! the divisor, shrinking every `|is_i|`. Therefore both
-//! `max_i |is_i|` and any non-negative weighting of the `|is_i|`
-//! (the coarse bit estimate) are monotone non-increasing in
-//! `global_gain`. The predicate *"constraint satisfied"* is thus a
-//! step function of `global_gain` over the 8-bit field range `[0, 255]`
-//! (false below a threshold, true at and above it), so the smallest
-//! satisfying gain is found by binary search.
+//! the divisor, shrinking every `|is_i|`. Therefore `max_i |is_i|` (and
+//! any non-negative *weighting* of the magnitudes, such as the coarse
+//! estimate) is monotone non-increasing in `global_gain`, so the
+//! magnitude-clamp predicate is a step function over `[0, 255]` and the
+//! smallest satisfying gain is found by **binary search**.
+//!
+//! The **exact** Huffman count is the exception: Huffman codeword lengths
+//! are not monotone in magnitude and the minimum-bit codebook per region
+//! changes as the values shrink, so a coarser quantization can cost a few
+//! more bits than a finer one. The exact-count budget search therefore
+//! uses the spec's own upward `qquant = qquant + 1` step (§C.1.5.4.4),
+//! returning the first (smallest) gain whose count fits, rather than a
+//! bisection. See [`search_linear`].
 //!
 //! No external implementation was consulted; every rule is taken from
 //! the ISO/IEC 11172-3:1993 §C.1.5.4 / §2.4.1.7 / §2.4.3.4.7 text.
@@ -108,9 +114,11 @@ pub fn max_abs(is: &[i32; NUM_LINES]) -> i32 {
 /// as the sum over all non-zero lines of `bits(|is_i|) + 1` (a linear
 /// PCM word length plus one sign bit), where `bits(n)` is the number of
 /// bits to hold `n` (`0` for `n == 0`, `1` for `n == 1`, …). This is an
-/// order-of-magnitude proxy used only to exercise the budget-form
-/// search; it is **not** the exact codebook-length sum and must be
-/// replaced by the real §C.1.5.4.4 count in a later step.
+/// order-of-magnitude proxy that is **not** the exact codebook-length
+/// sum; the real §C.1.5.4.4 count now lives in [`exact_bit_count`] and
+/// gates [`search_bit_budget`]. `coarse_bit_estimate` is retained only
+/// for reference / comparison (its monotonicity in `global_gain` is a
+/// useful contrast with the exact count's non-monotonicity).
 #[must_use]
 pub fn coarse_bit_estimate(is: &[i32; NUM_LINES]) -> u64 {
     let mut bits = 0u64;
@@ -241,11 +249,12 @@ fn quantize_at(
 /// `[GAIN_MIN, GAIN_MAX]` whose quantized `is[]` satisfies `predicate`.
 ///
 /// `predicate(is)` must be monotone in `global_gain`: false for gains
-/// below some threshold and true at and above it. (Both the
-/// magnitude-clamp and coarse-bit-budget predicates are, because
-/// `|is_i|` is monotone non-increasing in `global_gain`.) Returns the
-/// threshold gain and its `is[]`; if no gain satisfies the predicate
-/// the result carries [`GAIN_MAX`] with `satisfied == false`.
+/// below some threshold and true at and above it. The magnitude-clamp
+/// predicate is (because `|is_i|` is monotone non-increasing in
+/// `global_gain`); the exact-bit-budget predicate is **not**, so it uses
+/// [`search_linear`] instead. Returns the threshold gain and its `is[]`;
+/// if no gain satisfies the predicate the result carries [`GAIN_MAX`]
+/// with `satisfied == false`.
 fn search<F>(
     xr: &[f32; NUM_LINES],
     gc_template: &GranuleChannel,
