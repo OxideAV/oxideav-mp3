@@ -230,11 +230,28 @@
 //! is still no psychoacoustic model, outer (distortion-control) loop, or
 //! scalefactor estimation.
 //!
-//! The remaining Phase 2 work — the psychoacoustic model, bit
-//! allocation, scalefactor estimation, and Huffman *encoding* of
-//! non-zero spectral lines — is still a later round. [`register`] installs the container demuxer; the codec
-//! `Decoder` and `Encoder` trait surfaces remain stubs that return
-//! [`Error::NotImplemented`].
+//! The [`stream_encoder`] module wires every Phase 2 primitive
+//! together as **Phase 2 step 10** — a top-level [`Mp3Encoder`] that
+//! consumes `i16` mono MPEG-1 CBR PCM samples via
+//! [`Mp3Encoder::push_samples`] and writes a sequence of complete
+//! self-delimiting MP3 frames (header + side-info + main-data slot)
+//! to a [`std::io::Write`] sink on [`Mp3Encoder::finish`]. Scope this
+//! round: mono / MPEG-1 only (32 / 44.1 / 48 kHz), long blocks,
+//! `scalefac_compress = 0`, no CRC, no Xing/Info VBR tag. Validated
+//! by an integration test that encodes a 1-second 440 Hz mono sine
+//! at 128 kbit/s, re-decodes via the crate's own decode primitives,
+//! and asserts PSNR > 20 dB (achieves ~86 dB) after accounting for
+//! the chain's 1057-sample group delay.
+//!
+//! The remaining Phase 2 work — the psychoacoustic model, the
+//! §C.1.5.4.3 outer (distortion-control) loop, scalefactor
+//! estimation, short / mixed block-type switching, stereo / LSF /
+//! VBR, and the runtime-context [`Encoder`] trait wiring on top of
+//! [`Mp3Encoder`] — is still a later round. [`register`] installs
+//! the container demuxer; the codec [`Decoder`] / [`Encoder`] trait
+//! surfaces remain stubs that return [`Error::NotImplemented`].
+//!
+//! [`Encoder`]: oxideav_core::Encoder
 //!
 //! [`Read`]: std::io::Read
 //! [`Seek`]: std::io::Seek
@@ -259,6 +276,7 @@ pub mod requantize;
 pub mod scalefactors;
 pub mod side_info;
 pub mod stereo;
+pub mod stream_encoder;
 pub mod synth;
 
 pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
@@ -308,6 +326,9 @@ pub use side_info::{
     SIDE_INFO_BYTES_STEREO,
 };
 pub use stereo::process_stereo;
+pub use stream_encoder::{
+    Mp3Encoder, StreamEncodeError, SAMPLES_PER_FRAME_MPEG1, SAMPLES_PER_GRANULE,
+};
 pub use synth::{n_coefficient, synth_granule, synth_row, SynthState, D_TABLE, PCM_PER_GRANULE};
 
 use oxideav_core::RuntimeContext;

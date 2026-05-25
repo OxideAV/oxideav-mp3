@@ -693,11 +693,39 @@ scalefactors + `is[]` bit-exactly through `Reservoir::assemble` plus the
 existing §2.4.1.7 decoder loop. Single-channel MPEG-1 only this round —
 multi-channel / LSF / outer-loop integration is deferred.
 
+**Phase 2 step 10 (stream-level PCM → MP3 encoder)** ties the steps
+1–9 primitives into a top-level `Mp3Encoder` (`stream_encoder` module)
+that consumes `i16` PCM samples and writes a sequence of complete
+self-delimiting MP3 frames (header + side_info + main_data slot) to a
+`std::io::Write` sink. The driver: (a) runs the §C.1.3 polyphase
+analysis filterbank per granule, (b) applies the §2.4.3.4.10.5
+frequency inversion + the inverse §2.4.3.4.10.1 alias-reduction butterfly,
+(c) runs the §2.4.3.4.10.2 forward MDCT per subband through the
+`mdct::MdctState` overlap, (d) quantizes (`quantize::quantize`) at a
+gain chosen by the in-tree `inner_loop::search_bit_budget` +
+`search_magnitude_clamp` followed by a local `qquant + 1` ratchet that
+re-emits with a linbits-reach-filtered Huffman table chooser, (e)
+emits `huffman::emit_huffman` into a `main_data::assemble_main_data`
+blob, and (f) schedules every assembled frame onto the §2.4.2.7 bit
+reservoir via `schedule_reservoir`. **Scope** — mono / MPEG-1 only
+this round (`SingleChannel` ChannelMode, 32 / 44.1 / 48 kHz), CBR,
+long blocks (no window switching), zero scalefactors (`scalefac_compress
+= 0`), no CRC, no Xing/Info VBR tag, no ID3 frontmatter. Verified
+end-to-end by `tests/stream_encoder_roundtrip.rs`: a one-second
+440 Hz mono sine tone at 128 kbit/s / 44.1 kHz, encoded into the
+on-wire byte sequence and re-decoded through the crate's own pipeline
+(`Mp3Demuxer` + `decode_scalefactors` + `decode_huffman` + `requantize`
++ `alias_reduce` + `imdct_granule` + `synth_granule`), achieves
+**PSNR > 80 dB** against the input (group delay 1057 samples = the
+filterbank 481-sample prototype delay + 576-sample lapped-MDCT 1-granule
+overlap). Stereo / LSF / VBR / Xing tag / outer-loop noise shaping /
+psychoacoustic model are deferred.
+
 The remaining Phase 2 work — the psychoacoustic model, the §C.1.5.4.3
-outer (distortion-control) loop, scalefactor estimation, and tying the
-step-9 reservoir scheduler into a stream-level `Encoder::encode` driver
-that emits a CBR file of properly-scheduled frames — is still a later
-round.
+outer (distortion-control) loop, scalefactor estimation, short / mixed
+block-type switching, stereo / LSF, and the runtime-context
+`Encoder::encode` trait wiring on top of `Mp3Encoder` — is still a
+later round.
 
 ### Not yet implemented
 

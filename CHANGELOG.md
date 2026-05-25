@@ -8,6 +8,55 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `stream_encoder` module **Phase 2 step 10** — the top-level
+  **`Mp3Encoder`** that wires the Phase 2 primitives (analysis
+  filterbank + forward MDCT overlap + inverse alias reduction +
+  quantize + Huffman bit emission + main_data assembly + bit-reservoir
+  scheduler) into a PCM-stream-in / MP3-frame-stream-out driver. The
+  encoder consumes `i16` mono PCM samples via
+  `Mp3Encoder::push_samples` (buffering until 1152 samples accumulate
+  for one MPEG-1 frame), assembles each frame's main_data with a
+  fixed-`scalefac_compress = 0` long-block configuration, picks a
+  `global_gain` per granule via `inner_loop::search_bit_budget` +
+  `search_magnitude_clamp` followed by a local `qquant + 1` ratchet
+  that re-emits with a linbits-reach-filtered table chooser (the
+  in-tree `choose_best_table_for_region` doesn't filter by linbits
+  reach — it can pick e.g. table 16 (`linbits=1`, magnitude reach 16)
+  for a range with `|is| = 100`, which would silently truncate
+  magnitudes at emission), and flushes the buffered frames onto the
+  §2.4.2.7 bit reservoir on `Mp3Encoder::finish` before writing the
+  full header + side_info + main_data slot sequence to a
+  `std::io::Write` sink.
+- Scope this round: **mono / MPEG-1 only** (32 / 44.1 / 48 kHz), CBR,
+  long blocks (`window_switching_flag = false`), zero scalefactors,
+  no CRC, no Xing/Info VBR tag, no ID3 frontmatter. Stereo / LSF /
+  VBR / outer noise-shaping loop / psychoacoustic model deferred to
+  later rounds.
+- New `tests/stream_encoder_roundtrip.rs` integration suite:
+  - `sine_tone_one_second_self_decode_psnr` — synthesises a 1-second
+    440 Hz mono sine at 44.1 kHz / 128 kbit/s, encodes it through
+    `Mp3Encoder`, walks the resulting byte stream with the crate's
+    own `Mp3Demuxer` + decoder primitives (`decode_scalefactors`,
+    `decode_huffman`, `requantize`, `alias_reduce`, `imdct_granule`,
+    `synth_granule`), and asserts **PSNR > 20 dB** (achieves ~86 dB
+    in practice) against the input after accounting for the chain's
+    1057-sample group delay (filterbank 481 + lapped MDCT 576).
+  - `silence_one_frame_decodes_to_near_zero` — zero PCM in → zero
+    PCM out within FP noise after warm-up.
+  - `per_frame_huffman_is_buffer_roundtrips` — every emitted
+    granule-channel parses through `decode_huffman` without error
+    and at least one granule carries non-zero `is[]` for a sine input.
+- Three new in-module unit tests:
+  - `inverse_alias_roundtrip_long_block` —
+    `alias_reduce(inverse_alias_reduce(xr)) ≈ xr` within FP noise.
+  - `lossless_chain_finds_unit_gain_scale_factor` — the encoder
+    analysis chain followed by the decoder synthesis chain
+    (BYPASSING quantize) reconstructs PCM scaled by `n/4 = 9` (the
+    Princen-Bradley TDAC factor); confirms the encoder's `/ 9`
+    forward-MDCT normalisation choice.
+  - `in_process_roundtrip_sine_psnr` — full chain WITH quantize but
+    bypassing the byte-stream + demuxer round-trip; achieves
+    ~87 dB PSNR at delay 1057 samples.
 - `main_data` module **Phase 2 step 9** — the **§2.4.2.7 cross-frame
   BIT-RESERVOIR SCHEDULER**, `main_data_begin > 0` path. The step-8
   assembler produces each frame's main-data bytes self-contained
