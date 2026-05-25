@@ -169,15 +169,21 @@
 //! [`huffman::decode_huffman`]-produced `[i32; 576]` through the stack
 //! and out comes a `[f32; 576]` PCM run. The Huffman stage covers
 //! **all** Table 3-B.7 codebooks (0..=31 minus the unused 4 and 14).
-//! The encoder side has begun **Phase 2** with the [`mdct`] module —
+//! The encoder side has begun **Phase 2** with the [`mdct`] module:
 //! the §2.4.3.4.10.2 forward MDCT primitive ([`mdct::mdct`]) for
 //! 36-point (long-block) and 12-point (short sub-block) transforms,
-//! the analysis companion of [`imdct::imdct`]. Round-trip exact:
-//! `mdct(imdct(X)) = (n/2)·X` per spec orthogonality. The remaining
-//! Phase 2 work — analysis windowing, the forward overlap split, the
-//! psychoacoustic model, bit allocation, scalefactor estimation, and
-//! Huffman *encoding* of non-zero spectral lines — is still a later
-//! round. [`register`] installs the container demuxer; the codec
+//! the analysis-side §2.4.3.4.10.3 windowing
+//! ([`mdct::window_long_family_analysis`] +
+//! [`mdct::window_short_analysis`], with the [`mdct::analysis_long_window`]
+//! / [`mdct::analysis_short_window`] primitives) for all four block
+//! types, and the analysis-side §2.4.3.4.10.4 forward overlap split
+//! ([`mdct::MdctState`] / [`mdct::forward_overlap`]). End-to-end Princen-
+//! Bradley TDAC verified on the long-block path: a three-granule
+//! forward-overlap → window → MDCT → IMDCT → window → overlap-add
+//! recovers the interior granule scaled by `n/2 = 18` exactly. The
+//! remaining Phase 2 work — the psychoacoustic model, bit allocation,
+//! scalefactor estimation, and Huffman *encoding* of non-zero
+//! spectral lines — is still a later round. [`register`] installs the container demuxer; the codec
 //! `Decoder` and `Encoder` trait surfaces remain stubs that return
 //! [`Error::NotImplemented`].
 //!
@@ -217,7 +223,10 @@ pub use frame::{
 };
 pub use huffman::{decode_huffman, HuffmanError, NUM_LINES};
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
-pub use mdct::mdct;
+pub use mdct::{
+    analysis_long_window, analysis_short_window, forward_overlap, mdct,
+    window_long_family_analysis, window_short_analysis, MdctState,
+};
 pub use reorder::reorder;
 pub use requantize::{requantize, scalefac_multiplier, PRETAB};
 pub use scalefactors::{

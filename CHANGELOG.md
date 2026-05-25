@@ -8,6 +8,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `mdct` module **Phase 2 step 2** — analysis windowing
+  (encoder mirror of §2.4.3.4.10.3) and the forward overlap split
+  (encoder mirror of §2.4.3.4.10.4):
+  - `analysis_long_window(i)` / `analysis_short_window(i)` —
+    `sin((π/36)(i+½))` and `sin((π/12)(i+½))` primitives, identical
+    to the synthesis-side windows (Princen-Bradley TDAC requires the
+    same window on both halves).
+  - `window_long_family_analysis(&xn, block_type)` — apply the four
+    long-family window shapes to 36 input samples: plain sine
+    (`block_type 0`); start (long-half 0..17, pass-through 18..23,
+    short-half 24..29, zero 30..35) for `block_type 1`; stop (zero
+    0..5, short-half 6..11, pass-through 12..17, long-half 18..35)
+    for `block_type 3`. Partitioning matches the §2.4.3.4.10.3
+    synthesis table exactly.
+  - `window_short_analysis(&xn)` — extract the three 12-sample short
+    sub-blocks from the 36-sample input via the analysis-side
+    inverse of the §2.4.3.4.10.3 d concatenation
+    (`xj_in[j][k] = xn[6 + 6·j + k]`), each pre-multiplied by the
+    short analysis window.
+  - `MdctState` / `forward_overlap(&current, &mut state)` — the
+    analysis mirror of `imdct::ImdctState` / §2.4.3.4.10.4
+    overlap-add: stream-start state is all zeros; each call assembles
+    a 36-sample forward-MDCT input frame `[prev_18, current_18]` and
+    rolls `prev_18 := current_18`.
+  - 12 new tests: long-window byte-for-byte vs `sin((π/36)(i+½))`
+    plus symmetry and `Σw² = 18` cross-check; short-window analog
+    with `Σw² = 6`; long / start / stop windowing per spec
+    partitioning, including the start↔stop complementary zero-region
+    check; short-block 3-sub-extraction with the half-overlap source
+    spans (i=6..17, 12..23, 18..29) matched against the synthesis
+    `y₀+y₁`/`y₁+y₂` overlap regions; forward-overlap state default-
+    zero, first-granule head-zero/tail-current, second-granule
+    head-prev/tail-current, and zero-input zero-output sanity; the
+    standalone time-space round-trip identity
+    `imdct(mdct(δ_0))[i] = (n/4)·(δ_0[i] ∓ reflection)` (the
+    aliased-with-self structure that TDAC cancels via adjacent-frame
+    overlap-add). The headline test is **end-to-end long-block
+    Princen-Bradley TDAC recovery** — feed three granules through
+    `forward_overlap` → `window_long_family_analysis(Long)` → `mdct`
+    → `imdct` → long-window → overlap-add, and the middle granule is
+    recovered scaled by `n/4 = 9` exactly (the time-space factor
+    `n/4` × the sine-window TDAC sum `w(i)² + w(i+n/2)² = 1`), on
+    arbitrary mixed-frequency input. This is the strongest single
+    test on the new analysis chain: it requires every analysis
+    primitive (window, overlap split, MDCT) and every synthesis
+    primitive (IMDCT, window, overlap-add) to line up exactly.
 - New `mdct` module — Layer III encoder **Phase 2 step 1**: the
   §2.4.3.4.10.2 **forward MDCT** primitive (`mdct(xn, n)`), the
   analysis companion of the synthesis-side `imdct::imdct`. Implements

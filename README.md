@@ -443,9 +443,9 @@ model):
   bitrate / sample-rate / channel-mode triple to the raw header
   indices.
 
-The `mdct` module begins the Layer III **encoder Phase 2** analysis
-filterbank with the §2.4.3.4.10.2 **forward MDCT** primitive — the
-encoder-side companion of `imdct::imdct`:
+The `mdct` module covers the Layer III **encoder Phase 2** analysis
+filterbank up to (and including) the forward overlap split — the
+encoder-side companion of `imdct::imdct_granule`:
 
 - `mdct(xn, n)` transforms `n` time samples into `n / 2` frequency bins
   using the same cosine kernel
@@ -457,15 +457,45 @@ encoder-side companion of `imdct::imdct`:
   `mdct(imdct(X), n)[k] = (n / 2) · X[k]`. Verified on impulse,
   multi-bin spectrum, and arbitrary mixed-frequency inputs for both
   `n = 36` and `n = 12`.
-- Linearity, output-length contract, and per-bin closed-form impulse
-  responses are all unit-tested by recomputing the §2.4.3.4.10.2 sum
-  inside the test, so the test text mirrors the spec rather than the
-  implementation.
+- **Analysis windowing** (encoder mirror of §2.4.3.4.10.3): the
+  `analysis_long_window(i) = sin((π/36)(i+½))` and
+  `analysis_short_window(i) = sin((π/12)(i+½))` primitives are
+  identical to the synthesis-side windows (Princen-Bradley TDAC
+  requires the same window on both halves of a lapped MDCT codec).
+  `window_long_family_analysis(&xn, block_type)` applies the four
+  long-family window shapes — plain sine for `Long` (block_type 0);
+  long-half 0..17 + pass-through 18..23 + short-half 24..29 + zero
+  30..35 for `Start` (block_type 1); zero 0..5 + short-half 6..11 +
+  pass-through 12..17 + long-half 18..35 for `End` (block_type 3) —
+  to 36 input samples, with the partitioning matching the
+  §2.4.3.4.10.3 synthesis table exactly. `window_short_analysis(&xn)`
+  extracts the three 12-sample short sub-blocks per the analysis
+  inverse `xj_in[j][k] = xn[6 + 6·j + k]` (the same 12-sample spans
+  the synthesis side reads y_0/y_1/y_2 from, including the
+  half-overlap source regions), each pre-multiplied by the short
+  window.
+- **Forward overlap split** (encoder mirror of §2.4.3.4.10.4):
+  `MdctState` carries the previous granule's 18 subband-time samples
+  across calls; `forward_overlap(&current_18, &mut state)` assembles
+  the 36-sample forward-MDCT input frame as `[prev_18, current_18]`
+  and rolls `prev_18 := current_18`, the structural analog of the
+  synthesis side's `result[i] = z[i] + s_prev[i]` /
+  `s_next[i] = z[i+18]` overlap-add. Stream-start state is all zeros.
+- **End-to-end TDAC verified** on the long-block path: three
+  successive granules pushed through `forward_overlap` →
+  `window_long_family_analysis(Long)` → `mdct` → `imdct` → long
+  window → overlap-add recover the interior granule scaled by
+  `n/4 = 9` exactly, on arbitrary mixed-frequency input — the
+  Princen-Bradley identity that makes the lapped MDCT a critically-
+  sampled exact-reconstruction transform. (Scaling factor: the spec
+  MDCT/IMDCT pair has bin-space `mdct(imdct(X)) = (n/2)·X` and
+  time-space `imdct(mdct(x))[i] = (n/4)·(x[i] ∓ reflection)`. The
+  sine-window pair sum `sin²θ + cos²θ = 1` then yields the `n/4`
+  overall.)
 
-The remaining Phase 2 work — analysis windowing (the mirror of
-§2.4.3.4.10.3), the forward overlap split, the psychoacoustic model,
-bit allocation, scalefactor estimation, and Huffman *encoding* of
-non-zero spectral lines — is still a later round.
+The remaining Phase 2 work — the psychoacoustic model, bit allocation,
+scalefactor estimation, and Huffman *encoding* of non-zero spectral
+lines — is still a later round.
 
 ### Not yet implemented
 
@@ -474,8 +504,8 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 step 1 (forward MDCT primitive only)** —
-it still lacks the analysis windowing, the forward overlap split, the
+**Phase 1 framing + Phase 2 steps 1–2 (forward MDCT primitive +
+analysis windowing + forward overlap split)** — it still lacks the
 psychoacoustic model, bit allocation, scalefactor estimation, and
 Huffman *encoding* of non-zero spectral lines, plus the bit-reservoir
 scheduling that those need. `register()` installs the container
