@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `gain_search` module **Phase 2 step 5** — the **inner-loop global-gain
+  search** that wraps the `quantize` primitive (ISO/IEC 11172-3:1993
+  informational Annex C §C.1.5.4.4). Given a target `xr[576]` and a
+  constraint, it picks the smallest `global_gain` (finest quantization)
+  whose quantized `is[576]` satisfies the constraint. Two forms:
+  - **magnitude** (`search_gain_for_max_value`): the §C.1.5.4.4.2 clamp
+    — increase the step until `max|is| <= max_quant`. Default budget is
+    `MAX_HUFFMAN_VALUE` (8191); the largest code table's hard ceiling
+    `MAX_TABLE_VALUE` (8206 = `15 + (2^13 - 1)`) is exposed for callers
+    that want the full range.
+  - **bit budget** (`search_gain_for_bit_budget`): the §C.1.5.4 "increase
+    the step until it codes within the available bits" loop, using a
+    coarse `estimate_bits` placeholder (NOT the exact §C.1.5.4.4.5/8
+    Huffman count — region subdivision + table selection are later
+    primitives).
+
+  `max|is|` is monotonically non-increasing in `global_gain` (a `+1`
+  step enlarges the `2^((gg-210)/4)` divisor), so the spec's linear
+  `qquant+1` walk is replaced by a binary search over `[0, 255]` that
+  returns the same fixpoint. `GainSearch` returns the chosen gain, the
+  `is[]`, `max_abs`, `estimated_bits`, and a `satisfied` flag (`false`
+  at gain 255 means the constraint needs scalefactor amplification, a
+  later loop stage). Measured on flat targets at 44.1 kHz: gains track
+  monotonically (`xr` 1→141, 10→154, 100→168, …, 1e6→221, ≈+13 per
+  decade), `max|is| <= 8191` everywhere, and `requantize(is)` relative
+  RMS vs target ≈ 1e-4. 13 new unit tests in `src/gain_search_tests.rs`.
+
+  Scope is the gain search only: no psychoacoustic model, no outer
+  (distortion-control) loop, no scalefactor amplification, no region
+  subdivision, no table selection, no exact bit count.
+
 - `quantize` module **Phase 2 step 4** — the **§2.4.3.4.7 quantization
   primitive**, the algebraic inverse of `requantize::requantize`. Given
   a target float spectrum `xr[576]` and an already-chosen

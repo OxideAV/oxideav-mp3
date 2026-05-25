@@ -231,6 +231,7 @@ pub mod analysis;
 pub mod demuxer;
 pub mod encoder;
 pub mod frame;
+pub mod gain_search;
 pub mod huffman;
 pub mod imdct;
 pub mod mdct;
@@ -255,6 +256,10 @@ pub use encoder::{
 pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
     Mp3FrameHeader, MpegVersion,
+};
+pub use gain_search::{
+    estimate_bits, max_abs_is, search_gain_for_bit_budget, search_gain_for_max_value, GainSearch,
+    MAX_HUFFMAN_VALUE, MAX_TABLE_VALUE,
 };
 pub use huffman::{decode_huffman, HuffmanError, NUM_LINES};
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};

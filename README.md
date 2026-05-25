@@ -578,9 +578,32 @@ iterations. Those are the next encoder build-out steps; once they pick a
 `(global_gain, sf)` configuration for a target `xr`, this primitive
 quantizes deterministically against it.
 
-The remaining Phase 2 work — the psychoacoustic model, bit allocation,
-scalefactor estimation, and Huffman *encoding* of non-zero spectral
-lines — is still a later round.
+**Phase 2 step 5 (inner-loop global-gain search)** wraps the primitive in
+the [`gain_search`] module — the §C.1.5.4.4 rate-control step. For a
+target `xr[576]` and an already-chosen scalefactor configuration it picks
+the *smallest* `global_gain` (finest quantization) whose quantized `is[]`
+satisfies a constraint:
+
+- magnitude (`search_gain_for_max_value`): the §C.1.5.4.4.2 clamp —
+  increase the step until `max|is| <= max_quant`, default
+  `MAX_HUFFMAN_VALUE` (8191; the largest table's hard ceiling
+  `MAX_TABLE_VALUE` 8206 is also exposed).
+- bit budget (`search_gain_for_bit_budget`): the §C.1.5.4 "increase the
+  step until it codes within the available bits" loop, using a coarse
+  `estimate_bits` placeholder (not the exact §C.1.5.4.4.5/8 Huffman
+  count — region subdivision + table selection are later primitives).
+
+Because `max|is|` is monotone in `global_gain`, the spec's linear
+`qquant+1` walk becomes a binary search over `[0, 255]` returning the
+same fixpoint. Measured on flat 44.1 kHz targets the gain tracks
+monotonically (`xr` 1→141, 100→168, 1e6→221, ≈+13 per decade), stays
+under the 8191 budget, and `requantize(is)` relative RMS vs target ≈
+1e-4. No psychoacoustic model, no outer loop, no scalefactor
+amplification.
+
+The remaining Phase 2 work — the psychoacoustic model, the outer
+(distortion-control) loop, scalefactor estimation, and Huffman *encoding*
+of non-zero spectral lines — is still a later round.
 
 ### Not yet implemented
 
