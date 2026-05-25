@@ -8,6 +8,43 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `inner_loop` module **Phase 2 step 5** — the **§C.1.5.4.4 inner-loop
+  `global_gain` search** wrapping the §2.4.3.4.7 `quantize` primitive.
+  Holding a chosen scalefactor configuration fixed, it binary-searches
+  the 8-bit `global_gain` field for the **smallest** gain (finest
+  quantization) whose quantized `is[576]` satisfies a constraint. The
+  search is valid because `|is_i|` is monotone non-increasing in
+  `global_gain` (a larger gain divides by a larger `2^((gg-210)/4)`),
+  making the "constraint satisfied" predicate a step function over
+  `[GAIN_MIN, GAIN_MAX] = [0, 255]`.
+  - `search_magnitude_clamp` — the §C.1.5.4.4.2 maximum-value test:
+    smallest gain with `max|is| ≤ 8191` (`BIG_VALUES_LIMIT`, from the
+    §2.4.1.7 big-values definition). For a fixed `sf` the coarsest gain
+    `GAIN_MAX` divides by only `2^((255-210)/4)`, so a target louder
+    than `2^11.25 · 8191^(4/3) ≈ 4.0e8` (at `sf = 0`) cannot be clamped
+    by gain alone — the result then reports `satisfied == false` with
+    the `GAIN_MAX` fallback (the outer loop / scalefactors, not in
+    scope, would extend the range).
+  - `search_bit_budget` — smallest gain whose `coarse_bit_estimate`
+    (a `bits(|is_i|) + 1` placeholder, **not** the exact §C.1.5.4.4.5 /
+    §C.1.5.4.4.8 Huffman count) fits a supplied budget.
+  - `InnerLoopResult` carries `global_gain`, `is[576]`, `max_abs`, and
+    a `satisfied` flag; `max_abs` and `coarse_bit_estimate` are public
+    helpers.
+
+  14 new unit tests in `src/inner_loop_tests.rs` verify: `max|is|` and
+  the coarse bit count are monotone across all 256 gains; the chosen
+  gain is minimal (gain−1 violates) and keeps `max|is| ≤ 8191`; louder
+  targets pick coarser-or-equal gains across a 6-decade amplitude sweep;
+  tighter budgets pick coarser gains; `requantize(is)` at the chosen
+  gain reproduces the target within the quantizer-grid bound; the
+  clamp-reach boundary is honoured on both sides; and zero / silence
+  edge cases pick `GAIN_MIN` / all-zero `is`.
+
+  Scope of this step is the `global_gain` scalar only: no psychoacoustic
+  model, no §C.1.5.4.3 outer (distortion-control) loop, no scalefactor
+  estimation, no exact Huffman bit count.
+
 - `quantize` module **Phase 2 step 4** — the **§2.4.3.4.7 quantization
   primitive**, the algebraic inverse of `requantize::requantize`. Given
   a target float spectrum `xr[576]` and an already-chosen

@@ -213,6 +213,23 @@
 //! scalefactor estimation, no noise-shaping iteration — those are
 //! subsequent steps.
 //!
+//! The [`inner_loop`] module adds the **inner-loop `global_gain`
+//! search** — the rate-control loop of ISO/IEC 11172-3:1993 Annex C
+//! §C.1.5.4.4 (informational) — that wraps the [`quantize`] primitive.
+//! Holding a chosen scalefactor configuration fixed, it binary-searches
+//! the 8-bit `global_gain` field for the **smallest** gain (finest
+//! quantization) whose quantized `is[576]` satisfies a constraint, using
+//! the monotonicity of `|is_i|` in `global_gain`.
+//! [`inner_loop::search_magnitude_clamp`] enforces the §2.4.1.7
+//! big-values bound (`max|is| ≤ 8191`, [`inner_loop::BIG_VALUES_LIMIT`],
+//! the §C.1.5.4.4.2 maximum-value test);
+//! [`inner_loop::search_bit_budget`] finds the smallest gain whose
+//! [`inner_loop::coarse_bit_estimate`] fits a supplied bit budget. The
+//! bit estimate is an order-of-magnitude placeholder — the exact
+//! §C.1.5.4.4.5 / §C.1.5.4.4.8 Huffman count is a later step — and there
+//! is still no psychoacoustic model, outer (distortion-control) loop, or
+//! scalefactor estimation.
+//!
 //! The remaining Phase 2 work — the psychoacoustic model, bit
 //! allocation, scalefactor estimation, and Huffman *encoding* of
 //! non-zero spectral lines — is still a later round. [`register`] installs the container demuxer; the codec
@@ -233,6 +250,7 @@ pub mod encoder;
 pub mod frame;
 pub mod huffman;
 pub mod imdct;
+pub mod inner_loop;
 pub mod mdct;
 pub mod quantize;
 pub mod reorder;
@@ -258,6 +276,10 @@ pub use frame::{
 };
 pub use huffman::{decode_huffman, HuffmanError, NUM_LINES};
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
+pub use inner_loop::{
+    coarse_bit_estimate, max_abs, search_bit_budget, search_magnitude_clamp, InnerLoopResult,
+    BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
+};
 pub use mdct::{
     analysis_long_window, analysis_short_window, forward_overlap, mdct,
     window_long_family_analysis, window_short_analysis, MdctState,

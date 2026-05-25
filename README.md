@@ -572,15 +572,45 @@ between `xr_back` and `xr_ref` measures `0.0e0` — within `f32` precision
 the integer-power-law grid is closed under the encoder/decoder round-trip
 the moment `xr` is already on the grid.
 
-The primitive does **not** search for `global_gain`, allocate bits,
-choose scalefactors, or run §C.1.5.4 (informational) noise-shaping
-iterations. Those are the next encoder build-out steps; once they pick a
-`(global_gain, sf)` configuration for a target `xr`, this primitive
-quantizes deterministically against it.
+The primitive does **not** itself search for `global_gain`, allocate
+bits, choose scalefactors, or run §C.1.5.4 (informational) noise-shaping
+iterations.
 
-The remaining Phase 2 work — the psychoacoustic model, bit allocation,
-scalefactor estimation, and Huffman *encoding* of non-zero spectral
-lines — is still a later round.
+**Phase 2 step 5 (inner-loop `global_gain` search)** wraps that
+primitive in the [`inner_loop`] module — the §C.1.5.4.4 rate-control
+loop. Holding a chosen scalefactor configuration fixed, it binary-
+searches the 8-bit `global_gain` field for the **smallest** gain (finest
+quantization, largest output magnitudes) whose quantized `is[576]` meets
+a constraint. The search is valid because `|is_i|` — and hence both
+`max|is|` and any non-negative bit weighting — is monotone
+non-increasing in `global_gain` (a larger gain divides by a larger
+`2^((gg−210)/4)`), so the "constraint satisfied" predicate is a step
+function over `[0, 255]`.
+
+- `search_magnitude_clamp` enforces the §2.4.1.7 big-values bound
+  `max|is| ≤ 8191` (`BIG_VALUES_LIMIT`, the §C.1.5.4.4.2 maximum-value
+  test). For a fixed `sf` the coarsest gain (`GAIN_MAX = 255`) divides by
+  only a finite `2^((255−210)/4)`, so amplitudes louder than
+  `2^11.25 · 8191^(4/3) ≈ 4.0×10⁸` (at `sf = 0`) cannot be clamped by
+  gain alone; the result then reports `satisfied == false` and carries
+  the `GAIN_MAX` fallback (the outer loop / scalefactors, not in scope,
+  would extend the range).
+- `search_bit_budget` finds the smallest gain whose `coarse_bit_estimate`
+  fits a supplied budget. That estimate (`bits(|is_i|) + 1` summed over
+  non-zero lines) is an **order-of-magnitude placeholder** — the exact
+  §C.1.5.4.4.5 / §C.1.5.4.4.8 Huffman count is a later step.
+
+Verified: `max|is|` and the coarse bit count are monotone across all 256
+gains; the chosen gain is minimal (gain−1 violates) and keeps
+`max|is| ≤ 8191`; louder targets pick coarser-or-equal gains across a
+6-decade sweep; tighter budgets pick coarser gains; and
+`requantize(is)` at the chosen gain reproduces the target to within the
+quantizer-grid bound.
+
+The remaining Phase 2 work — the psychoacoustic model, the §C.1.5.4.3
+outer (distortion-control) loop, scalefactor estimation, the exact
+Huffman bit count, and Huffman *encoding* of non-zero spectral lines —
+is still a later round.
 
 ### Not yet implemented
 
@@ -589,12 +619,13 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 steps 1–4 (forward MDCT primitive +
+**Phase 1 framing + Phase 2 steps 1–5 (forward MDCT primitive +
 analysis windowing + forward overlap split + polyphase analysis
-subband filterbank + §2.4.3.4.7 quantization primitive)** — it still
-lacks the psychoacoustic model, bit allocation, scalefactor estimation,
-and Huffman *encoding* of non-zero spectral lines, plus the
-bit-reservoir scheduling that those need. `register()` installs the
+subband filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
+inner-loop `global_gain` search)** — it still lacks the psychoacoustic
+model, the §C.1.5.4.3 outer loop, scalefactor estimation, the exact
+Huffman bit count, and Huffman *encoding* of non-zero spectral lines,
+plus the bit-reservoir scheduling that those need. `register()` installs the
 container demuxer; the codec `Decoder` / `Encoder` trait surfaces
 remain stubs.
 
