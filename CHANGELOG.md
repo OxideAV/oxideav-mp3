@@ -8,6 +8,59 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `main_data` module **Phase 2 step 9** — the **§2.4.2.7 cross-frame
+  BIT-RESERVOIR SCHEDULER**, `main_data_begin > 0` path. The step-8
+  assembler produces each frame's main-data bytes self-contained
+  (`main_data_begin = 0`); a busy frame whose main_data exceeds its
+  per-frame slot byte budget (`frame_len - 4 - CRC? - side_info_bytes`)
+  was unschedulable. The new `schedule_reservoir` /
+  `ReservoirScheduler` route the busy frame's main_data backward into
+  earlier quiet frames' unused tail bytes — the §2.4.2.7 "bit
+  reservoir" — and stamp the back-pointer into the busy frame's
+  `SideInfo::main_data_begin`. The scheduler enforces both §2.4.2.7
+  invariants: `R_i ≥ 0` (cumulative slot ≥ cumulative main-data at
+  every prefix) and `R_i ≤ 511` (MPEG-1 9-bit cap) / `≤ 255` (LSF
+  8-bit cap), surfacing failures as `ReservoirError::SlotUnderflow` /
+  `ReservoirError::ReservoirOverflow`. Two-pass design (compute every
+  frame's `main_data_begin` up front, then carve the rolling main-data
+  concatenation into per-frame slots, zero-padding the final tail).
+  `RESERVOIR_MAX_MPEG1` / `RESERVOIR_MAX_LSF` constants surface the
+  on-wire bit-width caps.
+
+  Eight new round-trip unit tests in `src/main_data_tests.rs`:
+  - `schedule_single_quiet_frame_self_contained` — one-frame schedule
+    is the `main_data_begin = 0` path with zero-padded slot tail
+    (regression of step-8 behaviour through the new API).
+  - **`schedule_three_frame_busy_middle_via_prior_quiet`** — the
+    user-prompt scenario: middle frame's main_data (50 B) exceeds its
+    own slot (30 B) and is scheduled into the prior quiet frame's
+    unused tail. Expected `main_data_begin` sequence `[0, 20, 0]` and
+    decoder-side bit-exact recovery of all three frames' main_data via
+    `scalefactors::Reservoir::assemble`.
+  - **`three_frame_pipeline_round_trip_with_real_main_data`** — full
+    pipeline cross-check at MPEG-1 128 kbps / 44.1 kHz mono: three
+    real `assemble_main_data` outputs (frame 0 / 2 with
+    `big_values = 1`, frame 1 with `big_values = 200` per granule,
+    both granules per frame) scheduled into 200-byte slots, decoded
+    back through `Reservoir::assemble` + the existing §2.4.1.7
+    main_data() loop, recovering every granule's scalefactors + `is[]`
+    bit-exactly.
+  - `reservoir_scheduler_builder_matches_one_shot` — `push` /
+    `finish` stateful builder is equivalent to one-shot
+    `schedule_reservoir`.
+  - `schedule_busy_frame_with_no_prior_reservoir_underflows` /
+    `schedule_reservoir_cap_mpeg1_511` /
+    `schedule_reservoir_cap_lsf_255` — error surfaces for the
+    schedulability and reservoir-cap invariants.
+  - `reservoir_cap_constants_match_spec_bit_widths` — the 511 / 255
+    constants are the literal §2.4.2.7 9-bit / 8-bit field widths.
+
+  Single-channel MPEG-1 only this round; LSF cap enforcement aside,
+  every test runs MPEG-1. The outer-loop / multi-channel /
+  encoder-side `silent_side_info`-driven multi-frame stream wiring is
+  deferred to a later round, and the scheduler itself is layout-only —
+  it does not run the analysis / quantization stack.
+
 - `main_data` module **Phase 2 step 8** — the **§2.4.1.7 `main_data()`
   ASSEMBLER** plus the no-reservoir `main_data_begin = 0` path.
   `assemble_main_data` composes a complete per-frame main-data block by

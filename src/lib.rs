@@ -286,7 +286,10 @@ pub use inner_loop::{
     coarse_bit_estimate, exact_bit_count, max_abs, search_bit_budget, search_magnitude_clamp,
     ExactBitCount, InnerLoopResult, BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
 };
-pub use main_data::{assemble_main_data, AssembledMainData, GranuleChannelData};
+pub use main_data::{
+    assemble_main_data, schedule_reservoir, AssembledMainData, GranuleChannelData, ReservoirError,
+    ReservoirFrame, ReservoirScheduler, ScheduledFrame, RESERVOIR_MAX_LSF, RESERVOIR_MAX_MPEG1,
+};
 pub use mdct::{
     analysis_long_window, analysis_short_window, forward_overlap, mdct,
     window_long_family_analysis, window_short_analysis, MdctState,

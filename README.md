@@ -668,10 +668,36 @@ exactly `total_bits`: MPEG-1 long two-channel, MPEG-1 two-granule mono
 (scfsi all-false), MPEG-1 short, LSF long, and a `decode_scalefactors`
 first-granule cross-check.
 
+**Phase 2 step 9 (cross-frame bit-reservoir scheduling)** turns the
+step-8 self-contained `main_data_begin = 0` path into a real §2.4.2.7
+reservoir scheduler that can route a busy frame's main_data backward
+into earlier quiet frames' unused tails. The `main_data` module's
+`schedule_reservoir` (plus the stateful `ReservoirScheduler` builder)
+takes a parallel slice of `(main_data bytes, slot_bytes, lsf?)` triples
+and per-frame `SideInfo`s, validates the two §2.4.2.7 schedulability
+invariants — `R_i ≥ 0` (cumulative slot ≥ cumulative main_data at every
+prefix) and `R_i ≤ 511` / `≤ 255` (the on-wire 9-bit MPEG-1 / 8-bit LSF
+cap, surfaced as `RESERVOIR_MAX_MPEG1` / `RESERVOIR_MAX_LSF`) — then
+carves the rolling main-data concatenation into per-frame slots and
+stamps each frame's `SideInfo::main_data_begin` to point back to where
+its main_data actually starts. Schedulability failures surface as
+`ReservoirError::SlotUnderflow` (busy frame outran prior reservoir + own
+slot) or `ReservoirError::ReservoirOverflow` (reservoir would exceed the
+on-wire cap). Verified by eight tests, anchored on a synthetic 3-frame
+sequence (quiet / busy / quiet) where the middle frame's main_data
+(50 B) exceeds its slot (30 B) and is scheduled into the prior quiet
+frame's 20-byte tail (`main_data_begin` sequence `[0, 20, 0]`), and an
+end-to-end pipeline cross-check (`big_values = 200` middle frame at
+MPEG-1 128 kbps / 44.1 kHz mono) that round-trips every granule's
+scalefactors + `is[]` bit-exactly through `Reservoir::assemble` plus the
+existing §2.4.1.7 decoder loop. Single-channel MPEG-1 only this round —
+multi-channel / LSF / outer-loop integration is deferred.
+
 The remaining Phase 2 work — the psychoacoustic model, the §C.1.5.4.3
-outer (distortion-control) loop, scalefactor estimation, and **real**
-bit-reservoir scheduling (`main_data_begin > 0`, carrying spare bits
-forward) on top of the no-reservoir assembler — is still a later round.
+outer (distortion-control) loop, scalefactor estimation, and tying the
+step-9 reservoir scheduler into a stream-level `Encoder::encode` driver
+that emits a CBR file of properly-scheduled frames — is still a later
+round.
 
 ### Not yet implemented
 
@@ -680,17 +706,17 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 steps 1–8 (forward MDCT primitive +
+**Phase 1 framing + Phase 2 steps 1–9 (forward MDCT primitive +
 analysis windowing + forward overlap split + polyphase analysis
 subband filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
-count + §2.4.1.7 Huffman bit emission + §2.4.1.7 main-data assembly with
-`main_data_begin = 0`)** — it still lacks the psychoacoustic model, the
-§C.1.5.4.3 outer loop, scalefactor estimation, and the real
-bit-reservoir scheduling (`main_data_begin > 0`) that would pack the
-assembled granules into a rate-limited stream. `register()` installs the
-container demuxer; the codec `Decoder` / `Encoder` trait surfaces
-remain stubs.
+count + §2.4.1.7 Huffman bit emission + §2.4.1.7 main-data assembly +
+§2.4.2.7 cross-frame bit-reservoir scheduling with
+`main_data_begin > 0`)** — it still lacks the psychoacoustic model, the
+§C.1.5.4.3 outer loop, scalefactor estimation, and the stream-level
+`Encoder::encode` driver that would tie the scheduler into a CBR file
+emitter. `register()` installs the container demuxer; the codec
+`Decoder` / `Encoder` trait surfaces remain stubs.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
