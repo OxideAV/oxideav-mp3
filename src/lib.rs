@@ -201,6 +201,18 @@
 //! 20..32) with RMS deviation below `1e-6` and cross-band leakage RMS
 //! likewise below `1e-6`, for every subband independently.
 //!
+//! The [`quantize`] module adds the **encoder-side §2.4.3.4.7
+//! quantization primitive** — the algebraic inverse of
+//! [`requantize::requantize`]. Given a target `xr[576]` and an
+//! already-chosen `GranuleChannel` + `ScaleFactors` configuration,
+//! [`quantize::quantize`] computes the integer Huffman-input buffer
+//! `is[576]` such that feeding `is` back through
+//! [`requantize::requantize`] (same `gc` / `sf` / sample-rate / version)
+//! reproduces `xr` within `f32` round-to-nearest precision. It is the
+//! pure primitive — no `global_gain` search, no bit allocation, no
+//! scalefactor estimation, no noise-shaping iteration — those are
+//! subsequent steps.
+//!
 //! The remaining Phase 2 work — the psychoacoustic model, bit
 //! allocation, scalefactor estimation, and Huffman *encoding* of
 //! non-zero spectral lines — is still a later round. [`register`] installs the container demuxer; the codec
@@ -222,6 +234,7 @@ pub mod frame;
 pub mod huffman;
 pub mod imdct;
 pub mod mdct;
+pub mod quantize;
 pub mod reorder;
 pub mod requantize;
 pub mod scalefactors;
@@ -249,6 +262,7 @@ pub use mdct::{
     analysis_long_window, analysis_short_window, forward_overlap, mdct,
     window_long_family_analysis, window_short_analysis, MdctState,
 };
+pub use quantize::quantize;
 pub use reorder::reorder;
 pub use requantize::{requantize, scalefac_multiplier, PRETAB};
 pub use scalefactors::{

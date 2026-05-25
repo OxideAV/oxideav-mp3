@@ -546,6 +546,38 @@ filterbank in `synth`:
     precision spec-derivable invariant of the bank's cosine-
     modulated structure.
 
+**Phase 2 step 4 (quantization primitive)** is now wired up in the
+[`quantize`] module. Given a target spectrum `xr[576]` and an
+already-chosen `GranuleChannel` + `ScaleFactors` configuration,
+[`quantize::quantize`] computes the integer Huffman-input buffer
+`is[576]` that — when fed back through [`requantize::requantize`] with
+the same configuration — reproduces `xr[576]` within `f32`
+round-to-nearest precision. It is the exact algebraic inverse of the
+§2.4.3.4.7.1 decoder formula:
+
+```text
+|is_i| = round( (|xr_i| / G(sfb, w))^(3/4) )
+G_long (sfb)    = 2^((gg-210)/4) * 2^(-mult * (sf_l[sfb] + preflag*pretab[sfb]))
+G_short(sfb, w) = 2^((gg-210-8*subblock_gain[w])/4) * 2^(-mult * sf_s[sfb][w])
+```
+
+with the same long / short / mixed split (lines 0..36 long, 36..short_end
+short for mixed blocks) and the same per-window subblock-gain bookkeeping
+as the decoder. The round-trip `is -> xr -> is' -> xr_back` is **bit-exact
+on every tested configuration** (long-block at every `global_gain` in
+180..240, scalefactors 0..4, `preflag` on/off, both `scalefac_scale`
+settings; short-block with non-zero `subblock_gain[w]`; mixed-block with
+non-trivial `scalefac_l` and `scalefac_s`; LSF at 24 kHz). Bin-level RMS
+between `xr_back` and `xr_ref` measures `0.0e0` — within `f32` precision
+the integer-power-law grid is closed under the encoder/decoder round-trip
+the moment `xr` is already on the grid.
+
+The primitive does **not** search for `global_gain`, allocate bits,
+choose scalefactors, or run §C.1.5.4 (informational) noise-shaping
+iterations. Those are the next encoder build-out steps; once they pick a
+`(global_gain, sf)` configuration for a target `xr`, this primitive
+quantizes deterministically against it.
+
 The remaining Phase 2 work — the psychoacoustic model, bit allocation,
 scalefactor estimation, and Huffman *encoding* of non-zero spectral
 lines — is still a later round.
@@ -557,13 +589,14 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 steps 1–3 (forward MDCT primitive +
+**Phase 1 framing + Phase 2 steps 1–4 (forward MDCT primitive +
 analysis windowing + forward overlap split + polyphase analysis
-subband filterbank)** — it still lacks the
-psychoacoustic model, bit allocation, scalefactor estimation, and
-Huffman *encoding* of non-zero spectral lines, plus the bit-reservoir
-scheduling that those need. `register()` installs the container
-demuxer; the codec `Decoder` / `Encoder` trait surfaces remain stubs.
+subband filterbank + §2.4.3.4.7 quantization primitive)** — it still
+lacks the psychoacoustic model, bit allocation, scalefactor estimation,
+and Huffman *encoding* of non-zero spectral lines, plus the
+bit-reservoir scheduling that those need. `register()` installs the
+container demuxer; the codec `Decoder` / `Encoder` trait surfaces
+remain stubs.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

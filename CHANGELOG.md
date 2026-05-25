@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `quantize` module **Phase 2 step 4** — the **§2.4.3.4.7 quantization
+  primitive**, the algebraic inverse of `requantize::requantize`. Given
+  a target float spectrum `xr[576]` and an already-chosen
+  `GranuleChannel` + `ScaleFactors` configuration,
+  [`quantize::quantize`] computes the integer Huffman-input buffer
+  `is[576]` such that feeding `is` back through `requantize` with the
+  same configuration reproduces `xr` within `f32` round-to-nearest
+  precision. Implements both block forms:
+  - Long: `|is_i| = round((|xr_i| / G_long(sfb))^(3/4))` with
+    `G_long(sfb) = 2^((gg-210)/4) * 2^(-mult*(sf_l[sfb] +
+    preflag*pretab[sfb]))`.
+  - Short / per-window: `G_short(sfb, w) = 2^((gg-210-8*subblock_gain[w])/4)
+    * 2^(-mult*sf_s[sfb][w])`.
+  - Mixed-block split (lines 0..36 long, 36..short-active-end short
+    starting at short sfb 3) mirrors the decoder.
+  - Sign of `xr` is reapplied after the magnitude round; zero target
+    yields zero quantizer output regardless of gains.
+
+  Round-trip `is -> xr_ref -> is' -> xr_back` is **bit-exact** on every
+  tested configuration: long-block at every `global_gain ∈ {180, 200,
+  210, 224, 240}`, long with scalefactors 0..4 and both
+  `scalefac_scale` settings, long with `preflag`, short with non-zero
+  per-window `subblock_gain`, short with per-window `scalefac_s`,
+  mixed-block with non-trivial long/short scalefactors, and LSF at
+  24 kHz. Bin-level RMS between `xr_back` and `xr_ref` is `0.0e0` —
+  the integer-power-law grid is closed under the round-trip the moment
+  `xr` already lies on it (and a `xr` produced by `requantize` always
+  does). 14 new unit tests in `src/quantize_tests.rs`.
+
+  Scope of this step is the primitive only: no `global_gain` search,
+  no bit allocation, no scalefactor estimation, no §C.1.5.4
+  (informational) noise-shaping iteration loop. Those become
+  subsequent primitives built on top of this one.
+
 - `analysis` module **Phase 2 step 3** — the **polyphase analysis
   subband filterbank** (ISO/IEC 11172-3:1993 Annex C §C.1.3 / Figure
   C.4), the algebraic dual of the §2.4.3.2 / Figure A.2 synthesis
