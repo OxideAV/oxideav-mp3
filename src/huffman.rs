@@ -38,7 +38,7 @@
 //! bits for the granule … have been exhausted").
 
 use crate::frame::MpegVersion;
-use crate::scalefactors::MainDataReader;
+use crate::scalefactors::{MainDataReader, MainDataWriter};
 use crate::side_info::{BlockType, GranuleChannel};
 
 /// Number of quantized frequency lines produced per granule-channel.
@@ -751,64 +751,20 @@ pub fn count_huffman_bits(
 // is byte-aligned and reads back through `MainDataReader` bit-for-bit, so
 // `encode_huffman` → `decode_huffman` recovers the original `is[]`.
 //
-// The emitted bit length (before the trailing byte-padding) equals the
-// §C.1.5.4.4.5 / .8 `count_huffman_bits` for the same inputs: the writer
-// emits exactly the codeword (`HEntry.len` / `QUAD_A.0` bits), one
-// `linbits` field per magnitude-≥-15 component, and one sign bit per
-// non-zero value — the same three terms `big_pair_bits` /
-// `count1_quad_bits` sum.
-// =====================================================================
+// The emitted bit length equals the §C.1.5.4.4.5 / .8 `count_huffman_bits`
+// for the same inputs: the writer emits exactly the codeword
+// (`HEntry.len` / `QUAD_A.0` bits), one `linbits` field per magnitude-≥-15
+// component, and one sign bit per non-zero value — the same three terms
+// `big_pair_bits` / `count1_quad_bits` sum. The emitter writes into a
+// shared [`MainDataWriter`] (the inverse of `MainDataReader`), so the
+// Huffman (part3) payload can be appended directly after a granule's
+// scalefactor (part2) bits with no intervening byte alignment — the
+// §2.4.1.7 `main_data()` layout.
 
-/// An MSB-first bit sink whose byte output is read back identically by
-/// [`MainDataReader`]: bits pack into the current byte from bit 7 down,
-/// a completed byte is flushed, and [`HuffmanBitWriter::finish`]
-/// zero-pads the trailing partial byte to a byte boundary. `bit_len`
-/// tracks the number of payload bits written (excluding the final pad),
-/// so the caller can compare it against `count_huffman_bits`.
-struct HuffmanBitWriter {
-    bytes: Vec<u8>,
-    cur: u8,
-    nbits: u8,
-    bit_len: usize,
-}
-
-impl HuffmanBitWriter {
-    fn new() -> Self {
-        HuffmanBitWriter {
-            bytes: Vec::new(),
-            cur: 0,
-            nbits: 0,
-            bit_len: 0,
-        }
-    }
-
-    /// Write the low `n` bits of `value` (`0 ≤ n ≤ 32`), MSB-first. This
-    /// is the exact inverse of [`MainDataReader::read`].
-    fn write(&mut self, value: u32, n: u32) {
-        for i in (0..n).rev() {
-            let bit = ((value >> i) & 1) as u8;
-            self.cur = (self.cur << 1) | bit;
-            self.nbits += 1;
-            if self.nbits == 8 {
-                self.bytes.push(self.cur);
-                self.cur = 0;
-                self.nbits = 0;
-            }
-        }
-        self.bit_len += n as usize;
-    }
-
-    /// Flush the trailing partial byte (zero-padded) and return the
-    /// packed bytes. The pad bits are NOT counted in `bit_len`.
-    fn finish(mut self) -> Vec<u8> {
-        if self.nbits > 0 {
-            self.cur <<= 8 - self.nbits;
-            self.bytes.push(self.cur);
-            self.cur = 0;
-            self.nbits = 0;
-        }
-        self.bytes
-    }
+/// Write the sign bit for a non-zero value: `1` if negative, `0` if
+/// positive (mirrors `decode_big_pair`'s `read(1) == 1` negation).
+fn write_sign(w: &mut MainDataWriter, v: i32) {
+    w.write(u32::from(v < 0), 1);
 }
 
 /// Error from the Huffman **encode** stage.
@@ -865,7 +821,7 @@ pub struct Mp3HuffmanData {
 /// negative) for each non-zero component. The §2.4.1.7 order is
 /// codeword → linbits_x → sign_x → linbits_y → sign_y.
 fn emit_big_pair(
-    w: &mut HuffmanBitWriter,
+    w: &mut MainDataWriter,
     table: &BigTable,
     x: i32,
     y: i32,
@@ -891,30 +847,22 @@ fn emit_big_pair(
         w.write(ax - 15, linbits);
     }
     if x != 0 {
-        w.write_sign(x);
+        write_sign(w, x);
     }
     // linbits ESC for y, then sign for y.
     if ay >= 15 && linbits > 0 {
         w.write(ay - 15, linbits);
     }
     if y != 0 {
-        w.write_sign(y);
+        write_sign(w, y);
     }
     Ok(())
-}
-
-impl HuffmanBitWriter {
-    /// Write the sign bit for a non-zero value: `1` if negative, `0` if
-    /// positive (mirrors `decode_big_pair`'s `read(1) == 1` negation).
-    fn write_sign(&mut self, v: i32) {
-        self.write(u32::from(v < 0), 1);
-    }
 }
 
 /// Emit the big-values pairs of `is[start..end]` with codebook
 /// `table_idx`, the inverse of the region loop in `decode_huffman`.
 fn emit_region(
-    w: &mut HuffmanBitWriter,
+    w: &mut MainDataWriter,
     is: &[i32; NUM_LINES],
     start: usize,
     end: usize,
@@ -935,7 +883,7 @@ fn emit_region(
 /// `QUAD_A` codeword for the `(|v|<<3)|(|w|<<2)|(|x|<<1)|(|y|)` pattern.
 /// Sign bits (`1` for negative) follow each non-zero value in v, w, x, y
 /// order.
-fn emit_count1_quad(bw: &mut HuffmanBitWriter, v: i32, w: i32, x: i32, y: i32, table_b: bool) {
+fn emit_count1_quad(bw: &mut MainDataWriter, v: i32, w: i32, x: i32, y: i32, table_b: bool) {
     let nz = |c: i32| u32::from(c != 0);
     if table_b {
         // Table B: one bit per value, 0 → magnitude 1, 1 → 0. The
@@ -949,16 +897,16 @@ fn emit_count1_quad(bw: &mut HuffmanBitWriter, v: i32, w: i32, x: i32, y: i32, t
         bw.write(u32::from(code), u32::from(clen));
     }
     if v != 0 {
-        bw.write_sign(v);
+        write_sign(bw, v);
     }
     if w != 0 {
-        bw.write_sign(w);
+        write_sign(bw, w);
     }
     if x != 0 {
-        bw.write_sign(x);
+        write_sign(bw, x);
     }
     if y != 0 {
-        bw.write_sign(y);
+        write_sign(bw, y);
     }
 }
 
@@ -994,6 +942,50 @@ pub fn encode_huffman(
     count1_quads: usize,
     count1table_b: bool,
 ) -> Result<Mp3HuffmanData, HuffmanEncodeError> {
+    let mut w = MainDataWriter::new();
+    let bit_len = emit_huffman(
+        &mut w,
+        is,
+        big_pairs,
+        region_ends,
+        table_select,
+        count1_quads,
+        count1table_b,
+    )?;
+    Ok(Mp3HuffmanData {
+        bytes: w.finish(),
+        bit_len,
+    })
+}
+
+/// Emit the §2.4.1.7 `huffmancodebits()` (part3) payload of one
+/// granule-channel into a shared [`MainDataWriter`], returning the number
+/// of bits written.
+///
+/// Unlike [`encode_huffman`] (which wraps a fresh writer and byte-aligns
+/// the result), this appends the codewords directly to `w` at its current
+/// bit position, so a caller can place a granule's part2 scalefactors
+/// immediately before the part3 Huffman data with no intervening byte
+/// alignment — the contiguous `main_data()` layout. The inputs and the
+/// returned bit count are identical to [`encode_huffman`] /
+/// [`count_huffman_bits`].
+///
+/// # Errors
+///
+/// [`HuffmanEncodeError::BigValuesTooLarge`] if `big_pairs * 2` exceeds
+/// the 576-line granule capacity; [`HuffmanEncodeError::PairNotCodable`]
+/// if a big-values pair cannot be coded by its region's table;
+/// [`HuffmanEncodeError::UnusedTable`] if a `table_select` names an
+/// unused/out-of-range codebook.
+pub fn emit_huffman(
+    w: &mut MainDataWriter,
+    is: &[i32; NUM_LINES],
+    big_pairs: usize,
+    region_ends: (usize, usize),
+    table_select: [u8; 3],
+    count1_quads: usize,
+    count1table_b: bool,
+) -> Result<usize, HuffmanEncodeError> {
     if big_pairs * 2 > NUM_LINES {
         return Err(HuffmanEncodeError::BigValuesTooLarge);
     }
@@ -1001,33 +993,22 @@ pub fn encode_huffman(
     let r0 = region_ends.0.min(bv2);
     let r1 = region_ends.1.max(r0).min(bv2);
 
-    let mut w = HuffmanBitWriter::new();
+    let start = w.bit_pos();
     // Three big-values sub-regions, in line order (§2.4.1.7).
-    emit_region(&mut w, is, 0, r0, table_select[0])?;
-    emit_region(&mut w, is, r0, r1, table_select[1])?;
-    emit_region(&mut w, is, r1, bv2, table_select[2])?;
+    emit_region(w, is, 0, r0, table_select[0])?;
+    emit_region(w, is, r0, r1, table_select[1])?;
+    emit_region(w, is, r1, bv2, table_select[2])?;
 
     // count1 partition: whole quadruples above the big-values lines.
     let c1_start = bv2;
     let c1_end = (c1_start + count1_quads * 4).min(NUM_LINES);
     let mut k = c1_start;
     while k + 4 <= c1_end {
-        emit_count1_quad(
-            &mut w,
-            is[k],
-            is[k + 1],
-            is[k + 2],
-            is[k + 3],
-            count1table_b,
-        );
+        emit_count1_quad(w, is[k], is[k + 1], is[k + 2], is[k + 3], count1table_b);
         k += 4;
     }
 
-    let bit_len = w.bit_len;
-    Ok(Mp3HuffmanData {
-        bytes: w.finish(),
-        bit_len,
-    })
+    Ok(w.bit_pos() - start)
 }
 
 include!("huffman_tables.rs");

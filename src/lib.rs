@@ -251,6 +251,7 @@ pub mod frame;
 pub mod huffman;
 pub mod imdct;
 pub mod inner_loop;
+pub mod main_data;
 pub mod mdct;
 pub mod quantize;
 pub mod reorder;
@@ -276,14 +277,16 @@ pub use frame::{
 };
 pub use huffman::{
     choose_best_count1_table, choose_best_table_for_region, count1_bits, count_huffman_bits,
-    decode_huffman, encode_huffman, encoder_region_boundaries, partition_split, HuffmanEncodeError,
-    HuffmanError, Mp3HuffmanData, PartitionSplit, NUM_LINES, SELECTABLE_BIG_TABLES,
+    decode_huffman, emit_huffman, encode_huffman, encoder_region_boundaries, partition_split,
+    HuffmanEncodeError, HuffmanError, Mp3HuffmanData, PartitionSplit, NUM_LINES,
+    SELECTABLE_BIG_TABLES,
 };
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
 pub use inner_loop::{
     coarse_bit_estimate, exact_bit_count, max_abs, search_bit_budget, search_magnitude_clamp,
     ExactBitCount, InnerLoopResult, BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
 };
+pub use main_data::{assemble_main_data, AssembledMainData, GranuleChannelData};
 pub use mdct::{
     analysis_long_window, analysis_short_window, forward_overlap, mdct,
     window_long_family_analysis, window_short_analysis, MdctState,
@@ -293,7 +296,8 @@ pub use reorder::reorder;
 pub use requantize::{requantize, scalefac_multiplier, PRETAB};
 pub use scalefactors::{
     decode_scalefactors, lsf_scale_params, FrameScaleFactors, LsfScaleParams, MainDataReader,
-    Reservoir, ScaleFactorError, ScaleFactors, LONG_SFB, MPEG1_SLEN, SHORT_SFB, SHORT_WINDOWS,
+    MainDataWriter, Reservoir, ScaleFactorError, ScaleFactors, LONG_SFB, MPEG1_SLEN, SHORT_SFB,
+    SHORT_WINDOWS,
 };
 pub use side_info::{
     parse_side_info, BlockType, GranuleChannel, SideInfo, SideInfoError, GRANULES, GRANULES_LSF,

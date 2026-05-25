@@ -333,6 +333,70 @@ impl<'a> MainDataReader<'a> {
     }
 }
 
+/// An MSB-first bit **writer** into a growing main-data byte run — the
+/// exact inverse of [`MainDataReader`].
+///
+/// Bits pack into the current byte from bit 7 down; a completed byte is
+/// flushed, and [`MainDataWriter::finish`] zero-pads the trailing partial
+/// byte to a byte boundary (ISO/IEC 11172-3 §2.4.1: the most significant
+/// bit of each byte is transmitted first). [`MainDataWriter::bit_pos`]
+/// reports the number of *payload* bits written (excluding the final
+/// pad), so a caller can record per-field bit lengths
+/// (e.g. `part2_3_length`) and so a read-back through [`MainDataReader`]
+/// recovers every field bit-for-bit.
+#[derive(Debug, Default)]
+pub struct MainDataWriter {
+    bytes: Vec<u8>,
+    cur: u8,
+    nbits: u8,
+    bit_pos: usize,
+}
+
+impl MainDataWriter {
+    /// A new, empty writer positioned at bit 0.
+    #[must_use]
+    pub fn new() -> Self {
+        MainDataWriter::default()
+    }
+
+    /// Number of payload bits written so far (excluding any trailing pad
+    /// that [`MainDataWriter::finish`] would add).
+    #[must_use]
+    pub fn bit_pos(&self) -> usize {
+        self.bit_pos
+    }
+
+    /// Write the low `n` bits of `value` (`0 ≤ n ≤ 32`), MSB-first. The
+    /// exact inverse of [`MainDataReader::read`].
+    pub fn write(&mut self, value: u32, n: u32) {
+        for i in (0..n).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            self.cur = (self.cur << 1) | bit;
+            self.nbits += 1;
+            if self.nbits == 8 {
+                self.bytes.push(self.cur);
+                self.cur = 0;
+                self.nbits = 0;
+            }
+        }
+        self.bit_pos += n as usize;
+    }
+
+    /// Flush the trailing partial byte (zero-padded to a byte boundary)
+    /// and return the packed bytes. The pad bits are NOT counted in
+    /// [`MainDataWriter::bit_pos`].
+    #[must_use]
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.nbits > 0 {
+            self.cur <<= 8 - self.nbits;
+            self.bytes.push(self.cur);
+            self.cur = 0;
+            self.nbits = 0;
+        }
+        self.bytes
+    }
+}
+
 /// Derive the LSF `(slen1..4, nr_of_sfb1..4, preflag, intensity_scale)`
 /// from the 9-bit `scalefac_compress` (ISO/IEC 13818-3 §2.4.3.4).
 ///
@@ -470,7 +534,7 @@ pub fn mpeg1_long_band_slen(sfb: usize, slen1: u8, slen2: u8) -> u8 {
 /// scalefactors for this channel, used to fill the reused bands when
 /// `gr == 1` and the corresponding `scfsi` bit is set; pass `None` for
 /// `gr == 0`.
-fn read_mpeg1_granule_channel(
+pub(crate) fn read_mpeg1_granule_channel(
     r: &mut MainDataReader<'_>,
     gc: &GranuleChannel,
     scfsi: &[bool; 4],
@@ -535,7 +599,7 @@ fn read_mpeg1_granule_channel(
 
 /// Read the LSF (MPEG-2 / MPEG-2.5) scalefactors for one channel from
 /// `r` (ISO/IEC 13818-3 §2.4.3.4). There is one granule, so no `scfsi`.
-fn read_lsf_channel(
+pub(crate) fn read_lsf_channel(
     r: &mut MainDataReader<'_>,
     gc: &GranuleChannel,
     is_intensity_right: bool,
@@ -683,6 +747,124 @@ impl ScaleFactorSink for LsfMixedShortWriter<'_> {
     }
 }
 
+/// Write the MPEG-1 part2 scalefactors of one granule/channel into `w`,
+/// the exact inverse of [`read_mpeg1_granule_channel`].
+///
+/// `gr` and `scfsi` select the granule-1 reuse skips: a band group whose
+/// `scfsi` bit is set is *not* re-emitted for granule 1 (its granule-0
+/// value carries over), matching the decoder's `reuse` branch. `sf` holds
+/// the scalefactors to emit. Returns the number of part2 bits written.
+///
+/// The writer emits bits in the §2.4.1.7 `main_data()` order: long blocks
+/// in the four scfsi band groups, short blocks per `(sfb, window)`, mixed
+/// blocks long-window sfb 0..8 then short sfb 3..12.
+pub(crate) fn write_mpeg1_granule_channel(
+    w: &mut MainDataWriter,
+    gc: &GranuleChannel,
+    sf: &ScaleFactors,
+    scfsi: &[bool; 4],
+    gr: usize,
+) -> usize {
+    let start = w.bit_pos();
+    let (slen1, slen2) = MPEG1_SLEN[(gc.scalefac_compress & 0xF) as usize];
+    let short = gc.window_switching_flag && gc.block_type == BlockType::Short;
+
+    if short {
+        if gc.mixed_block_flag {
+            for &band in sf.long.iter().take(8) {
+                w.write(u32::from(band), u32::from(slen1));
+            }
+            for sfb in 3..12 {
+                let slen = if sfb < 6 { slen1 } else { slen2 };
+                for win in 0..SHORT_WINDOWS {
+                    w.write(u32::from(sf.short[sfb][win]), u32::from(slen));
+                }
+            }
+        } else {
+            for sfb in 0..SHORT_SFB {
+                let slen = if sfb < 6 { slen1 } else { slen2 };
+                for win in 0..SHORT_WINDOWS {
+                    w.write(u32::from(sf.short[sfb][win]), u32::from(slen));
+                }
+            }
+        }
+    } else {
+        const GROUPS: [(usize, usize); 4] = [(0, 6), (6, 11), (11, 16), (16, 21)];
+        for (g, &(lo, hi)) in GROUPS.iter().enumerate() {
+            let reuse = gr == 1 && scfsi[g];
+            if reuse {
+                continue;
+            }
+            for sfb in lo..hi {
+                let slen = mpeg1_long_band_slen(sfb, slen1, slen2);
+                w.write(u32::from(sf.long[sfb]), u32::from(slen));
+            }
+        }
+    }
+
+    w.bit_pos() - start
+}
+
+/// Write the LSF (MPEG-2 / MPEG-2.5) part2 scalefactors of one channel
+/// into `w`, the exact inverse of [`read_lsf_channel`]. Returns the
+/// number of part2 bits written.
+pub(crate) fn write_lsf_channel(
+    w: &mut MainDataWriter,
+    gc: &GranuleChannel,
+    sf: &ScaleFactors,
+    is_intensity_right: bool,
+) -> usize {
+    let start = w.bit_pos();
+    let params = lsf_scale_params(
+        gc.scalefac_compress,
+        gc.block_type,
+        gc.mixed_block_flag,
+        is_intensity_right,
+    );
+    let short = gc.window_switching_flag && gc.block_type == BlockType::Short;
+
+    // Collect the scalefactor values in the same linear order the reader's
+    // sink stored them, then emit them across the four partitions.
+    let mut values: Vec<u8> = Vec::new();
+    if short {
+        if gc.mixed_block_flag {
+            for &v in sf.long.iter().take(6) {
+                values.push(v);
+            }
+            for sfb in 3..SHORT_SFB {
+                for win in 0..SHORT_WINDOWS {
+                    values.push(sf.short[sfb][win]);
+                }
+            }
+        } else {
+            for sfb in 0..SHORT_SFB {
+                for win in 0..SHORT_WINDOWS {
+                    values.push(sf.short[sfb][win]);
+                }
+            }
+        }
+    } else {
+        for &v in sf.long.iter() {
+            values.push(v);
+        }
+    }
+
+    let mut idx = 0usize;
+    for p in 0..4 {
+        let slen = params.slen[p];
+        let count = params.nr_of_sfb[p] as usize;
+        for _ in 0..count {
+            let v = values.get(idx).copied().unwrap_or(0);
+            if slen != 0 {
+                w.write(u32::from(v), u32::from(slen));
+            }
+            idx += 1;
+        }
+    }
+
+    w.bit_pos() - start
+}
+
 /// Decode all Layer III scalefactors for one frame from a contiguous
 /// main-data byte run.
 ///
@@ -763,7 +945,7 @@ pub fn decode_scalefactors(
 /// with the intensity bit of `mode_extension` set (`'01'` or `'11'`).
 /// Only then does the LSF right-channel `int_scalefac_compress` branch
 /// apply (ISO/IEC 13818-3 §2.4.3.4).
-fn is_intensity_stereo(header: &Mp3FrameHeader) -> bool {
+pub(crate) fn is_intensity_stereo(header: &Mp3FrameHeader) -> bool {
     header.mode == ChannelMode::JointStereo && header.mode_extension.intensity_stereo
 }
 

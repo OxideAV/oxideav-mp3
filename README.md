@@ -643,13 +643,35 @@ that recovers the original `is[]` exactly with `bit_len ==
 count_huffman_bits`, across mixed big-values + count1, `linbits` escapes
 (tables 16 / 24), table-B count1, a band-aligned three-region split, and
 an end-to-end pipeline that derives the split + tables via the step-6
-choosers. No bit reservoir, side-info packing, or full-frame assembly
-yet — just the codeword emitter.
+choosers.
+
+**Phase 2 step 8 (main-data assembly)** binds the step-7 codewords into a
+complete per-granule/channel main-data block. The `main_data` module's
+`assemble_main_data` walks the §2.4.1.7 `main_data()` loop
+(`for (gr) for (ch)`), emitting each granule/channel's **part2**
+scalefactors immediately followed by its **part3** `huffmancodebits()`
+into one shared `MainDataWriter` (the MSB-first inverse of
+`MainDataReader`) with no byte alignment between fields. Part2 uses a new
+scalefactor writer (`write_mpeg1_granule_channel` / `write_lsf_channel`)
+that inverts the `scalefactors` decode path — MPEG-1 long (four scfsi
+band groups, granule-1 reuse skips) / short / mixed, and the LSF
+four-partition `slen` / `nr_of_sfb` scheme; part3 uses the new public
+`emit_huffman` (`encode_huffman` is now a thin wrapper over it). The
+assembler derives each granule's region split + `table_select` from the
+side info exactly as `decode_huffman` reads them, records every
+`part2_3_length` back into the `SideInfo`, sets `main_data_begin = 0`
+(the no-reservoir, self-contained-frame schedule), and returns the
+byte-padded block plus the `total_bits` sum. Verified by five round-trip
+tests that read the block back through the exact §2.4.1.7 loop and
+recover the scalefactors + `is[]` bit-exactly with the reader consuming
+exactly `total_bits`: MPEG-1 long two-channel, MPEG-1 two-granule mono
+(scfsi all-false), MPEG-1 short, LSF long, and a `decode_scalefactors`
+first-granule cross-check.
 
 The remaining Phase 2 work — the psychoacoustic model, the §C.1.5.4.3
-outer (distortion-control) loop, scalefactor estimation, and the
-bit-reservoir scheduling + full-frame main-data assembly that bind the
-emitted Huffman payload into a stream — is still a later round.
+outer (distortion-control) loop, scalefactor estimation, and **real**
+bit-reservoir scheduling (`main_data_begin > 0`, carrying spare bits
+forward) on top of the no-reservoir assembler — is still a later round.
 
 ### Not yet implemented
 
@@ -658,14 +680,15 @@ complete; what's missing is the per-frame iteration that consumes
 [`FrameWalker`] frames, parses header + side-info + scalefactors,
 Huffman-decodes both granules per channel, runs the full pipeline, and
 emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 steps 1–7 (forward MDCT primitive +
+**Phase 1 framing + Phase 2 steps 1–8 (forward MDCT primitive +
 analysis windowing + forward overlap split + polyphase analysis
 subband filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
-count + §2.4.1.7 Huffman bit emission)** — it still lacks the
-psychoacoustic model, the §C.1.5.4.3 outer loop, scalefactor estimation,
-and the bit-reservoir scheduling + full-frame main-data assembly that
-bind the emitted Huffman payload into a stream. `register()` installs the
+count + §2.4.1.7 Huffman bit emission + §2.4.1.7 main-data assembly with
+`main_data_begin = 0`)** — it still lacks the psychoacoustic model, the
+§C.1.5.4.3 outer loop, scalefactor estimation, and the real
+bit-reservoir scheduling (`main_data_begin > 0`) that would pack the
+assembled granules into a rate-limited stream. `register()` installs the
 container demuxer; the codec `Decoder` / `Encoder` trait surfaces
 remain stubs.
 

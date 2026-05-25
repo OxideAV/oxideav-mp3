@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `main_data` module **Phase 2 step 8** — the **§2.4.1.7 `main_data()`
+  ASSEMBLER** plus the no-reservoir `main_data_begin = 0` path.
+  `assemble_main_data` composes a complete per-frame main-data block by
+  walking the spec's `for (gr) for (ch)` loop, emitting each
+  granule/channel's **part2** scalefactors immediately followed by its
+  **part3** Huffman codewords into one shared `MainDataWriter`, with no
+  byte alignment between fields (the contiguous on-wire layout):
+  - **part2** — a new scalefactor writer (`MainDataWriter` +
+    `write_mpeg1_granule_channel` / `write_lsf_channel`) inverts the
+    `scalefactors` decode path: MPEG-1 long (four scfsi band groups,
+    granule-1 reuse skips), short (per `(sfb, window)`), and mixed blocks,
+    and the LSF four-partition `slen`/`nr_of_sfb` scheme from
+    `scalefac_compress`.
+  - **part3** — `huffman::emit_huffman` emits the `huffmancodebits()`
+    payload into the same shared writer at its current bit position (the
+    region split + `table_select` derived from the side info exactly as
+    `decode_huffman` reads them, so the per-line region/table assignment
+    cannot desync).
+  - Records each granule/channel's `part2_3_length` (= part2 + part3
+    bits) back into the supplied `SideInfo`, sets `main_data_begin = 0`,
+    and returns the byte-padded block plus the `total_bits` sum.
+  - `MainDataWriter` (the MSB-first inverse of `MainDataReader`) and
+    `emit_huffman` are now public; `encode_huffman` is reimplemented on
+    top of `emit_huffman` (unchanged API/behaviour).
+
+  5 new round-trip unit tests in `src/main_data_tests.rs` assemble known
+  scalefactors + quantized `is[]` then read the block back through the
+  exact §2.4.1.7 loop (part2 then part3 per granule/channel), recovering
+  the scalefactors and `is[]` bit-exactly with the reader consuming
+  exactly `total_bits`: MPEG-1 long two-channel, MPEG-1 two-granule mono
+  (scfsi all-false), MPEG-1 short block, LSF long, and a cross-check that
+  the first granule's part2 matches `decode_scalefactors`. No
+  psychoacoustic model, no outer/distortion loop, no real reservoir
+  scheduling this round — just the assembler + `main_data_begin = 0`.
+
 - `huffman` module **Phase 2 step 7** — the **§2.4.1.7
   `huffmancodebits()` bit EMISSION**, the forward encoder counterpart to
   `decode_huffman`. Given a quantized `is[576]`, the big-values region
