@@ -613,25 +613,47 @@ fn partition_split_separates_bigvalues_and_count1() {
 /// per region shifts, so a coarser quantization can cost a few more bits
 /// than a finer one. This is exactly why `search_bit_budget` uses the
 /// spec's upward `qquant + 1` scan rather than a binary search. We assert
-/// the count is well-defined for every gain and exhibits at least one
-/// non-monotone step on a flat spectrum (documenting the property the
-/// linear scan exists to handle). It must also reach 0 at GAIN_MAX.
+/// the count is well-defined for every gain whose `is[]` satisfies the
+/// §C.1.5.4.4.2 magnitude clamp (`max|is| <= BIG_VALUES_LIMIT`) and
+/// exhibits at least one non-monotone step on a flat spectrum
+/// (documenting the property the linear scan exists to handle). It must
+/// also reach 0 at GAIN_MAX.
+///
+/// Gains finer than the magnitude-clamp lower bound are skipped — the
+/// r154 linbits-reach filter in
+/// [`crate::huffman::choose_best_table_for_region`] correctly returns
+/// `None` for ranges whose `max|is|` exceeds every codebook's reach
+/// (table 23's `linbits=13` reach of 8206 covers the 8191 clamp but
+/// nothing past it), so the exact-bit-count predicate is well-defined
+/// only on the clamp-respecting subset, which is exactly the subset
+/// the surrounding `search_bit_budget` walks (it starts from the gain
+/// `search_magnitude_clamp` returned).
 #[test]
 fn exact_bits_not_strictly_monotone_but_well_defined() {
     let gc = long_gc(false);
     let sf = ScaleFactors::default();
     let xr = flat(30.0);
+    // Lower bound of the well-defined range: the smallest gain whose
+    // quantized `is[]` fits the §C.1.5.4.4.2 8191 clamp. The §C.1.5.4.4
+    // outer scan starts from here, never from the unconditional
+    // `GAIN_MIN`.
+    let clamp = search_magnitude_clamp(&xr, &gc, &sf, SR, V);
+    assert!(
+        clamp.satisfied,
+        "flat(30.0) must be clamp-reachable for the test premise to hold"
+    );
+    let gain_lo = clamp.global_gain;
     let mut prev = u64::MAX;
     let mut saw_rise = false;
-    for g in (GAIN_MIN as u16)..=(GAIN_MAX as u16) {
+    for g in (gain_lo as u16)..=(GAIN_MAX as u16) {
         let mut g_gc = gc;
         g_gc.global_gain = g as u8;
         let is = quantize(&xr, &g_gc, &sf, SR, V);
-        // Best-table selection always codes a real quantized spectrum.
+        // Best-table selection always codes a clamp-respecting spectrum.
         let bits = exact_bit_count(&is, &g_gc)
-            .expect("a real quantized spectrum is always codable")
+            .expect("a clamp-respecting quantized spectrum is always codable")
             .bits as u64;
-        if g > GAIN_MIN as u16 && bits > prev {
+        if g > gain_lo as u16 && bits > prev {
             saw_rise = true;
         }
         prev = bits;

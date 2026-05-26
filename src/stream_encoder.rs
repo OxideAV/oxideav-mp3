@@ -62,7 +62,9 @@ use std::io::{self, Write};
 
 use crate::analysis::{analyze_granule, AnalysisState};
 use crate::frame::{ChannelMode, ModeExtension, Mp3FrameHeader, MpegVersion};
-use crate::huffman::{choose_best_count1_table, partition_split, NUM_LINES};
+use crate::huffman::{
+    choose_best_count1_table, choose_best_table_for_region, partition_split, NUM_LINES,
+};
 use crate::inner_loop::{search_bit_budget, search_magnitude_clamp, GAIN_MAX, GAIN_MIN};
 use crate::main_data::{
     assemble_main_data, schedule_reservoir, GranuleChannelData, ReservoirError, ReservoirFrame,
@@ -2046,79 +2048,18 @@ fn choose_region_split(
     (r0_end.min(bv2), r1_end.min(bv2), r0_count, r1_count)
 }
 
-/// Pick the best big-values codebook for `is[start..end]` that is
-/// **actually capable** of coding every pair in the range (the
-/// in-tree [`choose_best_table_for_region`] only checks the codebook's
-/// `xlen` corner, not whether `linbits` covers the actual magnitude —
-/// so it can pick e.g. table 16 (`linbits=1`, magnitude reach 16) for
-/// a range with `|is| = 100`, which would silently truncate
-/// magnitudes at emission time).
-///
-/// We filter candidate codebooks by per-table magnitude reach (the
-/// largest magnitude they can encode without truncation), keep only
-/// those whose reach ≥ the range's `max|is|`, and pick the minimum
-/// bit cost among the survivors. Falls back to table 23 (linbits=13,
-/// reach 8206) when no other table fits — it always covers our 8191
-/// clamp.
+/// Pick the best big-values codebook for `is[start..end]`, delegating
+/// to the in-tree [`choose_best_table_for_region`] which (as of r154)
+/// applies the §C.1.5.4.4.8 linbits-reach filter so the returned
+/// codebook is guaranteed to encode every magnitude in the range
+/// without truncation. Falls back to table 23 (`linbits=13`, reach
+/// 8206 — covers the §C.1.5.4.4.2 clamp of 8191) on the
+/// no-table-in-reach edge case the chooser reserves for corrupt
+/// input.
 fn best_table_or(is: &[i32; NUM_LINES], start: usize, end: usize) -> u8 {
-    if start >= end {
-        return 0;
-    }
-    let max_mag = is[start..end]
-        .iter()
-        .map(|v| v.unsigned_abs())
-        .max()
-        .unwrap_or(0);
-    let reach = |idx: u8| -> u32 {
-        // Tables 0..=15: linbits=0 → reach = xlen - 1 (xlen from
-        // huffman_tables.rs). Tables 16..=31: linbits in 1..=13 →
-        // reach = 15 + 2^linbits - 1.
-        match idx {
-            0 => 0,
-            1 => 1,
-            2 | 3 => 2,
-            5 | 6 => 3,
-            7..=9 => 5,
-            10..=12 => 7,
-            13 | 15 => 15,
-            16 => 16,
-            17 => 18,
-            18 => 22,
-            19 => 30,
-            20 => 78,
-            21 => 270,
-            22 => 1038,
-            23 => 8206,
-            24 => 30,
-            25 => 46,
-            26 => 78,
-            27 => 142,
-            28 => 270,
-            29 => 526,
-            30 => 2062,
-            31 => 8206,
-            _ => 0,
-        }
-    };
-    use crate::huffman::SELECTABLE_BIG_TABLES;
-    let mut best: Option<(u8, usize)> = None;
-    for &idx in SELECTABLE_BIG_TABLES.iter() {
-        if reach(idx) < max_mag {
-            continue;
-        }
-        // Use the in-tree single-table cost helper indirectly: it
-        // returns Some only when every pair in [0, end) is codable by
-        // `idx` (corner test). For ranges starting at start > 0 we
-        // re-use this by chopping off the leading portion in a
-        // scratch buffer.
-        if let Some(bits) = bits_for_range(is, start, end, idx) {
-            match best {
-                Some((_, b)) if bits >= b => {}
-                _ => best = Some((idx, bits)),
-            }
-        }
-    }
-    best.map(|(t, _)| t).unwrap_or(23)
+    choose_best_table_for_region(is, start, end)
+        .map(|(t, _)| t)
+        .unwrap_or(23)
 }
 
 /// Bit cost of coding `is[start..end)` as one big-values region under

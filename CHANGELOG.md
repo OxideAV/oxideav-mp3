@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§C.1.5.4.4.8 linbits-reach filter in
+  `huffman::choose_best_table_for_region`** (Phase 2 step 24,
+  #1106). The §B.7 codebooks have widely-varying magnitude reach —
+  the small tables 0..=15 reach `xlen - 1` (no linbits escape), the
+  ESC tables 16..=31 reach `15 + (2^linbits - 1)` — and the
+  pre-r154 chooser only checked the codebook's `xlen` corner. The
+  decoder's `decode_big_pair` clamps the Huffman symbol to 15
+  before lookup, so the corner test was identically satisfied by
+  every ESC table regardless of magnitude. The encoder then
+  silently truncated the value at emission time: a range with
+  `|is| = 100` would pick e.g. table 16 (`linbits=1`, reach 16),
+  and `emit_big_pair` would write `(100 - 15) & 0x1 = 1` instead
+  of the full delta, producing a decoded `15 + 1 = 16`. The new
+  `huffman::big_table_reach(idx)` public helper returns the
+  per-codebook reach, and `choose_best_table_for_region` now drops
+  candidates whose reach is less than the range's `max|is|`. The
+  duplicate reach lookup local to `stream_encoder::best_table_or`
+  is removed (the function collapses to a thin wrapper around the
+  in-tree chooser). Eight new unit tests pin `big_table_reach` to
+  the §B.7 transcribed `xlen` / `linbits` values, exercise the
+  chooser's filter at the magnitude-15 / -16 / -8191 boundaries,
+  assert the all-zero / empty-range fallbacks, and assert that a
+  magnitude beyond every codebook's reach (`|is| = 9000`) returns
+  `None` rather than silently truncating. One `inner_loop` test
+  that inadvertently relied on the silent-truncation behaviour
+  (its `flat(30.0)` spectrum at very fine `global_gain` exceeded
+  the §C.1.5.4.4.2 magnitude clamp) is tightened to walk only the
+  clamp-respecting subset of the gain range that
+  `search_bit_budget` itself walks. 474 tests pass (was 466).
 - **§2.4.2.7 forward mixed-block MDCT path on the encode side**
   (Phase 2 step 23) — new `Mp3Encoder::force_mixed_blocks_for_testing`
   toggle that drives every assembled granule onto the mixed-block

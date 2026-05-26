@@ -840,4 +840,196 @@ mod tests {
         let err = encode_huffman(&is, 289, (0, 0), [0, 0, 0], 0, false).unwrap_err();
         assert_eq!(err, HuffmanEncodeError::BigValuesTooLarge);
     }
+
+    // =================================================================
+    // r154 — §C.1.5.4.4.8 linbits-reach filter (#1106)
+    //
+    // The §B.7 codebooks have widely-varying magnitude reach. The small
+    // tables 0..=15 are reach = xlen - 1 (no linbits escape); the ESC
+    // tables 16..=31 carry `15 + (2^linbits - 1)`. The encoder's table
+    // chooser must filter codebooks by reach so the §2.4.1.7
+    // huffmancodebits() emission round-trips bit-exactly. These tests
+    // pin the reach values and the chooser's filter behaviour to the
+    // §B.7 / §C.1.5.4.4.8 spec text.
+    // =================================================================
+
+    /// `big_table_reach` returns the §B.7 magnitude reach for every
+    /// selectable codebook. Hand-tabulated from the per-table
+    /// `xlen` / `linbits` headers transcribed in `huffman_tables.rs`
+    /// against §B.7. Tables 4 and 14 are "not used" → reach 0.
+    #[test]
+    fn big_table_reach_matches_spec_for_every_selectable_table() {
+        // (idx, expected_reach)
+        let spec_reach: [(u8, u32); 32] = [
+            (0, 0),        // single (0,0) entry, only codes zero pair
+            (1, 1),        // 2x2 small table, no linbits
+            (2, 2),        // 3x3
+            (3, 2),        // 3x3
+            (4, 0),        // not used
+            (5, 3),        // 4x4
+            (6, 3),        // 4x4
+            (7, 5),        // 6x6
+            (8, 5),        // 6x6
+            (9, 5),        // 6x6
+            (10, 7),       // 8x8
+            (11, 7),       // 8x8
+            (12, 7),       // 8x8
+            (13, 15),      // 16x16 no linbits
+            (14, 0),       // not used
+            (15, 15),      // 16x16 no linbits
+            (16, 15 + 1),  // linbits=1
+            (17, 15 + 3),  // linbits=2
+            (18, 15 + 7),  // linbits=3
+            (19, 15 + 15), // linbits=4
+            (20, 15 + 63), // linbits=6
+            (21, 15 + 255),
+            (22, 15 + 1023),
+            (23, 15 + 8191),
+            (24, 15 + 15),     // linbits=4
+            (25, 15 + 31),     // linbits=5
+            (26, 15 + 63),     // linbits=6
+            (27, 15 + 127),    // linbits=7
+            (28, 15 + 255),    // linbits=8
+            (29, 15 + 511),    // linbits=9
+            (30, 15 + 2047),   // linbits=11
+            (31, 15 + 8191),   // linbits=13
+        ];
+        for (idx, want) in spec_reach.iter().copied() {
+            assert_eq!(
+                crate::huffman::big_table_reach(idx),
+                want,
+                "big_table_reach({idx}) — expected §B.7 reach {want}"
+            );
+        }
+    }
+
+    /// `choose_best_table_for_region` must drop codebooks whose reach is
+    /// less than the range's `max|is|`, **even when** the corner-only
+    /// `xlen` check (`region_bits_with_table`) would accept them. The
+    /// ESC tables 16..=31 clamp the Huffman symbol to 15 before lookup,
+    /// so the corner test is identically satisfied for every ESC table,
+    /// regardless of magnitude — which is exactly the silent-truncation
+    /// trap the reach filter guards against (#1106).
+    ///
+    /// Construct an `is[]` with `|is[0]| = 100` and `is[1] = 0`: every
+    /// small table 1..=13 rejects via `xlen` (their `xlen ≤ 16`), and
+    /// every ESC table whose reach < 100 (16, 17, 18, 19, 24, 25, 26)
+    /// would silently truncate at emit. The chooser must therefore
+    /// return one of tables 20..=23 or 27..=31 (reach ≥ 100), and the
+    /// chosen codebook must round-trip bit-exactly through
+    /// `encode_huffman` → `decode_huffman`.
+    #[test]
+    fn chooser_filters_esc_tables_whose_linbits_truncates() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 100;
+        is[1] = 0;
+        let (best, _) = choose_best_table_for_region(&is, 0, 2).unwrap();
+        // The chooser must NOT have picked an under-reach ESC table.
+        // Reach < 100: 16 (16), 17 (18), 18 (22), 19 (30), 20 (78),
+        // 24 (30), 25 (46), 26 (78). Everything else covers 100.
+        const UNDER_REACH: [u8; 8] = [16, 17, 18, 19, 20, 24, 25, 26];
+        assert!(
+            !UNDER_REACH.contains(&best),
+            "chooser picked under-reach ESC table {best} for |is|=100"
+        );
+        assert!(
+            crate::huffman::big_table_reach(best) >= 100,
+            "chooser's best table {best} has reach < 100"
+        );
+        // Round-trip bit-exactness: emit + decode reproduces is[0..2]
+        // and the rest is zero.
+        assert_roundtrip(&is, 1, (2, 2), [best, 0, 0], 0, false, 0, 0);
+    }
+
+    /// Boundary check at magnitude 16: the smallest ESC table (16,
+    /// `linbits=1`, reach `15 + 1 = 16`) IS in reach and should be
+    /// permitted; the small tables 1..=15 (reach ≤ 15) must be filtered.
+    /// We don't pin which table the chooser picks (the minimum-bit
+    /// choice is a function of the codebook's symbol lengths, not of
+    /// reach), only that the reach invariant holds.
+    #[test]
+    fn chooser_reach_boundary_at_magnitude_16() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 16;
+        is[1] = 0;
+        let (best, _) = choose_best_table_for_region(&is, 0, 2).unwrap();
+        assert!(
+            crate::huffman::big_table_reach(best) >= 16,
+            "chooser picked table {best} with reach < 16 for |is|=16"
+        );
+        assert_roundtrip(&is, 1, (2, 2), [best, 0, 0], 0, false, 0, 0);
+    }
+
+    /// Magnitude 15 boundary: every small table with `xlen ≥ 16` (i.e.
+    /// 13 and 15) and every ESC table 16..=31 covers magnitude 15. The
+    /// chooser may pick any of them; we assert reach ≥ 15 and a clean
+    /// round-trip.
+    #[test]
+    fn chooser_reach_boundary_at_magnitude_15() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 15;
+        is[1] = 0;
+        let (best, _) = choose_best_table_for_region(&is, 0, 2).unwrap();
+        assert!(
+            crate::huffman::big_table_reach(best) >= 15,
+            "chooser picked table {best} with reach < 15 for |is|=15"
+        );
+        assert_roundtrip(&is, 1, (2, 2), [best, 0, 0], 0, false, 0, 0);
+    }
+
+    /// At the §C.1.5.4.4.2 clamp (`|is| = 8191`) the only in-reach
+    /// codebooks are 23 and 31 (linbits 13, reach 8206). The chooser
+    /// must pick one of them.
+    #[test]
+    fn chooser_picks_only_reach_8191_at_clamp() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 8191;
+        is[1] = 0;
+        let (best, _) = choose_best_table_for_region(&is, 0, 2).unwrap();
+        assert!(
+            best == 23 || best == 31,
+            "only tables 23/31 (reach 8206) cover the 8191 clamp; got {best}"
+        );
+        assert_roundtrip(&is, 1, (2, 2), [best, 0, 0], 0, false, 0, 0);
+    }
+
+    /// A magnitude past every codebook's reach (e.g. 9000 — beyond table
+    /// 23's reach of 8206) is uncodable: the chooser returns `None`. In
+    /// practice the magnitude clamp at §C.1.5.4.4.2 prevents this from
+    /// ever being reached by a real encode, but the chooser must report
+    /// "no table in reach" rather than silently truncate.
+    #[test]
+    fn chooser_returns_none_when_no_table_in_reach() {
+        let mut is = [0i32; NUM_LINES];
+        is[0] = 9000;
+        is[1] = 0;
+        assert!(
+            choose_best_table_for_region(&is, 0, 2).is_none(),
+            "magnitude 9000 exceeds every codebook's reach; chooser \
+             must report None rather than pick a truncating table"
+        );
+    }
+
+    /// Sanity: an all-zero range still picks table 0 (reach 0 covers
+    /// magnitude 0).
+    #[test]
+    fn chooser_zero_range_picks_table_zero() {
+        let is = [0i32; NUM_LINES];
+        let (best, bits) = choose_best_table_for_region(&is, 0, 4).unwrap();
+        assert_eq!(best, 0);
+        assert_eq!(bits, 0);
+    }
+
+    /// Empty range is table 0 / zero bits per the existing §C.1.5.4.4.7
+    /// contract — the reach filter must not regress this.
+    #[test]
+    fn chooser_empty_range_remains_table_zero() {
+        let is = [0i32; NUM_LINES];
+        let (best, bits) = choose_best_table_for_region(&is, 4, 4).unwrap();
+        assert_eq!(best, 0);
+        assert_eq!(bits, 0);
+        let (best2, bits2) = choose_best_table_for_region(&is, 100, 50).unwrap();
+        assert_eq!(best2, 0);
+        assert_eq!(bits2, 0);
+    }
 }

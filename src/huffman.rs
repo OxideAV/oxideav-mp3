@@ -381,6 +381,48 @@ const LONG_BANDS_48: [usize; 22] = [
     0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384,
 ];
 
+/// Maximum unsigned magnitude that big-values codebook `idx` can encode
+/// **without truncation** — i.e. the largest `|is_i|` whose round-trip
+/// through `emit_big_pair` / `decode_big_pair` is bit-exact.
+///
+/// For the small tables 0..=15 the linbits ESC field is absent
+/// (`table.linbits == 0`); a value of magnitude `≥ 15` cannot be coded at
+/// all without that escape, and a magnitude `< 15` is coded directly by
+/// the Huffman symbol whose index equals the magnitude. The reach is
+/// therefore `xlen - 1` (= 1 for table 1, 2 for tables 2/3, 5 for tables
+/// 7/8/9, 7 for tables 10/11/12, and 15 for tables 13/15). Table 0 codes
+/// only the all-zero pair, so its reach is `0`.
+///
+/// For the large ESC tables 16..=31 the linbits field carries `(|is| -
+/// 15)` in `table.linbits` bits, so the reach is `15 + (2^linbits - 1)`
+/// (= 16, 18, 22, 30, 78, 270, 1038, 8206 for tables 16..=23; same
+/// progression with a shift for tables 24..=31). Tables 4 and 14 are
+/// "not used" in §B.7 and return `0`.
+///
+/// The encoder's table chooser ([`choose_best_table_for_region`]) uses
+/// this to drop codebooks whose reach is less than the actual `max|is|`
+/// in the range — otherwise the chooser could pick e.g. table 16
+/// (`linbits=1`, reach 16) for a range with `|is| = 100`, and
+/// `emit_big_pair` would silently truncate the value to its low
+/// `linbits` bits at emission time.
+#[must_use]
+pub fn big_table_reach(idx: u8) -> u32 {
+    match big_table(idx) {
+        Ok(table) => {
+            let xlen = u32::from(table.xlen);
+            let linbits = u32::from(table.linbits);
+            if linbits == 0 {
+                // Small table: reach = xlen - 1 (index 0..=xlen-1).
+                xlen.saturating_sub(1)
+            } else {
+                // ESC table: reach = 15 + (2^linbits - 1).
+                15 + ((1u32 << linbits) - 1)
+            }
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Resolve a 5-bit `table_select` into its Table 3-B.7 codebook,
 /// rejecting the "not used" tables 4 and 14.
 fn big_table(idx: u8) -> Result<&'static BigTable, HuffmanError> {
@@ -519,15 +561,27 @@ pub const SELECTABLE_BIG_TABLES: [u8; 30] = [
 ///
 /// Mirrors the spec's "trying all of these tables" strategy: every
 /// selectable codebook (0..=31 minus the unused 4 / 14) is costed and the
-/// minimum-bit table is returned as `(table_select, bits)`. Tables that
-/// cannot code a value in the range (magnitude out of the codebook's
-/// reach with no `linbits` escape) are skipped. An empty range
-/// (`start >= end`) is coded by table 0 at `0` bits.
+/// minimum-bit table is returned as `(table_select, bits)`. An empty
+/// range (`start >= end`) is coded by table 0 at `0` bits.
 ///
-/// Returns `None` only if **no** codebook can code the range — impossible
-/// in practice because the ESC tables 16..=31 reach any magnitude up to
-/// the §C.1.5.4.4.2 clamp via their `linbits` field, so this is reserved
-/// for a corrupt input range.
+/// **Linbits-reach filter (encoder correctness, #1106).** A candidate
+/// codebook is silently dropped if its [`big_table_reach`] is less than
+/// the range's `max|is|` — without this filter, the chooser could pick
+/// e.g. table 16 (`linbits=1`, reach 16) for a range with `|is| = 100`,
+/// and `emit_big_pair` would write only the low `linbits` bits of
+/// `|is| - 15` (here `85 & 0x1 = 1`), silently emitting a `16` instead
+/// of `100` at decode time. The corner-only `xlen` check inside
+/// `region_bits_with_table` catches small-table overflow (any magnitude
+/// `≥ xlen` is rejected as not-codable) but **does not** catch ESC-table
+/// overflow, because the Huffman symbol is clamped to 15 before the
+/// codebook lookup. The reach test is the encoder-side correctness
+/// guarantee that the decode round-trip is bit-exact.
+///
+/// Returns `None` only if **no** codebook is in-reach for the range —
+/// impossible in practice because table 23 has reach 8206 (its
+/// `linbits=13` field plus the 15-anchor), well past the §C.1.5.4.4.2
+/// magnitude clamp of 8191, so this is reserved for a corrupt input
+/// range or a programming error.
 #[must_use]
 pub fn choose_best_table_for_region(
     is: &[i32; NUM_LINES],
@@ -538,8 +592,23 @@ pub fn choose_best_table_for_region(
         // An empty region costs nothing and is nominally table 0.
         return Some((0, 0));
     }
+    // §C.1.5.4.4.8 — find the range's peak magnitude so we can filter
+    // codebooks whose linbits cannot represent it.
+    let end_clamped = end.min(NUM_LINES);
+    let max_mag = is[start..end_clamped]
+        .iter()
+        .map(|v| v.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+
     let mut best: Option<(u8, usize)> = None;
     for &idx in SELECTABLE_BIG_TABLES.iter() {
+        // Reach filter: drop codebooks that would truncate the largest
+        // magnitude in the range. Table 0 has reach 0 and is selectable
+        // only for an all-zero range; this falls out naturally.
+        if big_table_reach(idx) < max_mag {
+            continue;
+        }
         if let Some(bits) = region_bits_with_table(is, start, end, idx) {
             match best {
                 Some((_, b)) if bits >= b => {}

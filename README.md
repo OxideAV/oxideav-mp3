@@ -1160,6 +1160,37 @@ a follow-up round; the present step lands the bitstream-side
 primitive + the dispatch wiring so that follow-up only needs to add
 the decision layer on top.
 
+**Phase 2 step 24 (§C.1.5.4.4.8 linbits-reach filter)** closes a
+silent-truncation gap in the encoder's Huffman codebook chooser. The
+§B.7 codebooks have widely-varying magnitude reach: the small tables
+0..=15 reach `xlen - 1` (no linbits escape), the ESC tables 16..=31
+reach `15 + (2^linbits - 1)` (e.g. table 16 `linbits = 1` reach 16;
+table 23 `linbits = 13` reach 8206). The pre-r154
+`huffman::choose_best_table_for_region` only verified the codebook's
+`xlen` corner — and because the decoder's `decode_big_pair` clamps
+the Huffman symbol to 15 before the table lookup, that corner test
+was identically satisfied by **every** ESC table regardless of
+magnitude. The encoder's `emit_big_pair` then silently truncated:
+for a range with `|is| = 100`, the chooser could pick table 16
+(`linbits = 1`), and emission would write `(100 − 15) & 0x1 = 1`
+instead of the full delta, decoding back to `15 + 1 = 16`. The
+in-tree workaround in `stream_encoder::best_table_or` had its own
+hand-tabulated reach lookup; with the filter folded into the public
+chooser, that local function collapses to a thin wrapper. The new
+`huffman::big_table_reach(idx)` public helper exposes the
+per-codebook reach the chooser uses. Verified by eight new unit tests
+(`big_table_reach` pinned to §B.7 transcribed `xlen` / `linbits` for
+all 32 codebooks; chooser-filter behaviour at the magnitude-15 /
+-16 / -100 / -8191 boundaries with `encode_huffman` →
+`decode_huffman` round-trip assertions; chooser returns `None` rather
+than truncating for a magnitude past every codebook's reach;
+all-zero / empty-range fallbacks). One pre-existing `inner_loop`
+non-monotonicity test that inadvertently relied on the
+silent-truncation behaviour — its `flat(30.0)` spectrum at very fine
+`global_gain` exceeded the §C.1.5.4.4.2 magnitude clamp — is
+tightened to walk only the clamp-respecting subset of the gain range
+that `search_bit_budget` itself walks. Net: 474 tests pass (was 466).
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), intensity-stereo encode (§2.4.3.4.9.3), signal-driven
@@ -1175,7 +1206,7 @@ wrapper — is still a later round.
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–22 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–24 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -1192,15 +1223,21 @@ escalation in the outer loop + §C.1.5.4.3.4 preemphasis decision in
 the outer loop + §2.4.2.3 joint-stereo auto MS/LR per-frame picker +
 trait-factory wrappers for the auto MS/LR picker + §2.4.3.4.10.2
 forward short-block MDCT path with `Mp3Encoder::force_short_blocks_for_testing`
-toggle)** — it still lacks the psychoacoustic model (so the outer
-loop's `xmin(sb)` is a uniform constant rather than per-band
-masking-aware), intensity-stereo encode (§2.4.3.4.9.3), signal-driven
-**auto** block-type decision (the §C.1.5 attack-detection heuristic +
-the LONG → START → SHORT → STOP → LONG transition state machine for
-*mixed* long-and-short streams; the forward short-block MDCT path
-itself is available behind the force-short toggle), mixed-block encode
-(the short forward path is pure-short only this round), and LSF
-encode.
+toggle + §2.4.2.7 forward mixed-block MDCT path with
+`Mp3Encoder::force_mixed_blocks_for_testing` toggle + §C.1.5.4.4.8
+linbits-reach filter in the Huffman table chooser)** — it still
+lacks the psychoacoustic model (so the outer loop's `xmin(sb)` is a
+uniform constant rather than per-band masking-aware),
+intensity-stereo encode (§2.4.3.4.9.3), signal-driven **auto**
+block-type decision (the §C.1.5 attack-detection heuristic + the
+LONG → START → SHORT → STOP → LONG transition state machine for
+*mixed* long-and-short streams; the forward short-block and
+mixed-block MDCT paths themselves are available behind the
+force-short / force-mixed toggles), multi-channel short/mixed
+support (§2.4.3.4.9 cross-channel block-type agreement is the gap
+the force-short / force-mixed toggles reject stereo on), §C.1.5.4.3
+outer-loop short-block analogue (the long-only `outer_loop_search_long`
+needs a per-window `subblock_gain` search), and LSF encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

@@ -402,9 +402,9 @@ pub use frame::{
     Mp3FrameHeader, MpegVersion,
 };
 pub use huffman::{
-    choose_best_count1_table, choose_best_table_for_region, count1_bits, count_huffman_bits,
-    decode_huffman, emit_huffman, encode_huffman, encoder_region_boundaries, partition_split,
-    HuffmanEncodeError, HuffmanError, Mp3HuffmanData, PartitionSplit, NUM_LINES,
+    big_table_reach, choose_best_count1_table, choose_best_table_for_region, count1_bits,
+    count_huffman_bits, decode_huffman, emit_huffman, encode_huffman, encoder_region_boundaries,
+    partition_split, HuffmanEncodeError, HuffmanError, Mp3HuffmanData, PartitionSplit, NUM_LINES,
     SELECTABLE_BIG_TABLES,
 };
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
