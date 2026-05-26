@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Trait-factory wrappers for joint-stereo auto MS/LR encoding**
+  (Phase 2 step 21): `codec_encoder::make_encoder_joint_stereo_auto`
+  and `make_encoder_joint_stereo_auto_with_threshold` reach the new
+  `Mp3Encoder::new_joint_stereo_auto` constructor (Phase 2 step 20)
+  through the framework's `oxideav_core::Encoder` factory shape, so
+  trait-only consumers can opt into the per-frame MS/LR picker without
+  going through the direct `Mp3Encoder` API. The threshold variant
+  exposes `Mp3Encoder::with_ms_auto_threshold`'s `[0.0, 1.0]`
+  clamping. Honours the workspace dual-API convention: both the
+  direct `Mp3Encoder::new_joint_stereo_auto` constructor and the trait
+  factory landed on the same step, neither one is the "preferred"
+  entry point. The bit-rate validation is now factored out into a
+  `validate_joint_stereo_params` helper shared with the existing
+  `make_encoder_joint_stereo_ms` factory; the wrapper buffering /
+  `flush`-time slicing in `Mp3CoreEncoder` is unchanged (the new
+  factories build the same trait-object wrapper around a
+  joint-stereo-armed `Mp3Encoder`). Validated by six new unit tests
+  on `codec_encoder` (`make_encoder_joint_stereo_auto_emits_picked_mode_extension`
+  — proves correlated stereo selects `mode_extension = '10'`;
+  `make_encoder_joint_stereo_auto_with_threshold_threshold_zero_forces_lr`
+  — proves `threshold = 0` suppresses MS on any non-trivial side
+  energy; `make_encoder_joint_stereo_auto_rejects_mono` /
+  `make_encoder_joint_stereo_auto_requires_sample_rate` /
+  `make_encoder_joint_stereo_auto_defaults_bitrate_to_192k` /
+  `make_encoder_joint_stereo_auto_with_threshold_clamps_out_of_range`).
+
 - **§2.4.2.3 joint-stereo auto MS/LR per-frame picker**
   (Phase 2 step 20): a new constructor
   [`Mp3Encoder::new_joint_stereo_auto`] arms the encoder in joint mode

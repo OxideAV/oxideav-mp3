@@ -1050,6 +1050,38 @@ proving the decision is genuinely per-frame and not encoder-wide;
 (d) all-silence input handled without dividing by zero
 (`E_L + E_R = 0` short-circuits to "MS by convention").
 
+**Phase 2 step 21 (joint-stereo auto MS/LR through the trait factory)**
+exposes the round-149 picker through the framework's
+`oxideav_core::Encoder` factory shape, so trait-only consumers can
+reach it without dropping down to the direct `Mp3Encoder` API. Two
+new entry points on `codec_encoder` mirror the existing
+`make_encoder_joint_stereo_ms`: `make_encoder_joint_stereo_auto(params)`
+builds the auto picker with the default `0.5` threshold;
+`make_encoder_joint_stereo_auto_with_threshold(params, t)` lets the
+caller pick the side-channel energy threshold (clamped to
+`[0.0, 1.0]` by `Mp3Encoder::with_ms_auto_threshold`). Both
+validate `params.channels == 2` (joint stereo is two-channel by
+definition), require a `sample_rate`, default `bit_rate` to 192 kbit/s
+when absent, and produce the same `Mp3CoreEncoder` trait-object the
+mono / independent-stereo factories produce — the per-frame picker
+runs inside the wrapped `Mp3Encoder`, so the trait-side
+`send_frame` / `flush` / `receive_packet` shape is unchanged. The
+factory ergonomics keep the workspace's dual-API convention intact:
+the direct `Mp3Encoder::new_joint_stereo_auto` constructor (round
+149) and this trait factory (round 150) are equally first-class
+entry points. Validated by six new unit tests in
+`src/codec_encoder.rs`
+(`make_encoder_joint_stereo_auto_emits_picked_mode_extension` proves
+correlated stereo selects `mode_extension = '10'` on every
+steady-state frame through the trait wrapper;
+`make_encoder_joint_stereo_auto_with_threshold_threshold_zero_forces_lr`
+proves `threshold = 0` suppresses MS on any non-trivial side energy;
+`make_encoder_joint_stereo_auto_rejects_mono` /
+`make_encoder_joint_stereo_auto_requires_sample_rate` /
+`make_encoder_joint_stereo_auto_defaults_bitrate_to_192k` /
+`make_encoder_joint_stereo_auto_with_threshold_clamps_out_of_range`
+exercise the param-validation surface).
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), intensity-stereo encode (§2.4.3.4.9.3), short / mixed
@@ -1061,7 +1093,7 @@ trait wrapper — is still a later round.
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–20 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–21 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -1075,8 +1107,9 @@ CRC-16 frame protection + independent-stereo (`ChannelMode::Stereo` /
 `ChannelMode::DualChannel`) encode through the trait wrapper +
 §2.4.3.4.9.2 joint-stereo MS encode + §C.1.5.4.3 `scalefac_scale 0→1`
 escalation in the outer loop + §C.1.5.4.3.4 preemphasis decision in
-the outer loop + §2.4.2.3 joint-stereo auto MS/LR per-frame
-picker)** — it still lacks the psychoacoustic model (so the outer
+the outer loop + §2.4.2.3 joint-stereo auto MS/LR per-frame picker +
+trait-factory wrappers for the auto MS/LR picker)** — it still lacks
+the psychoacoustic model (so the outer
 loop's `xmin(sb)` is a uniform constant rather than per-band
 masking-aware), intensity-stereo encode (§2.4.3.4.9.3), short /
 mixed block-type switching, and LSF encode.

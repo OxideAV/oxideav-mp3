@@ -285,9 +285,15 @@
 //! [`Encoder::flush`]. The dual-API convention is honoured: the direct
 //! [`Mp3Encoder`] factory remains the historical streaming entry
 //! point, and [`codec_encoder::make_encoder`] /
-//! [`codec_encoder::make_encoder_with_outer_loop`] expose the
-//! `oxideav-core` factory shape. [`register`] now installs both the
-//! container demuxer and this encoder factory in one call.
+//! [`codec_encoder::make_encoder_with_outer_loop`] /
+//! [`codec_encoder::make_encoder_joint_stereo_ms`] /
+//! [`codec_encoder::make_encoder_joint_stereo_auto`] /
+//! [`codec_encoder::make_encoder_joint_stereo_auto_with_threshold`]
+//! expose the `oxideav-core` factory shape — the auto MS/LR
+//! per-frame picker (Phase 2 step 20, `Mp3Encoder::new_joint_stereo_auto`)
+//! reachable through the trait factory landed as Phase 2 step 21.
+//! [`register`] now installs both the container demuxer and this
+//! encoder factory in one call.
 //!
 //! The [`codec_decoder`] module adds the symmetric **decoder-side**
 //! Phase 2 step 12: the [`Decoder`] trait wiring on top of the existing
@@ -378,7 +384,8 @@ pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
 pub use analysis::{analyze_granule, analyze_row, m_coefficient, AnalysisState, C_TABLE, X_LEN};
 pub use codec_decoder::{make_decoder, register_codecs, Mp3CoreDecoder};
 pub use codec_encoder::{
-    make_encoder, make_encoder_joint_stereo_ms, make_encoder_with_outer_loop, Mp3CoreEncoder,
+    make_encoder, make_encoder_joint_stereo_auto, make_encoder_joint_stereo_auto_with_threshold,
+    make_encoder_joint_stereo_ms, make_encoder_with_outer_loop, Mp3CoreEncoder,
 };
 pub use crc::{crc16_bits, crc16_layer3, INITIAL_STATE as CRC_INITIAL_STATE};
 pub use demuxer::{
