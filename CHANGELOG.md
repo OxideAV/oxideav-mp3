@@ -8,6 +8,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§C.1.5.4.3.4 preemphasis decision in the outer loop**
+  (Phase 2 step 19): the outer (distortion-control) loop now decides
+  whether to switch on `preflag` (the §2.4.2.7 side-info bit that
+  enables the Table B.6 `pretab[]` high-frequency-amplification
+  shortcut). After the first inner-loop call each granule-channel
+  evaluates the spec's only explicit hint for this decision —
+  "preemphasis could be switched on if in all of the upper 4
+  scalefactor bands the actual distortion exceeds the threshold after
+  the first call of the inner loop" (§C.1.5.4.3.4). When that
+  condition holds (every one of `xfsf[17..=20]` exceeds the uniform
+  `xmin`), `sf.preflag` is set to `true` and the loop re-runs from
+  the same iteration counter against the inflated effective per-band
+  scalefactor `scalefac_l[sfb] + pretab[sfb]`. The pretab boost is
+  free (one transmitted bit; no `part2_3_length` impact) and only
+  amplifies the upper bands (`pretab = [0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,
+  2,2,3,3,3,2]`); the §C.1.5.4.3.6 cap (15 / 7) on the transmitted
+  `scalefac_l[sfb]` is untouched because the cap math reads
+  `sf.long[sfb]` only. The decision is one-shot per
+  granule-channel — once `sf.preflag` flips on it stays on for the
+  rest of the loop. Three implementation changes ship together: (a)
+  `OuterLoopResult` gains a `preflag: bool` field mirroring
+  `scalefactors.preflag` so the caller can read the decision without
+  destructuring; (b) `band_distortion_long` adds `pretab[sfb]` into its
+  colouring exponent when `sf.preflag` is set, so the §C.1.5.4.3.3
+  per-band distortion is computed against the same reconstruction the
+  decoder will compute (without this the loop's distortion metric
+  would compare a preflag-boosted reconstruction against an
+  un-boosted reference and never converge); (c) the stream encoder
+  mirrors `sf.preflag` onto `gc.preflag` before the re-quantize loop,
+  so the side-info bit reaches the bitstream and the decoder re-reads
+  it via `sf.preflag = gc.preflag` in `read_mpeg1_granule_channel`.
+  Validated by four new unit tests
+  (`outer_loop_default_preflag_off_when_threshold_easily_met` /
+  `outer_loop_default_preflag_off_when_only_low_bands_over_threshold` /
+  `outer_loop_preflag_off_when_only_three_upper_bands_over` pin the
+  negative arms — preflag must NOT fire when the §C.1.5.4.3.4
+  upper-4 condition is unmet; `outer_loop_preflag_fires_when_all_upper_four_over_threshold`
+  pins the positive arm under a controlled fixture covering
+  `xr[196..418]`) and by a new end-to-end integration test
+  `outer_loop_preflag_fires_on_hf_heavy_content` that confirms an
+  HF-heavy three-tone input (10 kHz / 14 kHz / 17 kHz at 0.25 amp
+  each) actually surfaces granule-channels with `preflag = 1` in the
+  re-parsed side-info, end-to-end through the encoder.
 - **§C.1.5.4.3 `scalefac_scale` escalation in the outer loop**
   (Phase 2 step 18): the §C.1.5.4.3 outer (distortion-control) loop
   now implements the spec's `scalefac_scale 0 → 1` switch ("If after

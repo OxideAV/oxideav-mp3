@@ -972,12 +972,43 @@ L at 192 kbit/s — **per-channel PSNR L = 84.2 dB / R = 85.2 dB**;
 input recovers `|L|` strictly more than 3× `|R|`) — plus 2 unit
 tests on the trait factory (mode bits + mono rejection).
 
+**Phase 2 step 19 (preemphasis encode)** wires the §C.1.5.4.3.4
+preemphasis lever the outer loop has carried as a placeholder field
+since step 11 into the actual noise-shaping decision. After the first
+inner-loop call each granule-channel checks the spec's explicit worked
+example for switching on preemphasis — "if in all of the upper 4
+scalefactor bands the actual distortion exceeds the threshold after the
+first call of the inner loop". When that condition holds, `sf.preflag`
+is set to `true` and the rest of the outer loop runs against the
+inflated effective per-band scalefactor `scalefac_l[sfb] + pretab[sfb]`
+(Table B.6). The pretab boost is **free** (one transmitted bit; no
+`part2_3_length` impact) and only affects the upper bands (`pretab[sfb]
+∈ {0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,2,2,3,3,3,2}`), so it leaves the
+§C.1.5.4.3.6 cap (15 / 7 on the transmitted `scalefac_l[sfb]`)
+untouched while giving the encoder a costless head-start on the
+spectrum's high-frequency residue. Three changes land together: (a)
+`OuterLoopResult` gains a `preflag: bool` field mirroring
+`scalefactors.preflag`; (b) `band_distortion_long` adds `pretab[sfb]`
+to its colouring exponent when `sf.preflag` is set so the §C.1.5.4.3.3
+distortion is computed against the same reconstruction the decoder
+will compute; (c) the stream encoder mirrors `sf.preflag` onto
+`gc.preflag` before re-quantize, so the side-info bit reaches the
+bitstream and the decoder re-applies the same pretab on the way out.
+Validated by four unit tests (`outer_loop_default_preflag_off_when_*`
+pin the negative arm — preflag does NOT fire with a giant threshold,
+nor with only low bands carrying energy, nor when only three of the
+upper four exceed threshold; `outer_loop_preflag_fires_when_all_upper_four_over_threshold`
+pins the positive arm under a controlled spectral fixture) and by an
+end-to-end integration test
+`outer_loop_preflag_fires_on_hf_heavy_content` that confirms the
+encoder produces a stream with `gc.preflag = 1` granule-channels
+recoverable via `parse_side_info` on an HF-heavy multi-tone input.
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), an encoder-side decision to gate MS on per-band signal
 correlation (currently always-on when the constructor is used),
-intensity-stereo encode (§2.4.3.4.9.3), preemphasis (§C.1.5.4.3.4)
-and `scalefac_scale = 1` escalation, short / mixed block-type
+intensity-stereo encode (§2.4.3.4.9.3), short / mixed block-type
 switching, LSF encode, stereo / LSF decode through the trait
 wrapper — is still a later round.
 
@@ -986,7 +1017,7 @@ wrapper — is still a later round.
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–17 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–19 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -999,13 +1030,13 @@ true-VBR per-frame bitrate + Xing TOC auto-fill + opt-in §2.4.3.1
 CRC-16 frame protection + independent-stereo (`ChannelMode::Stereo` /
 `ChannelMode::DualChannel`) encode through the trait wrapper +
 §2.4.3.4.9.2 joint-stereo MS encode + §C.1.5.4.3 `scalefac_scale 0→1`
-escalation in the outer loop)** — it still lacks the psychoacoustic
-model (so the outer loop's `xmin(sb)` is a uniform constant rather
-than per-band masking-aware), an encoder-side decision to gate MS
-per-band on signal correlation (currently always-on when the MS
-constructor is used), intensity-stereo encode (§2.4.3.4.9.3),
-preemphasis (§C.1.5.4.3.4) amplification, short / mixed block-type
-switching, and LSF encode.
+escalation in the outer loop + §C.1.5.4.3.4 preemphasis decision in
+the outer loop)** — it still lacks the psychoacoustic model (so the
+outer loop's `xmin(sb)` is a uniform constant rather than per-band
+masking-aware), an encoder-side decision to gate MS per-band on
+signal correlation (currently always-on when the MS constructor is
+used), intensity-stereo encode (§2.4.3.4.9.3), short / mixed
+block-type switching, and LSF encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

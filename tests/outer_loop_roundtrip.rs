@@ -439,3 +439,56 @@ fn outer_loop_silence_decodes_to_near_zero() {
         assert!(peak <= 16, "outer-loop silence peak too high: {peak}");
     }
 }
+
+/// §C.1.5.4.3.4 round-148: encode HF-heavy content with a tight outer
+/// threshold and verify that at least one emitted granule-channel
+/// surfaces `preflag = true` in its decoded side-info. This is the
+/// end-to-end witness that:
+///
+/// * the §C.1.5.4.3.4 "upper-4 long bands all over threshold" decision
+///   actually fires in the outer-loop pass for real spectra (not just
+///   the unit-test fixture),
+/// * the stream encoder mirrors `sf.preflag` onto `gc.preflag` before
+///   the side-info write (so the bit actually reaches the bitstream),
+/// * the per-granule-channel state surfaces back through the demuxer +
+///   `parse_side_info` round-trip with the same value the encoder
+///   produced.
+#[test]
+fn outer_loop_preflag_fires_on_hf_heavy_content() {
+    // Three sine tones in the upper half of the spectrum — chosen so
+    // their MDCT energy distributes across multiple high-band sfb after
+    // the polyphase filterbank, increasing the chance that all four of
+    // sfb 17..=20 carry quantization residue exceeding the tight
+    // threshold simultaneously.
+    let pcm = multi_tone_pcm(PCM_LEN_SAMPLES, &[10_000.0, 14_000.0, 17_000.0], 0.25);
+    let bytes = encode_with(
+        || {
+            Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, 1.0e-30)
+                .expect("encoder build")
+        },
+        &pcm,
+    );
+    assert_demuxes(&bytes);
+
+    // Walk every frame, parse its side info, and count granule-channels
+    // whose preflag bit reads back set.
+    let mut preflag_count = 0usize;
+    let mut total_gc = 0usize;
+    for frame in FrameWalker::new(&bytes) {
+        let hdr = parse_header(&frame.data[..4]).expect("header parse");
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
+        for gr in 0..si.granule_count as usize {
+            for ch in 0..si.channels as usize {
+                total_gc += 1;
+                if si.granules[gr][ch].preflag {
+                    preflag_count += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        preflag_count > 0,
+        "expected at least one granule-channel with preflag = 1, \
+         got {preflag_count}/{total_gc} (the §C.1.5.4.3.4 path is wired but not firing)",
+    );
+}

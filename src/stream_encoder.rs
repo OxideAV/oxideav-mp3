@@ -939,12 +939,19 @@ impl Mp3Encoder {
                             thr,
                             DEFAULT_OUTER_LOOP_MAX_ITER,
                         );
-                        // The outer loop reports whether it escalated to
-                        // scalefac_scale = 1 (§C.1.5.4.3 dynamic-range
-                        // doubling) — propagate that into the
-                        // granule-channel so the re-quantize below and
-                        // the side-info write below pick up the matching
-                        // multiplier (1.0 vs 0.5).
+                        // The outer loop reports:
+                        //   * `scalefac_scale` — §C.1.5.4.3 dynamic-range
+                        //     escalation (multiplier 1.0 vs 0.5);
+                        //   * `scalefactors.preflag` — §C.1.5.4.3.4
+                        //     preemphasis (Table B.6 pretab boost on the
+                        //     upper bands).
+                        // Both must be propagated into the granule-channel
+                        // so the re-quantize step below and the side-info
+                        // write reflect what the outer loop converged on.
+                        // `sf.preflag` (returned inside `res.scalefactors`)
+                        // is what `quantize()` reads; `gc.preflag` is what
+                        // the side-info encoder writes — we mirror them
+                        // below at the top of the `loop`.
                         (res.scalefactors, res.global_gain, res.scalefac_scale)
                     }
                     None => {
@@ -1015,7 +1022,15 @@ impl Mp3Encoder {
                     gc = gc_template;
                     gc.global_gain = global_gain;
                     gc.scalefac_compress = scalefac_compress;
-                    gc.preflag = false;
+                    // §C.1.5.4.3.4 preemphasis: mirror `sf.preflag` into
+                    // `gc.preflag`. The side-info writer emits `gc.preflag`
+                    // and the decoder feeds it back into `sf.preflag` at
+                    // parse time; the requantize / quantize primitives
+                    // read `sf.preflag`. Both pathways must agree, so the
+                    // single source of truth here is the `sf.preflag` the
+                    // outer loop returned (or `false` for the fixed-gain
+                    // branch where no outer loop runs).
+                    gc.preflag = sf.preflag;
                     // §C.1.5.4.3 escalation: when the outer loop reports
                     // scalefac_scale = 1, the re-quantize step here MUST
                     // use the same multiplier (1.0 vs 0.5) — otherwise

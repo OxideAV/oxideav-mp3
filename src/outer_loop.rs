@@ -55,11 +55,20 @@
 //! * **Long blocks only.** Short / mixed blocks have a per-window
 //!   scalefactor table (`scalefac_s[sfb][win]`) and a different upper
 //!   limit; deferred until the encoder's block-type-switching step lands.
-//! * **No preemphasis (§C.1.5.4.3.4).** The pretab amplification is an
-//!   optional precondition step the spec ties to "all of the upper 4
-//!   scalefactor bands" exceeding threshold after the first inner pass;
-//!   we leave `preflag = false` so the band-by-band amplification is the
-//!   only noise-shaping lever.
+//! * **Preemphasis (§C.1.5.4.3.4)** (round 148): after the first inner
+//!   loop call the loop checks the spec's suggested condition — "if in
+//!   all of the upper 4 scalefactor bands the actual distortion exceeds
+//!   the threshold". When that holds, `preflag` is set to `1`, which
+//!   adds the Table B.6 `pretab[]` values
+//!   `[0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,2,2,3,3,3,2]` to the effective
+//!   per-band scalefactor for the rest of the loop. The pretab boost
+//!   is `free` (one transmitted bit; no `part2_3_length` impact), and
+//!   it does NOT raise the §C.1.5.4.3.6 cap (15/7) on the transmitted
+//!   `scalefac_l[sfb]` — the cap math reads `sf.long[sfb]` only and the
+//!   amplifier still tops out there. Once decided, `preflag` stays on
+//!   for the remainder of the loop and is reflected in the returned
+//!   [`OuterLoopResult::scalefactors`]'s `preflag` field for the
+//!   side-info writer.
 //! * **`scalefac_scale = 1` escalation** (round 147): when an
 //!   amplification step would push a band's scalefactor past its
 //!   §C.1.5.4.3.6 cap (15 for `sfb ∈ [0, 10]`, 7 for `sfb ∈ [11, 20]`)
@@ -158,6 +167,14 @@ pub struct OuterLoopResult {
     /// propagate this into the granule-channel's `scalefac_scale` bit
     /// before re-quantizing or writing the side-info.
     pub scalefac_scale: bool,
+    /// `preflag` flag (§2.4.2.7 + §C.1.5.4.3.4): `true` when the loop
+    /// chose to switch on the Table B.6 pretab high-frequency
+    /// amplification. The same value lives at
+    /// [`OuterLoopResult::scalefactors`]'s `preflag` field; both must
+    /// be propagated by the caller — `gc.preflag` for the side-info
+    /// write, and `sf.preflag` (already in `scalefactors`) for any
+    /// re-quantize / re-requantize step downstream.
+    pub preflag: bool,
     /// Iteration accounting.
     pub stats: OuterLoopStats,
 }
@@ -209,7 +226,7 @@ pub fn band_distortion_long(
     sample_rate_hz: u32,
     version: MpegVersion,
 ) -> [f64; LONG_SFB] {
-    use crate::requantize::scalefac_multiplier;
+    use crate::requantize::{scalefac_multiplier, PRETAB};
     let starts = long_band_starts(sample_rate_hz, version);
     let mult = f64::from(scalefac_multiplier(scalefac_scale));
     let mut out = [0.0f64; LONG_SFB];
@@ -231,7 +248,21 @@ pub fn band_distortion_long(
         // residual is the original-domain residual times the same factor;
         // squaring gives the SSE multiplier 2^(2·mult·scalefac(sb))·...
         // where `mult` already encodes the (1+scalefac_scale)/2 split.
-        let sf_val = f64::from(sf.long[sfb.min(LONG_SFB - 1)]);
+        // When `sf.preflag` is set (§C.1.5.4.3.4 preemphasis), the
+        // effective scalefactor the decoder reconstructs against is
+        // `scalefac_l[sfb] + pretab[sfb]` (Table B.6) — both
+        // [`crate::requantize::requantize`] and
+        // [`crate::quantize::quantize`] add the pretab term — so the
+        // colouring factor here MUST add it as well, otherwise the
+        // outer loop's distortion metric would compare a reconstruction
+        // boosted by pretab against an original NOT boosted by pretab.
+        let sf_idx = sfb.min(LONG_SFB - 1);
+        let pre = if sf.preflag {
+            f64::from(PRETAB[sf_idx])
+        } else {
+            0.0
+        };
+        let sf_val = f64::from(sf.long[sf_idx]) + pre;
         let scale = (2.0 * mult * sf_val).exp2();
         *slot = (sse / bw) * scale;
     }
@@ -281,6 +312,13 @@ pub fn outer_loop_search_long(
     // would terminate the loop.
     let mut scalefac_scale = false;
     let mut escalated_once = false;
+    // §C.1.5.4.3.4 preemphasis state. The spec's suggested heuristic
+    // (the one explicit hint the spec provides) is to switch on preflag
+    // when, after the first inner-loop call, the upper-4 long
+    // scalefactor bands (sfb 17..=20) all exceed their threshold. The
+    // decision is taken once; once set, preflag stays on for the rest
+    // of the loop (one transmitted bit; cheap).
+    let mut preflag_decided = false;
 
     // Saved last-good state. The spec saves scalefactors BEFORE each
     // amplification, so that if the next iteration trips a termination
@@ -314,10 +352,15 @@ pub fn outer_loop_search_long(
         );
 
         // Decode-side reconstruction to compute per-band distortion.
+        // `gc_full.preflag` mirrors `sf.preflag` so the requantize step
+        // here matches what the side-info write will instruct the
+        // decoder to do; without this, the §C.1.5.4.3.3 distortion
+        // would be computed against the wrong reconstruction once
+        // preemphasis is on.
         let mut gc_full = *gc_template;
         gc_full.global_gain = inner.global_gain;
         gc_full.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
-        gc_full.preflag = false;
+        gc_full.preflag = sf.preflag;
         gc_full.scalefac_scale = scalefac_scale;
         let xr_back = requantize(&inner.is, &gc_full, &sf, sample_rate_hz, version);
         let xfsf = band_distortion_long(
@@ -339,6 +382,37 @@ pub fn outer_loop_search_long(
                 if next > u16::from(scalefac_long_upper_limit(sfb)) {
                     would_exceed_cap = true;
                 }
+            }
+        }
+
+        // §C.1.5.4.3.4 preemphasis decision (taken after the first
+        // inner-loop call, exactly as the spec phrases it: "the
+        // condition to switch on the preemphasis is up to the
+        // implementation. For example preemphasis could be switched on
+        // if in all of the upper 4 scalefactor bands the actual
+        // distortion exceeds the threshold after the first call of the
+        // inner loop"). The spec's worked example IS the implementation
+        // we adopt here — it is the only explicit hint the spec offers,
+        // and it costs at most one re-run of the iteration body. Once
+        // preflag flips on:
+        //   * `sf.preflag = true` so the next [`run_inner`] / `quantize`
+        //     reads the inflated effective scalefactor (and the
+        //     `xfsf` computed next iteration matches it);
+        //   * `last_good_*` is NOT updated here — preflag is a
+        //     decoder-side reconstruction setting that the saved state
+        //     should also reflect, which is automatic because we just
+        //     `continue` so the next loop iteration's "save last-good
+        //     BEFORE amplifying" path covers the new state;
+        //   * the `iterations` counter ticks up (the re-evaluation
+        //     after switching on preflag is genuinely a fresh
+        //     inner-loop call against a different sf).
+        if !preflag_decided {
+            preflag_decided = true;
+            let upper_four_all_over = xfsf[17..=20].iter().all(|&d| d > uniform_threshold);
+            if upper_four_all_over {
+                sf.preflag = true;
+                iterations += 1;
+                continue;
             }
         }
 
@@ -418,6 +492,12 @@ pub fn outer_loop_search_long(
     }
 
     OuterLoopResult {
+        // `last_good_sf.preflag` already carries the resolved §C.1.5.4.3.4
+        // decision because `sf.preflag` is set in-place when the
+        // upper-4-bands condition fires (before any subsequent
+        // last-good save), and every later `last_good_sf = sf`
+        // assignment copies the same flag along with the band values.
+        preflag: last_good_sf.preflag,
         scalefactors: last_good_sf,
         global_gain: last_good_inner.global_gain,
         is: last_good_inner.is,
@@ -744,5 +824,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn outer_loop_default_preflag_off_when_threshold_easily_met() {
+        // §C.1.5.4.3.4: the spec's suggested heuristic switches preflag
+        // on only when ALL of the upper-4 long bands (sfb 17..=20)
+        // exceed threshold after the first inner pass. With a giant
+        // threshold no band exceeds it, so preflag must stay off.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.013).sin() * 100.0;
+        }
+        let gc = long_template();
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e30, 64);
+        assert!(!res.preflag, "preflag must default to false");
+        assert!(
+            !res.scalefactors.preflag,
+            "scalefactors.preflag must mirror result.preflag"
+        );
+    }
+
+    #[test]
+    fn outer_loop_default_preflag_off_when_only_low_bands_over_threshold() {
+        // §C.1.5.4.3.4 heuristic requires ALL of sfb 17..=20 over
+        // threshold. A fixture where only a low band has any energy
+        // exposes those upper bands to zero baseline distortion — the
+        // condition is unmet and preflag must stay off, exercising the
+        // negative arm of the new decision branch.
+        let mut xr = [0.0f32; NUM_LINES];
+        xr[5] = 100.0;
+        let gc = long_template();
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e-30, 64);
+        assert!(
+            !res.preflag,
+            "preflag must NOT fire when upper-4 bands carry no energy",
+        );
+    }
+
+    #[test]
+    fn outer_loop_preflag_fires_when_all_upper_four_over_threshold() {
+        // §C.1.5.4.3.4: build a fixture where all four of sfb 17..=20
+        // carry energy producing a baseline distortion well above the
+        // chosen threshold. The 44.1 kHz long-block band starts
+        // (Table B.8b LONG_STARTS_44) are
+        //   sfb 17 → [196, 238)
+        //   sfb 18 → [238, 288)
+        //   sfb 19 → [288, 342)
+        //   sfb 20 → [342, 418)
+        // Plant non-power-of-two amplitudes that quantize with residual
+        // error so xfsf > 0 on every one of those bands; with a tiny
+        // threshold the first-iteration §C.1.5.4.3.4 condition is met
+        // and preflag flips on.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (offset, slot) in xr[196..418].iter_mut().enumerate() {
+            *slot = 500.0 + (offset as f32) * 7.3;
+        }
+        let gc = long_template();
+
+        // Threshold tiny relative to the per-band baseline distortion
+        // so xfsf[17..=20] all sit well above it after the very first
+        // inner-loop pass.
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e-30, 128);
+        assert!(
+            res.preflag,
+            "preflag should have fired (sfb 17..=20 all over threshold), \
+             got preflag={} sf={:?} converged={} iters={}",
+            res.preflag, &res.scalefactors.long, res.stats.converged, res.stats.iterations,
+        );
+        assert!(
+            res.scalefactors.preflag,
+            "result.scalefactors.preflag must mirror result.preflag \
+             so the caller's quantize() / side-info write pick up the same flag",
+        );
+    }
+
+    #[test]
+    fn outer_loop_preflag_off_when_only_three_upper_bands_over() {
+        // Strict reading of §C.1.5.4.3.4: ALL FOUR of sfb 17..=20 must
+        // exceed threshold. If sfb 17 has zero energy (and therefore
+        // zero baseline distortion) while 18/19/20 have plenty, the
+        // condition is unmet and preflag stays off.
+        let mut xr = [0.0f32; NUM_LINES];
+        // Skip sfb 17 (lines [196, 238)); load sfb 18..=20.
+        for (offset, slot) in xr[238..418].iter_mut().enumerate() {
+            *slot = 500.0 + (offset as f32) * 7.3;
+        }
+        let gc = long_template();
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e-30, 128);
+        assert!(
+            !res.preflag,
+            "preflag must NOT fire if any of sfb 17..=20 is at zero distortion \
+             (got preflag={} sf={:?})",
+            res.preflag, &res.scalefactors.long,
+        );
     }
 }
