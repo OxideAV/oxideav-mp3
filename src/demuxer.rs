@@ -264,11 +264,13 @@ pub fn parse_xing_info(frame_payload: &[u8], side_info_bytes: usize) -> Option<X
 /// [`crate::side_info`].
 #[must_use]
 pub fn side_info_len(version: MpegVersion, channels: u8) -> usize {
-    match (version, channels) {
-        (MpegVersion::Mpeg1, 1) => SIDE_INFO_BYTES_MONO,
-        (MpegVersion::Mpeg1, _) => SIDE_INFO_BYTES_STEREO,
-        (MpegVersion::Mpeg2, 1) => SIDE_INFO_BYTES_LSF_MONO,
-        (MpegVersion::Mpeg2, _) => SIDE_INFO_BYTES_LSF_STEREO,
+    // MPEG-2.5 inherits the LSF side-info layout per the
+    // `MpegVersion::Mpeg25` doc-comment + `MPEG-2.5-GAP.md`.
+    match (version.is_lsf(), channels) {
+        (false, 1) => SIDE_INFO_BYTES_MONO,
+        (false, _) => SIDE_INFO_BYTES_STEREO,
+        (true, 1) => SIDE_INFO_BYTES_LSF_MONO,
+        (true, _) => SIDE_INFO_BYTES_LSF_STEREO,
     }
 }
 

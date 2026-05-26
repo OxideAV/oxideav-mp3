@@ -1191,6 +1191,57 @@ silent-truncation behaviour — its `flat(30.0)` spectrum at very fine
 tightened to walk only the clamp-respecting subset of the gain range
 that `search_bit_budget` itself walks. Net: 474 tests pass (was 466).
 
+**Phase 2 step 25 (MPEG-2.5 frame-parser support)** extends the
+framing layer to the proprietary Fraunhofer-IIS "MPEG-2.5" extension
+documented in `docs/audio/mp3/MPEG-2.5-GAP.md` (K. Brandenburg /
+H. Popp, *An introduction to MPEG Layer-3*, EBU Technical Review 283,
+June 2000; Fraunhofer-IIS U.S. patent RE44,897; datavoyage community
+header reference). The §2.4.2.3 syncword is narrowed from 12 to
+11 bits (`'1111 1111 111'`, header positions 31..21) and bit 20 is
+repurposed as a second version-selector, so the 2-bit version field
+at positions 20..19 is `'11'` = MPEG-1, `'10'` = MPEG-2 LSF, `'01'` =
+reserved (new `HeaderError::ReservedVersion`), `'00'` = MPEG-2.5. A
+new third [`MpegVersion::Mpeg25`] enum variant, a new
+`SAMPLE_RATE_V25 = [11_025, 12_000, 8_000]` table (per the patent's
+"preferably half the sampling rate" and the datavoyage table), and a
+new `MpegVersion::is_lsf()` helper carry MPEG-2.5 through every
+downstream call site: `samples_per_frame` returns 576 like MPEG-2,
+`frame_len` uses the 72-byte coefficient, the V2,L1 / V2,L2&L3
+bitrate ladders are reused (Fraunhofer patent "applied to ISO/IEC
+13818-3"), the §13818-3 LSF side-info layout / scalefactor decode /
+intensity-stereo factors / Xing-frame side-info-bytes calculation /
+encoder `side_info_bytes` / demuxer `side_info_len` all dispatch on
+the `is_lsf()` helper. The encoder's `write_header` writer is
+re-grounded on the same 11-bit-sync layout and a new
+`version_bits(MpegVersion) -> u32` returns the 2-bit field. The
+`FrameWalker` pre-filter (already `& 0xE0 == 0xE0`) now matches the
+narrowed sync exactly without further change. `make_silent_header`
+accepts the three MPEG-2.5 sample rates and infers the new version;
+the `oxideav_core::Decoder` trait wrapper this round is still
+MPEG-1-only and rejects MPEG-2.5 with the same "decoder this round
+is MPEG-1 only" message it returns for MPEG-2 LSF (consistent with
+the in-tree `Mpeg25 != Mpeg1` test). Validated by 11 new unit tests
+in `src/frame.rs` (single MPEG-2.5 32 kbps / 11.025 kHz parse with
+576-sample / 208-byte invariants; full V2,L1&L23 ladder pinning at
+the low and high ends; 8 kbps / 8 kHz / +padding frame-length pin;
+all-three sample-rate table pin; reserved-version `'01'`
+rejection; first-two-byte wire-format invariant; FrameWalker yields
+back-to-back MPEG-2.5 frames; FrameWalker yields a mixed MPEG-1 +
+MPEG-2.5 stream; `is_lsf` groups MPEG-2 and MPEG-2.5) and 3 new
+unit tests in `src/encoder.rs` (writer ↔ parser inverse for the
+new version; all three MPEG-2.5 sample rates round-trip through
+the writer; `make_silent_header` accepts the MPEG-2.5 rate set
+including 7 350 Hz rejection as the new unrecognised-rate stand-in
+in place of the old 11 025 Hz stand-in). Net: 496 tests pass
+(was 474). Spec-coverage note: the docs collaborator's residual
+observer-trace items in `MPEG-2.5-GAP.md` (scalefactor-band index
+tables for the 8 / 11.025 / 12 kHz rates, bit-exact Huffman table
+mapping, and frame-size formula verification at the low rates) are
+needed before a *decoded* MPEG-2.5 stream can be PCM-validated; the
+present step lands only the framing layer so a downstream demuxer
+can iterate / introspect / re-emit MPEG-2.5 frames without
+upgrading the audio-decode chain.
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), intensity-stereo encode (§2.4.3.4.9.3), signal-driven
@@ -1206,17 +1257,20 @@ wrapper — is still a later round.
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–24 (forward
-MDCT primitive + analysis windowing + forward overlap split +
-polyphase analysis subband filterbank + §2.4.3.4.7 quantization
-primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
-§C.1.5.4.4.5/.8 Huffman bit count + §2.4.1.7 Huffman bit emission +
-§2.4.1.7 main-data assembly + §2.4.2.7 cross-frame bit-reservoir
-scheduling with `main_data_begin > 0` + stream-level PCM → MP3 driver
-+ §C.1.5.4.3 outer (distortion-control) loop + `oxideav_core::Encoder`
-trait wiring + opt-in Xing / Info VBR information-frame emission +
-true-VBR per-frame bitrate + Xing TOC auto-fill + opt-in §2.4.3.1
-CRC-16 frame protection + independent-stereo (`ChannelMode::Stereo` /
+round; the framing layer accepts MPEG-2.5 as of step 25 but the
+trait-wrapper audio-decode chain still rejects it pending the
+`MPEG-2.5-GAP.md` observer-trace items). The encoder is **Phase 1
+framing + Phase 2 steps 1–25 (forward MDCT primitive + analysis
+windowing + forward overlap split + polyphase analysis subband
+filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
+inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
+count + §2.4.1.7 Huffman bit emission + §2.4.1.7 main-data assembly
++ §2.4.2.7 cross-frame bit-reservoir scheduling with
+`main_data_begin > 0` + stream-level PCM → MP3 driver + §C.1.5.4.3
+outer (distortion-control) loop + `oxideav_core::Encoder` trait
+wiring + opt-in Xing / Info VBR information-frame emission + true-VBR
+per-frame bitrate + Xing TOC auto-fill + opt-in §2.4.3.1 CRC-16 frame
+protection + independent-stereo (`ChannelMode::Stereo` /
 `ChannelMode::DualChannel`) encode through the trait wrapper +
 §2.4.3.4.9.2 joint-stereo MS encode + §C.1.5.4.3 `scalefac_scale 0→1`
 escalation in the outer loop + §C.1.5.4.3.4 preemphasis decision in
@@ -1225,7 +1279,8 @@ trait-factory wrappers for the auto MS/LR picker + §2.4.3.4.10.2
 forward short-block MDCT path with `Mp3Encoder::force_short_blocks_for_testing`
 toggle + §2.4.2.7 forward mixed-block MDCT path with
 `Mp3Encoder::force_mixed_blocks_for_testing` toggle + §C.1.5.4.4.8
-linbits-reach filter in the Huffman table chooser)** — it still
+linbits-reach filter in the Huffman table chooser + MPEG-2.5 frame
+header parse + writer + sample-rate-table dispatch)** — it still
 lacks the psychoacoustic model (so the outer loop's `xmin(sb)` is a
 uniform constant rather than per-band masking-aware),
 intensity-stereo encode (§2.4.3.4.9.3), signal-driven **auto**
@@ -1237,7 +1292,12 @@ force-short / force-mixed toggles), multi-channel short/mixed
 support (§2.4.3.4.9 cross-channel block-type agreement is the gap
 the force-short / force-mixed toggles reject stereo on), §C.1.5.4.3
 outer-loop short-block analogue (the long-only `outer_loop_search_long`
-needs a per-window `subblock_gain` search), and LSF encode.
+needs a per-window `subblock_gain` search), and LSF / MPEG-2.5
+encode (the framing layer round-trips MPEG-2.5 headers but the
+encoder's stream-level driver still rejects non-MPEG-1 streams; the
+MPEG-2.5-specific scalefactor-band tables + Huffman table mapping
++ low-rate frame-size validation items in `MPEG-2.5-GAP.md` are
+needed before bit-exact MPEG-2.5 encode is implementable).
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

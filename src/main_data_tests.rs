@@ -83,7 +83,7 @@ mod tests {
             MpegVersion::Mpeg1 => {
                 read_mpeg1_granule_channel(r, gc, &si.scfsi[ch], gr, prev_sf)
             }
-            MpegVersion::Mpeg2 => {
+            MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => {
                 let is_intensity_right = intensity && ch == 1;
                 read_lsf_channel(r, gc, is_intensity_right)
             }

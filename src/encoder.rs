@@ -99,13 +99,18 @@ impl BitWriter {
     }
 }
 
-/// Map a [`MpegVersion`] to its header `ID` bit (ISO/IEC 11172-3
-/// §2.4.2.3: `'1'` = MPEG-1; ISO/IEC 13818-3 §2.4.2.3: `'0'` = MPEG-2
-/// lower sampling frequencies).
-fn id_bit(version: MpegVersion) -> u32 {
+/// Map a [`MpegVersion`] to its 2-bit version field at header bit
+/// positions 20..19. ISO/IEC 11172-3 §2.4.2.3 fixes bit 20 as part of
+/// the 12-bit syncword and the `ID` bit at position 19 selects MPEG-1
+/// (`'1'`) vs MPEG-2 LSF (`'0'`). The Fraunhofer-IIS MPEG-2.5
+/// extension (see [`MpegVersion`]) repurposes bit 20 as a second
+/// selector, giving `'00'` = MPEG-2.5 alongside `'10'` = MPEG-2 and
+/// `'11'` = MPEG-1.
+fn version_bits(version: MpegVersion) -> u32 {
     match version {
-        MpegVersion::Mpeg1 => 1,
-        MpegVersion::Mpeg2 => 0,
+        MpegVersion::Mpeg1 => 0b11,
+        MpegVersion::Mpeg2 => 0b10,
+        MpegVersion::Mpeg25 => 0b00,
     }
 }
 
@@ -163,8 +168,12 @@ fn emphasis_bits(emphasis: Emphasis) -> u32 {
 #[must_use]
 pub fn write_header(header: &Mp3FrameHeader) -> [u8; 4] {
     let protection = u32::from(!header.crc_protected);
-    let raw: u32 = (0xFFF << 20)
-        | (id_bit(header.version) << 19)
+    // Frame-sync: 11 bits `'1111 1111 111'` at positions 31..21
+    // (the spec defines a 12-bit syncword with bit 20 = '1'; the
+    // narrower 11-bit pattern is shared with the Fraunhofer-IIS
+    // MPEG-2.5 extension and the version field at 20..19 selects).
+    let raw: u32 = (0x7FF << 21)
+        | (version_bits(header.version) << 19)
         | (layer_bits(header.layer) << 17)
         | (protection << 16)
         | (u32::from(header.bitrate_index) << 12)
@@ -359,7 +368,7 @@ impl std::error::Error for EncodeError {}
 #[must_use]
 pub fn silent_side_info(header: &Mp3FrameHeader) -> SideInfo {
     let nch = header.channel_count();
-    let lsf = header.version == MpegVersion::Mpeg2;
+    let lsf = header.version.is_lsf();
     let granule_count = if lsf { GRANULES_LSF } else { GRANULES } as u8;
 
     SideInfo {
@@ -376,11 +385,14 @@ pub fn silent_side_info(header: &Mp3FrameHeader) -> SideInfo {
 /// The byte length of a Layer III side-info block for `version` /
 /// `channels` (ISO/IEC 11172-3 §2.4.1.7 / ISO/IEC 13818-3 §2.4.1.7).
 fn side_info_bytes(version: MpegVersion, channels: u8) -> usize {
-    match (version, channels == 1) {
-        (MpegVersion::Mpeg1, true) => SIDE_INFO_BYTES_MONO,
-        (MpegVersion::Mpeg1, false) => SIDE_INFO_BYTES_STEREO,
-        (MpegVersion::Mpeg2, true) => SIDE_INFO_BYTES_LSF_MONO,
-        (MpegVersion::Mpeg2, false) => SIDE_INFO_BYTES_LSF_STEREO,
+    // MPEG-2.5 reuses the LSF side-info layout (Fraunhofer patent
+    // "applied to ISO/IEC 13818-3"). The mono / stereo split below
+    // is on `channels == 1`, so two arms suffice.
+    match (version.is_lsf(), channels == 1) {
+        (false, true) => SIDE_INFO_BYTES_MONO,
+        (false, false) => SIDE_INFO_BYTES_STEREO,
+        (true, true) => SIDE_INFO_BYTES_LSF_MONO,
+        (true, false) => SIDE_INFO_BYTES_LSF_STEREO,
     }
 }
 
@@ -447,19 +459,20 @@ pub fn encode_silent_frame(header: &Mp3FrameHeader) -> Result<Vec<u8>, EncodeErr
 ///
 /// Resolves `bitrate_kbps` and `sample_rate_hz` to their raw header
 /// indices, infers the [`MpegVersion`] from the sample rate (MPEG-1
-/// rates 32 / 44.1 / 48 kHz vs MPEG-2 LSF 16 / 22.05 / 24 kHz), and
-/// fills the remaining header fields with the standard CBR defaults
-/// (no CRC, no padding, private bit clear, mode_extension `'00'`,
-/// copyright clear, original set, no emphasis).
+/// rates 32 / 44.1 / 48 kHz vs MPEG-2 LSF 16 / 22.05 / 24 kHz vs the
+/// Fraunhofer MPEG-2.5 extension 8 / 11.025 / 12 kHz), and fills the
+/// remaining header fields with the standard CBR defaults (no CRC,
+/// no padding, private bit clear, mode_extension `'00'`, copyright
+/// clear, original set, no emphasis).
 ///
 /// # Errors
 ///
 /// Returns [`EncodeError::FreeFormat`] when `bitrate_kbps` /
 /// `sample_rate_hz` / `mode` do not map to a valid Layer III header
 /// index (the requested bitrate is not on the layer's ladder for the
-/// inferred version, or the sample rate is not a recognised MPEG-1 / LSF
-/// rate). The error name is reused as the catch-all "no valid index"
-/// signal for this convenience constructor.
+/// inferred version, or the sample rate is not a recognised MPEG-1 /
+/// LSF / MPEG-2.5 rate). The error name is reused as the catch-all
+/// "no valid index" signal for this convenience constructor.
 pub fn make_silent_header(
     bitrate_kbps: u32,
     sample_rate_hz: u32,
@@ -492,8 +505,9 @@ pub fn make_silent_header(
 }
 
 /// Resolve a sample rate (Hz) to its `(version, sampling_frequency_index)`
-/// per ISO/IEC 11172-3 §2.4.2.3 (MPEG-1) and ISO/IEC 13818-3 §2.4.2.3
-/// (MPEG-2 LSF). Returns `None` for an unrecognised rate.
+/// per ISO/IEC 11172-3 §2.4.2.3 (MPEG-1), ISO/IEC 13818-3 §2.4.2.3
+/// (MPEG-2 LSF), and the Fraunhofer-IIS MPEG-2.5 extension (see
+/// [`MpegVersion`]). Returns `None` for an unrecognised rate.
 fn sample_rate_index(rate: u32) -> Option<(MpegVersion, u8)> {
     match rate {
         44_100 => Some((MpegVersion::Mpeg1, 0)),
@@ -502,6 +516,11 @@ fn sample_rate_index(rate: u32) -> Option<(MpegVersion, u8)> {
         22_050 => Some((MpegVersion::Mpeg2, 0)),
         24_000 => Some((MpegVersion::Mpeg2, 1)),
         16_000 => Some((MpegVersion::Mpeg2, 2)),
+        // MPEG-2.5 sample rates (`docs/audio/mp3/MPEG-2.5-GAP.md`,
+        // datavoyage table + Fraunhofer patent RE44,897).
+        11_025 => Some((MpegVersion::Mpeg25, 0)),
+        12_000 => Some((MpegVersion::Mpeg25, 1)),
+        8_000 => Some((MpegVersion::Mpeg25, 2)),
         _ => None,
     }
 }
@@ -520,7 +539,8 @@ fn layer3_bitrate_index(version: MpegVersion, kbps: u32) -> Option<u8> {
     ];
     let ladder = match version {
         MpegVersion::Mpeg1 => &V1_L3,
-        MpegVersion::Mpeg2 => &V2_L23,
+        // MPEG-2.5 reuses the LSF Layer II/III ladder.
+        MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => &V2_L23,
     };
     ladder
         .iter()
@@ -554,6 +574,43 @@ mod tests {
         let parsed = parse_header(&bytes).unwrap();
         assert_eq!(parsed, h);
         assert_eq!(parsed.version, MpegVersion::Mpeg2);
+    }
+
+    #[test]
+    fn header_writer_is_parse_inverse_mpeg25() {
+        // Fraunhofer MPEG-2.5 extension: Layer III, 32 kbps / 11.025 kHz
+        // mono — round-trip through the writer and parser.
+        let h = make_silent_header(32, 11_025, ChannelMode::SingleChannel).unwrap();
+        assert_eq!(h.version, MpegVersion::Mpeg25);
+        assert_eq!(h.sample_rate_hz, 11_025);
+        assert_eq!(h.bitrate_kbps, Some(32));
+        let bytes = write_header(&h);
+        // First two bytes are 0xFF 0xEx (11-bit sync + version-field
+        // bit-20 = 0). Bit 20 distinguishes MPEG-2.5 from MPEG-2 LSF.
+        assert_eq!(bytes[0], 0xFF);
+        assert_eq!(bytes[1] & 0xE0, 0xE0);
+        assert_eq!(bytes[1] & 0x10, 0x00);
+        let parsed = parse_header(&bytes).unwrap();
+        assert_eq!(parsed, h);
+        assert_eq!(parsed.version, MpegVersion::Mpeg25);
+        // Samples-per-frame and frame_len follow the LSF rules.
+        // 72 * 32000 / 11025 = 208 (integer truncation).
+        assert_eq!(parsed.samples_per_frame(), 576);
+        assert_eq!(parsed.frame_len(), Some(208));
+    }
+
+    #[test]
+    fn header_writer_mpeg25_all_three_sample_rates() {
+        // 11_025 → idx 0; 12_000 → idx 1; 8_000 → idx 2. Pick a
+        // bitrate present on the V2 L2/L3 ladder.
+        for (rate, sfi) in [(11_025u32, 0u8), (12_000, 1), (8_000, 2)] {
+            let h = make_silent_header(32, rate, ChannelMode::SingleChannel).unwrap();
+            assert_eq!(h.version, MpegVersion::Mpeg25);
+            assert_eq!(h.sampling_frequency_index, sfi);
+            let parsed = parse_header(&write_header(&h)).unwrap();
+            assert_eq!(parsed.sample_rate_hz, rate);
+            assert_eq!(parsed.version, MpegVersion::Mpeg25);
+        }
     }
 
     #[test]
@@ -764,10 +821,22 @@ mod tests {
 
     #[test]
     fn make_silent_header_rejects_bad_sample_rate() {
+        // 7350 Hz is not on any of the MPEG-1 / MPEG-2 LSF /
+        // MPEG-2.5 sample-rate tables.
         assert_eq!(
-            make_silent_header(128, 11_025, ChannelMode::Stereo),
+            make_silent_header(128, 7_350, ChannelMode::Stereo),
             Err(EncodeError::FreeFormat)
         );
+    }
+
+    #[test]
+    fn make_silent_header_accepts_mpeg25_rates() {
+        for rate in [8_000u32, 11_025, 12_000] {
+            let h = make_silent_header(32, rate, ChannelMode::SingleChannel)
+                .expect("MPEG-2.5 rate accepted");
+            assert_eq!(h.version, MpegVersion::Mpeg25);
+            assert_eq!(h.sample_rate_hz, rate);
+        }
     }
 
     #[test]

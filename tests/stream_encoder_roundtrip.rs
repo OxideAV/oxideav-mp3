@@ -207,8 +207,9 @@ fn decode_scalefactors_until(
                     }
                     let _ = prev_g0_sf;
                 }
-                MpegVersion::Mpeg2 => {
-                    // Not exercised in this round (LSF deferred).
+                MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => {
+                    // Not exercised in this round (LSF / MPEG-2.5
+                    // deferred for the part2-skip helper).
                     return None;
                 }
             }

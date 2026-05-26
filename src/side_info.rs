@@ -427,7 +427,10 @@ pub fn parse_side_info(header: &Mp3FrameHeader, data: &[u8]) -> Result<SideInfo,
 
     match header.version {
         MpegVersion::Mpeg1 => parse_mpeg1(data, mono, nch),
-        MpegVersion::Mpeg2 => parse_lsf(data, mono, nch),
+        // MPEG-2.5 inherits the §13818-3 LSF side-info layout
+        // (one granule, scfsi absent, 8-bit main_data_begin, 9-bit
+        // scalefac_compress) per the Fraunhofer patent.
+        MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => parse_lsf(data, mono, nch),
     }
 }
 

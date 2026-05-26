@@ -441,7 +441,8 @@ fn intensity_factors(is_pos: u8, intensity_scale: bool, version: MpegVersion) ->
             let kr = 1.0 / denom;
             (kl, kr, true)
         }
-        MpegVersion::Mpeg2 => {
+        // MPEG-2 and MPEG-2.5 share the §13818-3 LSF intensity factors.
+        MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => {
             // ISO/IEC 13818-3 §2.4.3.2 step 4/5 replacement.
             // i0 = 1/sqrt(2) for intensity_scale==1, else 1/sqrt(sqrt(2)).
             let i0 = if intensity_scale {

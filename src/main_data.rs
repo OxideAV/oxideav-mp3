@@ -197,7 +197,8 @@ pub fn assemble_main_data(
                         gr,
                     );
                 }
-                MpegVersion::Mpeg2 => {
+                // MPEG-2.5 inherits the LSF scalefactor write path.
+                MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => {
                     let is_intensity_right = intensity && ch == 1;
                     write_lsf_channel(&mut w, &side_info.granules[gr][ch], sf, is_intensity_right);
                 }

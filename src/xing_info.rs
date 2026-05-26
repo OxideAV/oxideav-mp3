@@ -258,7 +258,7 @@ pub fn build_info_frame(
     // starts at offset 4 (header) + side_info bytes.
     let payload = build_xing_info_payload(spec)?;
     let nch = header.channel_count();
-    let lsf = header.version == crate::frame::MpegVersion::Mpeg2;
+    let lsf = header.version.is_lsf();
     let si_bytes = match (lsf, nch == 1) {
         (false, true) => crate::side_info::SIDE_INFO_BYTES_MONO,
         (false, false) => crate::side_info::SIDE_INFO_BYTES_STEREO,

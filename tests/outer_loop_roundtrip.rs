@@ -184,8 +184,8 @@ fn decode_mp3_mono(bytes: &[u8]) -> Vec<i16> {
                         }
                         s
                     }
-                    MpegVersion::Mpeg2 => {
-                        unreachable!("LSF outer-loop encode not in scope this round")
+                    MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => {
+                        unreachable!("LSF / MPEG-2.5 outer-loop encode not in scope this round")
                     }
                 };
                 let part2_bits = r.bit_pos() - gc_start;

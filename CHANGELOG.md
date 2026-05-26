@@ -8,6 +8,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **MPEG-2.5 frame-parser support** (Phase 2 step 25). The framing
+  layer now accepts the proprietary Fraunhofer-IIS "MPEG-2.5"
+  extension documented in `docs/audio/mp3/MPEG-2.5-GAP.md` (Popp /
+  Brandenburg, EBU Technical Review 283; Fraunhofer-IIS U.S. patent
+  RE44,897; datavoyage community header reference). The §2.4.2.3
+  syncword is narrowed from 12 to 11 bits (`'1111 1111 111'` at
+  header positions 31..21), and the resulting 2-bit version field at
+  positions 20..19 is decoded as `'11'` = MPEG-1, `'10'` = MPEG-2
+  LSF, `'01'` = reserved (new `HeaderError::ReservedVersion`),
+  `'00'` = MPEG-2.5. A new third `MpegVersion::Mpeg25` enum variant
+  carries through the rest of the framing stack: `samples_per_frame`
+  returns 576 like MPEG-2, `frame_len` uses the 72-byte Layer-III
+  coefficient, the V2,L1 / V2,L2&L3 bitrate ladders are reused
+  (Fraunhofer patent "applied to ISO/IEC 13818-3"), the §13818-3 LSF
+  side-info layout / scalefactor decode / stereo intensity factors /
+  Xing-frame side-info-bytes / encoder `side_info_bytes` / demuxer
+  `side_info_len` all dispatch on a new `MpegVersion::is_lsf()`
+  helper. A new `SAMPLE_RATE_V25 = [11_025, 12_000, 8_000]` table
+  is added per the patent's "preferably half the sampling rate"
+  formulation and the datavoyage table. The encoder's `write_header`
+  is re-grounded on the 11-bit-sync layout and a new
+  `version_bits(MpegVersion) -> u32` returns the 2-bit version
+  field. `make_silent_header` accepts the three MPEG-2.5 sample
+  rates and infers the new version. The `oxideav_core::Decoder`
+  trait wrapper this round is still MPEG-1-only and rejects
+  MPEG-2.5 with the same "decoder this round is MPEG-1 only"
+  message it returns for MPEG-2 LSF. Validated by 11 new unit tests
+  in `src/frame.rs` (MPEG-2.5 32 kbps / 11.025 kHz parse with
+  576-sample / 208-byte invariants; V2,L1&L23 ladder pinning at the
+  low and high ends; 8 kbps / 8 kHz / +padding frame-length pin;
+  all-three sample-rate table pin; reserved-version `'01'`
+  rejection; first-two-byte wire-format invariant; FrameWalker
+  iterates back-to-back MPEG-2.5 frames; FrameWalker iterates a
+  mixed MPEG-1 + MPEG-2.5 stream; `is_lsf` groups MPEG-2 and
+  MPEG-2.5) and 3 new unit tests in `src/encoder.rs` (writer ↔
+  parser inverse on the new version; all three MPEG-2.5 sample
+  rates round-trip through the writer; `make_silent_header`
+  accepts the MPEG-2.5 rate set). Net: 496 tests pass (was 474).
 - **§C.1.5.4.4.8 linbits-reach filter in
   `huffman::choose_best_table_for_region`** (Phase 2 step 24,
   #1106). The §B.7 codebooks have widely-varying magnitude reach —

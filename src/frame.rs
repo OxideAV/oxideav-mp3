@@ -35,19 +35,59 @@
 //! | original/copy      |   1  |
 //! | emphasis           |   2  |
 
-/// MPEG audio version, distinguished by the header `ID` bit.
+/// MPEG audio version, distinguished by the header `ID` bit (ISO/IEC
+/// 11172-3 / ISO/IEC 13818-3) and, for the proprietary Fraunhofer-IIS
+/// extension, by the bit immediately preceding `ID`.
 ///
-/// Per ISO/IEC 11172-3 §2.4.2.3 the `ID` bit equals `'1'` for MPEG-1
-/// audio. Per ISO/IEC 13818-3 §2.4.2.3 the same bit equals `'0'` for
-/// the extension to lower sampling frequencies (MPEG-2).
+/// The standard's wire encoding uses a single `ID` bit at position 19
+/// of the 32-bit header. The Fraunhofer "MPEG-2.5" extension (see
+/// `docs/audio/mp3/MPEG-2.5-GAP.md`: K. Brandenburg / H. Popp,
+/// *An introduction to MPEG Layer-3*, EBU Technical Review 283, June
+/// 2000, and Fraunhofer-IIS U.S. patent RE44,897) repurposes the bit
+/// at position 20 — which the ISO standards mandate as part of the
+/// `'1111 1111 1111'` syncword — to signal a third version. The
+/// resulting two-bit field at positions 20..19 is:
+///
+/// * `'11'` — MPEG-1 (ISO/IEC 11172-3)
+/// * `'10'` — MPEG-2 LSF (ISO/IEC 13818-3)
+/// * `'01'` — reserved (rejected as `HeaderError::ReservedVersion`)
+/// * `'00'` — MPEG-2.5 (Fraunhofer-IIS extension; 8 / 11.025 /
+///   12 kHz sampling frequencies)
+///
+/// A standards-compliant reader that does not implement the
+/// extension treats the upper 12 bits as the syncword and never
+/// reaches a frame whose bit-20 is zero. This crate accepts the
+/// extension and exposes it as the `Mpeg25` variant; for every
+/// post-framing-layer concern (side-info layout, scalefactor
+/// decode, sample-per-frame count, frame-byte length coefficient,
+/// bitrate ladder), MPEG-2.5 follows the same LSF rules as MPEG-2;
+/// only the sample-rate table differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MpegVersion {
-    /// `ID == 1`: ISO/IEC 11172-3 (MPEG-1) sampling frequencies
+    /// 20..19 == `'11'`: ISO/IEC 11172-3 (MPEG-1) sampling frequencies
     /// (32 / 44.1 / 48 kHz).
     Mpeg1,
-    /// `ID == 0`: ISO/IEC 13818-3 (MPEG-2) lower sampling
+    /// 20..19 == `'10'`: ISO/IEC 13818-3 (MPEG-2) lower sampling
     /// frequencies (16 / 22.05 / 24 kHz).
     Mpeg2,
+    /// 20..19 == `'00'`: Fraunhofer-IIS "MPEG-2.5" extension
+    /// (8 / 11.025 / 12 kHz). LSF semantics in every other respect.
+    Mpeg25,
+}
+
+impl MpegVersion {
+    /// `true` for the LSF families (MPEG-2 and MPEG-2.5).
+    ///
+    /// LSF here is the umbrella term for "lower sampling frequency"
+    /// — every post-framing-layer code path that distinguishes
+    /// MPEG-1 from MPEG-2 (side-info layout, scalefactor compress
+    /// width, samples-per-frame, frame-length coefficient,
+    /// bitrate-ladder dispatch, etc.) groups MPEG-2.5 with MPEG-2
+    /// per the patent's "applied to ISO/IEC 13818-3" framing.
+    #[must_use]
+    pub fn is_lsf(self) -> bool {
+        matches!(self, MpegVersion::Mpeg2 | MpegVersion::Mpeg25)
+    }
 }
 
 /// MPEG audio layer, from the 2-bit `layer` field.
@@ -190,7 +230,10 @@ impl Mp3FrameHeader {
             (Layer::LayerI, _) => 384,
             (Layer::LayerII, _) => 1152,
             (Layer::LayerIII, MpegVersion::Mpeg1) => 1152,
-            (Layer::LayerIII, MpegVersion::Mpeg2) => 576,
+            // MPEG-2.5 inherits the §13818-3 576-sample Layer III
+            // count (Fraunhofer patent RE44,897 §"applied to
+            // ISO/IEC 13818-3").
+            (Layer::LayerIII, MpegVersion::Mpeg2 | MpegVersion::Mpeg25) => 576,
         }
     }
 
@@ -240,7 +283,9 @@ impl Mp3FrameHeader {
             Layer::LayerIII => {
                 let coeff = match self.version {
                     MpegVersion::Mpeg1 => 144, // 1152 samples / 8
-                    MpegVersion::Mpeg2 => 72,  // 576 samples / 8
+                    // MPEG-2 and MPEG-2.5 share the 576-sample
+                    // LSF Layer III count, so both use coeff 72.
+                    MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => 72,
                 };
                 (coeff * bitrate_bps) / sr + pad
             }
@@ -265,9 +310,16 @@ impl Mp3FrameHeader {
 pub enum HeaderError {
     /// Fewer than four bytes were available.
     TooShort,
-    /// The leading 12 bits were not the `'1111 1111 1111'` syncword
-    /// (ISO/IEC 11172-3 §2.4.2.3).
+    /// The leading 11 bits were not the `'1111 1111 111'` frame-sync
+    /// pattern (ISO/IEC 11172-3 §2.4.2.3 mandates a 12-bit syncword;
+    /// the Fraunhofer-IIS MPEG-2.5 extension narrows this to 11 bits
+    /// — see `docs/audio/mp3/MPEG-2.5-GAP.md`).
     BadSync,
+    /// The 2-bit version field at bit positions 20..19 held `'01'`,
+    /// which is reserved (and would never be reached by a strict
+    /// ISO/IEC 11172-3 reader since it requires bit 20 = `'1'` as
+    /// part of the 12-bit syncword).
+    ReservedVersion,
     /// The `layer` field held the reserved value `'00'`.
     ReservedLayer,
     /// The `bitrate_index` field held the forbidden value `'1111'`.
@@ -280,7 +332,8 @@ impl core::fmt::Display for HeaderError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let msg = match self {
             HeaderError::TooShort => "header too short (need 4 bytes)",
-            HeaderError::BadSync => "missing 12-bit frame syncword",
+            HeaderError::BadSync => "missing 11-bit frame syncword",
+            HeaderError::ReservedVersion => "reserved version field '01'",
             HeaderError::ReservedLayer => "reserved layer value '00'",
             HeaderError::ForbiddenBitrate => "forbidden bitrate_index '1111'",
             HeaderError::ReservedSampleRate => "reserved sampling_frequency '11'",
@@ -327,6 +380,12 @@ const SAMPLE_RATE_V1: [u32; 3] = [44_100, 48_000, 32_000];
 /// MPEG-2 LSF sampling frequencies (ISO/IEC 13818-3 §2.4.2.3):
 /// `'00'` = 22.05, `'01'` = 24, `'10'` = 16 kHz; `'11'` reserved.
 const SAMPLE_RATE_V2: [u32; 3] = [22_050, 24_000, 16_000];
+/// MPEG-2.5 sampling frequencies (Fraunhofer-IIS extension; see
+/// `docs/audio/mp3/MPEG-2.5-GAP.md`):
+/// `'00'` = 11.025, `'01'` = 12, `'10'` = 8 kHz; `'11'` reserved.
+/// Exactly half of [`SAMPLE_RATE_V2`] at each index, matching the
+/// patent's "preferably half the sampling rate" formulation.
+const SAMPLE_RATE_V25: [u32; 3] = [11_025, 12_000, 8_000];
 
 /// Parse the four bytes of an MPEG audio frame header.
 ///
@@ -349,16 +408,21 @@ pub fn parse_header(bytes: &[u8]) -> Result<Mp3FrameHeader, HeaderError> {
     }
     let raw = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
-    // syncword: top 12 bits must be all ones (ISO/IEC 11172-3 §2.4.2.3).
-    if (raw >> 20) != 0xFFF {
+    // Frame sync: bits 31..21 must be all ones. The ISO/IEC 11172-3
+    // §2.4.2.3 syncword is 12 bits with bit 20 = '1'; the Fraunhofer
+    // MPEG-2.5 extension narrows it to 11 bits and repurposes bit 20
+    // (see the `MpegVersion` doc-comment + `MPEG-2.5-GAP.md`).
+    if (raw >> 21) != 0x7FF {
         return Err(HeaderError::BadSync);
     }
 
-    // ID: 1 bit. '1' = MPEG-1 (11172-3), '0' = MPEG-2 LSF (13818-3).
-    let version = if (raw >> 19) & 1 == 1 {
-        MpegVersion::Mpeg1
-    } else {
-        MpegVersion::Mpeg2
+    // Version field: 2 bits at positions 20..19.
+    //   '11' MPEG-1, '10' MPEG-2 LSF, '01' reserved, '00' MPEG-2.5.
+    let version = match (raw >> 19) & 0b11 {
+        0b11 => MpegVersion::Mpeg1,
+        0b10 => MpegVersion::Mpeg2,
+        0b00 => MpegVersion::Mpeg25,
+        _ => return Err(HeaderError::ReservedVersion),
     };
 
     // layer: 2 bits, '11'=I '10'=II '01'=III '00'=reserved.
@@ -380,12 +444,19 @@ pub fn parse_header(bytes: &[u8]) -> Result<Mp3FrameHeader, HeaderError> {
     let bitrate_kbps = if bitrate_index == 0 {
         None // free format
     } else {
+        // MPEG-2.5 reuses the MPEG-2 LSF bitrate ladders: the
+        // Fraunhofer patent RE44,897 (Sec. 5, "applied to ISO/IEC
+        // 13818-3") describes the extension as inheriting the LSF
+        // ladders, and the EBU article + datavoyage reference both
+        // give the V2,L1 / V2,L2&L3 ladders as the bitrate set.
         let ladder = match (version, layer) {
             (MpegVersion::Mpeg1, Layer::LayerI) => &BITRATE_V1_L1,
             (MpegVersion::Mpeg1, Layer::LayerII) => &BITRATE_V1_L2,
             (MpegVersion::Mpeg1, Layer::LayerIII) => &BITRATE_V1_L3,
-            (MpegVersion::Mpeg2, Layer::LayerI) => &BITRATE_V2_L1,
-            (MpegVersion::Mpeg2, Layer::LayerII | Layer::LayerIII) => &BITRATE_V2_L23,
+            (MpegVersion::Mpeg2 | MpegVersion::Mpeg25, Layer::LayerI) => &BITRATE_V2_L1,
+            (MpegVersion::Mpeg2 | MpegVersion::Mpeg25, Layer::LayerII | Layer::LayerIII) => {
+                &BITRATE_V2_L23
+            }
         };
         Some(ladder[bitrate_index as usize])
     };
@@ -398,6 +469,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<Mp3FrameHeader, HeaderError> {
     let sample_rate_hz = match version {
         MpegVersion::Mpeg1 => SAMPLE_RATE_V1[sampling_frequency_index as usize],
         MpegVersion::Mpeg2 => SAMPLE_RATE_V2[sampling_frequency_index as usize],
+        MpegVersion::Mpeg25 => SAMPLE_RATE_V25[sampling_frequency_index as usize],
     };
 
     let padding = (raw >> 9) & 1 == 1;
@@ -501,8 +573,14 @@ impl<'a> Iterator for FrameWalker<'a> {
     fn next(&mut self) -> Option<Frame<'a>> {
         // Need at least a full 4-byte header to test a sync point.
         while self.pos + 4 <= self.buf.len() {
-            // Cheap pre-filter: first byte and top nibble of the
-            // second byte must be the start of the 12-bit syncword.
+            // Cheap pre-filter: first byte must be 0xFF and the top
+            // three bits of the second byte must be `'111'` to form
+            // the 11-bit frame-sync pattern shared by MPEG-1, MPEG-2
+            // LSF, and the Fraunhofer MPEG-2.5 extension. (A strict
+            // 12-bit-sync reader would mask `& 0xF0 == 0xF0`; the
+            // narrower `0xE0` allows MPEG-2.5's bit-20-zero
+            // encoding through to the version-field dispatch in
+            // `parse_header`.)
             if self.buf[self.pos] != 0xFF || (self.buf[self.pos + 1] & 0xE0) != 0xE0 {
                 self.pos += 1;
                 continue;
@@ -543,6 +621,12 @@ mod tests {
     /// positions mirror ISO/IEC 11172-3 §2.4.1.3 exactly so the
     /// tests construct their inputs straight from the spec layout
     /// rather than from any pre-baked byte pattern.
+    ///
+    /// The `id` argument is the 1-bit ISO/IEC 11172-3 `ID` field;
+    /// `1` selects MPEG-1, `0` selects MPEG-2 LSF. To build an
+    /// MPEG-2.5 header use [`build_header_v25`] (or the raw
+    /// [`build_header_versioned`] helper) which writes a `'0'` into
+    /// bit 20 of the would-be syncword.
     #[allow(clippy::too_many_arguments)]
     fn build_header(
         id: u32,
@@ -558,8 +642,49 @@ mod tests {
         original: u32,
         emphasis: u32,
     ) -> [u8; 4] {
-        let raw: u32 = (0xFFF << 20)
-            | (id << 19)
+        // Two-bit version field at positions 20..19. For ID=1 the
+        // upper bit is also `1`, so the resulting top 12 bits are
+        // `0xFFF` — the strict ISO syncword. For ID=0 they are
+        // `0xFFE` — the 11-bit MPEG-2.5 frame-sync followed by
+        // `'10'` = MPEG-2 LSF.
+        let version_field = if id == 1 { 0b11 } else { 0b10 };
+        build_header_versioned(
+            version_field,
+            layer,
+            protection,
+            bitrate_index,
+            sampling_frequency,
+            padding,
+            private,
+            mode,
+            mode_ext,
+            copyright,
+            original,
+            emphasis,
+        )
+    }
+
+    /// Like [`build_header`] but takes the full 2-bit version field
+    /// at bit positions 20..19 directly (so callers can build
+    /// MPEG-2.5 / reserved-version headers as well).
+    #[allow(clippy::too_many_arguments)]
+    fn build_header_versioned(
+        version_field: u32,
+        layer: u32,
+        protection: u32,
+        bitrate_index: u32,
+        sampling_frequency: u32,
+        padding: u32,
+        private: u32,
+        mode: u32,
+        mode_ext: u32,
+        copyright: u32,
+        original: u32,
+        emphasis: u32,
+    ) -> [u8; 4] {
+        // 11-bit frame-sync `'1111 1111 111'` then version field.
+        let raw: u32 = (0x7FF << 21)
+            | (version_field << 19)
             | (layer << 17)
             | (protection << 16)
             | (bitrate_index << 12)
@@ -572,6 +697,38 @@ mod tests {
             | (original << 2)
             | emphasis;
         raw.to_be_bytes()
+    }
+
+    /// Build an MPEG-2.5 (version_field == `'00'`) header — used to
+    /// construct the Fraunhofer-IIS extension's wire bytes in tests.
+    #[allow(clippy::too_many_arguments)]
+    fn build_header_v25(
+        layer: u32,
+        protection: u32,
+        bitrate_index: u32,
+        sampling_frequency: u32,
+        padding: u32,
+        private: u32,
+        mode: u32,
+        mode_ext: u32,
+        copyright: u32,
+        original: u32,
+        emphasis: u32,
+    ) -> [u8; 4] {
+        build_header_versioned(
+            0b00,
+            layer,
+            protection,
+            bitrate_index,
+            sampling_frequency,
+            padding,
+            private,
+            mode,
+            mode_ext,
+            copyright,
+            original,
+            emphasis,
+        )
     }
 
     #[test]
@@ -648,6 +805,130 @@ mod tests {
             let h = build_header(0, 0b01, 1, 0b1000, idx, 0, 0, 0b11, 0, 0, 1, 0);
             assert_eq!(parse_header(&h).unwrap().sample_rate_hz, expect);
         }
+    }
+
+    #[test]
+    fn parses_mpeg25_layer3_32k_11025() {
+        // MPEG-2.5 (version_field=00), Layer III, no CRC. The V2,L2&L3
+        // ladder reads `[0, 8, 16, 24, 32, ...]` at indices 0..=14, so
+        // bitrate_index 0100 (decimal 4) selects 32 kbps. Sample-rate
+        // index 00 = 11025 Hz.
+        let h = build_header_v25(0b01, 1, 0b0100, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        let hdr = parse_header(&h).expect("valid MPEG-2.5 header");
+        assert_eq!(hdr.version, MpegVersion::Mpeg25);
+        assert_eq!(hdr.layer, Layer::LayerIII);
+        assert_eq!(hdr.bitrate_kbps, Some(32));
+        assert_eq!(hdr.sample_rate_hz, 11_025);
+        // MPEG-2.5 inherits the §13818-3 576-sample Layer III count.
+        assert_eq!(hdr.samples_per_frame(), 576);
+        // 72 * 32000 / 11025 = 208 (integer truncation; the fractional
+        // part 208.979 is absorbed by the padding-slot scheduler over
+        // successive frames).
+        assert_eq!(hdr.frame_len(), Some(208));
+        // LSF helper groups MPEG-2.5 with MPEG-2.
+        assert!(hdr.version.is_lsf());
+    }
+
+    #[test]
+    fn mpeg25_sample_rate_table() {
+        // Patent RE44,897 + datavoyage: index '00'=11.025,
+        // '01'=12, '10'=8 kHz. Exactly half of MPEG-2 LSF.
+        for (idx, expect) in [(0b00, 11_025), (0b01, 12_000), (0b10, 8_000)] {
+            let h = build_header_v25(0b01, 1, 0b0100, idx, 0, 0, 0b11, 0, 0, 1, 0);
+            assert_eq!(parse_header(&h).unwrap().sample_rate_hz, expect);
+        }
+    }
+
+    #[test]
+    fn mpeg25_uses_v2_bitrate_ladder() {
+        // V2,L2&L3 ladder shared with MPEG-2 LSF. Index 0001 = 8 kbps,
+        // 1110 = 160 kbps (the ladder peaks at 160 for V2,L3).
+        let lo = build_header_v25(0b01, 1, 0b0001, 0b10, 0, 0, 0b11, 0, 0, 1, 0);
+        assert_eq!(parse_header(&lo).unwrap().bitrate_kbps, Some(8));
+        let hi = build_header_v25(0b01, 1, 0b1110, 0b10, 0, 0, 0b11, 0, 0, 1, 0);
+        assert_eq!(parse_header(&hi).unwrap().bitrate_kbps, Some(160));
+    }
+
+    #[test]
+    fn mpeg25_frame_len_8khz_8kbps_with_padding() {
+        // 72 * 8000 / 8000 = 72 bytes, plus 1 padding slot = 73.
+        let h = build_header_v25(0b01, 1, 0b0001, 0b10, 1, 0, 0b11, 0, 0, 1, 0);
+        let hdr = parse_header(&h).unwrap();
+        assert!(hdr.padding);
+        assert_eq!(hdr.sample_rate_hz, 8_000);
+        assert_eq!(hdr.bitrate_kbps, Some(8));
+        assert_eq!(hdr.frame_len(), Some(73));
+    }
+
+    #[test]
+    fn rejects_reserved_version_field() {
+        // version_field = '01' is reserved and must be rejected
+        // without falling through to MPEG-2 / MPEG-2.5 handling.
+        let h = build_header_versioned(0b01, 0b01, 1, 0b1001, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        assert_eq!(parse_header(&h), Err(HeaderError::ReservedVersion));
+    }
+
+    #[test]
+    fn mpeg25_wire_first_two_bytes_are_ffe_dispatched() {
+        // The MPEG-2.5 first two bytes are 0xFF 0xEx (top 3 bits of
+        // byte 1 = `'111'`, then version-field bit 4 = `'0'`). The
+        // FrameWalker pre-filter accepts this, and parse_header then
+        // routes to Mpeg25.
+        let h = build_header_v25(0b01, 1, 0b0100, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        assert_eq!(h[0], 0xFF);
+        assert_eq!(h[1] & 0xE0, 0xE0);
+        // Bit 4 of byte 1 (i.e. bit 20 of the raw header) is the
+        // MPEG-2.5 marker: must be zero.
+        assert_eq!(h[1] & 0x10, 0x00);
+    }
+
+    #[test]
+    fn walker_iterates_mpeg25_frames() {
+        // Two identical MPEG-2.5 frames back to back: walker must
+        // pre-filter, parse, length-check, and yield both.
+        let hb = build_header_v25(0b01, 1, 0b0100, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        let len = parse_header(&hb).unwrap().frame_len().unwrap();
+        assert_eq!(len, 208);
+        let mut buf = Vec::new();
+        for _ in 0..2 {
+            buf.extend_from_slice(&hb);
+            buf.extend(std::iter::repeat_n(0u8, len - 4));
+        }
+        let frames: Vec<_> = FrameWalker::new(&buf).collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].header.version, MpegVersion::Mpeg25);
+        assert_eq!(frames[0].offset, 0);
+        assert_eq!(frames[0].data.len(), 208);
+        assert_eq!(frames[1].offset, 208);
+    }
+
+    #[test]
+    fn walker_mixed_mpeg1_and_mpeg25_resyncs() {
+        // An MPEG-1 frame followed by an MPEG-2.5 frame in the same
+        // stream — verifies the walker's pre-filter doesn't reject
+        // the narrower MPEG-2.5 sync.
+        let h_v1 = build_header(1, 0b01, 1, 0b1001, 0b00, 0, 0, 0b00, 0, 0, 1, 0);
+        let len_v1 = parse_header(&h_v1).unwrap().frame_len().unwrap();
+        let h_v25 = build_header_v25(0b01, 1, 0b0100, 0b00, 0, 0, 0b11, 0, 0, 1, 0);
+        let len_v25 = parse_header(&h_v25).unwrap().frame_len().unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&h_v1);
+        buf.extend(std::iter::repeat_n(0u8, len_v1 - 4));
+        let second_start = buf.len();
+        buf.extend_from_slice(&h_v25);
+        buf.extend(std::iter::repeat_n(0u8, len_v25 - 4));
+        let frames: Vec<_> = FrameWalker::new(&buf).collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].header.version, MpegVersion::Mpeg1);
+        assert_eq!(frames[1].header.version, MpegVersion::Mpeg25);
+        assert_eq!(frames[1].offset, second_start);
+    }
+
+    #[test]
+    fn is_lsf_groups_mpeg2_and_mpeg25() {
+        assert!(!MpegVersion::Mpeg1.is_lsf());
+        assert!(MpegVersion::Mpeg2.is_lsf());
+        assert!(MpegVersion::Mpeg25.is_lsf());
     }
 
     #[test]

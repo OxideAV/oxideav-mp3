@@ -956,7 +956,10 @@ pub fn decode_scalefactors(
                 }
             }
         }
-        MpegVersion::Mpeg2 => {
+        // MPEG-2 LSF and MPEG-2.5 share the §13818-3 single-granule
+        // scalefactor decode path (Fraunhofer patent + per the
+        // `MpegVersion` doc-comment).
+        MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => {
             // LSF: exactly one granule.
             for ch in 0..nch {
                 let gc = &side_info.granules[0][ch];
