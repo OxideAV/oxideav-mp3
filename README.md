@@ -1123,15 +1123,52 @@ roundtrip at 44.1 kHz pure-short, long-block identity pass-through,
 mixed-block long-region preservation, per-subband forward-MDCT chain
 energy bound).
 
+**Phase 2 step 23 (§2.4.2.7 forward mixed-block MDCT path)** layers a
+mixed-block dispatch on top of the step-22 forward short MDCT, so the
+encoder can emit a granule whose lowest two polyphase subbands (lines
+0..36) are coded with the long-family window + one 36-point MDCT
+each, and whose upper 30 subbands (lines 36..576) are coded with the
+three-window short MDCT. `Mp3Encoder::force_mixed_blocks_for_testing`
+is the deterministic test handle for this primitive: with the toggle
+on (mono only this round, mutually exclusive with the step-22
+force-short toggle), every assembled granule emits a §2.4.2.7 mixed
+block — the long-block forward path (`forward_overlap →
+window_long_family_analysis(Long) → 36-pt mdct → ÷9`, identical to
+the long-only baseline) runs on subbands 0 and 1, the short-block
+forward path (`forward_short_mdct_subband`) runs on subbands 2..31,
+and `forward_reorder` is then invoked with a mixed `GranuleChannel`
+so the long region (lines 0..36) passes through unchanged while the
+short region's SFB 3..12 is rewritten into native bitstream
+`[sfb][win][k]` order. No inverse alias reduction is applied — the
+decoder's `alias_reduce` tests `block_type == Short` and returns
+unchanged for both pure-short and mixed granules. The
+per-granule-channel side info carries `window_switching_flag = 1`,
+`block_type = Short`, `mixed_block_flag = 1`, with the §C.1.5.4.4.6
+short-family region split (region 0 hardcoded to the first 36 lines,
+region 1 to the rest of big_values, region 2 empty) — the same split
+the pure-short path uses, which here happens to align exactly with
+the long / short subband boundary. Validated by six new integration
+tests in `tests/mixed_block_encoder_roundtrip.rs` (toggle rejected on
+stereo; force-short ↔ force-mixed mutual exclusion in both
+directions; default off; force-mixed stream's side info matches the
+window-switched-mixed skeleton; force-mixed stream accepted by
+`Mp3Demuxer::next_packet`; force-mixed stream decodes end-to-end to
+finite, non-silent PCM with audible zero crossings). The
+signal-driven attack-detection heuristic that picks among Long /
+Start / Short / Stop / Mixed per-granule from signal energy remains
+a follow-up round; the present step lands the bitstream-side
+primitive + the dispatch wiring so that follow-up only needs to add
+the decision layer on top.
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), intensity-stereo encode (§2.4.3.4.9.3), signal-driven
 **auto** block-type decision (the §C.1.5 attack-detection heuristic +
 the LONG → START → SHORT → STOP → LONG transition state machine; the
-forward short-block MDCT path itself is available behind the
-force-short toggle as of round 151), mixed-block encode, LSF encode,
-and stereo / LSF decode through the trait wrapper — is still a later
-round.
+forward short-block and mixed-block MDCT paths themselves are
+available behind the force-short / force-mixed toggles as of rounds
+151 / 152), LSF encode, and stereo / LSF decode through the trait
+wrapper — is still a later round.
 
 ### Not yet implemented
 

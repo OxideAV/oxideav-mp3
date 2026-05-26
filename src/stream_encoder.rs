@@ -386,6 +386,63 @@ pub struct Mp3Encoder {
     ///
     /// Default `false`; the encoder behaves as in every previous round.
     force_short_blocks: bool,
+
+    /// When `true`, every assembled granule emits a §2.4.2.7 **mixed**
+    /// block (`window_switching_flag = 1`, `block_type = 2`,
+    /// `mixed_block_flag = 1`): the two lowest polyphase subbands (0 and
+    /// 1, covering the lowest 36 frequency lines) are coded with the
+    /// long-family window + one 36-point forward MDCT each (the same
+    /// path the long-block branch uses), while the upper 30 subbands (2
+    /// through 31) are coded with the short-block path — three
+    /// independent 12-point forward MDCTs per subband over the lapped
+    /// 36-sample frame, no alias reduction, window-interleaved layout.
+    /// [`crate::short_block::forward_reorder`] then rewrites the short
+    /// region (short scalefactor bands 3..12) into the native bitstream
+    /// `[sfb][win][k]` interleave, while the long region (lines 0..36)
+    /// passes through unchanged (mirrors the decoder's
+    /// [`crate::reorder::reorder`] mixed-block branch).
+    ///
+    /// This is the **encoder-side** mirror of the decoder's mixed-block
+    /// path. The decoder branches in three places on `mixed_block_flag`:
+    ///
+    /// * [`crate::imdct::imdct_granule`] runs the long IMDCT path on
+    ///   subbands 0/1 and the short path on the rest.
+    /// * [`crate::reorder::reorder`] starts the short reorder at SFB 3
+    ///   (preserving lines 0..36 in long order).
+    /// * [`crate::requantize::requantize`] / [`crate::quantize::quantize`]
+    ///   apply long-band requantization to lines 0..36 and short-band
+    ///   requantization to the rest.
+    /// * [`crate::alias::alias_reduce`] is **not** applied (the
+    ///   §2.4.3.4.10.1 test is on `block_type == Short` alone; a mixed
+    ///   block is still `block_type == Short`).
+    ///
+    /// While the flag is on the forward path mirrors all four: the long
+    /// branch's `forward_overlap → window_long_family_analysis → 36-pt
+    /// MDCT → ÷9` runs on subbands 0/1, the short branch's
+    /// [`crate::short_block::forward_short_mdct_subband`] runs on
+    /// subbands 2..31, [`crate::short_block::forward_reorder`] rewrites
+    /// the short bands into native order while preserving lines 0..36,
+    /// and inverse alias reduction is **skipped** (mirroring the
+    /// decoder).
+    ///
+    /// Restrictions in this round:
+    ///
+    /// * **Mono only.** Stereo / joint-stereo / dual-channel + mixed is
+    ///   intentionally rejected by
+    ///   [`Mp3Encoder::force_mixed_blocks_for_testing`] for the same
+    ///   reason the force-short flag is mono-only: the §2.4.3.4.9
+    ///   cross-channel block-type-agreement wiring is a follow-up
+    ///   round.
+    /// * **No outer loop.** The fixed-gain inner-loop-only path runs
+    ///   for mixed blocks identically to the way it runs for long and
+    ///   short.
+    /// * **Mutually exclusive with `force_short_blocks`.** A granule
+    ///   can be long, short-only, or mixed — not all three.
+    ///   [`Mp3Encoder::force_mixed_blocks_for_testing`] rejects the
+    ///   combination.
+    ///
+    /// Default `false`; the encoder behaves as in every previous round.
+    force_mixed_blocks: bool,
 }
 
 /// Variable-bitrate config attached to [`Mp3Encoder`] by
@@ -486,6 +543,7 @@ impl Mp3Encoder {
             ms_stereo: false,
             ms_auto_threshold: None,
             force_short_blocks: false,
+            force_mixed_blocks: false,
         })
     }
 
@@ -513,6 +571,11 @@ impl Mp3Encoder {
         if enabled && self.nch != 1 {
             return Err(StreamEncodeError::StereoUnsupported);
         }
+        if enabled {
+            // Mixed and pure-short are mutually exclusive: a granule is
+            // long, short, or mixed. Enabling pure-short clears mixed.
+            self.force_mixed_blocks = false;
+        }
         self.force_short_blocks = enabled;
         Ok(())
     }
@@ -523,6 +586,48 @@ impl Mp3Encoder {
     #[must_use]
     pub fn force_short_blocks_enabled(&self) -> bool {
         self.force_short_blocks
+    }
+
+    /// Force every assembled granule onto the §2.4.2.7 **mixed**-block
+    /// (`block_type = 2`, `mixed_block_flag = 1`) encode path; see the
+    /// [`Self::force_mixed_blocks`] field for the per-granule
+    /// behavioural contract.
+    ///
+    /// Restrictions (mirrored from the field doc):
+    ///
+    /// * Mono only — same §2.4.3.4.9 cross-channel agreement gap that
+    ///   force-short hits.
+    /// * Mutually exclusive with [`Self::force_short_blocks_for_testing`].
+    ///   Enabling this resets `force_short_blocks` to `false` so a
+    ///   single granule cannot ask for both at once.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamEncodeError::StereoUnsupported`] when the encoder's
+    /// channel count is > 1 (matches the
+    /// [`Self::force_short_blocks_for_testing`] policy).
+    pub fn force_mixed_blocks_for_testing(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), StreamEncodeError> {
+        if enabled && self.nch != 1 {
+            return Err(StreamEncodeError::StereoUnsupported);
+        }
+        if enabled {
+            // Mixed and pure-short are mutually exclusive: a granule is
+            // long, short, or mixed. Enabling mixed clears short.
+            self.force_short_blocks = false;
+        }
+        self.force_mixed_blocks = enabled;
+        Ok(())
+    }
+
+    /// `true` when the encoder is forcing every granule onto the
+    /// §2.4.2.7 mixed-block encode path (see
+    /// [`Self::force_mixed_blocks_for_testing`]).
+    #[must_use]
+    pub fn force_mixed_blocks_enabled(&self) -> bool {
+        self.force_mixed_blocks
     }
 
     /// Build a joint-stereo encoder that emits §2.4.3.4.9.2 **MS-stereo**
@@ -1055,9 +1160,9 @@ impl Mp3Encoder {
                     }
                 }
 
-                // Forward MDCT per subband. Two paths:
+                // Forward MDCT per subband. Three paths:
                 //
-                // * **Long block** (default; `force_short_blocks` off):
+                // * **Long block** (default; both force flags off):
                 //   forward-overlap with the saved previous granule →
                 //   window (long) → 36-point forward MDCT → 18 frequency
                 //   lines, then inverse-alias-reduce so the decoder's
@@ -1077,6 +1182,25 @@ impl Mp3Encoder {
                 //   rewrites the bins into the native bitstream
                 //   `[sfb][win][k]` interleave the §2.4.1.7 part3
                 //   Huffman path expects.
+                //
+                // * **Mixed block** (`force_mixed_blocks` on; mono-only;
+                //   see [`Mp3Encoder::force_mixed_blocks_for_testing`]):
+                //   the long-block forward path runs on subbands 0 and 1
+                //   (lines 0..36), the short-block forward path runs on
+                //   subbands 2..31. No alias reduction (decoder treats
+                //   `block_type == Short` for the whole granule
+                //   regardless of `mixed_block_flag`, so
+                //   [`crate::alias::alias_reduce`] is a pass-through).
+                //   [`crate::short_block::forward_reorder`] is then
+                //   driven with the mixed gc so the long region
+                //   (lines 0..36) passes through and only the short
+                //   region (short SFB 3..12) is rewritten into native
+                //   bitstream order. The §2.4.3.4.10.4 overlap-add
+                //   state is per-subband — long subbands consume the
+                //   long IMDCT path on decode, short subbands the short
+                //   path; both paths share the same per-subband
+                //   [`crate::mdct::MdctState`] history slot, so the
+                //   forward branch matches what the decoder expects.
                 //
                 // Scale derivation (long path). The §2.4.3.4.10.2
                 // IMDCT and the analysis MDCT use the same unscaled
@@ -1120,6 +1244,63 @@ impl Mp3Encoder {
                     xr_pre_per_gc[gr][ch] = crate::short_block::forward_reorder(
                         &xr,
                         &gc_short,
+                        self.sample_rate_hz,
+                        self.version,
+                    );
+                } else if self.force_mixed_blocks {
+                    // Mixed-block forward path. Subbands 0 and 1 run the
+                    // long-family forward MDCT (single 36-point MDCT
+                    // with the plain sine window → ÷9 unit-gain scale
+                    // → 18 bins in increasing-frequency order); subbands
+                    // 2..31 run the short-block forward path (three
+                    // 12-point MDCTs each over the lapped 36-sample
+                    // frame, divided by 3 inside
+                    // `forward_short_mdct_subband` → 18 bins in
+                    // subband-window-interleaved layout). The
+                    // per-subband [`MdctState`] history is shared
+                    // between branches so the next granule's overlap
+                    // proceeds correctly whichever branch the next
+                    // granule lands in.
+                    for sb in 0..2 {
+                        let mut current = [0.0f64; LONG_N / 2];
+                        for (t, slot) in current.iter_mut().enumerate() {
+                            *slot = f64::from(inv[sb][t]);
+                        }
+                        let frame36 = forward_overlap(&current, &mut self.mdct_state[ch][sb]);
+                        let windowed = window_long_family_analysis(&frame36, BlockType::Long);
+                        let bins = mdct(&windowed, LONG_N);
+                        for (k, &b) in bins.iter().enumerate() {
+                            xr[sb * 18 + k] = (b / 9.0) as f32;
+                        }
+                    }
+                    for sb in 2..32 {
+                        let mut current = [0.0f64; LONG_N / 2];
+                        for (t, slot) in current.iter_mut().enumerate() {
+                            *slot = f64::from(inv[sb][t]);
+                        }
+                        let bins = crate::short_block::forward_short_mdct_subband(
+                            &current,
+                            &mut self.mdct_state[ch][sb],
+                        );
+                        let base = sb * 18;
+                        xr[base..base + 18].copy_from_slice(&bins);
+                    }
+                    // Build a mixed GranuleChannel to drive the reorder.
+                    // `forward_reorder` consults `mixed_block_flag` and
+                    // copies the long region (lines 0..36) unchanged
+                    // while rewriting short SFB 3..12 from
+                    // subband-window-interleaved into native bitstream
+                    // `[sfb][win][k]` order.
+                    let gc_mixed = default_mixed_gc();
+                    // No inverse alias reduction. The decoder's
+                    // [`crate::alias::alias_reduce`] tests
+                    // `block_type == Short` only and returns unchanged
+                    // for both short and mixed granules, so applying
+                    // the inverse here would leave a residual butterfly
+                    // on the decode side that nothing reverses.
+                    xr_pre_per_gc[gr][ch] = crate::short_block::forward_reorder(
+                        &xr,
+                        &gc_mixed,
                         self.sample_rate_hz,
                         self.version,
                     );
@@ -1292,6 +1473,8 @@ impl Mp3Encoder {
                 //     `xmin[sb]` threshold.
                 let gc_template = if self.force_short_blocks {
                     default_short_gc()
+                } else if self.force_mixed_blocks {
+                    default_mixed_gc()
                 } else {
                     default_long_gc()
                 };
@@ -1423,16 +1606,26 @@ impl Mp3Encoder {
                     split = partition_split(&is);
                     bv2 = split.big_pairs * 2;
                     gc.big_values = split.big_pairs as u16;
-                    if self.force_short_blocks {
+                    if self.force_short_blocks || self.force_mixed_blocks {
                         // §C.1.5.4.4.6 + huffman::region_boundaries:
-                        // short blocks hardcode region 0 to the first 36
-                        // lines and region 1 to the rest of big_values
-                        // (region 2 empty). The transmitted
+                        // short and mixed blocks hardcode region 0 to
+                        // the first 36 lines and region 1 to the rest of
+                        // big_values (region 2 empty). The transmitted
                         // region0_count / region1_count are not on the
                         // wire (encoder::write_granule_channel writes
                         // the window-switched branch which omits them);
                         // keep the spec-default sentinels from the
-                        // short template intact.
+                        // short / mixed template intact.
+                        //
+                        // Mixed-block detail: the §2.4.2.7 fixed
+                        // region 0 covers exactly the 36 long-region
+                        // lines (subbands 0..1), so the region-0
+                        // boundary aligns naturally with the long /
+                        // short split inside the granule. Region 1
+                        // then carries all big_values that fall in the
+                        // short region (subbands 2..31), already
+                        // re-ordered into `[sfb][win][k]` native order
+                        // by `forward_reorder` above.
                         r0_end = 36usize.min(bv2);
                         r1_end = bv2;
                     } else {
@@ -2022,6 +2215,38 @@ fn default_short_gc() -> GranuleChannel {
         subblock_gain: [0; 3],
         region0_count: r0,
         region1_count: r1,
+        preflag: false,
+        scalefac_scale: false,
+        count1table_select: false,
+    }
+}
+
+/// A default mixed-block granule-channel record: window_switching on,
+/// `block_type = Short`, `mixed_block_flag = true`, all selectors zero,
+/// region defaults that match what
+/// [`crate::side_info::parse_side_info`] reconstructs for a mixed
+/// window-switched granule (`region0_count = 7`, `region1_count = 63`
+/// — the 3-bit field caps at 7 on the wire, but a parser only reads
+/// `region0_count` from the value table and synthesises the `63` for
+/// `region1_count`; both numbers are decoder-ignored for short-family
+/// granules, so the encoder writes `7 / 7` and trusts the parser's
+/// reconstruction). Used by the force-mixed encode path (see
+/// [`Mp3Encoder::force_mixed_blocks_for_testing`]).
+fn default_mixed_gc() -> GranuleChannel {
+    GranuleChannel {
+        part2_3_length: 0,
+        big_values: 0,
+        global_gain: 0,
+        scalefac_compress: 0,
+        window_switching_flag: true,
+        block_type: BlockType::Short,
+        mixed_block_flag: true,
+        table_select: [0; 3],
+        subblock_gain: [0; 3],
+        // Wire field widths are 4-bit / 3-bit; the decoder regenerates
+        // these for window-switched blocks regardless of carried values.
+        region0_count: 7,
+        region1_count: 7,
         preflag: false,
         scalefac_scale: false,
         count1table_select: false,

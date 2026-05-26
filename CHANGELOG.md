@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.2.7 forward mixed-block MDCT path on the encode side**
+  (Phase 2 step 23) — new `Mp3Encoder::force_mixed_blocks_for_testing`
+  toggle that drives every assembled granule onto the mixed-block
+  encode path. Subbands 0 and 1 (the lowest 36 frequency lines) are
+  coded with the long-family forward MDCT (`forward_overlap →
+  window_long_family_analysis(Long) → 36-point mdct → ÷9`,
+  identical to the long-block branch); subbands 2..31 are coded
+  with the short-block forward MDCT (`forward_short_mdct_subband`).
+  `forward_reorder` is then invoked with a mixed `GranuleChannel` so
+  the long region (lines 0..36) passes through unchanged while the
+  short region's SFB 3..12 is rewritten into native bitstream
+  `[sfb][win][k]` order. No inverse alias reduction (the decoder's
+  `alias_reduce` tests `block_type == Short` and returns unchanged
+  for both pure short and mixed granules). The per-granule-channel
+  side info carries `window_switching_flag = 1`, `block_type = Short`,
+  `mixed_block_flag = 1`, and the §2.4.2.7-default region sentinels
+  (decoder-reconstructed at parse time). Mono-only this round (same
+  §2.4.3.4.9 cross-channel block-type-agreement gap that gates the
+  pure-short toggle); mutually exclusive with
+  `force_short_blocks_for_testing` (enabling one clears the other).
+  A new `tests/mixed_block_encoder_roundtrip.rs` integration covers
+  the side-info contract, the decoder round-trip (encoded PCM →
+  `huffman → requantize → reorder → alias → imdct → synth` →
+  finite-energy non-silent reconstruction), the mutual-exclusivity
+  rule, and the stereo-encoder rejection.
 - **§2.4.3.4.10.2 forward short-block MDCT path on the encode side**
   (Phase 2 step 22): new `short_block` module exposing
   `forward_short_mdct_subband` (three independent 12-point MDCTs per
