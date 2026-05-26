@@ -8,6 +8,63 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.3.4.10.2 forward short-block MDCT path on the encode side**
+  (Phase 2 step 22): new `short_block` module exposing
+  `forward_short_mdct_subband` (three independent 12-point MDCTs per
+  polyphase subband over the lapped 36-sample frame, output in the
+  subband-window-interleaved layout `out[3·k + win]` the decoder's
+  `imdct.rs::windowed_block` short branch consumes), `forward_reorder`
+  (bit-exact inverse of `crate::reorder::reorder`: subband-window-
+  interleaved → native bitstream `[sfb][win][k]`), and
+  `short_block_region_defaults` (the spec-default `region_address1 = 8`,
+  `region_address2 = 36` short-block sentinels per §2.4.2.7, clamped to
+  the 3-bit `region1_count` cap). The new `MdctState::from_saved`
+  constructor exposes the per-subband forward-overlap memory so the
+  short-block path can update state atomically at the end of its MDCT
+  chain. The `crate::mdct::window_short_analysis` and 12-point
+  `crate::mdct::mdct` primitives that ship since round 130 carry the
+  windowing and transform; this round wires them together with the
+  scale factor (`n/4 = 3` Princen-Bradley for `n = 12`) and the
+  subband-window layout the decoder reads.
+- **`Mp3Encoder::force_short_blocks_for_testing` toggle** integrating
+  the forward short-block primitive into the PCM → MP3 stream
+  encoder. With the toggle on (mono only this round; multi-channel
+  short-block encode needs the §2.4.3.4.9 cross-channel block-type
+  agreement wiring that lands in a follow-up), every assembled
+  granule emits a §2.4.2.7 short block: forward analysis runs
+  `forward_short_mdct_subband` per subband instead of long-block
+  forward-overlap + 36-point MDCT; no alias reduction (§2.4.3.4.10.1
+  scopes it to `block_type != 2`); `forward_reorder` rewrites the
+  bins into the bitstream `[sfb][win][k]` interleave; the
+  per-granule-channel side info carries `window_switching_flag = 1`,
+  `block_type = Short`, `mixed_block_flag = 0`,
+  `subblock_gain = [0; 3]`, and the spec-default region sentinels.
+  The §C.1.5.4.4.6 short-block region split (region 0 hardcoded to
+  the first 36 lines, region 1 to the rest of big_values, region 2
+  empty) is honoured by the inner loop's region-end + table-select
+  pass so the encoder's emitted big-values cost matches the decoder's
+  `huffman::region_boundaries` short-block override. The toggle is a
+  deterministic test handle for the encode-side primitive; the
+  signal-driven §C.1.5 attack-detection auto-decision heuristic +
+  the LONG → START → SHORT → STOP → LONG transition state machine
+  required for *mixed* long-and-short streams remain a follow-up
+  round.
+- **`tests/short_block_encoder_roundtrip.rs`** integration test
+  battery: confirms (a) the toggle rejects multi-channel encoders,
+  (b) the long-baseline stream still carries only long granules,
+  (c) the force-short stream's emitted side info carries the
+  expected `(window_switching_flag, block_type, mixed_block_flag,
+  subblock_gain)` quartet on every granule-channel, (d) the
+  force-short stream is accepted by `Mp3Demuxer::next_packet`, and
+  (e) the force-short stream decodes end-to-end through the crate's
+  own primitives (`huffman → requantize → reorder → alias → imdct
+  → synth`) to finite, non-silent PCM with audible zero crossings.
+  Five new tests; runs in well under a second. Four new in-module
+  unit tests on `short_block` exercise the forward-reorder ↔ decoder-
+  reorder roundtrip (44.1 kHz pure-short), the long-block identity
+  pass-through, the mixed-block long-region preservation, the
+  per-subband forward-MDCT chain's energy bound, and the
+  `MdctState::from_saved` constructor symmetry.
 - **Trait-factory wrappers for joint-stereo auto MS/LR encoding**
   (Phase 2 step 21): `codec_encoder::make_encoder_joint_stereo_auto`
   and `make_encoder_joint_stereo_auto_with_threshold` reach the new

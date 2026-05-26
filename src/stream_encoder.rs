@@ -318,6 +318,74 @@ pub struct Mp3Encoder {
     /// than half the energy and the MS rotation would amplify rather
     /// than reduce quantization stress on the side channel.
     ms_auto_threshold: Option<f64>,
+
+    /// When `true`, every assembled granule emits a §2.4.2.7 short
+    /// block (`window_switching_flag = 1`, `block_type = 2`,
+    /// `mixed_block_flag = 0`): three independent 12-point MDCTs per
+    /// subband (instead of one 36-point MDCT), no alias reduction
+    /// (§2.4.3.4.10.1 scopes it to `block_type != 2`), the
+    /// §2.4.3.4.8 reorder (encoder side: [`crate::short_block::forward_reorder`])
+    /// applied to lay the bins out in the native bitstream
+    /// `[sfb][win][k]` interleave. Side-info defaults follow
+    /// [`crate::short_block::short_block_region_defaults`].
+    ///
+    /// This is the **encoder-side** mirror of the decoder's short-block
+    /// path. ISO/IEC 11172-3 leaves the block-type decision algorithm
+    /// entirely to the encoder (§C.1.5 references the psychoacoustic
+    /// model the spec offers in Annex D, but the algorithm itself is
+    /// non-normative); a signal-driven attack-detection heuristic that
+    /// auto-toggles between long and short is a separate concern from
+    /// the bitstream-side primitive, so this round exposes the toggle
+    /// as a deterministic test handle. The auto-decision heuristic
+    /// (and the §C.1.5.2 LONG → START → SHORT → STOP → LONG transition
+    /// state machine for *mixed* long-and-short streams) lands in a
+    /// follow-up round.
+    ///
+    /// While the flag is on:
+    ///
+    /// * The forward analysis stage feeds each subband's 18 new
+    ///   subband-time samples plus the previous granule's saved 18
+    ///   through [`crate::short_block::forward_short_mdct_subband`]
+    ///   instead of the long-block forward-overlap + 36-point MDCT.
+    ///   The per-subband [`crate::mdct::MdctState`] is shared between
+    ///   the two paths, so a per-test toggle within a stream would
+    ///   correctly preserve the previous granule's `saved` half.
+    /// * The granule-channel side-info is rewritten:
+    ///   `window_switching_flag = true`, `block_type = Short`,
+    ///   `mixed_block_flag = false`, `subblock_gain = [0; 3]`,
+    ///   `region0_count` / `region1_count` carry the
+    ///   [`crate::short_block::short_block_region_defaults`] (decoder
+    ///   ignores them; see [`crate::huffman`]'s `region_boundaries`).
+    /// * No alias reduction on the encode side (decoder skips it for
+    ///   short blocks).
+    /// * After the per-subband forward MDCT, the 576-line buffer is
+    ///   in subband-window-interleaved layout (line `3·k + win` of each
+    ///   subband's 18-line slot holds frequency bin `k` of short window
+    ///   `win`). [`crate::short_block::forward_reorder`] rewrites the
+    ///   short bands (or short region of a mixed block; not used in
+    ///   this round's force-all-short mode) into the native bitstream
+    ///   `[sfb][win][k]` interleave.
+    ///
+    /// Restrictions in this round:
+    ///
+    /// * **Mono only.** Stereo / joint-stereo / dual-channel + force-short
+    ///   is intentionally rejected by [`Mp3Encoder::force_short_blocks_for_testing`]
+    ///   to keep the integration surface small; the stereo+short combo
+    ///   reuses the same primitive but needs the §2.4.3.4.9 "both channels
+    ///   share the same block type when MS is enabled" wiring + the
+    ///   intensity-stereo per-window bound, which lands in a follow-up
+    ///   round.
+    /// * **No outer loop.** The fixed-gain inner-loop-only path runs
+    ///   for short blocks the same way it does for long blocks; the
+    ///   §C.1.5.4.3 outer loop's long-only API surface
+    ///   ([`crate::outer_loop::outer_loop_search_long`]) is not engaged.
+    /// * **No mixed blocks.** Pure short only; the `mixed_block_flag`
+    ///   long-region split needs the long forward MDCT for subbands 0
+    ///   and 1 plus the short MDCT for the rest, an extra wiring step
+    ///   deferred to a follow-up.
+    ///
+    /// Default `false`; the encoder behaves as in every previous round.
+    force_short_blocks: bool,
 }
 
 /// Variable-bitrate config attached to [`Mp3Encoder`] by
@@ -417,7 +485,44 @@ impl Mp3Encoder {
             crc_enabled: false,
             ms_stereo: false,
             ms_auto_threshold: None,
+            force_short_blocks: false,
         })
+    }
+
+    /// Force every assembled granule onto the §2.4.2.7 short-block
+    /// (`block_type = 2`) encode path; see the
+    /// [`Self::force_short_blocks`] field for the per-granule
+    /// behavioural contract.
+    ///
+    /// Mono-only restriction: short-block encode for stereo / joint /
+    /// dual-channel needs §2.4.3.4.9 cross-channel block-type
+    /// agreement wiring that lands in a follow-up round, so this
+    /// toggle rejects multi-channel encoders.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamEncodeError::StereoUnsupported`] when the encoder's
+    /// channel count is > 1 (the dispatch tag is reused — the actual
+    /// case is "force-short combined with multi-channel," but the
+    /// existing error variant captures the same "channel layout
+    /// unsupported by this opt-in" semantics).
+    pub fn force_short_blocks_for_testing(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), StreamEncodeError> {
+        if enabled && self.nch != 1 {
+            return Err(StreamEncodeError::StereoUnsupported);
+        }
+        self.force_short_blocks = enabled;
+        Ok(())
+    }
+
+    /// `true` when the encoder is forcing every granule onto the
+    /// §2.4.2.7 short-block encode path (see
+    /// [`Self::force_short_blocks_for_testing`]).
+    #[must_use]
+    pub fn force_short_blocks_enabled(&self) -> bool {
+        self.force_short_blocks
     }
 
     /// Build a joint-stereo encoder that emits §2.4.3.4.9.2 **MS-stereo**
@@ -950,48 +1055,104 @@ impl Mp3Encoder {
                     }
                 }
 
-                // Forward MDCT per subband: forward-overlap with the
-                // saved previous granule → window (long) → 36-point
-                // forward MDCT → 18 frequency lines.
+                // Forward MDCT per subband. Two paths:
                 //
-                // Scale derivation. The §2.4.3.4.10.2 IMDCT and the
-                // analysis MDCT use the same unscaled cosine kernel,
-                // so the time-space lapped-MDCT round-trip
-                //   encoder window → MDCT → decoder IMDCT → window →
-                //   overlap-add
-                // recovers the input scaled by `n/4 = 9` (the
-                // Princen-Bradley TDAC factor; see
+                // * **Long block** (default; `force_short_blocks` off):
+                //   forward-overlap with the saved previous granule →
+                //   window (long) → 36-point forward MDCT → 18 frequency
+                //   lines, then inverse-alias-reduce so the decoder's
+                //   forward alias-reduction recovers the post-MDCT
+                //   bins.
+                //
+                // * **Short block** (`force_short_blocks` on; mono-only
+                //   in this round per
+                //   [`Mp3Encoder::force_short_blocks_for_testing`]):
+                //   three independent 12-point MDCTs per subband over
+                //   the lapped 36-sample frame
+                //   ([`crate::short_block::forward_short_mdct_subband`]),
+                //   producing 18 bins in subband-window-interleaved
+                //   layout (`out[3·k + win]`). No alias reduction
+                //   (§2.4.3.4.10.1 scopes it to `block_type != 2`).
+                //   Then [`crate::short_block::forward_reorder`]
+                //   rewrites the bins into the native bitstream
+                //   `[sfb][win][k]` interleave the §2.4.1.7 part3
+                //   Huffman path expects.
+                //
+                // Scale derivation (long path). The §2.4.3.4.10.2
+                // IMDCT and the analysis MDCT use the same unscaled
+                // cosine kernel, so the time-space lapped-MDCT round-
+                // trip `encoder window → MDCT → decoder IMDCT → window
+                // → overlap-add` recovers the input scaled by `n/4 = 9`
+                // (the Princen-Bradley TDAC factor; see
                 // `analysis_synthesis_long_block_tdac_recovery` in
-                // `mdct.rs`). Dividing the forward MDCT output by 9
-                // makes the chain unit-gain.
+                // `mdct.rs`). The short path's analog `n = 12 → n/4 =
+                // 3` is applied inside
+                // [`crate::short_block::forward_short_mdct_subband`].
                 let mut xr = [0.0f32; NUM_LINES];
-                for sb in 0..32 {
-                    let mut current = [0.0f64; LONG_N / 2];
-                    for (t, slot) in current.iter_mut().enumerate() {
-                        *slot = f64::from(inv[sb][t]);
+                if self.force_short_blocks {
+                    // Short-block forward path. Subband sb still owns
+                    // lines [sb*18, (sb+1)*18); the 18 bins per subband
+                    // are window-interleaved (`3·k + win`).
+                    for sb in 0..32 {
+                        let mut current = [0.0f64; LONG_N / 2];
+                        for (t, slot) in current.iter_mut().enumerate() {
+                            *slot = f64::from(inv[sb][t]);
+                        }
+                        let bins = crate::short_block::forward_short_mdct_subband(
+                            &current,
+                            &mut self.mdct_state[ch][sb],
+                        );
+                        let base = sb * 18;
+                        xr[base..base + 18].copy_from_slice(&bins);
                     }
-                    let frame36 = forward_overlap(&current, &mut self.mdct_state[ch][sb]);
-                    let windowed = window_long_family_analysis(&frame36, BlockType::Long);
-                    let bins = mdct(&windowed, LONG_N);
-                    for (k, &b) in bins.iter().enumerate() {
-                        // Long-block xr placement: subband sb owns
-                        // lines [sb*18, (sb+1)*18).
-                        xr[sb * 18 + k] = (b / 9.0) as f32;
+                    // Build a short GranuleChannel to drive the reorder.
+                    let mut gc_short = default_long_gc();
+                    let (r0, r1) = crate::short_block::short_block_region_defaults();
+                    gc_short.window_switching_flag = true;
+                    gc_short.block_type = BlockType::Short;
+                    gc_short.mixed_block_flag = false;
+                    gc_short.region0_count = r0;
+                    gc_short.region1_count = r1;
+                    // Forward reorder: subband-window-interleaved →
+                    // native bitstream [sfb][win][k]. No inverse alias
+                    // reduction (short blocks skip §2.4.3.4.10.1 on the
+                    // decoder side; encoder mirrors).
+                    xr_pre_per_gc[gr][ch] = crate::short_block::forward_reorder(
+                        &xr,
+                        &gc_short,
+                        self.sample_rate_hz,
+                        self.version,
+                    );
+                } else {
+                    // Long-block forward path (default, every round
+                    // prior to 151).
+                    for sb in 0..32 {
+                        let mut current = [0.0f64; LONG_N / 2];
+                        for (t, slot) in current.iter_mut().enumerate() {
+                            *slot = f64::from(inv[sb][t]);
+                        }
+                        let frame36 = forward_overlap(&current, &mut self.mdct_state[ch][sb]);
+                        let windowed = window_long_family_analysis(&frame36, BlockType::Long);
+                        let bins = mdct(&windowed, LONG_N);
+                        for (k, &b) in bins.iter().enumerate() {
+                            // Long-block xr placement: subband sb owns
+                            // lines [sb*18, (sb+1)*18).
+                            xr[sb * 18 + k] = (b / 9.0) as f32;
+                        }
                     }
+                    // Inverse alias reduction. The decoder applies
+                    // `xar[lo] = xr[lo]*cs - xr[hi]*ca` /
+                    // `xar[hi] = xr[hi]*cs + xr[lo]*ca` over the 31
+                    // subband boundaries (8 butterflies each). The
+                    // butterfly is orthogonal (cs²+ca²=1); its inverse
+                    // negates `ca`:
+                    //   xr[lo] = xar[lo]*cs + xar[hi]*ca
+                    //   xr[hi] = xar[hi]*cs - xar[lo]*ca
+                    // For long blocks we apply the inverse here so the
+                    // decoder's forward alias-reduction recovers the
+                    // post-MDCT bins.
+                    xr_pre_per_gc[gr][ch] = inverse_alias_reduce(&xr);
                 }
-
-                // Inverse alias reduction. The decoder applies
-                // `xar[lo] = xr[lo]*cs - xr[hi]*ca` /
-                // `xar[hi] = xr[hi]*cs + xr[lo]*ca` over the 31
-                // subband boundaries (8 butterflies each). The
-                // butterfly is orthogonal (cs²+ca²=1); its inverse
-                // negates `ca`:
-                //   xr[lo] = xar[lo]*cs + xar[hi]*ca
-                //   xr[hi] = xar[hi]*cs - xar[lo]*ca
-                // For long blocks (our scope) we apply the inverse
-                // here so the decoder's forward alias-reduction
-                // recovers the post-MDCT bins.
-                xr_pre_per_gc[gr][ch] = inverse_alias_reduce(&xr);
             }
         }
 
@@ -1129,7 +1290,11 @@ impl Mp3Encoder {
                 //     top of the inner loop, with non-zero per-band
                 //     scalefactor amplification driven by the uniform
                 //     `xmin[sb]` threshold.
-                let gc_template = default_long_gc();
+                let gc_template = if self.force_short_blocks {
+                    default_short_gc()
+                } else {
+                    default_long_gc()
+                };
                 let per_gc_bits = self.per_gc_bit_budget();
                 // When the outer loop runs, part2 (scalefactors) costs
                 // 74 bits per granule-channel (`scalefac_compress = 15`:
@@ -1258,12 +1423,26 @@ impl Mp3Encoder {
                     split = partition_split(&is);
                     bv2 = split.big_pairs * 2;
                     gc.big_values = split.big_pairs as u16;
-                    let (r0e, r1e, r0c, r1c) =
-                        choose_region_split(self.sample_rate_hz, self.version, bv2);
-                    r0_end = r0e;
-                    r1_end = r1e;
-                    gc.region0_count = r0c;
-                    gc.region1_count = r1c;
+                    if self.force_short_blocks {
+                        // §C.1.5.4.4.6 + huffman::region_boundaries:
+                        // short blocks hardcode region 0 to the first 36
+                        // lines and region 1 to the rest of big_values
+                        // (region 2 empty). The transmitted
+                        // region0_count / region1_count are not on the
+                        // wire (encoder::write_granule_channel writes
+                        // the window-switched branch which omits them);
+                        // keep the spec-default sentinels from the
+                        // short template intact.
+                        r0_end = 36usize.min(bv2);
+                        r1_end = bv2;
+                    } else {
+                        let (r0e, r1e, r0c, r1c) =
+                            choose_region_split(self.sample_rate_hz, self.version, bv2);
+                        r0_end = r0e;
+                        r1_end = r1e;
+                        gc.region0_count = r0c;
+                        gc.region1_count = r1c;
+                    }
                     t0 = best_table_or(&is, 0, r0_end);
                     t1 = best_table_or(&is, r0_end, r1_end);
                     t2 = best_table_or(&is, r1_end, bv2);
@@ -1815,6 +1994,34 @@ fn default_long_gc() -> GranuleChannel {
         subblock_gain: [0; 3],
         region0_count: 20,
         region1_count: 0,
+        preflag: false,
+        scalefac_scale: false,
+        count1table_select: false,
+    }
+}
+
+/// A default pure-short-block granule-channel record: window_switching
+/// on, `block_type = Short`, `mixed_block_flag = false`, all
+/// selectors zero, region defaults from
+/// [`crate::short_block::short_block_region_defaults`] (these are not
+/// transmitted on the wire for window-switched blocks per
+/// [`crate::encoder::write_granule_channel`], but populate the struct
+/// for parser-roundtrip equality). Used by the force-short encode path
+/// (see [`Mp3Encoder::force_short_blocks_for_testing`]).
+fn default_short_gc() -> GranuleChannel {
+    let (r0, r1) = crate::short_block::short_block_region_defaults();
+    GranuleChannel {
+        part2_3_length: 0,
+        big_values: 0,
+        global_gain: 0,
+        scalefac_compress: 0,
+        window_switching_flag: true,
+        block_type: BlockType::Short,
+        mixed_block_flag: false,
+        table_select: [0; 3],
+        subblock_gain: [0; 3],
+        region0_count: r0,
+        region1_count: r1,
         preflag: false,
         scalefac_scale: false,
         count1table_select: false,

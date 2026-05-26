@@ -1082,18 +1082,63 @@ proves `threshold = 0` suppresses MS on any non-trivial side energy;
 `make_encoder_joint_stereo_auto_with_threshold_clamps_out_of_range`
 exercise the param-validation surface).
 
+**Phase 2 step 22 (§2.4.3.4.10.2 forward short-block MDCT path)** wires
+the encoder's per-subband forward MDCT to switch from the long-block
+36-point transform to three independent 12-point transforms per
+polyphase subband when the granule's chosen `block_type` is `Short`.
+The new `short_block` module exposes `forward_short_mdct_subband` (the
+three short MDCTs + the subband-window-interleaved layout the
+decoder's `imdct.rs::windowed_block` consumes; output divided by the
+Princen-Bradley `n/4 = 3` scale for unit gain), `forward_reorder`
+(bit-exact inverse of `crate::reorder::reorder`: subband-window-
+interleaved → native bitstream `[sfb][win][k]`), and
+`short_block_region_defaults` (the spec-default short-block region
+sentinels). `Mp3Encoder::force_short_blocks_for_testing` is the
+deterministic test handle for the encode-side primitive: with the
+toggle on (mono only this round; multi-channel needs the §2.4.3.4.9
+cross-channel block-type agreement wiring deferred to a follow-up),
+every assembled granule emits a §2.4.2.7 short block — forward
+analysis runs the three-window short MDCT per subband, no alias
+reduction is applied (§2.4.3.4.10.1 scopes alias reduction to
+`block_type != 2`), the forward reorder rewrites the bins into the
+bitstream interleave, and the per-granule-channel side info carries
+`window_switching_flag = 1`, `block_type = Short`,
+`mixed_block_flag = 0`, `subblock_gain = [0; 3]`, with the §C.1.5.4.4.6
+short-block region split (region 0 hardcoded to the first 36 lines,
+region 1 to the rest of big_values, region 2 empty) honoured by the
+inner loop's region-end + table-select pass. The signal-driven
+attack-detection auto-decision heuristic + the
+LONG → START → SHORT → STOP → LONG transition state machine required
+for mixed long-and-short streams remain a follow-up round; this step
+lands the bitstream-side primitive + the side-info wiring so that
+follow-up only needs to add the decision layer on top. Validated by
+five new integration tests in `tests/short_block_encoder_roundtrip.rs`
+(toggle rejected on stereo encoder; long baseline carries only long
+granules; force-short stream's side info matches the
+window-switched-short skeleton; force-short stream is accepted by
+`Mp3Demuxer::next_packet`; force-short stream decodes end-to-end to
+finite, non-silent PCM with audible zero crossings) and four new
+unit tests in `src/short_block.rs` (forward-reorder ↔ decoder-reorder
+roundtrip at 44.1 kHz pure-short, long-block identity pass-through,
+mixed-block long-region preservation, per-subband forward-MDCT chain
+energy bound).
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
-constant), intensity-stereo encode (§2.4.3.4.9.3), short / mixed
-block-type switching, LSF encode, stereo / LSF decode through the
-trait wrapper — is still a later round.
+constant), intensity-stereo encode (§2.4.3.4.9.3), signal-driven
+**auto** block-type decision (the §C.1.5 attack-detection heuristic +
+the LONG → START → SHORT → STOP → LONG transition state machine; the
+forward short-block MDCT path itself is available behind the
+force-short toggle as of round 151), mixed-block encode, LSF encode,
+and stereo / LSF decode through the trait wrapper — is still a later
+round.
 
 ### Not yet implemented
 
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–21 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–22 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -1108,11 +1153,17 @@ CRC-16 frame protection + independent-stereo (`ChannelMode::Stereo` /
 §2.4.3.4.9.2 joint-stereo MS encode + §C.1.5.4.3 `scalefac_scale 0→1`
 escalation in the outer loop + §C.1.5.4.3.4 preemphasis decision in
 the outer loop + §2.4.2.3 joint-stereo auto MS/LR per-frame picker +
-trait-factory wrappers for the auto MS/LR picker)** — it still lacks
-the psychoacoustic model (so the outer
+trait-factory wrappers for the auto MS/LR picker + §2.4.3.4.10.2
+forward short-block MDCT path with `Mp3Encoder::force_short_blocks_for_testing`
+toggle)** — it still lacks the psychoacoustic model (so the outer
 loop's `xmin(sb)` is a uniform constant rather than per-band
-masking-aware), intensity-stereo encode (§2.4.3.4.9.3), short /
-mixed block-type switching, and LSF encode.
+masking-aware), intensity-stereo encode (§2.4.3.4.9.3), signal-driven
+**auto** block-type decision (the §C.1.5 attack-detection heuristic +
+the LONG → START → SHORT → STOP → LONG transition state machine for
+*mixed* long-and-short streams; the forward short-block MDCT path
+itself is available behind the force-short toggle), mixed-block encode
+(the short forward path is pure-short only this round), and LSF
+encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

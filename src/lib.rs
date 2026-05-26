@@ -374,6 +374,7 @@ pub mod quantize;
 pub mod reorder;
 pub mod requantize;
 pub mod scalefactors;
+pub mod short_block;
 pub mod side_info;
 pub mod stereo;
 pub mod stream_encoder;

@@ -320,6 +320,17 @@ impl MdctState {
     pub fn saved(&self) -> [f64; LONG_N / 2] {
         self.saved
     }
+
+    /// Build a state pre-populated with `saved` as its previous-granule
+    /// memory. Equivalent to `Self::new()` followed by manually setting
+    /// `saved` — exposed because [`crate::short_block::forward_short_mdct_subband`]
+    /// updates the per-subband memory atomically at the end of its
+    /// MDCT chain rather than mid-call, and needs a constructor that
+    /// takes the new value directly.
+    #[must_use]
+    pub fn from_saved(saved: [f64; LONG_N / 2]) -> Self {
+        MdctState { saved }
+    }
 }
 
 /// Assemble the 36-sample forward-MDCT input frame for one
