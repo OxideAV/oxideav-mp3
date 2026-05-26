@@ -445,6 +445,60 @@ pub struct Mp3Encoder {
     ///
     /// Default `false`; the encoder behaves as in every previous round.
     force_mixed_blocks: bool,
+
+    /// When `Some`, every assembled frame's per-granule block type is
+    /// chosen automatically from the PCM input by the
+    /// [`crate::attack_detect::AttackDetector`] + the
+    /// [`crate::block_type_sm::BlockTypeStateMachine`] (§C.1.5.2
+    /// `LONG → START → SHORT → STOP → LONG` transition geometry),
+    /// instead of forcing every granule onto a single block type via
+    /// the [`Self::force_short_blocks_for_testing`] /
+    /// [`Self::force_mixed_blocks_for_testing`] testing toggles.
+    ///
+    /// The carried struct holds the per-channel detector + scheduler
+    /// state across calls to [`Self::push_samples`] / [`Self::finish`].
+    ///
+    /// **Lookahead model.** The §C.1.5.2 transition geometry needs
+    /// **one granule of lookahead** to insert the `Start` window in
+    /// time for the next granule's `Short`. The encoder achieves this
+    /// by holding back the last granule of each
+    /// [`Self::push_samples`] burst until the next granule arrives,
+    /// so a frame is emitted only when its second granule's
+    /// successor is known (`finish` flushes the held-back granules
+    /// as a final frame with a zero-padded lookahead, equivalent to
+    /// "no attack ahead").
+    ///
+    /// **Mono-only restriction.** Auto block-type for stereo / joint
+    /// / dual-channel needs the §2.4.3.4.9 cross-channel block-type
+    /// agreement wiring deferred to a follow-up, so this toggle
+    /// rejects multi-channel encoders. Mutually exclusive with both
+    /// [`Self::force_short_blocks_for_testing`] and
+    /// [`Self::force_mixed_blocks_for_testing`].
+    ///
+    /// Default `None`; the encoder behaves as in every previous
+    /// round (every granule emits a long block).
+    auto_block_type: Option<AutoBlockTypeConfig>,
+}
+
+/// Per-channel auto-block-type state for [`Mp3Encoder`]. Holds the
+/// stateful attack detector + the block-type scheduler that
+/// translate the per-granule attack flags into the §C.1.5.2 transition
+/// geometry. One detector + one scheduler per channel; the mono-only
+/// restriction is enforced at API time so `nch == 1` here.
+#[derive(Debug, Clone)]
+struct AutoBlockTypeConfig {
+    /// Attack-detection ratio threshold (per-subframe energy over the
+    /// running ambient). See
+    /// [`crate::attack_detect::AttackDetector`] for semantics.
+    threshold: f64,
+    /// Per-channel attack detectors. Their ambient-energy estimate
+    /// carries across [`Mp3Encoder::push_samples`] calls.
+    detector: Vec<crate::attack_detect::AttackDetector>,
+    /// Per-channel block-type schedulers. Their `prev` block-type
+    /// carries across [`Mp3Encoder::push_samples`] calls so a burst
+    /// that spans frame boundaries still emits a single coherent
+    /// `Long → Start → Short → Stop → Long` sequence.
+    scheduler: Vec<crate::block_type_sm::BlockTypeStateMachine>,
 }
 
 /// Variable-bitrate config attached to [`Mp3Encoder`] by
@@ -546,6 +600,7 @@ impl Mp3Encoder {
             ms_auto_threshold: None,
             force_short_blocks: false,
             force_mixed_blocks: false,
+            auto_block_type: None,
         })
     }
 
@@ -577,6 +632,9 @@ impl Mp3Encoder {
             // Mixed and pure-short are mutually exclusive: a granule is
             // long, short, or mixed. Enabling pure-short clears mixed.
             self.force_mixed_blocks = false;
+            // Force-toggles and auto block-type are mutually
+            // exclusive: enabling a force-toggle clears auto.
+            self.auto_block_type = None;
         }
         self.force_short_blocks = enabled;
         Ok(())
@@ -619,6 +677,9 @@ impl Mp3Encoder {
             // Mixed and pure-short are mutually exclusive: a granule is
             // long, short, or mixed. Enabling mixed clears short.
             self.force_short_blocks = false;
+            // Force-toggles and auto block-type are mutually
+            // exclusive: enabling a force-toggle clears auto.
+            self.auto_block_type = None;
         }
         self.force_mixed_blocks = enabled;
         Ok(())
@@ -630,6 +691,103 @@ impl Mp3Encoder {
     #[must_use]
     pub fn force_mixed_blocks_enabled(&self) -> bool {
         self.force_mixed_blocks
+    }
+
+    /// Enable **signal-driven auto block-type** dispatch. With this
+    /// on, every assembled frame's per-granule
+    /// [`crate::side_info::BlockType`] is chosen by the
+    /// [`crate::attack_detect::AttackDetector`] +
+    /// [`crate::block_type_sm::BlockTypeStateMachine`] pair, instead
+    /// of the all-long default or the
+    /// [`Self::force_short_blocks_for_testing`] /
+    /// [`Self::force_mixed_blocks_for_testing`] all-forced testing
+    /// paths.
+    ///
+    /// The detector's ratio threshold (subframe energy over the
+    /// running ambient that the loudest subframe must exceed for the
+    /// granule to be flagged) is supplied here; pass
+    /// [`crate::attack_detect::DEFAULT_ATTACK_THRESHOLD`] for the
+    /// suggested-default `10.0`. See
+    /// [`crate::attack_detect`] for tuning guidance.
+    ///
+    /// The lookahead model uses one extra granule of latency, taken
+    /// out of the encoder's existing buffering envelope so the
+    /// `push_samples` / `finish` API contract is unchanged for
+    /// callers (the trailing granule is zero-padded at `finish`).
+    ///
+    /// Restrictions:
+    ///
+    /// * **Mono-only.** Stereo / joint / dual-channel auto needs the
+    ///   §2.4.3.4.9 cross-channel block-type agreement wiring that
+    ///   lands in a follow-up round; this toggle rejects multi-channel
+    ///   encoders.
+    /// * **Mutually exclusive with the force-toggles.** Enabling auto
+    ///   clears [`Self::force_short_blocks`] and
+    ///   [`Self::force_mixed_blocks`] (the testing toggles), and vice
+    ///   versa.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamEncodeError::StereoUnsupported`] when the encoder's
+    /// channel count is > 1.
+    pub fn enable_auto_block_type(&mut self, threshold: f64) -> Result<(), StreamEncodeError> {
+        if self.nch != 1 {
+            return Err(StreamEncodeError::StereoUnsupported);
+        }
+        // The outer loop's `outer_loop_search_long` is long-block only
+        // — its scalefactor bands are the long-family Table 3-B.8 set,
+        // not the short-family per-window set — so auto block-type
+        // (which can emit Short / Start / End granules) is incompatible
+        // with the outer loop until a short-block analogue lands
+        // (Phase 2 step 26+ followup). Reject the combination at
+        // enable-time rather than silently truncating granules.
+        if self.outer_loop_threshold.is_some() {
+            return Err(StreamEncodeError::StereoUnsupported);
+        }
+        // Mutually exclusive with the force-toggles; clear them.
+        self.force_short_blocks = false;
+        self.force_mixed_blocks = false;
+        let detector: Vec<_> = (0..self.nch)
+            .map(|_| crate::attack_detect::AttackDetector::with_threshold(threshold))
+            .collect();
+        let scheduler: Vec<_> = (0..self.nch)
+            .map(|_| crate::block_type_sm::BlockTypeStateMachine::new())
+            .collect();
+        // Read back the effective threshold (the detector clamps
+        // pathological inputs to the default, so capture what it
+        // settled on).
+        let effective_threshold = detector
+            .first()
+            .map(|d| d.threshold())
+            .unwrap_or(crate::attack_detect::DEFAULT_ATTACK_THRESHOLD);
+        self.auto_block_type = Some(AutoBlockTypeConfig {
+            threshold: effective_threshold,
+            detector,
+            scheduler,
+        });
+        Ok(())
+    }
+
+    /// `true` when [`Self::enable_auto_block_type`] is in effect.
+    #[must_use]
+    pub fn auto_block_type_enabled(&self) -> bool {
+        self.auto_block_type.is_some()
+    }
+
+    /// The active auto-block-type threshold (subframe-energy /
+    /// running-ambient ratio that the loudest subframe of a granule
+    /// must exceed to be flagged as carrying an attack). Returns
+    /// `None` when auto block-type is not enabled.
+    #[must_use]
+    pub fn auto_block_type_threshold(&self) -> Option<f64> {
+        self.auto_block_type.as_ref().map(|c| c.threshold)
+    }
+
+    /// Disable the [`Self::enable_auto_block_type`] auto dispatch
+    /// (returns the encoder to the all-long default path). No-op
+    /// when auto was not enabled.
+    pub fn disable_auto_block_type(&mut self) {
+        self.auto_block_type = None;
     }
 
     /// Build a joint-stereo encoder that emits §2.4.3.4.9.2 **MS-stereo**
@@ -996,21 +1154,41 @@ impl Mp3Encoder {
             self.pending_pcm[ch].push(f32::from(s) * SCALE);
         }
 
+        // Auto block-type needs one granule of PCM lookahead beyond
+        // the frame it's currently encoding so the §C.1.5.2
+        // `Long → Start` decision can anticipate the next granule's
+        // attack flag. Hold one extra granule in `pending_pcm` to
+        // satisfy that.
+        let lookahead_pad = if self.auto_block_type.is_some() {
+            SAMPLES_PER_GRANULE
+        } else {
+            0
+        };
+
         // Assemble frames as long as EVERY channel's pending buffer
-        // holds at least one full granule-frame worth of samples.
+        // holds at least one full granule-frame worth of samples
+        // PLUS the auto-block-type lookahead (zero when auto is off).
         while self
             .pending_pcm
             .iter()
-            .all(|buf| buf.len() >= SAMPLES_PER_FRAME_MPEG1)
+            .all(|buf| buf.len() >= SAMPLES_PER_FRAME_MPEG1 + lookahead_pad)
         {
             let mut per_ch_frame_pcm: Vec<Vec<f32>> = Vec::with_capacity(nch);
+            let mut per_ch_lookahead: Vec<Vec<f32>> = Vec::with_capacity(nch);
             for buf in self.pending_pcm.iter_mut() {
                 let mut take = vec![0.0f32; SAMPLES_PER_FRAME_MPEG1];
                 take.copy_from_slice(&buf[..SAMPLES_PER_FRAME_MPEG1]);
+                let mut peek = vec![0.0f32; lookahead_pad];
+                if lookahead_pad > 0 {
+                    peek.copy_from_slice(
+                        &buf[SAMPLES_PER_FRAME_MPEG1..SAMPLES_PER_FRAME_MPEG1 + lookahead_pad],
+                    );
+                }
                 buf.drain(..SAMPLES_PER_FRAME_MPEG1);
                 per_ch_frame_pcm.push(take);
+                per_ch_lookahead.push(peek);
             }
-            self.assemble_frame(&per_ch_frame_pcm)?;
+            self.assemble_frame_with_lookahead(&per_ch_frame_pcm, &per_ch_lookahead)?;
         }
         Ok(())
     }
@@ -1028,24 +1206,38 @@ impl Mp3Encoder {
     ///   retry).
     /// * [`StreamEncodeError::Io`] from the sink writes.
     pub fn finish<W: Write>(mut self, sink: &mut W) -> Result<usize, StreamEncodeError> {
-        // Tail-flush: any leftover per-channel samples shorter than a
-        // full frame are zero-padded so the last 1152 samples per
-        // channel are still emitted. If any channel has non-empty
-        // pending PCM, every channel emits a (potentially padded)
-        // tail frame so the per-channel buffers stay aligned.
-        let any_pending = self.pending_pcm.iter().any(|b| !b.is_empty());
-        if any_pending {
-            let nch = self.nch;
+        // Tail-flush. With auto block-type on, `push_samples` holds
+        // back one extra granule of PCM as the §C.1.5.2 lookahead,
+        // so at finish time we may have between 1 and 1152 + 576
+        // samples per channel still buffered. We emit them as one or
+        // two frames as needed, with a zero-padded "no attack ahead"
+        // lookahead for the very last frame.
+        let nch = self.nch;
+        let auto_on = self.auto_block_type.is_some();
+        loop {
+            let any_pending = self.pending_pcm.iter().any(|b| !b.is_empty());
+            if !any_pending {
+                break;
+            }
             let mut per_ch_tail: Vec<Vec<f32>> = Vec::with_capacity(nch);
+            let mut per_ch_lookahead: Vec<Vec<f32>> = Vec::with_capacity(nch);
             for buf in self.pending_pcm.iter_mut() {
                 let mut tail = vec![0.0f32; SAMPLES_PER_FRAME_MPEG1];
-                for (i, &v) in buf.iter().enumerate() {
-                    tail[i] = v;
-                }
-                buf.clear();
+                let take = buf.len().min(SAMPLES_PER_FRAME_MPEG1);
+                tail[..take].copy_from_slice(&buf[..take]);
+                buf.drain(..take);
                 per_ch_tail.push(tail);
+                // Build the lookahead PCM: if there's a next granule
+                // already in the buffer (still partially full from
+                // the held-back PCM), use it; otherwise zero-pad.
+                let mut peek = vec![0.0f32; if auto_on { SAMPLES_PER_GRANULE } else { 0 }];
+                if auto_on {
+                    let pk = buf.len().min(SAMPLES_PER_GRANULE);
+                    peek[..pk].copy_from_slice(&buf[..pk]);
+                }
+                per_ch_lookahead.push(peek);
             }
-            self.assemble_frame(&per_ch_tail)?;
+            self.assemble_frame_with_lookahead(&per_ch_tail, &per_ch_lookahead)?;
         }
         self.flush_to(sink)
     }
@@ -1097,7 +1289,20 @@ impl Mp3Encoder {
     // `side_info.granules[gr][ch]`, etc.), so the explicit `for ch in
     // 0..self.nch` reads more clearly than an iterator chain.
     #[allow(clippy::needless_range_loop)]
+    /// Back-compatible shim: drives [`Self::assemble_frame_with_lookahead`]
+    /// with an empty lookahead PCM (auto block-type off path).
+    #[allow(dead_code)]
     fn assemble_frame(&mut self, per_ch_frame_pcm: &[Vec<f32>]) -> Result<(), StreamEncodeError> {
+        let empty_lookahead: Vec<Vec<f32>> = (0..self.nch).map(|_| Vec::new()).collect();
+        self.assemble_frame_with_lookahead(per_ch_frame_pcm, &empty_lookahead)
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn assemble_frame_with_lookahead(
+        &mut self,
+        per_ch_frame_pcm: &[Vec<f32>],
+        per_ch_lookahead_pcm: &[Vec<f32>],
+    ) -> Result<(), StreamEncodeError> {
         debug_assert_eq!(per_ch_frame_pcm.len(), self.nch);
         for buf in per_ch_frame_pcm.iter() {
             debug_assert_eq!(buf.len(), SAMPLES_PER_FRAME_MPEG1);
@@ -1139,6 +1344,90 @@ impl Mp3Encoder {
         let mut xr_pre_per_gc: Vec<Vec<[f32; NUM_LINES]>> = (0..GRANULES)
             .map(|_| (0..self.nch).map(|_| [0.0f32; NUM_LINES]).collect())
             .collect();
+
+        // ---- Pre-pass: per-(gr, ch) block type ----
+        //
+        // The per-granule block type is the §C.1.5.2 transition state
+        // for the granule, chosen by one of three policies:
+        //
+        // * **Force toggles** (`force_short_blocks` / `force_mixed_blocks`):
+        //   every granule of every channel takes the forced type.
+        //   Mono-only by API restriction; this branch is the
+        //   r151..r153 path.
+        // * **Auto** (`auto_block_type.is_some()`): the
+        //   [`crate::attack_detect::AttackDetector`] classifies each
+        //   granule (and the lookahead granule) and the
+        //   [`crate::block_type_sm::BlockTypeStateMachine`] schedules
+        //   the §C.1.5.2 LONG → START → SHORT → STOP → LONG sequence
+        //   per channel.
+        // * **Default (all-long)**: every granule emits `Long`; this
+        //   is the path every round prior to 156 took.
+        //
+        // The block-type matrix decides which MDCT path each
+        // (gr, ch) tile takes below (long-family forward MDCT for
+        // Long / Start / End; three short forward MDCTs for Short;
+        // mixed for force-mixed). It also picks which
+        // `default_*_gc()` skeleton becomes the side-info template
+        // in pass 2.
+        let block_type_per_gc: [[BlockType; 2]; GRANULES] =
+            if let Some(ref mut cfg) = self.auto_block_type {
+                // Auto path: classify each of the 2 frame granules + 1
+                // lookahead granule per channel, then feed the scheduler.
+                // Channel-0 only this round (mono restriction enforced at
+                // `enable_auto_block_type`).
+                let mut out: [[BlockType; 2]; GRANULES] = [[BlockType::Long; 2]; GRANULES];
+                for ch in 0..self.nch {
+                    // 3 attack flags: gr0, gr1, lookahead (gr2 of the
+                    // virtual three-granule window). Lookahead is empty
+                    // at end-of-stream — treat that as "no attack ahead".
+                    let mut pcm_g0 = [0.0f32; SAMPLES_PER_GRANULE];
+                    let mut pcm_g1 = [0.0f32; SAMPLES_PER_GRANULE];
+                    let mut pcm_g2 = [0.0f32; SAMPLES_PER_GRANULE];
+                    pcm_g0.copy_from_slice(&per_ch_frame_pcm[ch][0..SAMPLES_PER_GRANULE]);
+                    pcm_g1.copy_from_slice(
+                        &per_ch_frame_pcm[ch][SAMPLES_PER_GRANULE..2 * SAMPLES_PER_GRANULE],
+                    );
+                    let look = &per_ch_lookahead_pcm[ch];
+                    if !look.is_empty() {
+                        let n = look.len().min(SAMPLES_PER_GRANULE);
+                        pcm_g2[..n].copy_from_slice(&look[..n]);
+                    }
+                    let a0 = cfg.detector[ch].classify(&pcm_g0);
+                    let a1 = cfg.detector[ch].classify(&pcm_g1);
+                    let lookahead_present = !look.is_empty();
+                    // Lookahead PCM may itself be empty (end-of-stream)
+                    // or all-zero (zero-padded tail-flush). In either
+                    // case we feed the scheduler `next_attack = false`
+                    // so the burst geometry closes cleanly with a Stop.
+                    // We do NOT classify a zero-padded buffer because
+                    // that would inject a spurious silent-floor sample
+                    // into the detector's ambient estimate; instead we
+                    // peek non-destructively by cloning the detector and
+                    // discard the resulting state.
+                    let a2 = if lookahead_present {
+                        let mut det_peek = cfg.detector[ch].clone();
+                        det_peek.classify(&pcm_g2)
+                    } else {
+                        false
+                    };
+                    // Feed the scheduler in granule-major order.
+                    let bt0 = cfg.scheduler[ch].step(a0, a1);
+                    let bt1 = cfg.scheduler[ch].step(a1, a2);
+                    out[0][ch] = bt0;
+                    out[1][ch] = bt1;
+                }
+                out
+            } else if self.force_short_blocks {
+                [[BlockType::Short; 2]; GRANULES]
+            } else if self.force_mixed_blocks {
+                // Mixed is still `block_type == Short` on the wire (the
+                // mixed_block_flag selects long-region carve-out
+                // separately).
+                [[BlockType::Short; 2]; GRANULES]
+            } else {
+                [[BlockType::Long; 2]; GRANULES]
+            };
+
         for gr in 0..GRANULES {
             for ch in 0..self.nch {
                 let gr_pcm =
@@ -1215,7 +1504,68 @@ impl Mp3Encoder {
                 // 3` is applied inside
                 // [`crate::short_block::forward_short_mdct_subband`].
                 let mut xr = [0.0f32; NUM_LINES];
-                if self.force_short_blocks {
+                let auto_bt_active = self.auto_block_type.is_some();
+                let auto_bt = block_type_per_gc[gr][ch];
+                if auto_bt_active {
+                    // Auto block-type dispatch. The §C.1.5.2 sequence
+                    // can put any of Long / Start / Short / End on this
+                    // granule. Long-family (Long / Start / End) all use
+                    // the 36-point forward MDCT with a block-type-specific
+                    // window from `window_long_family_analysis`; Short
+                    // uses the three 12-point forward MDCTs per subband
+                    // from `forward_short_mdct_subband`. Alias reduction
+                    // is applied on Long / Start / End (decoder's
+                    // §2.4.3.4.10.1 gate is `block_type == Short`).
+                    match auto_bt {
+                        BlockType::Short => {
+                            for sb in 0..32 {
+                                let mut current = [0.0f64; LONG_N / 2];
+                                for (t, slot) in current.iter_mut().enumerate() {
+                                    *slot = f64::from(inv[sb][t]);
+                                }
+                                let bins = crate::short_block::forward_short_mdct_subband(
+                                    &current,
+                                    &mut self.mdct_state[ch][sb],
+                                );
+                                let base = sb * 18;
+                                xr[base..base + 18].copy_from_slice(&bins);
+                            }
+                            let mut gc_short = default_long_gc();
+                            let (r0, r1) = crate::short_block::short_block_region_defaults();
+                            gc_short.window_switching_flag = true;
+                            gc_short.block_type = BlockType::Short;
+                            gc_short.mixed_block_flag = false;
+                            gc_short.region0_count = r0;
+                            gc_short.region1_count = r1;
+                            xr_pre_per_gc[gr][ch] = crate::short_block::forward_reorder(
+                                &xr,
+                                &gc_short,
+                                self.sample_rate_hz,
+                                self.version,
+                            );
+                        }
+                        BlockType::Long | BlockType::Start | BlockType::End => {
+                            for sb in 0..32 {
+                                let mut current = [0.0f64; LONG_N / 2];
+                                for (t, slot) in current.iter_mut().enumerate() {
+                                    *slot = f64::from(inv[sb][t]);
+                                }
+                                let frame36 =
+                                    forward_overlap(&current, &mut self.mdct_state[ch][sb]);
+                                let windowed = window_long_family_analysis(&frame36, auto_bt);
+                                let bins = mdct(&windowed, LONG_N);
+                                for (k, &b) in bins.iter().enumerate() {
+                                    xr[sb * 18 + k] = (b / 9.0) as f32;
+                                }
+                            }
+                            // Alias reduction is applied by the decoder
+                            // for block_type != Short, so we invert it
+                            // here just as the all-long default path
+                            // does.
+                            xr_pre_per_gc[gr][ch] = inverse_alias_reduce(&xr);
+                        }
+                    }
+                } else if self.force_short_blocks {
                     // Short-block forward path. Subband sb still owns
                     // lines [sb*18, (sb+1)*18); the 18 bins per subband
                     // are window-interleaved (`3·k + win`).
@@ -1473,7 +1823,23 @@ impl Mp3Encoder {
                 //     top of the inner loop, with non-zero per-band
                 //     scalefactor amplification driven by the uniform
                 //     `xmin[sb]` threshold.
-                let gc_template = if self.force_short_blocks {
+                let gc_template = if self.auto_block_type.is_some() {
+                    // Auto block-type: pick the side-info skeleton
+                    // that matches the per-(gr, ch) chosen block type
+                    // from the pre-pass above. Long stays on the
+                    // default-long skeleton; Start/End take the
+                    // long-family transition skeleton; Short takes the
+                    // pure-short skeleton. Mixed is unreachable from
+                    // the auto scheduler this round (no Mixed
+                    // transition in the LONG→START→SHORT→STOP path).
+                    match block_type_per_gc[gr][ch] {
+                        BlockType::Long => default_long_gc(),
+                        BlockType::Start | BlockType::End => {
+                            default_transition_gc(block_type_per_gc[gr][ch])
+                        }
+                        BlockType::Short => default_short_gc(),
+                    }
+                } else if self.force_short_blocks {
                     default_short_gc()
                 } else if self.force_mixed_blocks {
                     default_mixed_gc()
@@ -2186,6 +2552,44 @@ fn default_mixed_gc() -> GranuleChannel {
         subblock_gain: [0; 3],
         // Wire field widths are 4-bit / 3-bit; the decoder regenerates
         // these for window-switched blocks regardless of carried values.
+        region0_count: 7,
+        region1_count: 7,
+        preflag: false,
+        scalefac_scale: false,
+        count1table_select: false,
+    }
+}
+
+/// A default window-switched long-family granule-channel record for
+/// the §C.1.5.2 transition block types — `Start` (block_type 1) and
+/// `End` (block_type 3, "Stop"). Identical to
+/// [`default_long_gc`] except `window_switching_flag = true`,
+/// `block_type` is the carried value, and the region-count fields
+/// follow the §C.1.5.4.4.6 spec-default for window-switched long-family
+/// granules (`region0_count = 7` for `Start`/`End`, with `region1_count`
+/// = 36 to round out the big-values count; the parser regenerates the
+/// 4-bit-field default but the writer round-trips whatever we set).
+/// Used by the auto block-type path
+/// ([`Mp3Encoder::enable_auto_block_type`]).
+fn default_transition_gc(block_type: BlockType) -> GranuleChannel {
+    debug_assert!(matches!(block_type, BlockType::Start | BlockType::End));
+    GranuleChannel {
+        part2_3_length: 0,
+        big_values: 0,
+        global_gain: 0,
+        scalefac_compress: 0,
+        window_switching_flag: true,
+        block_type,
+        mixed_block_flag: false,
+        table_select: [0; 3],
+        subblock_gain: [0; 3],
+        // For window-switched long-family blocks (Start/End) the
+        // §C.1.5.4.4.6 default region split is the same window-switched
+        // skeleton the parser regenerates for short blocks
+        // (region0_count = 7 covers SFB 0..7, the parser then
+        // reconstructs the rest). The decoder doesn't act on the
+        // carried value for window-switched granules; the writer just
+        // needs to emit a structurally legal field.
         region0_count: 7,
         region1_count: 7,
         preflag: false,

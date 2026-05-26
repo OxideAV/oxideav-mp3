@@ -1242,15 +1242,99 @@ present step lands only the framing layer so a downstream demuxer
 can iterate / introspect / re-emit MPEG-2.5 frames without
 upgrading the audio-decode chain.
 
+**Phase 2 step 26 (signal-driven auto block-type dispatch)** replaces
+the global force-toggles with a per-granule decision driven by
+content, finally closing the long-standing follow-up the
+step-22 / step-23 short-block / mixed-block primitives flagged. Two
+new modules carry the logic:
+
+* The `attack_detect` module exposes a stateful `AttackDetector` that
+  splits each granule's 576 PCM samples into three 192-sample
+  subframes (matching the §2.4.2.7 three-window short-block
+  partition), computes per-subframe sum-of-squares energy, and flags
+  the granule as carrying an attack iff the loudest subframe exceeds
+  `threshold ×` the running ambient. The ambient is an exponentially
+  smoothed `min`-floor of recent subframe energies with leakage
+  `0.5`: slow enough to ride a sustained transient train without
+  rising into it, fast enough to track genuine background-level
+  changes within ≈ 4 granules. Default ratio `10.0`; the module
+  docs detail the tuning envelope (≥ 30 reserves shorts for only
+  the most extreme bursts, ≤ 3 over-fires on almost any modulated
+  signal). No external implementation was consulted — every
+  constant and every formula is justified by the clean-room
+  reasoning at the top of the module (energy localisation,
+  ambient-floor stability, IIR leakage).
+
+* The `block_type_sm` module exposes the §C.1.5.2
+  `LONG → START → SHORT → STOP → LONG` transition state machine that
+  turns the per-granule attack flags into geometrically valid
+  `BlockType` decisions. The machine takes one granule of lookahead
+  (`step(cur_attack, next_attack)`) so a `Start` window can be
+  committed in time to splice into the next granule's `Short` head.
+  The state transitions cover: sustained burst trains
+  (`Short → Short` as long as either current or next granule still
+  carries an attack), burst-then-quiet
+  (`Short → End → Long`), back-to-back bursts separated by at least
+  one Long granule (the post-`Stop` Long is mandatory because
+  `End`'s tail is the long-window tail; a `Short` head can't
+  splice into it), and the
+  `cur_attack`-without-`next_attack` "burst arrived without
+  anticipation" case that conservatively falls back to `Long`
+  (we can't retroactively emit a `Start` for the previous
+  granule). The transition geometry is all derived from
+  §2.4.3.4.10.3's window shapes plus the §2.4.3.4.10.4
+  overlap-add identity.
+
+`Mp3Encoder::enable_auto_block_type(threshold)` is the opt-in API
+that wires these together. The push / finish API contract is
+preserved: `push_samples` holds back one extra granule of PCM as
+the scheduler's lookahead while still emitting one frame per
+1152-sample chunk in steady state; `finish` zero-pads the
+held-back tail with a "no attack ahead" lookahead so the burst
+geometry closes cleanly with a `Stop` if the stream's last
+granule was inside a burst. The encoder dispatches per granule
+between four MDCT paths — the long-family forward 36-point MDCT
+with `BlockType::Long` / `Start` / `End` selecting the
+appropriate `window_long_family_analysis` shape for the granule,
+or three independent 12-point forward MDCTs via
+`short_block::forward_short_mdct_subband` for `Short` — and
+gates inverse alias reduction on `block_type != Short` per the
+literal §2.4.3.4.10.1 wording. The side-info wiring
+(`window_switching_flag` / `block_type` / window-switched-branch
+defaults) follows the chosen block type per granule too.
+
+Restrictions this round: mono only (cross-channel block-type
+agreement under §2.4.3.4.9 needed for stereo / joint /
+dual-channel), mutually exclusive with the existing
+force-toggles and with the outer loop (the long-only
+`outer_loop_search_long` doesn't yet handle Short / Start / End
+granules — a per-window `subblock_gain` short-block analogue is
+the natural follow-up). Validated by 27 new tests: 10 unit tests
+in `attack_detect.rs` (silent / unit-DC subframe energies, pure
+sine no-fire, step-burst flagged, pure silence not flagged with
+bounded ambient, detector adapts after repeated bursts, click
+after silence flagged, invalid-threshold fallback, reset clears
+ambient), 8 unit tests in `block_type_sm.rs` (all-calm Long-only,
+single burst emits Start/Short/Stop/Long, sustained burst holds
+Short, two bursts with a Long gap both fire, current-only attack
+without lookahead falls back to Long, Start → Short invariant,
+Stop → Long invariant even on immediate burst, reset to Long),
+and 9 integration tests in
+`tests/auto_block_type_roundtrip.rs` (stereo rejection, default
+off, enable/disable round trip, mutual exclusion with
+force-short / force-mixed / outer-loop, pure sine stays Long,
+click train engages Start / Short / End with §C.1.5.2
+transition-validity assertions on every emitted pair, demuxer
+acceptance of the auto stream). Net: 523 tests pass (was 496).
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
-(so the loop can spectrally redistribute bits without a hand-tuned
-constant), intensity-stereo encode (§2.4.3.4.9.3), signal-driven
-**auto** block-type decision (the §C.1.5 attack-detection heuristic +
-the LONG → START → SHORT → STOP → LONG transition state machine; the
-forward short-block and mixed-block MDCT paths themselves are
-available behind the force-short / force-mixed toggles as of rounds
-151 / 152), LSF encode, and stereo / LSF decode through the trait
-wrapper — is still a later round.
+(so the outer loop can spectrally redistribute bits without a
+hand-tuned constant), intensity-stereo encode (§2.4.3.4.9.3),
+§C.1.5.4.3 outer-loop short-block analogue (per-window
+`subblock_gain` search; needed before the auto block-type path of
+step 26 can run with the outer loop on), multi-channel short / mixed
+block-type agreement (§2.4.3.4.9), LSF encode, and stereo / LSF
+decode through the trait wrapper — is still a later round.
 
 ### Not yet implemented
 
@@ -1260,7 +1344,7 @@ scalefactor paths — are present; the wrapper is mono MPEG-1 only this
 round; the framing layer accepts MPEG-2.5 as of step 25 but the
 trait-wrapper audio-decode chain still rejects it pending the
 `MPEG-2.5-GAP.md` observer-trace items). The encoder is **Phase 1
-framing + Phase 2 steps 1–25 (forward MDCT primitive + analysis
+framing + Phase 2 steps 1–26 (forward MDCT primitive + analysis
 windowing + forward overlap split + polyphase analysis subband
 filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
@@ -1280,24 +1364,24 @@ forward short-block MDCT path with `Mp3Encoder::force_short_blocks_for_testing`
 toggle + §2.4.2.7 forward mixed-block MDCT path with
 `Mp3Encoder::force_mixed_blocks_for_testing` toggle + §C.1.5.4.4.8
 linbits-reach filter in the Huffman table chooser + MPEG-2.5 frame
-header parse + writer + sample-rate-table dispatch)** — it still
-lacks the psychoacoustic model (so the outer loop's `xmin(sb)` is a
-uniform constant rather than per-band masking-aware),
-intensity-stereo encode (§2.4.3.4.9.3), signal-driven **auto**
-block-type decision (the §C.1.5 attack-detection heuristic + the
-LONG → START → SHORT → STOP → LONG transition state machine for
-*mixed* long-and-short streams; the forward short-block and
-mixed-block MDCT paths themselves are available behind the
-force-short / force-mixed toggles), multi-channel short/mixed
+header parse + writer + sample-rate-table dispatch + §C.1.5
+signal-driven attack-detection heuristic and §C.1.5.2
+`LONG → START → SHORT → STOP → LONG` transition state machine via
+`Mp3Encoder::enable_auto_block_type`)** — it still lacks the
+psychoacoustic model (so the outer loop's `xmin(sb)` is a uniform
+constant rather than per-band masking-aware), intensity-stereo
+encode (§2.4.3.4.9.3), multi-channel short / mixed / auto-block-type
 support (§2.4.3.4.9 cross-channel block-type agreement is the gap
-the force-short / force-mixed toggles reject stereo on), §C.1.5.4.3
-outer-loop short-block analogue (the long-only `outer_loop_search_long`
-needs a per-window `subblock_gain` search), and LSF / MPEG-2.5
-encode (the framing layer round-trips MPEG-2.5 headers but the
-encoder's stream-level driver still rejects non-MPEG-1 streams; the
-MPEG-2.5-specific scalefactor-band tables + Huffman table mapping
-+ low-rate frame-size validation items in `MPEG-2.5-GAP.md` are
-needed before bit-exact MPEG-2.5 encode is implementable).
+the force-short / force-mixed toggles and the new auto path reject
+stereo on), §C.1.5.4.3 outer-loop short-block analogue (the
+long-only `outer_loop_search_long` needs a per-window
+`subblock_gain` search before the auto block-type path can run with
+the outer loop on), and LSF / MPEG-2.5 encode (the framing layer
+round-trips MPEG-2.5 headers but the encoder's stream-level driver
+still rejects non-MPEG-1 streams; the MPEG-2.5-specific
+scalefactor-band tables + Huffman table mapping + low-rate
+frame-size validation items in `MPEG-2.5-GAP.md` are needed before
+bit-exact MPEG-2.5 encode is implementable).
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

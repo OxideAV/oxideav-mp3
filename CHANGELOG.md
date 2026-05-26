@@ -8,6 +8,71 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Signal-driven auto block-type dispatch** (Phase 2 step 26).
+  Replaces the global force-toggles with a per-granule decision
+  driven by content. Two new modules carry the logic:
+  - `attack_detect` — a stateful `AttackDetector` that splits each
+    granule's 576 PCM samples into three 192-sample subframes
+    (matching the Layer III three-window short-block partition of
+    §2.4.2.7), computes per-subframe sum-of-squares energy, and flags
+    the granule as carrying an attack iff the loudest subframe
+    exceeds `threshold ×` the running ambient (an exponentially
+    smoothed `min`-floor of recent subframe energies with leakage
+    `0.5`). Default ratio `10.0`; module docs explain tuning. No
+    external reference was consulted — every constant is justified
+    by the clean-room reasoning in the module's preamble.
+  - `block_type_sm` — the §C.1.5.2
+    `LONG → START → SHORT → STOP → LONG` transition state machine
+    that turns the per-granule attack flags into geometrically
+    valid `BlockType` decisions. Takes one granule of lookahead
+    (`step(cur_attack, next_attack)`) so a `Start` window is
+    committed in time to splice into the next granule's `Short`
+    head; covers sustained bursts (`Short → Short`), burst-then-quiet
+    (`Short → End → Long`), and back-to-back bursts separated by at
+    least one Long granule. A `cur_attack` without a `next_attack`
+    is conservatively dropped (no `Start` available; falls back to
+    `Long`) — documented in the module preamble.
+  - `Mp3Encoder::enable_auto_block_type(threshold)` opt-in API
+    wires the detector + scheduler into the per-frame assemble
+    path. The push/finish API contract is preserved: the
+    `push_samples` loop holds back one extra granule as the
+    scheduler's lookahead while still emitting one frame per
+    1152-sample chunk in steady state; `finish` zero-pads the
+    held-back tail with a "no attack ahead" lookahead.
+  - Mutually exclusive with `force_short_blocks_for_testing`,
+    `force_mixed_blocks_for_testing`, and the outer loop (the
+    long-block-only `outer_loop_search_long` doesn't yet handle
+    Short / Start / End granules); enabling auto clears the
+    force-toggles and vice versa, and a configured outer loop
+    rejects the auto enable at API time.
+  - Mono-only this round; cross-channel block-type agreement
+    (§2.4.3.4.9) for stereo / joint / dual-channel auto block-type
+    deferred to a follow-up.
+  - Side-info wiring: the encoder emits the correct
+    `window_switching_flag` / `block_type` per granule, dispatches
+    the MDCT path (long-family 36-point with the Start / End
+    asymmetric windows from `mdct::window_long_family_analysis`,
+    three 12-point short MDCTs via
+    `short_block::forward_short_mdct_subband` for Short granules),
+    and gates inverse alias reduction on `block_type != Short` per
+    §2.4.3.4.10.1.
+  - Validated by 27 new tests: 10 unit tests in `attack_detect`
+    (silent / unit-DC subframe energies, pure-sine no-fire,
+    step-burst flagged, pure-silence not flagged + bounded
+    ambient, detector-adapts-after-bursts, click-after-silence
+    flagged, invalid-threshold fallback, reset clears ambient),
+    8 unit tests in `block_type_sm` (all-calm Long-only,
+    single-burst Start/Short/Stop/Long emission, sustained-burst
+    holds Short, two-bursts with Long gap, current-only attack
+    without lookahead falls back to Long, reset, Start→Short
+    invariant, Stop→Long invariant), and 9 integration tests in
+    `tests/auto_block_type_roundtrip.rs` covering the API surface
+    (stereo rejection, default-off, enable/disable round-trip,
+    mutual exclusion with force-short / force-mixed / outer-loop),
+    pure-sine staying long, click-train engaging Start / Short / End
+    with §C.1.5.2 transition-validity assertions on every emitted
+    pair, and demuxer-acceptance of the auto stream.
+
 - **MPEG-2.5 frame-parser support** (Phase 2 step 25). The framing
   layer now accepts the proprietary Fraunhofer-IIS "MPEG-2.5"
   extension documented in `docs/audio/mp3/MPEG-2.5-GAP.md` (Popp /

@@ -358,6 +358,8 @@
 
 pub mod alias;
 pub mod analysis;
+pub mod attack_detect;
+pub mod block_type_sm;
 pub mod codec_decoder;
 pub mod codec_encoder;
 pub mod crc;
@@ -383,6 +385,11 @@ pub mod xing_info;
 
 pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
 pub use analysis::{analyze_granule, analyze_row, m_coefficient, AnalysisState, C_TABLE, X_LEN};
+pub use attack_detect::{
+    granule_subframe_energies, subframe_energy, AttackDetector, DEFAULT_ATTACK_THRESHOLD,
+    SAMPLES_PER_SUBFRAME, SILENCE_FLOOR as ATTACK_SILENCE_FLOOR, SUBFRAMES_PER_GRANULE,
+};
+pub use block_type_sm::BlockTypeStateMachine;
 pub use codec_decoder::{make_decoder, register_codecs, Mp3CoreDecoder};
 pub use codec_encoder::{
     make_encoder, make_encoder_joint_stereo_auto, make_encoder_joint_stereo_auto_with_threshold,
