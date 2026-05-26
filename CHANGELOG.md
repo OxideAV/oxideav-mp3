@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `codec_decoder` module — the symmetric counterpart to the r140
+  `codec_encoder` wiring: `Mp3CoreDecoder` implements
+  `oxideav_core::Decoder` for mono MPEG-1 Layer III, parsing each
+  inbound `Packet`'s MP3 frame and walking the existing per-granule
+  `decode_huffman` → `requantize` → `alias_reduce` → `imdct_granule`
+  → `synth_granule` chain, converting the float PCM run to interleaved
+  S16 little-endian bytes for the returned `AudioFrame`. Per-stream
+  state — the §2.4.2.7 main-data bit reservoir, the §2.4.3.4.10.4
+  IMDCT overlap memory, and the §2.4.3.2 polyphase synthesis filter-
+  bank shift register — is carried across packets. `reset()` wipes all
+  three so the next `send_packet` decodes as if it were the first
+  (the `Decoder` trait's documented contract for post-seek recovery).
+- `codec_decoder::make_decoder` — direct-API factory matching the
+  `oxideav-core` `DecoderFactory` signature. This is the dual-API
+  convention preserved alongside the direct decode primitives
+  (`decode_huffman` / `requantize` / etc.), which remain the historical
+  entry point.
+- `codec_decoder::register_codecs` — replacement codec-registry
+  installer that registers BOTH the decoder factory AND the encoder
+  factory on a single `CodecInfo` (so the registry's
+  `implementations(codec_id)` lookup returns one entry that advertises
+  both capabilities). `crate::register` now calls this variant; the
+  prior `codec_encoder::register_codecs` (encoder-only) remains
+  available as a public function for callers that want encoder-only
+  registration.
+- `tests/decoder_trait_roundtrip.rs` integration suite:
+  - `registry_decoder_emits_audio_frames_with_monotonic_pts` — 250 ms
+    of sine driven through the registered `oxideav_core::Decoder`
+    trait API, confirms each emitted `AudioFrame` carries 1152 samples
+    per channel and a monotonic PTS stamped from the inbound packet.
+  - `registry_decoder_byte_exact_against_direct_chain` — the round-
+    mandate's bit-exact check: 500 ms of sine encoded → sliced into
+    per-MP3-frame packets → driven through the trait Decoder, asserts
+    the resulting i16 PCM byte stream equals the direct-chain output
+    (`decode_huffman` → `requantize` → `alias_reduce` →
+    `imdct_granule` → `synth_granule`) on the same input bytes,
+    sample-for-sample.
+  - `registry_installs_both_encoder_and_decoder_factories` —
+    `RuntimeContext` smoke test confirming `has_decoder` AND
+    `has_encoder` on `"mp3"` after a single `register(&mut ctx)` call.
 - `codec_encoder` module **Phase 2 step 12** — the runtime-context
   `oxideav_core::Encoder` trait wiring on top of the r138/r139
   `Mp3Encoder` stream encoder. `Mp3CoreEncoder` is a frame-to-packet

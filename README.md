@@ -754,42 +754,58 @@ schedule, and `receive_packet` drains one MP3 frame at a time (PTS and
 duration stamped in `1 / sample_rate` units). Two direct factories —
 `codec_encoder::make_encoder` (fixed-gain) and
 `codec_encoder::make_encoder_with_outer_loop` (distortion-control
-loop) — match the `oxideav-core` `EncoderFactory` signature, and
-`crate::register` now installs both the container demuxer and the
-encoder factory in one call (codec id `"mp3"`, WAVE tag `0x0055`,
-Matroska `A_MPEG/L3`). Validated by `tests/encoder_trait_roundtrip.rs`:
-the registered encoder, driven through the trait API only, round-trips
-a 1 s 440 Hz sine at **86.17 dB PSNR** — matching the direct-API
-baseline, confirming the adapter introduces no PSNR loss.
+loop) — match the `oxideav-core` `EncoderFactory` signature.
+Validated by `tests/encoder_trait_roundtrip.rs`: the registered
+encoder, driven through the trait API only, round-trips a 1 s 440 Hz
+sine at **86.17 dB PSNR** — matching the direct-API baseline,
+confirming the adapter introduces no PSNR loss.
+
+The `codec_decoder` module ships the **symmetric** decoder-side
+trait wiring. `Mp3CoreDecoder` implements `oxideav_core::Decoder`:
+`send_packet` parses one inbound MP3 frame (header + optional CRC +
+side-info + main-data slot), runs the per-granule
+`decode_huffman` → `requantize` → `alias_reduce` → `imdct_granule` →
+`synth_granule` chain, and queues an `AudioFrame` of interleaved S16
+PCM (1152 samples/channel for MPEG-1 Layer III). Per-stream state —
+the §2.4.2.7 bit reservoir, the §2.4.3.4.10.4 IMDCT overlap memory,
+and the §2.4.3.2 polyphase synthesis filterbank shift register — is
+carried across packets; `reset()` wipes all three for post-seek
+recovery. `codec_decoder::make_decoder` is the direct-API factory
+matching `oxideav-core`'s `DecoderFactory` signature.
+`crate::register` now installs the container demuxer **and** both
+codec factories on a single `CodecInfo` (codec id `"mp3"`, WAVE tag
+`0x0055`, Matroska `A_MPEG/L3`). Validated by
+`tests/decoder_trait_roundtrip.rs`: a 500 ms sine encoded → sliced
+into per-frame packets → driven through the trait Decoder produces
+i16 PCM **byte-exact identical** to the direct-chain output on the
+same input bytes (sample-for-sample match), and 250 ms of sine yields
+the expected count of `AudioFrame`s with 1152 samples/channel and
+monotonic PTS.
 
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), preemphasis (§C.1.5.4.3.4) and `scalefac_scale = 1`
-escalation, short / mixed block-type switching, stereo / LSF, and the
-`Decoder` trait wiring on top of the existing decode chain —
-is still a later round.
+escalation, short / mixed block-type switching, stereo / LSF / VBR
+encode, stereo / LSF decode through the trait wrapper — is still a
+later round.
 
 ### Not yet implemented
 
-No frame-driver / `Decoder` plumbing yet (the granule-level chain is
-complete; what's missing is the per-frame iteration that consumes
-[`FrameWalker`] frames, parses header + side-info + scalefactors,
-Huffman-decodes both granules per channel, runs the full pipeline, and
-emits a contiguous PCM buffer to the runtime context). The encoder is
-**Phase 1 framing + Phase 2 steps 1–11 (forward MDCT primitive +
-analysis windowing + forward overlap split + polyphase analysis
-subband filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
-inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
-count + §2.4.1.7 Huffman bit emission + §2.4.1.7 main-data assembly +
-§2.4.2.7 cross-frame bit-reservoir scheduling with
-`main_data_begin > 0` + stream-level PCM → MP3 driver + §C.1.5.4.3
-outer (distortion-control) loop + `oxideav_core::Encoder` trait
-wiring)** — it still lacks the psychoacoustic model (so the outer
-loop's `xmin(sb)` is a uniform constant rather than per-band
+Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
+underlying primitives — `process_stereo` and the LSF side-info /
+scalefactor paths — are present; the wrapper is mono MPEG-1 only this
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–11 (forward
+MDCT primitive + analysis windowing + forward overlap split +
+polyphase analysis subband filterbank + §2.4.3.4.7 quantization
+primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
+§C.1.5.4.4.5/.8 Huffman bit count + §2.4.1.7 Huffman bit emission +
+§2.4.1.7 main-data assembly + §2.4.2.7 cross-frame bit-reservoir
+scheduling with `main_data_begin > 0` + stream-level PCM → MP3 driver
++ §C.1.5.4.3 outer (distortion-control) loop + `oxideav_core::Encoder`
+trait wiring)** — it still lacks the psychoacoustic model (so the
+outer loop's `xmin(sb)` is a uniform constant rather than per-band
 masking-aware), preemphasis / `scalefac_scale = 1` escalation, short /
-mixed block-type switching, and stereo / LSF / VBR. `register()` now
-installs the container demuxer **and** the codec `Encoder` factory in
-one call; the codec `Decoder` trait surface remains a stub.
+mixed block-type switching, and stereo / LSF / VBR encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
