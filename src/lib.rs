@@ -305,6 +305,20 @@
 //! output, filling in `frames` / `bytes` from post-encode totals when
 //! the corresponding flag bit is set and the template field is `None`.
 //!
+//! The [`crc`] module adds the encoder-side **opt-in §2.4.3.1 / Annex B
+//! Table B.5 CRC-16 frame protection** (Phase 2 step 15).
+//! [`crc::crc16_bits`] is the raw-bit-stream §2.4.3.1 shift-register
+//! primitive (`G(X) = X^16 + X^15 + X^2 + 1`, initial state
+//! [`CRC_INITIAL_STATE`] = `0xFFFF`); [`crc::crc16_layer3`] wraps it for
+//! the Layer III protected set (header bits 16…31 plus the first 135
+//! side-info bits in single-channel mode, or 256 bits in other modes).
+//! [`Mp3Encoder::with_protection_bit`] is the opt-in toggle: once on,
+//! every emitted audio frame carries the 2-byte CRC slot between header
+//! and side-info, sets the wire `protection_bit = 0`, and consumes 2
+//! bytes of main-data slot capacity (the §2.4.2.3 frame_len is
+//! unchanged). The Xing / Info carrier frame stays CRC-free regardless
+//! of the toggle.
+//!
 //! The remaining Phase 2 work — the psychoacoustic model (so the
 //! threshold is per-band tonality-aware), scalefactor estimation
 //! (preemphasis / `scalefac_scale = 1` escalation), short / mixed
@@ -324,6 +338,7 @@ pub mod alias;
 pub mod analysis;
 pub mod codec_decoder;
 pub mod codec_encoder;
+pub mod crc;
 pub mod demuxer;
 pub mod encoder;
 pub mod frame;
@@ -347,6 +362,7 @@ pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
 pub use analysis::{analyze_granule, analyze_row, m_coefficient, AnalysisState, C_TABLE, X_LEN};
 pub use codec_decoder::{make_decoder, register_codecs, Mp3CoreDecoder};
 pub use codec_encoder::{make_encoder, make_encoder_with_outer_loop, Mp3CoreEncoder};
+pub use crc::{crc16_bits, crc16_layer3, INITIAL_STATE as CRC_INITIAL_STATE};
 pub use demuxer::{
     open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer, Mp3Tags, XingTag,
     XingTagId, CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,

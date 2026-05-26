@@ -844,6 +844,31 @@ identical frames to the CBR-at-K path. `MPEG1_L3_BITRATE_LADDER_KBPS`
 is re-exported for callers that need to enumerate the 14 selectable
 ladder values.
 
+**Phase 2 step 15 (opt-in §2.4.3.1 CRC-16 frame protection)** wires
+the ISO/IEC 11172-3 §2.4.3.1 / Annex B Table B.5 CRC-16 mechanism into
+the stream encoder. `Mp3Encoder::with_protection_bit(true)` flips a
+crate-wide toggle: every emitted audio frame thereafter sets the wire
+`protection_bit = 0` and carries the 16-bit CRC check word in the
+two-byte slot between the 4-byte header and the side-information
+block. The CRC slot is *inside* the §2.4.2.3 frame_len (per-frame and
+total stream byte counts are unchanged); the 2 bytes the CRC claims
+come out of main-data slot capacity, so the per-granule inner-loop
+bit budget shrinks by 16 bits. The CRC itself covers exactly the
+Annex B Table B.5 Layer III protected set: header bits 16…31 (bytes
+2..4) plus the first 135 bits of side-info in single-channel mode (or
+the first 256 bits in every other channel mode), MSB-first per the
+§2.4.3.1 / Figure A.9 shift-register procedure (`G(X) = X^16 + X^15 +
+X^2 + 1`, initial state `0xFFFF`). The new `crc` module exposes the
+primitive (`crc16_bits` over a raw bit sequence; `crc16_layer3` over
+the Annex B Table B.5 set) plus the spec constants. The Xing / Info
+carrier frame stays CRC-free regardless of the toggle so leading
+demuxer / seeker probes still see the standard Xing layout. The
+crate's existing `Mp3CoreDecoder` path already skips the 2-byte CRC
+slot per `Mp3FrameHeader::crc_protected`, so CRC-enabled streams
+round-trip the decoder transparently. Validated by `crc_roundtrip.rs`
+(3 integration tests) + 6 unit tests on the CRC primitive + 4 unit
+tests on the encoder toggle.
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), preemphasis (§C.1.5.4.3.4) and `scalefac_scale = 1`
@@ -856,7 +881,7 @@ round.
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–14 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–15 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -865,11 +890,12 @@ primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
 scheduling with `main_data_begin > 0` + stream-level PCM → MP3 driver
 + §C.1.5.4.3 outer (distortion-control) loop + `oxideav_core::Encoder`
 trait wiring + opt-in Xing / Info VBR information-frame emission +
-true-VBR per-frame bitrate + Xing TOC auto-fill)** — it still lacks
-the psychoacoustic model (so the outer loop's `xmin(sb)` is a uniform
-constant rather than per-band masking-aware), preemphasis /
-`scalefac_scale = 1` escalation, short / mixed block-type switching,
-and stereo / LSF encode.
+true-VBR per-frame bitrate + Xing TOC auto-fill + opt-in §2.4.3.1
+CRC-16 frame protection)** — it still lacks the psychoacoustic model
+(so the outer loop's `xmin(sb)` is a uniform constant rather than
+per-band masking-aware), preemphasis / `scalefac_scale = 1`
+escalation, short / mixed block-type switching, and stereo / LSF
+encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

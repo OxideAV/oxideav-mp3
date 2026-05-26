@@ -253,6 +253,16 @@ pub struct Mp3Encoder {
     /// VBR step is a post-hoc selection of the smallest ladder index
     /// each frame's main-data actually fits in.
     vbr: Option<VbrConfig>,
+
+    /// When `true`, [`Mp3Encoder::finish`] writes the §2.4.3.1 CRC-16
+    /// check word in the two-byte slot between the header and the
+    /// side-information block on every emitted audio frame, sets the
+    /// wire `protection_bit = 0` (i.e. `crc_protected = true` in the
+    /// parser's terms), and accounts for the resulting 2-byte loss in
+    /// each frame's main-data slot capacity. Default `false` (no CRC),
+    /// matching every previous round's behaviour. Toggle via
+    /// [`Mp3Encoder::with_protection_bit`].
+    crc_enabled: bool,
 }
 
 /// Variable-bitrate config attached to [`Mp3Encoder`] by
@@ -321,7 +331,47 @@ impl Mp3Encoder {
             outer_loop_threshold: None,
             xing_template: None,
             vbr: None,
+            crc_enabled: false,
         })
+    }
+
+    /// Opt in to the ISO/IEC 11172-3 §2.4.3.1 CRC-16 frame protection.
+    ///
+    /// With `enabled = true`, [`Mp3Encoder::finish`] writes a 16-bit
+    /// CRC check word in the slot between the header and the side-info
+    /// block on every emitted audio frame (header + 2-byte CRC +
+    /// side_info + main_data), and sets the wire `protection_bit = 0`
+    /// (i.e. the parsed [`crate::Mp3FrameHeader::crc_protected`] is
+    /// `true`). The CRC covers the §2.4.3.1 / Annex B Table B.5
+    /// protected set: header bits 16…31 (bytes 2..4) plus the first
+    /// 135 side-info bits in single-channel mode (or 256 bits in every
+    /// other channel mode), MSB-first per [`crate::crc::crc16_layer3`].
+    ///
+    /// The CRC slot consumes two bytes of the per-frame main-data
+    /// capacity (`slot = frame_len - 4 - 2 - side_info_bytes`); the
+    /// per-granule-channel inner-loop bit budget shrinks accordingly.
+    /// A frame whose assembled main-data does not fit the reduced slot
+    /// surfaces a [`StreamEncodeError::Reservoir`] at `finish` time —
+    /// raise the bitrate (or disable the CRC) and retry.
+    ///
+    /// The carrier-frame Xing / Info layer remains CRC-free regardless
+    /// of this toggle: the leading Xing carrier is emitted via the
+    /// existing [`crate::xing_info::build_info_frame`] silent-frame
+    /// path which forces `protection_bit = 1` so demuxers see a
+    /// regular leading frame and the standard Xing offsets remain
+    /// valid.
+    ///
+    /// Default `false`. Calling this with `false` after a `true` call
+    /// disables the CRC again.
+    pub fn with_protection_bit(&mut self, enabled: bool) {
+        self.crc_enabled = enabled;
+    }
+
+    /// `true` when the §2.4.3.1 CRC-16 protection is enabled for the
+    /// emitted audio frames (see [`Mp3Encoder::with_protection_bit`]).
+    #[must_use]
+    pub fn crc_enabled(&self) -> bool {
+        self.crc_enabled
     }
 
     /// Enable per-frame **variable-bitrate** index selection.
@@ -514,13 +564,16 @@ impl Mp3Encoder {
     /// per-granule-channel bits, not a target to fill.
     fn per_gc_bit_budget(&self) -> usize {
         let si_bytes = side_info_byte_len(self.nch);
+        let crc_bytes = if self.crc_enabled { 2 } else { 0 };
         // VBR caps per-granule bits at the max-index slot; CBR caps at
-        // the constructor slot.
+        // the constructor slot. In both cases the CRC (when enabled)
+        // claims two bytes from the main-data slot.
         let slot_bytes = match self.vbr {
-            Some(cfg) => ladder_slot_capacity(self.sample_rate_hz, cfg.max_index, si_bytes, true),
+            Some(cfg) => ladder_slot_capacity(self.sample_rate_hz, cfg.max_index, si_bytes, true)
+                .saturating_sub(crc_bytes),
             None => {
                 let frame_len = self.header_template.frame_len().unwrap_or(0);
-                frame_len.saturating_sub(4 + si_bytes)
+                frame_len.saturating_sub(4 + crc_bytes + si_bytes)
             }
         };
         let denom = GRANULES.saturating_mul(self.nch).max(1);
@@ -811,9 +864,14 @@ impl Mp3Encoder {
         //
         // For MPEG-1 Layer III the per-frame total length is
         //   `frame_len(padding) = 144 · bitrate / sample_rate + pad`
-        // and the slot is `frame_len - 4 - 0 (no CRC) - SI_bytes` =
-        //   `frame_len - 4 - 17` (mono) or `- 32` (stereo).
+        // and the slot is `frame_len - 4 - crc_bytes - SI_bytes`. When
+        // CRC is disabled (the default), `crc_bytes = 0` and the slot
+        // reduces to `frame_len - 4 - 17` (mono) / `- 32` (stereo);
+        // when [`Mp3Encoder::with_protection_bit`] is on, the §2.4.3.1
+        // 2-byte CRC slot sits between the header and the side-info
+        // block and shrinks the main-data capacity by two bytes.
         let si_bytes = side_info_byte_len(self.nch);
+        let crc_bytes: usize = if self.crc_enabled { 2 } else { 0 };
         let frames = self.frames;
         let n = frames.len();
         let mut headers: Vec<Mp3FrameHeader> = Vec::with_capacity(n);
@@ -838,6 +896,12 @@ impl Mp3Encoder {
         let mut acc: u64 = 0;
         for (i, f) in frames.into_iter().enumerate() {
             let mut hdr = f.header;
+            // The wire `protection_bit` (the inverse of `crc_protected`)
+            // follows the encoder-wide CRC toggle. Set it on every
+            // emitted audio frame; the Xing carrier path (above)
+            // forces its own header so this assignment does not leak
+            // into the carrier.
+            hdr.crc_protected = self.crc_enabled;
             let frame_len = if let Some(vbr_cfg) = self.vbr {
                 // True-VBR: pick the smallest §2.4.2.3 ladder index in
                 // `[min_index, max_index]` whose slot bytes are at
@@ -847,23 +911,26 @@ impl Mp3Encoder {
                 // schedule is per-frame "no carry-over" — every
                 // `main_data_begin == 0`.
                 let need = f.main_data.len();
-                let (idx_kbps, idx_byte) = pick_vbr_bitrate(self.sample_rate_hz, vbr_cfg, need)
-                    .ok_or(StreamEncodeError::VbrSlotTooSmall {
-                        frame_index: i,
-                        main_data_len: need,
-                        max_slot_bytes: ladder_slot_capacity(
-                            self.sample_rate_hz,
-                            vbr_cfg.max_index,
-                            si_bytes,
-                            /*padded=*/ true,
-                        ),
-                    })?;
+                let (idx_kbps, idx_byte) =
+                    pick_vbr_bitrate(self.sample_rate_hz, vbr_cfg, need, crc_bytes).ok_or(
+                        StreamEncodeError::VbrSlotTooSmall {
+                            frame_index: i,
+                            main_data_len: need,
+                            max_slot_bytes: ladder_slot_capacity(
+                                self.sample_rate_hz,
+                                vbr_cfg.max_index,
+                                si_bytes,
+                                /*padded=*/ true,
+                            )
+                            .saturating_sub(crc_bytes),
+                        },
+                    )?;
                 hdr.bitrate_index = idx_byte;
                 hdr.bitrate_kbps = Some(idx_kbps);
                 // VBR sub-step: choose padding to fit `need` exactly
                 // when one extra byte rounds the slot up to ≥ need.
                 let unpadded = hdr.frame_len().expect("VBR frame_len");
-                let unpadded_slot = unpadded - 4 - si_bytes;
+                let unpadded_slot = unpadded - 4 - crc_bytes - si_bytes;
                 hdr.padding = unpadded_slot < need;
                 hdr.frame_len().expect("VBR frame_len after pad")
             } else {
@@ -883,8 +950,9 @@ impl Mp3Encoder {
                 hdr.padding = pad;
                 hdr.frame_len().expect("CBR frame_len")
             };
-            // CRC-free: no 2-byte CRC field.
-            let slot = frame_len - 4 - si_bytes;
+            // Per-frame main-data slot: frame_len minus the 4-byte
+            // header, the optional 2-byte CRC, and the side-info bytes.
+            let slot = frame_len - 4 - crc_bytes - si_bytes;
             headers.push(hdr);
             side_infos.push(f.side_info);
             main_datas.push(f.main_data);
@@ -949,10 +1017,10 @@ impl Mp3Encoder {
         let mut cum_audio_offsets: Vec<u64> = Vec::with_capacity(scheduled.len() + 1);
         cum_audio_offsets.push(0);
         for sch in scheduled.iter() {
-            // frame_len = 4 (header) + si_bytes + slot.len() per
-            // construction; computing it from frame_lens[i] is the
-            // same arithmetic.
-            audio_total_bytes += 4 + si_bytes as u64 + sch.slot.len() as u64;
+            // frame_len = 4 (header) + crc_bytes + si_bytes +
+            // slot.len() per construction; computing it from
+            // frame_lens[i] is the same arithmetic.
+            audio_total_bytes += 4 + crc_bytes as u64 + si_bytes as u64 + sch.slot.len() as u64;
             cum_audio_offsets.push(audio_total_bytes);
         }
         let audio_total_bytes_u32: u32 = audio_total_bytes.try_into().unwrap_or(u32::MAX);
@@ -1001,13 +1069,23 @@ impl Mp3Encoder {
         }
 
         // Step 3b: emit each audio frame as header (4 bytes) +
-        // side_info (`si_bytes` bytes) + slot (variable bytes).
+        // optional CRC (2 bytes per §2.4.3.1) + side_info (`si_bytes`
+        // bytes) + slot (variable bytes).
         for (i, sch) in scheduled.iter().enumerate() {
             let hbytes = write_header(&headers[i]);
             sink.write_all(&hbytes)?;
             written += 4;
             let sib = write_side_info(&side_infos[i]);
             debug_assert_eq!(sib.len(), si_bytes);
+            if self.crc_enabled {
+                // §2.4.3.1: 16-bit CRC of header bits 16..31 plus the
+                // first 135 (mono) / 256 (other modes) bits of the
+                // side-info block, written big-endian (MSB first) in
+                // the two-byte slot between header and side_info.
+                let crc = crate::crc::crc16_layer3(&hbytes, &sib, self.nch as u8);
+                sink.write_all(&crc.to_be_bytes())?;
+                written += 2;
+            }
             sink.write_all(&sib)?;
             written += sib.len();
             sink.write_all(&sch.slot)?;
@@ -1310,10 +1388,16 @@ fn ladder_slot_capacity(
 
 /// Pick the smallest §2.4.2.3 ladder index in `[cfg.min_index,
 /// cfg.max_index]` whose slot — possibly with the per-frame padding
-/// byte — can hold `need` bytes of main-data. Returns the chosen
-/// `(kbps, ladder_index)` or `None` when even the max index's padded
-/// slot is insufficient.
-fn pick_vbr_bitrate(sample_rate_hz: u32, cfg: VbrConfig, need: usize) -> Option<(u32, u8)> {
+/// byte and after subtracting `crc_bytes` (2 when the §2.4.3.1 CRC
+/// slot is active, 0 otherwise) — can hold `need` bytes of main-data.
+/// Returns the chosen `(kbps, ladder_index)` or `None` when even the
+/// max index's padded slot is insufficient.
+fn pick_vbr_bitrate(
+    sample_rate_hz: u32,
+    cfg: VbrConfig,
+    need: usize,
+    crc_bytes: usize,
+) -> Option<(u32, u8)> {
     let si_bytes = 17; // mono-only this round; matches side_info_byte_len(1).
     for idx in cfg.min_index..=cfg.max_index {
         // Try unpadded first, then padded — the per-frame padding bit
@@ -1321,7 +1405,8 @@ fn pick_vbr_bitrate(sample_rate_hz: u32, cfg: VbrConfig, need: usize) -> Option<
         // VBR with min_kbps == max_kbps this preserves the CBR
         // Bresenham padding behaviour roughly (padding is enabled only
         // when needed).
-        let cap_padded = ladder_slot_capacity(sample_rate_hz, idx, si_bytes, true);
+        let cap_padded =
+            ladder_slot_capacity(sample_rate_hz, idx, si_bytes, true).saturating_sub(crc_bytes);
         if cap_padded >= need {
             let kbps = MPEG1_L3_BITRATE_LADDER_KBPS[(idx - 1) as usize];
             return Some((kbps, idx));
@@ -1665,5 +1750,110 @@ mod tests {
         // and starts with a valid header.
         assert_eq!(silent.len(), 417);
         assert_eq!((silent[0] as u16) << 4 | (silent[1] as u16) >> 4, 0xFFF);
+    }
+
+    #[test]
+    fn protection_bit_toggle_default_is_false() {
+        let enc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        assert!(!enc.crc_enabled());
+    }
+
+    #[test]
+    fn protection_bit_toggle_round_trips() {
+        let mut enc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        enc.with_protection_bit(true);
+        assert!(enc.crc_enabled());
+        enc.with_protection_bit(false);
+        assert!(!enc.crc_enabled());
+    }
+
+    #[test]
+    fn crc_enabled_frame_length_unchanged() {
+        // §2.4.3.1: the CRC slot is INSIDE the frame's existing byte
+        // length — it consumes 2 bytes of main-data slot, not 2 extra
+        // bytes added to the frame. So a CRC-enabled stream emits the
+        // same number of bytes per frame as a CRC-disabled stream at
+        // the same bitrate / sample rate.
+        // 128 kbit/s mono @ 44.1 kHz silence: ~3 frames, each 417 B
+        // unpadded + Bresenham padding.
+        let pcm = vec![0i16; SAMPLES_PER_FRAME_MPEG1 * 3];
+
+        let mut enc_nocrc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        enc_nocrc.push_samples(&pcm).unwrap();
+        let mut out_nocrc = Vec::new();
+        enc_nocrc.finish(&mut out_nocrc).unwrap();
+
+        let mut enc_crc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        enc_crc.with_protection_bit(true);
+        enc_crc.push_samples(&pcm).unwrap();
+        let mut out_crc = Vec::new();
+        enc_crc.finish(&mut out_crc).unwrap();
+
+        // Same on-wire byte length: the CRC reclaims 2 bytes from the
+        // main-data slot, the frame's outer size is unchanged.
+        assert_eq!(out_nocrc.len(), out_crc.len());
+
+        // Wire protection bit is set on every CRC-enabled audio frame.
+        // Walk the stream and verify.
+        use crate::frame::{parse_header, FrameWalker};
+        let frames_crc: Vec<_> = FrameWalker::new(&out_crc).collect();
+        for f in &frames_crc {
+            let hdr = parse_header(&f.data[..4]).unwrap();
+            assert!(
+                hdr.crc_protected,
+                "CRC-enabled frame must carry protection_bit=0"
+            );
+        }
+        // And the no-CRC stream sets it the other way.
+        let frames_nocrc: Vec<_> = FrameWalker::new(&out_nocrc).collect();
+        for f in &frames_nocrc {
+            let hdr = parse_header(&f.data[..4]).unwrap();
+            assert!(
+                !hdr.crc_protected,
+                "CRC-disabled frame must carry protection_bit=1"
+            );
+        }
+    }
+
+    #[test]
+    fn crc_value_matches_recomputed_crc() {
+        // Encode a stream with CRC enabled. For every emitted audio
+        // frame, the 2 bytes immediately after the header must equal
+        // the §2.4.3.1 CRC-16 over (header bytes 2..4) ++ (first 135
+        // bits of side_info) — the same computation
+        // [`crc16_layer3`] performs.
+        let pcm = vec![0i16; SAMPLES_PER_FRAME_MPEG1 * 4];
+
+        let mut enc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        enc.with_protection_bit(true);
+        enc.push_samples(&pcm).unwrap();
+        let mut out = Vec::new();
+        enc.finish(&mut out).unwrap();
+
+        use crate::frame::{parse_header, FrameWalker};
+        let frames: Vec<_> = FrameWalker::new(&out).collect();
+        // 4 frames of 1152 samples each — and the stream encoder may
+        // round up by one to absorb tail PCM, so 4..=5 is the safe
+        // bound.
+        assert!(
+            (4..=5).contains(&frames.len()),
+            "unexpected frame count {}",
+            frames.len()
+        );
+        for f in &frames {
+            let hdr_bytes: [u8; 4] = f.data[..4].try_into().unwrap();
+            let hdr = parse_header(&hdr_bytes).unwrap();
+            assert!(hdr.crc_protected);
+            let wire_crc = u16::from_be_bytes([f.data[4], f.data[5]]);
+            let nch = hdr.channel_count();
+            let si_bytes = side_info_byte_len(nch as usize);
+            let si_slice = &f.data[6..6 + si_bytes];
+            let expected = crate::crc::crc16_layer3(&hdr_bytes, si_slice, nch);
+            assert_eq!(
+                wire_crc, expected,
+                "frame at offset {} CRC mismatch: wire 0x{:04X} vs expected 0x{:04X}",
+                f.offset, wire_crc, expected
+            );
+        }
     }
 }

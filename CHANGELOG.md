@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Mp3Encoder::with_protection_bit(enabled)` — opt-in §2.4.3.1 CRC-16
+  frame protection (Phase 2 step 15). When `enabled = true`, every
+  emitted audio frame carries the 2-byte CRC check word in the slot
+  immediately after the 4-byte header, with the wire `protection_bit`
+  set to `0` per ISO/IEC 11172-3 §2.4.2.3. The CRC slot consumes two
+  bytes of main-data slot capacity (the §2.4.2.3 frame_len is
+  unchanged); the per-granule inner-loop bit budget shrinks by 16 bits.
+  Frames that no longer fit surface `StreamEncodeError::Reservoir` at
+  `finish` time — raise the bitrate or disable the CRC and retry. The
+  CRC value covers exactly the Annex B Table B.5 Layer III set: header
+  bits 16…31 plus the first 135 (mono) / 256 (other modes) side-info
+  bits, MSB-first per the §2.4.3.1 / Figure A.9 shift-register
+  procedure (`G(X) = X^16 + X^15 + X^2 + 1`, initial state `0xFFFF`).
+  The carrier Xing / Info frame is left CRC-free regardless of the
+  toggle. The crate's existing decode path already skips the CRC slot
+  per `Mp3FrameHeader::crc_protected`, so CRC-enabled streams
+  round-trip transparently.
+- New `crc` module exposing the §2.4.3.1 CRC primitive:
+  `crc::crc16_bits` (raw bit stream) and `crc::crc16_layer3` (the
+  Annex B Table B.5 Layer III protected-set wrapper), with the
+  `POLYNOMIAL_MASK = 0x8005` and `INITIAL_STATE = 0xFFFF` constants
+  re-exported at the crate root as `crc16_bits`, `crc16_layer3`, and
+  `CRC_INITIAL_STATE`.
+- `tests/crc_roundtrip.rs` integration suite (3 tests): every emitted
+  audio frame's wire CRC equals the independent `crc16_layer3`
+  recomputation; CRC-on and CRC-off streams emit identical per-frame
+  and total byte counts (the CRC takes from main-data capacity, not
+  from frame length); a CRC-enabled stream decodes through
+  `Mp3CoreDecoder` to silence-bounded PCM (no protection-bit
+  regression in the decoder path).
+
 - `Mp3Encoder::enable_vbr(min_kbps, max_kbps)` — opt-in true-VBR
   per-frame `bitrate_index` selection (Phase 2 step 14). With VBR
   active, the per-granule-channel inner-loop gain search runs the
