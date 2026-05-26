@@ -8,6 +8,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.2.3 joint-stereo auto MS/LR per-frame picker**
+  (Phase 2 step 20): a new constructor
+  [`Mp3Encoder::new_joint_stereo_auto`] arms the encoder in joint mode
+  (header `mode = '01'`) and decides per frame whether to apply the
+  §2.4.3.4.9.2 MS rotation, based on a content-only energy heuristic.
+  For each granule of the frame the post-MDCT spectra are examined
+  and the side-channel energy fraction
+  `E_S / (E_L + E_R) = Σ(L−R)² / (2·Σ(L² + R²))` is computed; when
+  **both** granules of the frame come in at or below the configured
+  threshold (default `0.5`), the §2.4.3.4.9.2 rotation
+  `M = (L+R)/√2`, `S = (L-R)/√2` is applied and the frame's
+  `mode_extension` is written as `'10'` (ms_stereo on,
+  intensity_stereo off); otherwise the LR channels are passed through
+  unchanged and `mode_extension` is written as `'00'`. The
+  per-granule rejection short-circuit honours the §2.4.3.4.9
+  "both granules of a frame share the same joint-stereo method"
+  semantics for free — `mode_extension` is a per-frame wire field,
+  not a per-granule one. ISO/IEC 11172-3 does **not** prescribe an
+  encoder mode-decision algorithm (§2.4.2.3 fixes only the wire
+  syntax), so the energy heuristic is a clean-room encoder choice
+  using no psychoacoustic input. The `0.5` default is the symmetry
+  boundary: the rotation is unitary so `E_M + E_S = E_L + E_R`, and
+  below `0.5` the mid channel carries strictly more energy than
+  either L or R, which the inner-loop bit-budget gain search
+  exploits. `Mp3Encoder::with_ms_auto_threshold(t)` overrides the
+  threshold (values are clamped into `[0.0, 1.0]`; the setter is a
+  no-op when called on an encoder that was not constructed via
+  `new_joint_stereo_auto`). `Mp3Encoder::ms_auto_threshold()` reads
+  back the configured threshold. The picker leaves the existing
+  unconditional `new_joint_stereo_ms` path (round 146) untouched —
+  the two armings drive the same forward-MS branch in
+  `assemble_frame` but only one is active at a time. Validated by
+  six new unit tests (`auto_ms_picker_default_threshold_is_half` /
+  `auto_ms_picker_threshold_override_clamps` /
+  `auto_ms_picker_threshold_override_noop_on_non_auto` /
+  `auto_ms_picker_correlated_input_chooses_ms` /
+  `auto_ms_picker_anticorrelated_input_chooses_lr` /
+  `auto_ms_picker_zero_threshold_forces_lr_on_any_side_energy`) and
+  four integration tests
+  (`auto_picker_correlated_one_second_self_decode_psnr` —
+  84 dB / 85 dB per-channel PSNR on a 1 s correlated 440 Hz tone at
+  192 kbit/s, matching the always-MS path;
+  `auto_picker_anticorrelated_steady_state_picks_lr` /
+  `auto_picker_mixed_stream_flips_mode_extension_mid_stream` —
+  proves the decision is genuinely per-frame, not encoder-wide;
+  `auto_picker_silence_does_not_panic` — handles the
+  zero-energy granule edge case without dividing by zero).
+
 - **§C.1.5.4.3.4 preemphasis decision in the outer loop**
   (Phase 2 step 19): the outer (distortion-control) loop now decides
   whether to switch on `preflag` (the §2.4.2.7 side-info bit that

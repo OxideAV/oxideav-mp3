@@ -289,6 +289,35 @@ pub struct Mp3Encoder {
     /// (§2.4.3.4.9.3) is not implemented on the encode side; this flag
     /// only enables the MS half of joint stereo.
     ms_stereo: bool,
+
+    /// When `Some`, the encoder is in **auto MS/LR per-frame** joint mode
+    /// (constructor [`Mp3Encoder::new_joint_stereo_auto`]): every assembled
+    /// frame's post-MDCT L/R spectra are analysed, and the §2.4.3.4.9.2
+    /// MS rotation is applied only when the side-channel energy ratio
+    /// `E_S / (E_L + E_R)` for both granules of the frame is at or below
+    /// the carried threshold. The header `mode` is fixed at
+    /// `ChannelMode::JointStereo` (`mode = '01'`); the per-frame
+    /// `mode_extension` is then either `'10'` (ms_stereo on,
+    /// intensity_stereo off) when the picker chose MS, or `'00'`
+    /// (neither method active — bitstream is identical to two
+    /// independent stereo channels under a joint header) when the
+    /// picker chose LR. The standalone [`Mp3Encoder::ms_stereo`] flag
+    /// stays `false` so the unconditional pass-1.5 forward MS branch
+    /// in [`Mp3Encoder::assemble_frame`] is gated on this picker
+    /// instead.
+    ///
+    /// The threshold is the upper bound on `E_S / (E_L + E_R)` at which
+    /// MS is preferred. ISO/IEC 11172-3 does not prescribe an encoder
+    /// mode-decision algorithm — the spec leaves the joint-stereo
+    /// method-enable bits entirely to the encoder — so a content-only
+    /// energy heuristic is chosen here. The default `0.5` (set by
+    /// [`Mp3Encoder::new_joint_stereo_auto`]) is the symmetry boundary:
+    /// `E_S = E_M` is the energy of uncorrelated L/R; below it MS
+    /// concentrates strictly more energy in the mid channel than the
+    /// independent split does, above it the side channel carries more
+    /// than half the energy and the MS rotation would amplify rather
+    /// than reduce quantization stress on the side channel.
+    ms_auto_threshold: Option<f64>,
 }
 
 /// Variable-bitrate config attached to [`Mp3Encoder`] by
@@ -387,6 +416,7 @@ impl Mp3Encoder {
             vbr: None,
             crc_enabled: false,
             ms_stereo: false,
+            ms_auto_threshold: None,
         })
     }
 
@@ -464,6 +494,103 @@ impl Mp3Encoder {
     #[must_use]
     pub fn ms_stereo_enabled(&self) -> bool {
         self.ms_stereo
+    }
+
+    /// Build a joint-stereo encoder that decides per-frame whether to
+    /// apply the §2.4.3.4.9.2 MS rotation or fall back to independent
+    /// L/R coding, based on a content-only energy heuristic.
+    ///
+    /// The frame header carries `mode = '01'` (joint stereo) on every
+    /// audio frame; the two `mode_extension` bits are then chosen per
+    /// frame by the picker:
+    ///
+    /// * `'10'` (ms_stereo on, intensity_stereo off) when **both**
+    ///   granules of the frame have side-channel energy fraction
+    ///   `E_S / (E_L + E_R) ≤ threshold` (channels well-correlated;
+    ///   the MS rotation concentrates energy in the mid channel and
+    ///   helps the inner loop).
+    /// * `'00'` (neither method active) when either granule has
+    ///   `E_S / (E_L + E_R) > threshold` (channels are uncorrelated
+    ///   or anti-correlated; MS would inflate the side channel and
+    ///   waste bits).
+    ///
+    /// Decision criterion derivation. The §2.4.3.4.9.2 rotation
+    /// `M = (L+R)/√2`, `S = (L-R)/√2` is unitary, so
+    /// `E_M + E_S = E_L + E_R` for any L/R pair. `E_S / (E_L + E_R)`
+    /// therefore takes value 0 when `L = R` (perfect mono),
+    /// 0.5 when L and R are uncorrelated with equal energy, and 1
+    /// when `L = -R` (pure anti-phase). The default threshold `0.5`
+    /// is the symmetry boundary: below it the M channel carries strictly
+    /// more energy than either L or R, so quantization noise on the
+    /// (now smaller) S channel costs fewer audible bits than the
+    /// independent-channel split would have spent on the same noise on
+    /// L and R; above it the side channel carries more than half the
+    /// energy and the rotation is counter-productive.
+    ///
+    /// ISO/IEC 11172-3 does **not** prescribe how to make this
+    /// decision — §2.4.2.3 fixes only the wire syntax of the
+    /// `mode_extension` field. The energy heuristic is a clean-room
+    /// encoder choice that uses no psychoacoustic input and no
+    /// external implementation as a reference.
+    ///
+    /// `mode` is hard-coded to [`ChannelMode::JointStereo`]; pass
+    /// `bitrate_kbps` / `sample_rate_hz` per the MPEG-1 Layer III ladder.
+    ///
+    /// Both granules of a frame share the same mode_extension and (in
+    /// this round) the same `BlockType::Long`, so the §2.4.3.4.9
+    /// "both channels must share the same block type when MS is
+    /// enabled" requirement is automatically satisfied.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Mp3Encoder::new`].
+    pub fn new_joint_stereo_auto(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+    ) -> Result<Self, StreamEncodeError> {
+        // Build through the independent-stereo path so the channel
+        // count, header indices, per-channel analysis/MDCT state, and
+        // pending-PCM buffers are all configured for two channels.
+        let mut enc = Self::new(bitrate_kbps, sample_rate_hz, ChannelMode::Stereo)?;
+        // Upgrade the header template to joint-stereo with a starting
+        // mode_extension of '00'; the per-frame picker in
+        // `assemble_frame` rewrites it on each frame.
+        enc.header_template.mode = ChannelMode::JointStereo;
+        enc.header_template.mode_extension = ModeExtension {
+            intensity_stereo: false,
+            ms_stereo: false,
+            raw: 0b00,
+        };
+        // `ms_stereo` stays false — the auto picker drives the
+        // forward-MS branch per frame via `ms_auto_threshold`.
+        enc.ms_auto_threshold = Some(0.5);
+        Ok(enc)
+    }
+
+    /// `Some(t)` when the encoder is configured for the per-frame
+    /// MS-vs-LR picker (see [`Mp3Encoder::new_joint_stereo_auto`]), where
+    /// `t` is the upper bound on side-channel energy fraction at which
+    /// MS is preferred.
+    #[must_use]
+    pub fn ms_auto_threshold(&self) -> Option<f64> {
+        self.ms_auto_threshold
+    }
+
+    /// Override the side-channel energy threshold used by the per-frame
+    /// MS-vs-LR picker (see [`Mp3Encoder::new_joint_stereo_auto`]).
+    ///
+    /// `threshold` is the upper bound on `E_S / (E_L + E_R)` at which a
+    /// frame's two granules both qualify for MS. Values outside
+    /// `[0.0, 1.0]` are clamped to that range. Calling this on an
+    /// encoder that was **not** constructed via
+    /// [`Mp3Encoder::new_joint_stereo_auto`] is a no-op (the picker is
+    /// not armed).
+    pub fn with_ms_auto_threshold(mut self, threshold: f64) -> Self {
+        if self.ms_auto_threshold.is_some() {
+            let clamped = threshold.clamp(0.0, 1.0);
+            self.ms_auto_threshold = Some(clamped);
+        }
+        self
     }
 
     /// Opt in to the ISO/IEC 11172-3 §2.4.3.1 CRC-16 frame protection.
@@ -884,7 +1011,75 @@ impl Mp3Encoder {
         // stereo is not, the entire spectrum is decoded in MS-stereo");
         // the intensity-bound logic only kicks in when intensity stereo
         // is also active, which this round's encoder never emits.
-        if self.ms_stereo && self.nch == 2 {
+        //
+        // Two driver paths:
+        //   * `ms_stereo` (set by `new_joint_stereo_ms`): the matrix
+        //     fires unconditionally on every frame.
+        //   * `ms_auto_threshold` (set by `new_joint_stereo_auto`): the
+        //     matrix fires only when **both** granules of the frame
+        //     have side-channel energy fraction
+        //       E_S / (E_L + E_R) = Σ((L−R)/√2)² / Σ(L² + R²)
+        //                         = Σ(L − R)² / (2·Σ(L² + R²))
+        //     at or below the carried threshold (default 0.5). The
+        //     rotation is unitary so `E_M + E_S = E_L + E_R`; this
+        //     ratio is 0 for perfectly mono content, 0.5 for
+        //     uncorrelated equal-energy channels, and 1 for pure
+        //     anti-phase content. Below 0.5 the mid channel carries
+        //     more energy than either L or R individually, which the
+        //     inner loop's bit-budget gain search exploits.
+        //
+        // The frame's mode_extension header field is set to '10' when
+        // MS fires and '00' when it does not. Both `ms_stereo` and the
+        // auto picker keep `mode = '01'` (joint stereo) on the header.
+        let mut frame_mode_extension = self.header_template.mode_extension;
+        let apply_ms_this_frame = if self.nch == 2 {
+            if self.ms_stereo {
+                true
+            } else if let Some(threshold) = self.ms_auto_threshold {
+                // Compute the side-energy fraction across both granules
+                // of the frame. Reject MS as soon as one granule exceeds
+                // the threshold so the §2.4.3.4.9 "both granules share
+                // the same joint-stereo method" semantics are honoured
+                // for free (the wire mode_extension is a per-frame
+                // field, not a per-granule one).
+                let mut all_ok = true;
+                for gr in 0..GRANULES {
+                    let left = &xr_pre_per_gc[gr][0];
+                    let right = &xr_pre_per_gc[gr][1];
+                    let mut lr_energy = 0.0f64;
+                    let mut side_energy_x2 = 0.0f64;
+                    for i in 0..NUM_LINES {
+                        let l = f64::from(left[i]);
+                        let r = f64::from(right[i]);
+                        lr_energy += l * l + r * r;
+                        let d = l - r;
+                        side_energy_x2 += d * d;
+                    }
+                    // side_energy = Σ((L−R)/√2)² = side_energy_x2 / 2.
+                    // side_energy / (E_L + E_R)
+                    //     = side_energy_x2 / (2 · lr_energy).
+                    // Compare without the divide to dodge the
+                    // pathological lr_energy == 0 case (a fully silent
+                    // granule trivially passes — both numerator and
+                    // denominator are 0; pick MS by convention since
+                    // mono == mid-only).
+                    if lr_energy <= 0.0 {
+                        continue;
+                    }
+                    let ratio = side_energy_x2 / (2.0 * lr_energy);
+                    if ratio > threshold {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                all_ok
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if apply_ms_this_frame {
             const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
             for gr in 0..GRANULES {
                 // Split the per-channel borrow without copying both
@@ -900,6 +1095,25 @@ impl Mp3Encoder {
                     right[i] = (l - r) * INV_SQRT2;
                 }
             }
+        }
+        // Reflect the per-frame decision on the carried frame header
+        // (only matters for the auto picker; the unconditional
+        // `new_joint_stereo_ms` path keeps the constructor's '10'
+        // header template and the auto path overwrites it here).
+        if self.ms_auto_threshold.is_some() && self.nch == 2 {
+            frame_mode_extension = if apply_ms_this_frame {
+                ModeExtension {
+                    intensity_stereo: false,
+                    ms_stereo: true,
+                    raw: 0b10,
+                }
+            } else {
+                ModeExtension {
+                    intensity_stereo: false,
+                    ms_stereo: false,
+                    raw: 0b00,
+                }
+            };
         }
 
         // ---- Pass 2: per-(gr, ch) quantization + side-info build ----
@@ -1097,6 +1311,10 @@ impl Mp3Encoder {
         // ---- Main-data assembly ----
         let mut header = self.header_template;
         header.padding = false; // initial; reservoir step decides
+                                // Per-frame mode_extension from the joint-stereo picker (no-op
+                                // for the unconditional `new_joint_stereo_ms` path — the
+                                // template already carries '10' there).
+        header.mode_extension = frame_mode_extension;
         let asm = assemble_main_data(&header, &mut side_info, &scalefactors, &gc_data)
             .map_err(|e| StreamEncodeError::Huffman(e.to_string()))?;
 
@@ -2111,6 +2329,203 @@ mod tests {
                 wire_crc, expected,
                 "frame at offset {} CRC mismatch: wire 0x{:04X} vs expected 0x{:04X}",
                 f.offset, wire_crc, expected
+            );
+        }
+    }
+
+    // ---- §2.4.2.3 joint-stereo auto MS/LR per-frame picker (round 149) ----
+
+    /// `new_joint_stereo_auto` arms the picker with the default 0.5
+    /// threshold, upgrades the header template to joint-stereo, leaves
+    /// the unconditional MS flag off, and configures two channels.
+    #[test]
+    fn auto_ms_picker_default_threshold_is_half() {
+        let enc = Mp3Encoder::new_joint_stereo_auto(192, 44_100).unwrap();
+        assert_eq!(enc.ms_auto_threshold(), Some(0.5));
+        // Unconditional MS stays off — the picker drives the
+        // forward-MS branch per frame instead.
+        assert!(!enc.ms_stereo_enabled());
+        // Header template carries `mode = '01'` (joint stereo) with a
+        // starting `mode_extension = '00'` (the per-frame picker
+        // rewrites it).
+        assert!(matches!(enc.header_template.mode, ChannelMode::JointStereo));
+        assert!(!enc.header_template.mode_extension.ms_stereo);
+        assert!(!enc.header_template.mode_extension.intensity_stereo);
+    }
+
+    /// `with_ms_auto_threshold` overrides the threshold and clamps
+    /// out-of-range values into `[0.0, 1.0]`.
+    #[test]
+    fn auto_ms_picker_threshold_override_clamps() {
+        let enc = Mp3Encoder::new_joint_stereo_auto(192, 44_100)
+            .unwrap()
+            .with_ms_auto_threshold(0.25);
+        assert_eq!(enc.ms_auto_threshold(), Some(0.25));
+
+        let enc = Mp3Encoder::new_joint_stereo_auto(192, 44_100)
+            .unwrap()
+            .with_ms_auto_threshold(-1.0);
+        assert_eq!(enc.ms_auto_threshold(), Some(0.0));
+
+        let enc = Mp3Encoder::new_joint_stereo_auto(192, 44_100)
+            .unwrap()
+            .with_ms_auto_threshold(2.5);
+        assert_eq!(enc.ms_auto_threshold(), Some(1.0));
+    }
+
+    /// `with_ms_auto_threshold` on a non-auto encoder is a no-op (the
+    /// picker is not armed; the threshold setter does not silently turn
+    /// it on).
+    #[test]
+    fn auto_ms_picker_threshold_override_noop_on_non_auto() {
+        let enc = Mp3Encoder::new(192, 44_100, ChannelMode::Stereo)
+            .unwrap()
+            .with_ms_auto_threshold(0.25);
+        assert_eq!(enc.ms_auto_threshold(), None);
+
+        let enc = Mp3Encoder::new_joint_stereo_ms(192, 44_100)
+            .unwrap()
+            .with_ms_auto_threshold(0.25);
+        assert_eq!(enc.ms_auto_threshold(), None);
+        // And ms_stereo (unconditional MS) stays armed.
+        assert!(enc.ms_stereo_enabled());
+    }
+
+    /// A correlated-content frame (L ≈ R) picks MS: every emitted
+    /// audio frame's header carries `mode_extension = '10'`.
+    #[test]
+    fn auto_ms_picker_correlated_input_chooses_ms() {
+        use crate::frame::{parse_header, FrameWalker};
+        use std::f32::consts::PI;
+
+        const SR: u32 = 44_100;
+        const BR: u32 = 192;
+        // ~1/4 sec of strongly correlated 440 Hz tone panned 70/30.
+        let n = SAMPLES_PER_FRAME_MPEG1 * 10;
+        let mut pcm = Vec::with_capacity(n * 2);
+        let scale = i16::MAX as f32 * 0.5;
+        for i in 0..n {
+            let t = i as f32 / SR as f32;
+            let s = (2.0 * PI * 440.0 * t).sin();
+            // Pan: L = 0.7s, R = 0.7s (perfect mono — most extreme
+            // correlated case so the side energy is ~0).
+            let v = (s * scale).round() as i16;
+            pcm.push(v);
+            pcm.push(v);
+        }
+        let mut enc = Mp3Encoder::new_joint_stereo_auto(BR, SR).unwrap();
+        enc.push_samples(&pcm).unwrap();
+        let mut out = Vec::new();
+        enc.finish(&mut out).unwrap();
+
+        let frames: Vec<_> = FrameWalker::new(&out).collect();
+        assert!(
+            frames.len() >= 8,
+            "expected several frames, got {}",
+            frames.len()
+        );
+        for f in &frames {
+            let hdr_bytes: [u8; 4] = f.data[..4].try_into().unwrap();
+            let hdr = parse_header(&hdr_bytes).unwrap();
+            assert!(matches!(hdr.mode, ChannelMode::JointStereo));
+            assert!(
+                hdr.mode_extension.ms_stereo,
+                "correlated input must pick ms_stereo on frame at offset {}",
+                f.offset
+            );
+            assert!(!hdr.mode_extension.intensity_stereo);
+        }
+    }
+
+    /// An anti-correlated frame (R = -L) picks LR: every emitted audio
+    /// frame's header carries `mode_extension = '00'`.
+    #[test]
+    fn auto_ms_picker_anticorrelated_input_chooses_lr() {
+        use crate::frame::{parse_header, FrameWalker};
+        use std::f32::consts::PI;
+
+        const SR: u32 = 44_100;
+        const BR: u32 = 192;
+        let n = SAMPLES_PER_FRAME_MPEG1 * 10;
+        let mut pcm = Vec::with_capacity(n * 2);
+        let scale = i16::MAX as f32 * 0.5;
+        for i in 0..n {
+            let t = i as f32 / SR as f32;
+            let s = (2.0 * PI * 440.0 * t).sin();
+            // Anti-correlated: R = -L. The MS rotation here flips:
+            // M = (L+R)/√2 = 0, S = (L-R)/√2 = √2·L; all energy goes
+            // into the side channel and ratio = 1.0 > 0.5.
+            let v = (s * scale).round() as i16;
+            pcm.push(v);
+            pcm.push(-v);
+        }
+        let mut enc = Mp3Encoder::new_joint_stereo_auto(BR, SR).unwrap();
+        enc.push_samples(&pcm).unwrap();
+        let mut out = Vec::new();
+        enc.finish(&mut out).unwrap();
+
+        let frames: Vec<_> = FrameWalker::new(&out).collect();
+        assert!(
+            frames.len() >= 8,
+            "expected several frames, got {}",
+            frames.len()
+        );
+        // Skip the very first frame: with cold MDCT overlap buffers the
+        // first granule's spectrum has little real content, and the
+        // ratio computation can fall on the wrong side of the threshold.
+        // Steady-state frames must all be LR.
+        for f in frames.iter().skip(2) {
+            let hdr_bytes: [u8; 4] = f.data[..4].try_into().unwrap();
+            let hdr = parse_header(&hdr_bytes).unwrap();
+            assert!(matches!(hdr.mode, ChannelMode::JointStereo));
+            assert!(
+                !hdr.mode_extension.ms_stereo,
+                "anti-correlated input must pick LR (mode_extension '00') on frame at offset {} but got ms_stereo on",
+                f.offset
+            );
+            assert!(!hdr.mode_extension.intensity_stereo);
+        }
+    }
+
+    /// Threshold tuned to 0.0 forces LR on every non-perfectly-mono
+    /// frame: with `E_S > 0` and `threshold = 0`, the ratio always
+    /// exceeds the threshold. A genuinely-mono signal (L == R)
+    /// produces `E_S = 0` and slips below.
+    #[test]
+    fn auto_ms_picker_zero_threshold_forces_lr_on_any_side_energy() {
+        use crate::frame::{parse_header, FrameWalker};
+        use std::f32::consts::PI;
+
+        const SR: u32 = 44_100;
+        const BR: u32 = 192;
+        // Mildly correlated content — L = 0.7s, R = 0.3s, so the side
+        // channel carries real energy.
+        let n = SAMPLES_PER_FRAME_MPEG1 * 8;
+        let mut pcm = Vec::with_capacity(n * 2);
+        let scale_l = i16::MAX as f32 * 0.7;
+        let scale_r = i16::MAX as f32 * 0.3;
+        for i in 0..n {
+            let t = i as f32 / SR as f32;
+            let s = (2.0 * PI * 440.0 * t).sin();
+            pcm.push((s * scale_l).round() as i16);
+            pcm.push((s * scale_r).round() as i16);
+        }
+        let mut enc = Mp3Encoder::new_joint_stereo_auto(BR, SR)
+            .unwrap()
+            .with_ms_auto_threshold(0.0);
+        enc.push_samples(&pcm).unwrap();
+        let mut out = Vec::new();
+        enc.finish(&mut out).unwrap();
+
+        let frames: Vec<_> = FrameWalker::new(&out).collect();
+        // Skip the cold-start frames.
+        for f in frames.iter().skip(2) {
+            let hdr_bytes: [u8; 4] = f.data[..4].try_into().unwrap();
+            let hdr = parse_header(&hdr_bytes).unwrap();
+            assert!(
+                !hdr.mode_extension.ms_stereo,
+                "threshold=0 must reject MS on frame at offset {} (any side energy disqualifies)",
+                f.offset
             );
         }
     }

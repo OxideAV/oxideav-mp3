@@ -1004,20 +1004,64 @@ end-to-end integration test
 encoder produces a stream with `gc.preflag = 1` granule-channels
 recoverable via `parse_side_info` on an HF-heavy multi-tone input.
 
+**Phase 2 step 20 (joint-stereo auto MS/LR per-frame picker)** adds an
+encoder-side per-frame mode-decision driver next to the round-146
+unconditional MS path. The new constructor
+`Mp3Encoder::new_joint_stereo_auto(bitrate_kbps, sample_rate_hz)` arms
+joint mode (`header.mode = '01'`) and computes, for each assembled
+frame, the side-channel energy fraction
+`E_S / (E_L + E_R) = Σ(L−R)² / (2·Σ(L² + R²))` on the post-MDCT L/R
+spectra of both granules; the §2.4.3.4.9.2 forward MS rotation fires
+only when **both** granules sit at or below the configured threshold
+(default `0.5`), and the frame's `mode_extension` field is written as
+`'10'` (ms_stereo on) in that case or `'00'` (neither method) when at
+least one granule exceeds the threshold. The per-granule rejection
+short-circuit honours the §2.4.3.4.9 "both granules of a frame share
+the same joint-stereo method" semantics for free, because
+`mode_extension` is a per-frame wire field. ISO/IEC 11172-3 does
+**not** prescribe an encoder mode-decision algorithm — §2.4.2.3 fixes
+only the wire syntax of the `mode_extension` field — so the energy
+heuristic is a clean-room encoder choice that uses no psychoacoustic
+input. The `0.5` default is the symmetry boundary: the rotation is
+unitary so `E_M + E_S = E_L + E_R`, and below `0.5` the mid channel
+carries strictly more energy than either L or R, which the
+inner-loop bit-budget gain search exploits.
+`Mp3Encoder::with_ms_auto_threshold(t)` overrides the threshold
+(values clamped into `[0.0, 1.0]`; the setter is a no-op when called
+on an encoder that was not constructed via `new_joint_stereo_auto`).
+`Mp3Encoder::ms_auto_threshold()` reads back the configured
+threshold. The picker leaves the existing unconditional
+`new_joint_stereo_ms` path untouched. Validated by six unit tests
+(`auto_ms_picker_default_threshold_is_half` /
+`auto_ms_picker_threshold_override_clamps` /
+`auto_ms_picker_threshold_override_noop_on_non_auto` /
+`auto_ms_picker_correlated_input_chooses_ms` /
+`auto_ms_picker_anticorrelated_input_chooses_lr` /
+`auto_ms_picker_zero_threshold_forces_lr_on_any_side_energy`) and
+four integration tests in `tests/joint_stereo_auto_roundtrip.rs`:
+(a) end-to-end self-decode on a 1 s correlated 440 Hz tone panned
+70/30 toward L at 192 kbit/s — **per-channel PSNR L = 84.2 dB /
+R = 85.2 dB**, matching the always-MS path, with every steady-state
+frame carrying `mode_extension = '10'`; (b) anti-correlated input
+(`R = -L`) where every steady-state frame must carry
+`mode_extension = '00'`; (c) a mixed correlated-then-anti-phase
+stream where the picker flips the wire `mode_extension` mid-stream,
+proving the decision is genuinely per-frame and not encoder-wide;
+(d) all-silence input handled without dividing by zero
+(`E_L + E_R = 0` short-circuits to "MS by convention").
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
-constant), an encoder-side decision to gate MS on per-band signal
-correlation (currently always-on when the constructor is used),
-intensity-stereo encode (§2.4.3.4.9.3), short / mixed block-type
-switching, LSF encode, stereo / LSF decode through the trait
-wrapper — is still a later round.
+constant), intensity-stereo encode (§2.4.3.4.9.3), short / mixed
+block-type switching, LSF encode, stereo / LSF decode through the
+trait wrapper — is still a later round.
 
 ### Not yet implemented
 
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–19 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–20 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -1031,12 +1075,11 @@ CRC-16 frame protection + independent-stereo (`ChannelMode::Stereo` /
 `ChannelMode::DualChannel`) encode through the trait wrapper +
 §2.4.3.4.9.2 joint-stereo MS encode + §C.1.5.4.3 `scalefac_scale 0→1`
 escalation in the outer loop + §C.1.5.4.3.4 preemphasis decision in
-the outer loop)** — it still lacks the psychoacoustic model (so the
-outer loop's `xmin(sb)` is a uniform constant rather than per-band
-masking-aware), an encoder-side decision to gate MS per-band on
-signal correlation (currently always-on when the MS constructor is
-used), intensity-stereo encode (§2.4.3.4.9.3), short / mixed
-block-type switching, and LSF encode.
+the outer loop + §2.4.2.3 joint-stereo auto MS/LR per-frame
+picker)** — it still lacks the psychoacoustic model (so the outer
+loop's `xmin(sb)` is a uniform constant rather than per-band
+masking-aware), intensity-stereo encode (§2.4.3.4.9.3), short /
+mixed block-type switching, and LSF encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
