@@ -13,8 +13,12 @@
 //! The test:
 //!
 //! 1. Sanity-checks the API surface (mono-only restriction, mutual
-//!    exclusion with the testing toggles + the outer loop, enable /
-//!    disable round-trip).
+//!    exclusion with the testing toggles, enable / disable round-trip).
+//!    As of r158 the outer-loop combination is *accepted* (Short
+//!    granules dispatch onto `outer_loop_search_short`, Start/End
+//!    granules fall back to the fixed-gain inner-loop path) — the
+//!    rejection assertion from r156 has been replaced by a positive
+//!    integration test that exercises both code paths.
 //! 2. Confirms that auto-block-type **default off** is the identity
 //!    transform: every granule of a sustained-tone stream still
 //!    emits a long block.
@@ -149,10 +153,20 @@ fn auto_block_type_mutually_exclusive_with_force_mixed() {
 }
 
 #[test]
-fn auto_block_type_rejected_when_outer_loop_configured() {
-    // The outer loop is long-block-only this round; auto block-type
-    // can emit Short / Start / End which the loop doesn't yet handle.
-    // Reject the combination at enable-time.
+fn auto_block_type_combines_with_outer_loop_and_roundtrips() {
+    // r158 unblocked: `outer_loop_search_short` is now wired into the
+    // encoder so the §C.1.5.4.3 distortion-control loop can run on the
+    // auto-block-type Short granules. Start/End transition skeletons
+    // fall back to the fixed-gain inner-loop path inside the encoder.
+    //
+    // The combined configuration must:
+    //   * accept `enable_auto_block_type` on top of `new_with_outer_loop`
+    //     (the r156 rejection is removed);
+    //   * produce a structurally valid MP3 stream on a click-train
+    //     stimulus that engages the Short geometry;
+    //   * keep the §2.4.2.7 invariants on every short granule
+    //     (`preflag == false`; transmitted `subblock_gain` values fit the
+    //     3-bit field).
     let mut enc = Mp3Encoder::new_with_outer_loop(
         BR,
         SR,
@@ -161,14 +175,72 @@ fn auto_block_type_rejected_when_outer_loop_configured() {
     )
     .expect("outer-loop encoder build");
     assert!(!enc.auto_block_type_enabled());
-    let res = enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD);
+    enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto + outer-loop combination now accepted");
     assert!(
-        res.is_err(),
-        "auto + outer-loop should be rejected at enable time"
+        enc.auto_block_type_enabled(),
+        "flag must be set after enable"
     );
+
+    // Drive a click-train PCM that exercises the auto scheduler's
+    // LONG → START → SHORT → END → LONG sequence (so the outer-loop
+    // dispatch visits all four block-type cases at least once).
+    let n = SR as usize;
+    let pcm = click_train_pcm(n, /*click_period=*/ 6600);
+    enc.push_samples(&pcm).expect("push pcm");
+    let mut bytes = Vec::new();
+    let _ = enc.finish(&mut bytes).expect("encoder finish");
+
+    let mut frames = 0usize;
+    let mut saw_short = false;
+    for frame in FrameWalker::new(&bytes) {
+        frames += 1;
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
+        for gr in 0..si.granule_count as usize {
+            for ch in 0..si.channels as usize {
+                let gc = &si.granules[gr][ch];
+                // §2.4.2.7 invariant: short blocks never set preflag.
+                if gc.window_switching_flag && gc.block_type == BlockType::Short {
+                    assert!(
+                        !gc.preflag,
+                        "short block emitted with preflag (violates §2.4.2.7)"
+                    );
+                    saw_short = true;
+                }
+                // 3-bit field check on subblock_gain.
+                for &sg in &gc.subblock_gain {
+                    assert!(sg <= 7, "subblock_gain {sg} exceeds 3-bit field");
+                }
+            }
+        }
+    }
+    assert!(frames > 0, "no frames emitted in auto + outer-loop stream");
     assert!(
-        !enc.auto_block_type_enabled(),
-        "flag must stay off after rejection"
+        saw_short,
+        "click-train auto + outer-loop did not engage any Short granule \
+         (outer-loop dispatch on Short would not have been exercised)"
+    );
+
+    // Demuxer must still accept the resulting byte stream end-to-end.
+    let cursor = Cursor::new(bytes);
+    let mut demux = Mp3Demuxer::open(Box::new(cursor)).expect("demuxer open");
+    let mut packets = 0usize;
+    loop {
+        match demux.next_packet() {
+            Ok(_pkt) => {
+                packets += 1;
+                if packets > 2_000 {
+                    break;
+                }
+            }
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux next_packet: {e}"),
+        }
+    }
+    assert!(
+        packets > 0,
+        "demuxer accepted no packets from auto + outer-loop stream"
     );
 }
 

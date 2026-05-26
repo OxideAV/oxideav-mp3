@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Auto block-type × outer-loop integration** (Phase 2 step 28).
+  Wires the r157 `outer_loop_search_short` primitive into
+  `Mp3Encoder::assemble_frame_with_lookahead`, completing the missing
+  half of the §C.1.5.4.3 distortion-control coverage for the auto
+  scheduler. Three changes:
+  - `enable_auto_block_type` no longer rejects encoders configured
+    with `new_with_outer_loop`. The pair-rejection from r156 was a
+    placeholder pending the short-block primitive; r157 added the
+    primitive, and r158 dispatches onto it.
+  - The per-(gr, ch) outer-loop arm in `assemble_frame_with_lookahead`
+    inspects the granule's selected block type and dispatches:
+    `BlockType::Long` → `outer_loop_search_long` (the r144 path);
+    `BlockType::Short` with `mixed_block_flag == false` →
+    `outer_loop_search_short`; `BlockType::Start` / `BlockType::End`
+    (long-family transition skeletons) fall back to the fixed-gain
+    inner-loop path (no outer-loop primitive covers transition
+    skeletons yet — their §2.4.2.7 coefficient distribution shifts
+    mid-overlap so the uniform-`xmin` heuristic over-amplifies; a
+    follow-up round will target them with a psy-aware threshold).
+    Mixed-block Short is a separate follow-up (cf. r157 followup #1).
+  - `subblock_gain[w]` returned by `outer_loop_search_short` is now
+    propagated into the granule-channel's side-info field; the
+    §C.1.5.4.4.5 part2 / part3 budget split also tracks the per-block
+    part2 cost (Long: 74 bits, pure-short: 126 bits, mixed: 122
+    bits) so the inner-loop budget check is bit-accurate per shape.
+  - `tests/auto_block_type_roundtrip.rs` rewrites the r156 rejection
+    test as a positive integration test: a click-train PCM is encoded
+    through `new_with_outer_loop` + `enable_auto_block_type`,
+    `FrameWalker` parses every emitted frame, the §2.4.2.7 invariants
+    (`preflag == false` on short, `subblock_gain[w] <= 7`) are
+    verified, the demuxer accepts the stream, and at least one
+    `BlockType::Short` granule is witnessed so the new dispatch path
+    is provably exercised. Tests: 532 pass (same as r157; one
+    rejection test rewritten in place per guardrail #3).
+
 - **§C.1.5.4.3 outer-loop short-block analogue** (Phase 2 step 27).
   `outer_loop_search_short` is the per-(sfb, window)
   distortion-control iteration the auto-block-type dispatcher from

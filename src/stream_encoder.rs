@@ -70,7 +70,9 @@ use crate::main_data::{
     assemble_main_data, schedule_reservoir, GranuleChannelData, ReservoirError, ReservoirFrame,
 };
 use crate::mdct::{forward_overlap, mdct, window_long_family_analysis, MdctState, LONG_N};
-use crate::outer_loop::{outer_loop_search_long, OUTER_LOOP_SCALEFAC_COMPRESS};
+use crate::outer_loop::{
+    outer_loop_search_long, outer_loop_search_short, OUTER_LOOP_SCALEFAC_COMPRESS,
+};
 use crate::quantize::quantize;
 use crate::scalefactors::{FrameScaleFactors, ScaleFactors};
 use crate::side_info::{BlockType, GranuleChannel, SideInfo, GRANULES};
@@ -734,16 +736,18 @@ impl Mp3Encoder {
         if self.nch != 1 {
             return Err(StreamEncodeError::StereoUnsupported);
         }
-        // The outer loop's `outer_loop_search_long` is long-block only
-        // — its scalefactor bands are the long-family Table 3-B.8 set,
-        // not the short-family per-window set — so auto block-type
-        // (which can emit Short / Start / End granules) is incompatible
-        // with the outer loop until a short-block analogue lands
-        // (Phase 2 step 26+ followup). Reject the combination at
-        // enable-time rather than silently truncating granules.
-        if self.outer_loop_threshold.is_some() {
-            return Err(StreamEncodeError::StereoUnsupported);
-        }
+        // Outer loop is now compatible with auto block-type:
+        //   * Long granules — `outer_loop_search_long`
+        //   * Short granules (`mixed_block_flag == false`) —
+        //     `outer_loop_search_short`
+        //   * Start / End transition granules — fall back to the
+        //     fixed-gain inner-loop path (no outer-loop primitive for
+        //     long-family window-switched skeletons yet; their part2
+        //     scalefactor layout is the long-family one but the §2.4.2.7
+        //     coefficient distribution shifts mid-overlap, so the
+        //     uniform-`xmin` heuristic over-amplifies; revisit in a
+        //     follow-up round once the psy model can target transition
+        //     granules separately).
         // Mutually exclusive with the force-toggles; clear them.
         self.force_short_blocks = false;
         self.force_mixed_blocks = false;
@@ -1847,82 +1851,175 @@ impl Mp3Encoder {
                     default_long_gc()
                 };
                 let per_gc_bits = self.per_gc_bit_budget();
-                // When the outer loop runs, part2 (scalefactors) costs
-                // 74 bits per granule-channel (`scalefac_compress = 15`:
-                // 11·slen1 + 10·slen2 = 11·4 + 10·3); the inner loop's
-                // part3 budget shrinks by that amount.
-                let part2_bits_outer: usize = 11 * 4 + 10 * 3;
-                let inner_budget_for_outer = per_gc_bits.saturating_sub(part2_bits_outer) as u64;
-                let (sf, initial_gain, scalefac_scale_outer) = match self.outer_loop_threshold {
-                    Some(thr) => {
-                        // Outer loop seeds scalefac_compress = 15 so the
-                        // chosen per-band scalefactors can be written
-                        // back as part2.
-                        let mut gc_for_ol = gc_template;
-                        gc_for_ol.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
-                        let res = outer_loop_search_long(
-                            &xr_pre,
-                            &gc_for_ol,
-                            self.sample_rate_hz,
-                            self.version,
-                            inner_budget_for_outer,
-                            thr,
-                            DEFAULT_OUTER_LOOP_MAX_ITER,
-                        );
-                        // The outer loop reports:
-                        //   * `scalefac_scale` — §C.1.5.4.3 dynamic-range
-                        //     escalation (multiplier 1.0 vs 0.5);
-                        //   * `scalefactors.preflag` — §C.1.5.4.3.4
-                        //     preemphasis (Table B.6 pretab boost on the
-                        //     upper bands).
-                        // Both must be propagated into the granule-channel
-                        // so the re-quantize step below and the side-info
-                        // write reflect what the outer loop converged on.
-                        // `sf.preflag` (returned inside `res.scalefactors`)
-                        // is what `quantize()` reads; `gc.preflag` is what
-                        // the side-info encoder writes — we mirror them
-                        // below at the top of the `loop`.
-                        (res.scalefactors, res.global_gain, res.scalefac_scale)
+                // Part2 (scalefactor) cost under `scalefac_compress = 15`
+                // (slen1 = 4, slen2 = 3) depends on block type:
+                //
+                //   * Long: 21 long bands grouped 11·slen1 + 10·slen2
+                //     (the §C.1.5.4.3.6 partitioning the outer loop uses).
+                //     Cost: 11·4 + 10·3 = 74 bits.
+                //   * Pure-short (`block_type == Short`,
+                //     `mixed_block_flag == false`): 12 short SFB × 3
+                //     windows, slen1 for sfb 0..6 and slen2 for sfb 6..12.
+                //     Cost: 6·3·4 + 6·3·3 = 126 bits.
+                //   * Mixed (`block_type == Short`,
+                //     `mixed_block_flag == true`): 8 long sfb (slen1
+                //     each) + short sfb 3..12 × 3 windows (slen1 for
+                //     sfb 3..6, slen2 for sfb 6..12). Cost:
+                //     8·4 + 3·3·4 + 6·3·3 = 32 + 36 + 54 = 122 bits.
+                //
+                // See `crate::scalefactors::write_mpeg1_granule_channel`
+                // for the wire layout each branch mirrors.
+                let part2_bits_outer: usize = if gc_template.window_switching_flag
+                    && gc_template.block_type == BlockType::Short
+                {
+                    if gc_template.mixed_block_flag {
+                        8 * 4 + 3 * 3 * 4 + 6 * 3 * 3
+                    } else {
+                        6 * 3 * 4 + 6 * 3 * 3
                     }
-                    None => {
-                        let sf = ScaleFactors::default();
-                        // VBR-mode gain choice: skip the bit-budget
-                        // gain search. Without a psychoacoustic model
-                        // the budget search would saturate the chosen
-                        // VBR max-index slot regardless of content
-                        // complexity — defeating the point of letting
-                        // the encoder pick a smaller per-frame bitrate.
-                        // The magnitude-clamp gain alone (the smallest
-                        // gain with `max|is| ≤ 8191`) is the natural
-                        // content-driven quality floor and lets the
-                        // per-frame VBR-index selector see a true
-                        // content-dependent main-data size. CBR keeps
-                        // the dual search; the VBR path uses clamp-only.
-                        let res_clamp = search_magnitude_clamp(
-                            &xr_pre,
-                            &gc_template,
-                            &sf,
-                            self.sample_rate_hz,
-                            self.version,
-                        );
-                        let initial_gain = if self.vbr.is_some() {
-                            res_clamp.global_gain
-                        } else {
-                            let res_budget = search_bit_budget(
+                } else {
+                    11 * 4 + 10 * 3
+                };
+                let inner_budget_for_outer = per_gc_bits.saturating_sub(part2_bits_outer) as u64;
+                // The outer loop only runs on the two block-type shapes
+                // covered by a primitive today: Long (the original r144
+                // path) and pure-Short (`outer_loop_search_short`, r157).
+                // Start / End / mixed-Short fall back to the fixed-gain
+                // inner-loop path with `scalefactor_compress = 0` (zero
+                // scalefactors) so the rest of the encoder stays
+                // shape-compatible with the side-info skeleton this
+                // (gr, ch) selected upstream.
+                let outer_loop_eligible = matches!(
+                    (
+                        gc_template.window_switching_flag,
+                        gc_template.block_type,
+                        gc_template.mixed_block_flag,
+                    ),
+                    (false, BlockType::Long, _) | (true, BlockType::Short, false)
+                );
+                let (sf, initial_gain, scalefac_scale_outer, subblock_gain_outer) =
+                    match self.outer_loop_threshold {
+                        Some(thr) if outer_loop_eligible => {
+                            // Outer loop seeds scalefac_compress = 15 so the
+                            // chosen per-band scalefactors can be written
+                            // back as part2.
+                            let mut gc_for_ol = gc_template;
+                            gc_for_ol.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
+                            match gc_template.block_type {
+                                BlockType::Long => {
+                                    let res = outer_loop_search_long(
+                                        &xr_pre,
+                                        &gc_for_ol,
+                                        self.sample_rate_hz,
+                                        self.version,
+                                        inner_budget_for_outer,
+                                        thr,
+                                        DEFAULT_OUTER_LOOP_MAX_ITER,
+                                    );
+                                    // The outer loop reports:
+                                    //   * `scalefac_scale` — §C.1.5.4.3
+                                    //     dynamic-range escalation
+                                    //     (multiplier 1.0 vs 0.5);
+                                    //   * `scalefactors.preflag` —
+                                    //     §C.1.5.4.3.4 preemphasis
+                                    //     (Table B.6 pretab boost on the
+                                    //     upper bands).
+                                    // Both must be propagated into the
+                                    // granule-channel so the re-quantize
+                                    // step below and the side-info write
+                                    // reflect what the outer loop
+                                    // converged on. `sf.preflag` is what
+                                    // `quantize()` reads; `gc.preflag` is
+                                    // what the side-info encoder writes —
+                                    // we mirror them below at the top of
+                                    // the `loop`.
+                                    (
+                                        res.scalefactors,
+                                        res.global_gain,
+                                        res.scalefac_scale,
+                                        [0u8; 3],
+                                    )
+                                }
+                                BlockType::Short => {
+                                    // Pure-short outer loop (§C.1.5.4.3
+                                    // analogue) — r157
+                                    // `outer_loop_search_short`. Reports
+                                    // per-window `subblock_gain` (raised
+                                    // from zero on §C.1.5.4.4.2
+                                    // magnitude-clamp failures); preflag
+                                    // is invariant `false` for short blocks
+                                    // (§2.4.2.7). The MPEG-1 part2 wire
+                                    // layout for pure-short reads
+                                    // `sf.short[sfb][win]` for sfb 0..12
+                                    // (see `write_mpeg1_granule_channel`).
+                                    let res = outer_loop_search_short(
+                                        &xr_pre,
+                                        &gc_for_ol,
+                                        self.sample_rate_hz,
+                                        self.version,
+                                        inner_budget_for_outer,
+                                        thr,
+                                        DEFAULT_OUTER_LOOP_MAX_ITER,
+                                    );
+                                    (
+                                        res.scalefactors,
+                                        res.global_gain,
+                                        res.scalefac_scale,
+                                        res.subblock_gain,
+                                    )
+                                }
+                                // Unreachable: gating above forbids
+                                // Start / End from this arm.
+                                BlockType::Start | BlockType::End => {
+                                    debug_assert!(false, "outer-loop ineligible block_type");
+                                    (ScaleFactors::default(), 0u8, false, [0u8; 3])
+                                }
+                            }
+                        }
+                        _ => {
+                            // Fixed-gain inner-loop path. Reached when
+                            // (a) outer loop disabled, or (b) outer
+                            // loop enabled but block type is Start /
+                            // End / mixed-Short and no outer-loop
+                            // primitive covers that shape yet.
+                            let sf = ScaleFactors::default();
+                            // VBR-mode gain choice: skip the bit-budget
+                            // gain search. Without a psychoacoustic model
+                            // the budget search would saturate the chosen
+                            // VBR max-index slot regardless of content
+                            // complexity — defeating the point of letting
+                            // the encoder pick a smaller per-frame bitrate.
+                            // The magnitude-clamp gain alone (the smallest
+                            // gain with `max|is| ≤ 8191`) is the natural
+                            // content-driven quality floor and lets the
+                            // per-frame VBR-index selector see a true
+                            // content-dependent main-data size. CBR keeps
+                            // the dual search; the VBR path uses clamp-only.
+                            let res_clamp = search_magnitude_clamp(
                                 &xr_pre,
                                 &gc_template,
                                 &sf,
                                 self.sample_rate_hz,
                                 self.version,
-                                per_gc_bits as u64,
                             );
-                            res_budget.global_gain.max(res_clamp.global_gain)
-                        };
-                        // No outer loop ⇒ no escalation; scalefac_scale
-                        // stays 0 for the fixed-gain path.
-                        (sf, initial_gain, false)
-                    }
-                };
+                            let initial_gain = if self.vbr.is_some() {
+                                res_clamp.global_gain
+                            } else {
+                                let res_budget = search_bit_budget(
+                                    &xr_pre,
+                                    &gc_template,
+                                    &sf,
+                                    self.sample_rate_hz,
+                                    self.version,
+                                    per_gc_bits as u64,
+                                );
+                                res_budget.global_gain.max(res_clamp.global_gain)
+                            };
+                            // No outer loop ⇒ no escalation; scalefac_scale
+                            // stays 0 for the fixed-gain path.
+                            (sf, initial_gain, false, [0u8; 3])
+                        }
+                    };
                 let mut global_gain = initial_gain;
                 let _ = (GAIN_MAX, GAIN_MIN); // re-export keep-alive
 
@@ -1932,7 +2029,15 @@ impl Mp3Encoder {
                 // budget, bump the gain by 1 and retry — the
                 // §C.1.5.4.4 `qquant + 1` outer ratchet, applied
                 // here only as a budget-overrun safety net.
-                let scalefac_compress = if self.outer_loop_threshold.is_some() {
+                //
+                // The outer-loop branches above bake non-zero
+                // scalefactors into `sf`; the fallback path leaves
+                // `sf` at default (zeros). Only the outer-loop branches
+                // need `scalefac_compress = 15` written into the
+                // side-info — the fallback path's zero scalefactors
+                // round-trip equally with `scalefac_compress = 0`.
+                let ran_outer_loop = self.outer_loop_threshold.is_some() && outer_loop_eligible;
+                let scalefac_compress = if ran_outer_loop {
                     OUTER_LOOP_SCALEFAC_COMPRESS
                 } else {
                     0
@@ -1969,12 +2074,24 @@ impl Mp3Encoder {
                     // the side-info bit later instructs the decoder to
                     // requantize with.
                     gc.scalefac_scale = scalefac_scale_outer;
+                    // §2.4.2.7 subblock_gain: the short-block outer loop
+                    // raises individual windows' per-window gain off zero
+                    // when the §C.1.5.4.4.2 magnitude clamp can't fit a
+                    // window under 8191. Mirror those into the granule;
+                    // for every other block type / fallback path the
+                    // outer-loop dispatcher leaves it as `[0; 3]`, which
+                    // matches the template default.
+                    gc.subblock_gain = subblock_gain_outer;
                     is = quantize(&xr_pre, &gc, &sf, self.sample_rate_hz, self.version);
                     clamp_above(&mut is, 8191);
                     split = partition_split(&is);
                     bv2 = split.big_pairs * 2;
                     gc.big_values = split.big_pairs as u16;
-                    if self.force_short_blocks || self.force_mixed_blocks {
+                    if self.force_short_blocks
+                        || self.force_mixed_blocks
+                        || (gc_template.window_switching_flag
+                            && gc_template.block_type == BlockType::Short)
+                    {
                         // §C.1.5.4.4.6 + huffman::region_boundaries:
                         // short and mixed blocks hardcode region 0 to
                         // the first 36 lines and region 1 to the rest of
@@ -1994,6 +2111,14 @@ impl Mp3Encoder {
                         // short region (subbands 2..31), already
                         // re-ordered into `[sfb][win][k]` native order
                         // by `forward_reorder` above.
+                        //
+                        // The auto-block-type path
+                        // ([`Mp3Encoder::enable_auto_block_type`]) may
+                        // also emit `BlockType::Short` granules without
+                        // setting either force-toggle, so we extend the
+                        // gate to any window-switched short-family
+                        // template — the wire layout and the §2.4.4.5
+                        // bit-cost check are then consistent.
                         r0_end = 36usize.min(bv2);
                         r1_end = bv2;
                     } else {
@@ -2026,7 +2151,7 @@ impl Mp3Encoder {
                         + bits_for_range(&is, r1_end, bv2, t2).unwrap_or(usize::MAX / 4);
                     let cnt1_bits = crate::huffman::count1_bits(&is, c1s, c1e, count1_b);
                     let total = big_bits + cnt1_bits;
-                    let budget_for_part3 = if self.outer_loop_threshold.is_some() {
+                    let budget_for_part3 = if ran_outer_loop {
                         inner_budget_for_outer as usize
                     } else {
                         per_gc_bits

@@ -1303,15 +1303,17 @@ literal §2.4.3.4.10.1 wording. The side-info wiring
 (`window_switching_flag` / `block_type` / window-switched-branch
 defaults) follows the chosen block type per granule too.
 
-Restrictions this round: mono only (cross-channel block-type
-agreement under §2.4.3.4.9 needed for stereo / joint /
-dual-channel), mutually exclusive with the existing
-force-toggles and with the outer loop (the long-only
-`outer_loop_search_long` doesn't yet handle Short / Start / End
-granules — a per-window `subblock_gain` short-block analogue is
-the natural follow-up). Validated by 27 new tests: 10 unit tests
-in `attack_detect.rs` (silent / unit-DC subframe energies, pure
-sine no-fire, step-burst flagged, pure silence not flagged with
+Restrictions on the auto path: mono only (cross-channel
+block-type agreement under §2.4.3.4.9 needed for stereo / joint /
+dual-channel) and mutually exclusive with the existing
+force-toggles (the testing toggles set the block type globally;
+auto chooses per granule). The outer-loop combination is
+**accepted** as of step 28 — see the "Phase 2 step 28" section
+below for the dispatch shape; the r156 rejection of that
+combination has been replaced by a positive integration test.
+Validated by 27 new tests landed in step 26: 10 unit tests in
+`attack_detect.rs` (silent / unit-DC subframe energies, pure sine
+no-fire, step-burst flagged, pure silence not flagged with
 bounded ambient, detector adapts after repeated bursts, click
 after silence flagged, invalid-threshold fallback, reset clears
 ambient), 8 unit tests in `block_type_sm.rs` (all-calm Long-only,
@@ -1322,10 +1324,12 @@ Stop → Long invariant even on immediate burst, reset to Long),
 and 9 integration tests in
 `tests/auto_block_type_roundtrip.rs` (stereo rejection, default
 off, enable/disable round trip, mutual exclusion with
-force-short / force-mixed / outer-loop, pure sine stays Long,
-click train engages Start / Short / End with §C.1.5.2
-transition-validity assertions on every emitted pair, demuxer
-acceptance of the auto stream). Net: 523 tests pass (was 496).
+force-short / force-mixed, pure sine stays Long, click train
+engages Start / Short / End with §C.1.5.2 transition-validity
+assertions on every emitted pair, demuxer acceptance of the auto
+stream, auto + outer-loop combined integration roundtrip). Net:
+523 tests pass at step 26 (was 496); step 27 raised it to 532;
+step 28 preserves 532 (one test rewritten in place).
 
 **Phase 2 step 27 (§C.1.5.4.3 short-block outer-loop analogue)**
 lands `outer_loop_search_short` — the per-(sfb, window)
@@ -1366,14 +1370,16 @@ mirrors `outer_loop_search_long` for `block_type == Short`,
   unconditionally, mirroring the spec and the existing decoder
   invariant.
 
-Restrictions this round: pure short only (`mixed_block_flag == 0`).
-The mixed-block analogue layers the long-block amplifier (over the
-long-window bands 0..=7) on top of this short-block amplifier (over
-the short-window bands 3..=11) with the spec's remapped cap split;
-it is mechanically straightforward but its own piece of work.
-Integration with `Mp3Encoder` (so `enable_auto_block_type` can run
-with the outer loop on for Short granules) is a separate step —
-this round ships the primitive ready to be wired in.
+Restrictions on the step-27 primitive: pure short only
+(`mixed_block_flag == 0`). The mixed-block analogue layers the
+long-block amplifier (over the long-window bands 0..=7) on top of
+this short-block amplifier (over the short-window bands 3..=11)
+with the spec's remapped cap split; it is mechanically
+straightforward but its own piece of work. **Integration into
+`Mp3Encoder` lands in step 28 below** — `enable_auto_block_type`
+can now run with the outer loop on for Short granules; Start / End
+transition skeletons fall back to the fixed-gain inner-loop path
+pending a transition-aware outer-loop primitive.
 
 Validated by 9 new tests inside `outer_loop.rs`:
 `short_upper_limits_match_spec`,
@@ -1394,16 +1400,62 @@ amplitudes never spend a `subblock_gain` bit),
 exercising the §C.1.5.4.3 escalation branch). Net: 532 tests pass
 (was 523).
 
-The remaining Phase 2 work — a real per-band psychoacoustic threshold
-(so the outer loop can spectrally redistribute bits without a
-hand-tuned constant), intensity-stereo encode (§2.4.3.4.9.3),
-multi-channel short / mixed block-type agreement (§2.4.3.4.9), the
-mixed-block outer-loop variant (layering long-block + short-block
-amplifiers across the 8-long-band + 9-short-band mixed layout),
-wiring `outer_loop_search_short` into `Mp3Encoder` so the auto
-block-type path can run with the outer loop on, LSF encode, and
-stereo / LSF decode through the trait wrapper — is still a later
-round.
+**Phase 2 step 28 (auto block-type × outer-loop integration)** wires
+`outer_loop_search_short` into `Mp3Encoder::assemble_frame_with_lookahead`,
+completing the missing half of §C.1.5.4.3 distortion-control coverage
+for the auto scheduler.
+
+`enable_auto_block_type` no longer rejects encoders configured with
+`new_with_outer_loop` — the r156 pair-rejection was a placeholder
+pending the short-block primitive that r157 landed. The per-(gr, ch)
+outer-loop arm now inspects the granule's selected block type and
+dispatches:
+
+* **`BlockType::Long`** (window_switching off) →
+  `outer_loop_search_long` (the r144 path); part2 cost 74 bits
+  (11·slen1 + 10·slen2 under `scalefac_compress = 15`).
+* **`BlockType::Short`** + `mixed_block_flag == false` →
+  `outer_loop_search_short` (the r157 primitive); part2 cost
+  126 bits (6·3·slen1 + 6·3·slen2). The returned per-window
+  `subblock_gain[w]` is propagated into the granule's
+  `subblock_gain` side-info field; the returned `scalefac_scale`
+  is mirrored on the side-info as in the long path.
+* **`BlockType::Start`** / **`BlockType::End`** (long-family
+  transition skeletons, window_switching on) → fall back to the
+  fixed-gain inner-loop path (magnitude clamp + bit-budget search).
+  No outer-loop primitive covers transition skeletons yet — their
+  §2.4.2.7 coefficient distribution shifts mid-overlap, so the
+  uniform-`xmin` heuristic over-amplifies; a follow-up round will
+  target them with a psy-aware threshold.
+
+The §C.1.5.4.4.5 part2 / part3 budget split also tracks the per-block
+part2 cost (Long: 74 bits, pure-short: 126 bits, mixed: 122 bits) so
+the inner-loop budget check is bit-accurate per shape (the previous
+single constant assumed Long).
+
+Validated by `tests/auto_block_type_roundtrip.rs::auto_block_type_combines_with_outer_loop_and_roundtrips`,
+which rewrites the r156 rejection assertion as a positive integration
+test: a click-train PCM is encoded through
+`Mp3Encoder::new_with_outer_loop(192, 44_100, SingleChannel,
+/*xmin=*/ 1e-6)` + `enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)`,
+`FrameWalker` parses every emitted frame, the §2.4.2.7 invariants
+(`preflag == false` on every short granule; `subblock_gain[w] <= 7`
+on every granule) are asserted, the demuxer accepts the stream, and
+at least one `BlockType::Short` granule is witnessed so the new
+dispatch path is provably exercised. Tests: 532 pass (same total as
+r157; the r156 rejection test was rewritten in place per guardrail
+#3).
+
+Remaining Phase 2 work: a real per-band psychoacoustic threshold (so
+the outer loop can spectrally redistribute bits without a hand-tuned
+constant), intensity-stereo encode (§2.4.3.4.9.3), multi-channel
+short / mixed block-type agreement (§2.4.3.4.9), the mixed-block
+outer-loop variant (layering long-block + short-block amplifiers
+across the 8-long-band + 9-short-band mixed layout), an outer-loop
+primitive that targets the §C.1.5.2 Start / End transition
+skeletons (currently the auto + outer-loop integration falls back
+to fixed-gain on those two block types), LSF encode, and stereo /
+LSF decode through the trait wrapper.
 
 ### Not yet implemented
 
@@ -1413,7 +1465,7 @@ scalefactor paths — are present; the wrapper is mono MPEG-1 only this
 round; the framing layer accepts MPEG-2.5 as of step 25 but the
 trait-wrapper audio-decode chain still rejects it pending the
 `MPEG-2.5-GAP.md` observer-trace items). The encoder is **Phase 1
-framing + Phase 2 steps 1–27 (forward MDCT primitive + analysis
+framing + Phase 2 steps 1–28 (forward MDCT primitive + analysis
 windowing + forward overlap split + polyphase analysis subband
 filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
@@ -1439,27 +1491,30 @@ signal-driven attack-detection heuristic and §C.1.5.2
 `Mp3Encoder::enable_auto_block_type` + §C.1.5.4.3 pure-short
 outer-loop primitive `outer_loop_search_short` with per-(sfb,
 window) `scalefac_s` amplification and bounded `subblock_gain`
-search)** — it still lacks the
-psychoacoustic model (so the outer loop's `xmin(sb)` is a uniform
-constant rather than per-band masking-aware), intensity-stereo
-encode (§2.4.3.4.9.3), multi-channel short / mixed / auto-block-type
-support (§2.4.3.4.9 cross-channel block-type agreement is the gap
-the force-short / force-mixed toggles and the new auto path reject
-stereo on), wiring `outer_loop_search_short` (present as of
-step 27) into `Mp3Encoder` so the auto block-type path can run
-with the outer loop on for Short granules (and the §C.1.5.4.3
-short-block mixed-block analogue, which composes the long-block
-amplifier over the long-window bands 0..=7 with the new
-short-block amplifier over the short-window bands 3..=11), and
-LSF / MPEG-2.5 encode (the framing layer
-round-trips MPEG-2.5 headers but the encoder's stream-level driver
-still rejects non-MPEG-1 streams; the MPEG-2.5-specific
-scalefactor-band tables + Huffman table mapping + low-rate
-frame-size validation items in `MPEG-2.5-GAP.md` are needed before
-bit-exact MPEG-2.5 encode is implementable). The pure-short
-`outer_loop_search_short` primitive is present as of step 27 but
-not yet wired into `Mp3Encoder` (the auto block-type path of
-step 26 still runs without an outer loop on Short granules).
+search + auto-block-type × outer-loop integration so the auto
+scheduler runs `outer_loop_search_short` on Short granules and
+`outer_loop_search_long` on Long granules while Start / End
+transition skeletons fall back to fixed-gain)** — it still lacks
+the psychoacoustic model (so the outer loop's `xmin(sb)` is a
+uniform constant rather than per-band masking-aware),
+intensity-stereo encode (§2.4.3.4.9.3), multi-channel short /
+mixed / auto-block-type support (§2.4.3.4.9 cross-channel
+block-type agreement is the gap the force-short / force-mixed
+toggles and the new auto path reject stereo on), an outer-loop
+primitive that targets the §C.1.5.2 Start / End transition
+skeletons (currently the auto + outer-loop integration falls back
+to the fixed-gain inner-loop path for those two block types — the
+§2.4.2.7 coefficient distribution shifts mid-overlap and the
+uniform-`xmin` heuristic over-amplifies until a psy-aware
+threshold is wired in), the §C.1.5.4.3 short-block mixed-block
+analogue (which composes the long-block amplifier over the
+long-window bands 0..=7 with the new short-block amplifier over
+the short-window bands 3..=11), and LSF / MPEG-2.5 encode (the
+framing layer round-trips MPEG-2.5 headers but the encoder's
+stream-level driver still rejects non-MPEG-1 streams; the
+MPEG-2.5-specific scalefactor-band tables + Huffman table mapping
++ low-rate frame-size validation items in `MPEG-2.5-GAP.md` are
+needed before bit-exact MPEG-2.5 encode is implementable).
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
