@@ -1327,14 +1327,83 @@ click train engages Start / Short / End with §C.1.5.2
 transition-validity assertions on every emitted pair, demuxer
 acceptance of the auto stream). Net: 523 tests pass (was 496).
 
+**Phase 2 step 27 (§C.1.5.4.3 short-block outer-loop analogue)**
+lands `outer_loop_search_short` — the per-(sfb, window)
+distortion-control iteration the auto-block-type dispatcher from
+step 26 needs to run with the outer loop on. The new primitive
+mirrors `outer_loop_search_long` for `block_type == Short`,
+`mixed_block_flag == false` granules:
+
+* **Per-cell amplification.** `band_distortion_short(xr, xr_back,
+  sf, scalefac_scale, sr, ver)` returns the §C.1.5.4.3.3
+  distortion as a `[[f64; 3]; 12]` keyed by `(sfb, window)`. Each
+  iteration marks every cell with `xfsf_s[sfb][win] >
+  uniform_threshold` and amplifies `scalefac_s[sfb][win] += 1` for
+  the marked cells. Caps follow §C.1.5.4.3.6 with our
+  `OUTER_LOOP_SCALEFAC_COMPRESS = 15` (slen1 = 4, slen2 = 3): 15 for
+  the slen1-range short sfb 0..=5, 7 for the slen2-range sfb
+  6..=11.
+* **Bounded `subblock_gain` search.** Spec-silent (§C.1.5 leaves
+  the heuristic to the implementation); we adopt the §C.1.5.4.4.2
+  magnitude-clamp-driven scheme: when `search_magnitude_clamp`
+  reports `satisfied == false` (a single window grossly outranges
+  the others — the §2.4.3.4.7.1 `8·subblock_gain[w]` term exists
+  exactly for this case), `per_window_max_abs` identifies the
+  over-cap windows and bumps each one's `subblock_gain[w]` by 1
+  (saturating at the §2.4.2.7 3-bit cap of 7), then restarts the
+  iteration body. Quiet windows stay at zero; the field is never
+  spent on bands that don't need it.
+* **`scalefac_scale = 1` escalation.** Same §C.1.5.4.3 path as the
+  long-block loop: when an amplification would push any cell past
+  its §C.1.5.4.3.6 cap AND the loop is still in
+  `scalefac_scale = 0` mode, halve every in-progress per-cell
+  `scalefac_s` (round-to-nearest) and switch to
+  `scalefac_scale = 1`. The `2^(mult·sf_s)` colouring is preserved
+  (mult doubles 0.5 → 1.0; halving sf keeps the product
+  unchanged). One escalation event only.
+* **`preflag` invariant.** §2.4.2.7 says preflag is never set for
+  short blocks; the result's `scalefactors.preflag` stays `false`
+  unconditionally, mirroring the spec and the existing decoder
+  invariant.
+
+Restrictions this round: pure short only (`mixed_block_flag == 0`).
+The mixed-block analogue layers the long-block amplifier (over the
+long-window bands 0..=7) on top of this short-block amplifier (over
+the short-window bands 3..=11) with the spec's remapped cap split;
+it is mechanically straightforward but its own piece of work.
+Integration with `Mp3Encoder` (so `enable_auto_block_type` can run
+with the outer loop on for Short granules) is a separate step —
+this round ships the primitive ready to be wired in.
+
+Validated by 9 new tests inside `outer_loop.rs`:
+`short_upper_limits_match_spec`,
+`short_band_distortion_zero_when_perfect`,
+`outer_loop_short_terminates_with_huge_threshold`,
+`outer_loop_short_terminates_with_tiny_threshold`,
+`outer_loop_short_amplifies_only_offending_cells` (only the planted
+(sfb, win) cell ever amplifies; silent cells stay at zero),
+`outer_loop_short_raises_subblock_gain_on_extreme_window` (5e9
+amplitudes in window 0 only — well past the GAIN_MAX reach of
+~4.4e8 at default `subblock_gain` — must escalate
+`subblock_gain[0]` while leaving windows 1 and 2 at zero),
+`outer_loop_short_subblock_gain_stays_zero_on_quiet_input` (modest
+amplitudes never spend a `subblock_gain` bit),
+`outer_loop_short_default_preflag_off` (§2.4.2.7 invariant),
+`outer_loop_short_escalates_scalefac_scale_when_cap_would_terminate`
+(planted sfb-11 win-1 cell drives that cell past its slen2 cap of 7,
+exercising the §C.1.5.4.3 escalation branch). Net: 532 tests pass
+(was 523).
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the outer loop can spectrally redistribute bits without a
 hand-tuned constant), intensity-stereo encode (§2.4.3.4.9.3),
-§C.1.5.4.3 outer-loop short-block analogue (per-window
-`subblock_gain` search; needed before the auto block-type path of
-step 26 can run with the outer loop on), multi-channel short / mixed
-block-type agreement (§2.4.3.4.9), LSF encode, and stereo / LSF
-decode through the trait wrapper — is still a later round.
+multi-channel short / mixed block-type agreement (§2.4.3.4.9), the
+mixed-block outer-loop variant (layering long-block + short-block
+amplifiers across the 8-long-band + 9-short-band mixed layout),
+wiring `outer_loop_search_short` into `Mp3Encoder` so the auto
+block-type path can run with the outer loop on, LSF encode, and
+stereo / LSF decode through the trait wrapper — is still a later
+round.
 
 ### Not yet implemented
 
@@ -1344,7 +1413,7 @@ scalefactor paths — are present; the wrapper is mono MPEG-1 only this
 round; the framing layer accepts MPEG-2.5 as of step 25 but the
 trait-wrapper audio-decode chain still rejects it pending the
 `MPEG-2.5-GAP.md` observer-trace items). The encoder is **Phase 1
-framing + Phase 2 steps 1–26 (forward MDCT primitive + analysis
+framing + Phase 2 steps 1–27 (forward MDCT primitive + analysis
 windowing + forward overlap split + polyphase analysis subband
 filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
@@ -1367,21 +1436,30 @@ linbits-reach filter in the Huffman table chooser + MPEG-2.5 frame
 header parse + writer + sample-rate-table dispatch + §C.1.5
 signal-driven attack-detection heuristic and §C.1.5.2
 `LONG → START → SHORT → STOP → LONG` transition state machine via
-`Mp3Encoder::enable_auto_block_type`)** — it still lacks the
+`Mp3Encoder::enable_auto_block_type` + §C.1.5.4.3 pure-short
+outer-loop primitive `outer_loop_search_short` with per-(sfb,
+window) `scalefac_s` amplification and bounded `subblock_gain`
+search)** — it still lacks the
 psychoacoustic model (so the outer loop's `xmin(sb)` is a uniform
 constant rather than per-band masking-aware), intensity-stereo
 encode (§2.4.3.4.9.3), multi-channel short / mixed / auto-block-type
 support (§2.4.3.4.9 cross-channel block-type agreement is the gap
 the force-short / force-mixed toggles and the new auto path reject
-stereo on), §C.1.5.4.3 outer-loop short-block analogue (the
-long-only `outer_loop_search_long` needs a per-window
-`subblock_gain` search before the auto block-type path can run with
-the outer loop on), and LSF / MPEG-2.5 encode (the framing layer
+stereo on), wiring `outer_loop_search_short` (present as of
+step 27) into `Mp3Encoder` so the auto block-type path can run
+with the outer loop on for Short granules (and the §C.1.5.4.3
+short-block mixed-block analogue, which composes the long-block
+amplifier over the long-window bands 0..=7 with the new
+short-block amplifier over the short-window bands 3..=11), and
+LSF / MPEG-2.5 encode (the framing layer
 round-trips MPEG-2.5 headers but the encoder's stream-level driver
 still rejects non-MPEG-1 streams; the MPEG-2.5-specific
 scalefactor-band tables + Huffman table mapping + low-rate
 frame-size validation items in `MPEG-2.5-GAP.md` are needed before
-bit-exact MPEG-2.5 encode is implementable).
+bit-exact MPEG-2.5 encode is implementable). The pure-short
+`outer_loop_search_short` primitive is present as of step 27 but
+not yet wired into `Mp3Encoder` (the auto block-type path of
+step 26 still runs without an outer loop on Short granules).
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

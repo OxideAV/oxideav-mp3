@@ -94,8 +94,8 @@
 use crate::frame::MpegVersion;
 use crate::inner_loop::{search_bit_budget, search_magnitude_clamp, GAIN_MAX};
 use crate::quantize::quantize;
-use crate::requantize::{long_band_starts, requantize, NUM_LINES};
-use crate::scalefactors::{ScaleFactors, LONG_SFB};
+use crate::requantize::{long_band_starts, requantize, short_band_starts, NUM_LINES};
+use crate::scalefactors::{ScaleFactors, LONG_SFB, SHORT_SFB, SHORT_WINDOWS};
 use crate::side_info::{BlockType, GranuleChannel};
 
 /// Upper bound on the per-band scalefactor stored in `scalefac_l[sfb]`
@@ -553,6 +553,474 @@ struct InnerInvocation {
     is: [i32; NUM_LINES],
 }
 
+// =========================================================================
+// Short-block outer loop (Phase 2 step 27)
+// =========================================================================
+//
+// §C.1.5.4.3 with the §2.4.2.7 short-block reading: a `block_type == 2`,
+// `mixed_block_flag == 0` granule carries 12 scalefactor bands × 3 windows
+// (36 cells). Each cell has its own `scalefac_s[sfb][window]` and each of
+// the 3 windows shares one `subblock_gain[window]` (3-bit field, range
+// 0..=7) that subtracts an extra `8·subblock_gain[w]` from the long-block
+// `(global_gain - 210)/4` exponent (§2.4.3.4.7.1). The Annex C outer loop
+// is silent on *how* to search `subblock_gain`; we adopt the bounded
+// scheme below.
+//
+// # Per-(sfb, window) amplification
+//
+// Mirroring the long-block loop: each iteration computes per-cell
+// distortion `xfsf_s[sfb][window]` (the spec's §C.1.5.4.3.3 sum, applied
+// over the cell's freqline range), marks every cell over
+// `uniform_threshold`, and amplifies `scalefac_s[sfb][window] += 1` for
+// the marked cells. Termination is the same three §C.1.5.4.3.6 conditions
+// — no cell over threshold, every cell already amplified, or any cell
+// would exceed the §C.1.5.4.3.6 cap (15 for the slen1-range sfb 0..=5,
+// 7 for the slen2-range sfb 6..=11 — Table 3-B.5 with
+// `scalefac_compress = 15` giving `(slen1, slen2) = (4, 3)`).
+//
+// # `subblock_gain` search
+//
+// The §C.1.5.4.4.2 magnitude-clamp inner loop (`search_magnitude_clamp`)
+// already finds the smallest `global_gain` whose quantization keeps every
+// line within the 8191 big-values cap. For short blocks that global cap is
+// often tighter on one window than the others — a transient confined to
+// one short subframe forces the global gain coarser than the quieter
+// windows need. The §2.4.3.4.7.1 `subblock_gain[w]` field exists exactly
+// to relieve this: raising `subblock_gain[w]` by one divides window `w`'s
+// reconstruction by `2^(8/4) = 4`, so the corresponding pre-quantization
+// magnitudes shrink by the same factor relative to the global gain.
+//
+// We escalate `subblock_gain[w]` only when the per-window max magnitude
+// can't fit under 8191 with the chosen `global_gain` — i.e. when the
+// `search_magnitude_clamp` result reports `satisfied == false`. In that
+// case we identify which window(s) sit hardest against the cap and bump
+// their `subblock_gain[w]` by 1 (saturating at the §2.4.2.7 cap of 7).
+// This keeps the search bounded (`subblock_gain[w]` only ever rises, at
+// most 7 times per window) and never wastes bits on quiet windows.
+//
+// # `scalefac_scale` escalation
+//
+// Same §C.1.5.4.3 path as the long-block loop: when an amplification step
+// would push any cell past its §C.1.5.4.3.6 cap AND we're still in
+// `scalefac_scale = 0`, halve every in-progress per-cell scalefactor
+// (round-to-nearest) and switch to `scalefac_scale = 1`. The cap doubles
+// in dynamic-range value; one escalation event only.
+//
+// # `preflag`
+//
+// §2.4.2.7 says "preflag is never used if block_type == 2 (short blocks)",
+// so the long-block §C.1.5.4.3.4 preemphasis branch has no analogue here.
+// `preflag` stays `false` in the returned [`OuterLoopResult`].
+//
+// # `mixed_block_flag == 1` scope
+//
+// Excluded from this round. Mixed blocks have 8 long-window scalefactor
+// bands plus 9 short-window bands (sfb 3..=11) × 3 windows, with the
+// §C.1.5.4.3.6 cap remapped (15 for sfb 0..=17, 7 for the rest per the
+// spec's mixed-block text). The mixed analogue is a follow-up that
+// composes the long-block amplifier (over the long-window bands 0..=7)
+// with this short-block amplifier (over the short-window bands 3..=11);
+// it is mechanically straightforward but its own piece of work and is
+// dispatched as a separate round.
+//
+// # Acknowledgement
+//
+// No external implementation was consulted. The per-(sfb, window)
+// amplification mirror, the bounded subblock_gain escalation triggered
+// on §C.1.5.4.4.2 magnitude-clamp failure, and the `scalefac_scale`
+// halving step are derived from the §C.1.5.4.3 outer-loop pseudocode and
+// the §2.4.3.4.7.1 short-block formula directly.
+
+/// Per-cell short-block scalefactor cap (§C.1.5.4.3.6 with our
+/// `scalefac_compress = 15` ⇒ `(slen1, slen2) = (4, 3)`): 15 for the
+/// slen1-range short scalefactor bands `sfb ∈ [0, 5]`.
+pub const SCALEFAC_S_MAX_LOW: u8 = 15;
+
+/// Per-cell short-block scalefactor cap (§C.1.5.4.3.6 with our
+/// `scalefac_compress = 15` ⇒ `(slen1, slen2) = (4, 3)`): 7 for the
+/// slen2-range short scalefactor bands `sfb ∈ [6, 11]`.
+pub const SCALEFAC_S_MAX_HIGH: u8 = 7;
+
+/// The per-cell short-block scalefactor upper limit for short `sfb` per
+/// §C.1.5.4.3.6 / Table B.5 (with our `OUTER_LOOP_SCALEFAC_COMPRESS`).
+#[must_use]
+pub fn scalefac_short_upper_limit(sfb: usize) -> u8 {
+    if sfb <= 5 {
+        SCALEFAC_S_MAX_LOW
+    } else {
+        SCALEFAC_S_MAX_HIGH
+    }
+}
+
+/// Compute the per-(sfb, window) actual short-block distortion
+/// `xfsf_s[sfb][window]` (§C.1.5.4.3.3 applied to each short cell).
+///
+/// Layout invariant: `xr` and `xr_back` are in the native short-block
+/// `(sfb, window, freqline)` interleave (the §2.4.3.4.8 reorder lives
+/// downstream of this stage). For a short band with per-window start `s`
+/// and width `w`, the native span `[3·s, 3·(s+w))` is laid out as three
+/// runs `[win0 (w lines)][win1 (w lines)][win2 (w lines)]`.
+///
+/// The coloured-domain scaling matches `band_distortion_long`: with the
+/// scalefactor applied inside the encoder's quantizer, our original-domain
+/// residual must be multiplied by `2^(mult·scalefac_s(sfb, win))` (squared
+/// to `2^(2·mult·scalefac_s(sfb, win))` on the SSE) to recover the spec's
+/// coloured residual. Preflag does not apply to short blocks.
+#[must_use]
+pub fn band_distortion_short(
+    xr: &[f32; NUM_LINES],
+    xr_back: &[f32; NUM_LINES],
+    sf: &ScaleFactors,
+    scalefac_scale: bool,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) -> [[f64; SHORT_WINDOWS]; SHORT_SFB] {
+    use crate::requantize::scalefac_multiplier;
+    let starts = short_band_starts(sample_rate_hz, version);
+    let mult = f64::from(scalefac_multiplier(scalefac_scale));
+    let mut out = [[0.0f64; SHORT_WINDOWS]; SHORT_SFB];
+    for sfb in 0..SHORT_SFB {
+        let win_start = starts[sfb];
+        let win_width = starts[sfb + 1] - starts[sfb];
+        if win_width == 0 {
+            continue;
+        }
+        for (win, slot) in out[sfb].iter_mut().enumerate() {
+            let base = 3 * win_start + win * win_width;
+            let mut sse = 0.0f64;
+            let mut count = 0u32;
+            for k in 0..win_width {
+                let i = base + k;
+                if i >= NUM_LINES {
+                    break;
+                }
+                let d = f64::from(xr[i].abs()) - f64::from(xr_back[i].abs());
+                sse += d * d;
+                count += 1;
+            }
+            if count == 0 {
+                continue;
+            }
+            let bw = f64::from(count);
+            // Re-scale our original-domain SSE to the coloured-domain SSE
+            // the spec's metric uses, mirroring the long-block helper.
+            // `mult` = 0.5 (scalefac_scale = 0) → 1.0 (= 1).
+            let sf_val = f64::from(sf.short[sfb][win]);
+            let scale = (2.0 * mult * sf_val).exp2();
+            *slot = (sse / bw) * scale;
+        }
+    }
+    out
+}
+
+/// Per-window max `|is_i|` after quantization, looking only at the
+/// freqline range of window `w` across all short scalefactor bands.
+/// Used to decide which window(s) to escalate `subblock_gain` on when
+/// the global magnitude clamp fails.
+fn per_window_max_abs(
+    is: &[i32; NUM_LINES],
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) -> [i32; SHORT_WINDOWS] {
+    let starts = short_band_starts(sample_rate_hz, version);
+    let mut out = [0i32; SHORT_WINDOWS];
+    for sfb in 0..SHORT_SFB {
+        let win_start = starts[sfb];
+        let win_width = starts[sfb + 1] - starts[sfb];
+        if win_width == 0 {
+            continue;
+        }
+        for (win, slot) in out.iter_mut().enumerate() {
+            let base = 3 * win_start + win * win_width;
+            for k in 0..win_width {
+                let i = base + k;
+                if i >= NUM_LINES {
+                    break;
+                }
+                let v = is[i].unsigned_abs() as i32;
+                if v > *slot {
+                    *slot = v;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Outcome of a short-block outer-loop search for one granule-channel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OuterLoopShortResult {
+    /// The chosen per-(sfb, window) short-block scalefactors. `long` is
+    /// left zero (pure-short path; the mixed-block variant is a separate
+    /// follow-up).
+    pub scalefactors: ScaleFactors,
+    /// The chosen `global_gain` the last inner-loop pass settled on.
+    pub global_gain: u8,
+    /// The chosen per-window `subblock_gain[w]` (§2.4.2.7 3-bit field).
+    /// Each is in `[0, 7]`; raised from zero only when the §C.1.5.4.4.2
+    /// magnitude clamp couldn't fit window `w` under 8191.
+    pub subblock_gain: [u8; SHORT_WINDOWS],
+    /// The chosen `is[576]` quantized buffer matching the returned state.
+    pub is: [i32; NUM_LINES],
+    /// `scalefac_scale` flag (§2.4.2.7). `false` ⇒ multiplier 0.5; the
+    /// outer loop may escalate to `true` (multiplier 1.0) when the cap
+    /// would terminate amplification (§C.1.5.4.3).
+    pub scalefac_scale: bool,
+    /// Iteration accounting (same shape as [`OuterLoopStats`]).
+    pub stats: OuterLoopStats,
+}
+
+/// Run the §C.1.5.4.3 outer (distortion-control) iteration loop for one
+/// **pure-short** (`block_type == Short`, `mixed_block_flag == false`,
+/// `window_switching_flag == true`) granule-channel.
+///
+/// Per-(sfb, window) amplification, plus a bounded `subblock_gain` search
+/// triggered when the §C.1.5.4.4.2 magnitude clamp can't fit a window
+/// under 8191. `gc_template.scalefac_compress` MUST be
+/// [`OUTER_LOOP_SCALEFAC_COMPRESS`] so the part2 layout matches what the
+/// side-info writer will emit (slen1=4, slen2=3 ⇒ caps 15 / 7).
+///
+/// `uniform_threshold` is `xmin(sb)` applied uniformly across every cell
+/// (psychoacoustic model deferred — same convention as the long-block
+/// loop). `max_iter` caps the outer loop at a finite count.
+#[must_use]
+pub fn outer_loop_search_short(
+    xr: &[f32; NUM_LINES],
+    gc_template: &GranuleChannel,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    per_gc_bit_budget: u64,
+    uniform_threshold: f64,
+    max_iter: u32,
+) -> OuterLoopShortResult {
+    debug_assert!(gc_template.window_switching_flag);
+    debug_assert_eq!(gc_template.block_type, BlockType::Short);
+    debug_assert!(!gc_template.mixed_block_flag);
+
+    // §C.1.5.4.2.1 init: scalefactors zero, scalefac_scale 0,
+    // subblock_gain zero. preflag stays false (never set for short).
+    let mut sf = ScaleFactors::default();
+    let mut amplified = [[false; SHORT_WINDOWS]; SHORT_SFB];
+    let mut scalefac_scale = false;
+    let mut escalated_once = false;
+    let mut subblock_gain: [u8; SHORT_WINDOWS] = [0, 0, 0];
+
+    // Saved last-good state.
+    let mut last_good_sf = sf;
+    let mut last_good_scale = scalefac_scale;
+    let mut last_good_sg = subblock_gain;
+    let mut last_good_inner = run_inner_short(
+        xr,
+        gc_template,
+        &sf,
+        scalefac_scale,
+        subblock_gain,
+        sample_rate_hz,
+        version,
+        per_gc_bit_budget,
+    );
+
+    let mut iterations: u32 = 1;
+    let converged;
+    let mut bands_amplified_total: u32 = 0;
+
+    loop {
+        let inner = run_inner_short(
+            xr,
+            gc_template,
+            &sf,
+            scalefac_scale,
+            subblock_gain,
+            sample_rate_hz,
+            version,
+            per_gc_bit_budget,
+        );
+
+        // Decode-side reconstruction at the *current* state.
+        let mut gc_full = *gc_template;
+        gc_full.global_gain = inner.global_gain;
+        gc_full.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
+        gc_full.scalefac_scale = scalefac_scale;
+        gc_full.subblock_gain = subblock_gain;
+        gc_full.preflag = false;
+        let xr_back = requantize(&inner.is, &gc_full, &sf, sample_rate_hz, version);
+        let xfsf =
+            band_distortion_short(xr, &xr_back, &sf, scalefac_scale, sample_rate_hz, version);
+
+        // §C.1.5.4.4.2 magnitude-clamp follow-up: when the inner search
+        // could not bring `max|is| ≤ 8191` (a single window grossly
+        // outranges the others), raise the offending window's
+        // `subblock_gain[w]` by 1 (saturating at the §2.4.2.7 cap of 7)
+        // and restart the iteration body. This is the only path that
+        // ever moves `subblock_gain` off zero; it strictly shrinks the
+        // remaining work because raising `subblock_gain[w]` shrinks
+        // window `w`'s pre-quantization magnitudes.
+        if !inner.magnitude_clamped {
+            let per_win = per_window_max_abs(&inner.is, sample_rate_hz, version);
+            let mut bumped = false;
+            // Identify the window(s) sitting hardest against the cap.
+            // Bump every window that exceeds the cap; saturate at 7.
+            for w in 0..SHORT_WINDOWS {
+                if per_win[w] > crate::inner_loop::BIG_VALUES_LIMIT && subblock_gain[w] < 7 {
+                    subblock_gain[w] += 1;
+                    bumped = true;
+                }
+            }
+            // If at least one window still has headroom on subblock_gain,
+            // restart the iteration. If every over-cap window has already
+            // saturated at 7, fall through to the standard outer-loop
+            // termination below (the spec's "lack of computing time" /
+            // "scalefactors would exceed limit" branches conservatively
+            // accept the saturated state).
+            if bumped {
+                iterations += 1;
+                if iterations >= max_iter {
+                    converged = false;
+                    last_good_sf = sf;
+                    last_good_scale = scalefac_scale;
+                    last_good_sg = subblock_gain;
+                    last_good_inner = inner;
+                    break;
+                }
+                continue;
+            }
+        }
+
+        // Identify cells over threshold (§C.1.5.4.3.3 per-cell xfsf).
+        let mut any_over = false;
+        let mut would_exceed_cap = false;
+        for (sfb, xfsf_row) in xfsf.iter().enumerate() {
+            let cap = scalefac_short_upper_limit(sfb);
+            for (win, &d) in xfsf_row.iter().enumerate() {
+                if d > uniform_threshold {
+                    any_over = true;
+                    let next = u16::from(sf.short[sfb][win]) + 1;
+                    if next > u16::from(cap) {
+                        would_exceed_cap = true;
+                    }
+                }
+            }
+        }
+
+        // §C.1.5.4.3.6 termination paths.
+        if !any_over {
+            converged = true;
+            last_good_sf = sf;
+            last_good_scale = scalefac_scale;
+            last_good_sg = subblock_gain;
+            last_good_inner = inner;
+            break;
+        }
+        if would_exceed_cap && !escalated_once {
+            // §C.1.5.4.3 escalation: switch to `scalefac_scale = 1`. To
+            // preserve the current coloured spectrum the per-cell
+            // scalefactors are halved (mult doubles 0.5 → 1.0 ⇒ halving
+            // sf keeps `2^(mult·sf)` unchanged). The "amplified" tracker
+            // resets so the doubled-step amplifications can re-fire.
+            scalefac_scale = true;
+            escalated_once = true;
+            for row in sf.short.iter_mut() {
+                for v in row.iter_mut() {
+                    *v = (*v).div_ceil(2);
+                }
+            }
+            amplified = [[false; SHORT_WINDOWS]; SHORT_SFB];
+            iterations += 1;
+            continue;
+        }
+        // (a) all cells already amplified, (b) cap exceeded (after one
+        // escalation has fired or in mixed/short paths that lack further
+        // headroom), or (c) defensive iteration cap.
+        let all_amplified = amplified.iter().all(|row| row.iter().all(|&a| a));
+        if would_exceed_cap || all_amplified || iterations >= max_iter {
+            converged = false;
+            break;
+        }
+
+        // Save current state as the new last-good before amplifying.
+        last_good_sf = sf;
+        last_good_scale = scalefac_scale;
+        last_good_sg = subblock_gain;
+        last_good_inner = inner;
+
+        // §C.1.5.4.3.5 amplification, per-cell.
+        for (sfb, xfsf_row) in xfsf.iter().enumerate() {
+            let cap = scalefac_short_upper_limit(sfb);
+            for (win, &d) in xfsf_row.iter().enumerate() {
+                if d > uniform_threshold && sf.short[sfb][win] < cap {
+                    sf.short[sfb][win] = sf.short[sfb][win].saturating_add(1);
+                    if !amplified[sfb][win] {
+                        amplified[sfb][win] = true;
+                        bands_amplified_total += 1;
+                    }
+                }
+            }
+        }
+        iterations += 1;
+    }
+
+    OuterLoopShortResult {
+        scalefactors: last_good_sf,
+        global_gain: last_good_inner.global_gain,
+        subblock_gain: last_good_sg,
+        is: last_good_inner.is,
+        scalefac_scale: last_good_scale,
+        stats: OuterLoopStats {
+            iterations,
+            bands_amplified: bands_amplified_total,
+            converged,
+        },
+    }
+}
+
+/// Per-iteration short-block helper: install the outer loop's chosen
+/// `scalefac_compress`, `scalefac_scale` and `subblock_gain` on top of
+/// the template, then pick the smallest `global_gain` that fits the
+/// inner-loop bit budget AND the §C.1.5.4.4.2 magnitude clamp. Returns
+/// the chosen `global_gain`, the resulting `is[]`, and whether the
+/// magnitude clamp was actually satisfied (so the caller can escalate
+/// `subblock_gain` on a per-window basis when not).
+#[allow(clippy::too_many_arguments)]
+fn run_inner_short(
+    xr: &[f32; NUM_LINES],
+    gc_template: &GranuleChannel,
+    sf: &ScaleFactors,
+    scalefac_scale: bool,
+    subblock_gain: [u8; SHORT_WINDOWS],
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    per_gc_bit_budget: u64,
+) -> InnerShortInvocation {
+    let mut gc = *gc_template;
+    gc.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
+    gc.preflag = false;
+    gc.scalefac_scale = scalefac_scale;
+    gc.subblock_gain = subblock_gain;
+    let res_budget = search_bit_budget(xr, &gc, sf, sample_rate_hz, version, per_gc_bit_budget);
+    let res_clamp = search_magnitude_clamp(xr, &gc, sf, sample_rate_hz, version);
+    let gg = res_budget.global_gain.max(res_clamp.global_gain);
+    let mut gc_final = gc;
+    gc_final.global_gain = gg;
+    let is = quantize(xr, &gc_final, sf, sample_rate_hz, version);
+    let _ = (GAIN_MAX, res_budget.satisfied);
+    InnerShortInvocation {
+        global_gain: gg,
+        is,
+        magnitude_clamped: res_clamp.satisfied,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InnerShortInvocation {
+    global_gain: u8,
+    is: [i32; NUM_LINES],
+    /// `true` if the §C.1.5.4.4.2 magnitude clamp could be satisfied at
+    /// the chosen `global_gain` and `subblock_gain` configuration. When
+    /// `false`, the caller bumps `subblock_gain[w]` on the window(s) that
+    /// still exceed the cap.
+    magnitude_clamped: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,5 +1386,326 @@ mod tests {
              (got preflag={} sf={:?})",
             res.preflag, &res.scalefactors.long,
         );
+    }
+
+    // =====================================================================
+    // Short-block outer loop tests (Phase 2 step 27)
+    // =====================================================================
+
+    fn short_template() -> GranuleChannel {
+        GranuleChannel {
+            part2_3_length: 0,
+            big_values: 0,
+            global_gain: 0,
+            scalefac_compress: OUTER_LOOP_SCALEFAC_COMPRESS,
+            window_switching_flag: true,
+            block_type: BlockType::Short,
+            mixed_block_flag: false,
+            // Window-switched defaults from §2.4.2.7: region0_count = 8
+            // (since short blocks have no long-region transmitted
+            // region split — the fixed §C.1.5.4.4 SUBDIVIDE applies);
+            // region1_count is unused for short.
+            table_select: [0; 3],
+            subblock_gain: [0; 3],
+            region0_count: 8,
+            region1_count: 0,
+            preflag: false,
+            scalefac_scale: false,
+            count1table_select: false,
+        }
+    }
+
+    #[test]
+    fn short_upper_limits_match_spec() {
+        // §C.1.5.4.3.6 caps with scalefac_compress=15 ⇒ slen1=4 → cap 15,
+        // slen2=3 → cap 7. Pure-short split: sfb 0..=5 (slen1), sfb 6..=11
+        // (slen2).
+        for sfb in 0..=5 {
+            assert_eq!(scalefac_short_upper_limit(sfb), SCALEFAC_S_MAX_LOW);
+        }
+        for sfb in 6..=11 {
+            assert_eq!(scalefac_short_upper_limit(sfb), SCALEFAC_S_MAX_HIGH);
+        }
+    }
+
+    #[test]
+    fn short_band_distortion_zero_when_perfect() {
+        // Identity reconstruction ⇒ zero distortion in every (sfb, win)
+        // cell. Mirrors band_distortion_zero_when_perfect for shorts.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let xr_back = xr;
+        let sf = ScaleFactors::default();
+        let d = band_distortion_short(&xr, &xr_back, &sf, false, 44_100, MpegVersion::Mpeg1);
+        for row in &d {
+            for &v in row {
+                assert!(v < 1e-12, "expected zero distortion, got {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn outer_loop_short_terminates_with_huge_threshold() {
+        // Huge threshold ⇒ no cell exceeds it; the loop converges on the
+        // first iteration with no amplification, no subblock_gain bumps.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let gc = short_template();
+        let res = outer_loop_search_short(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e30, 64);
+        assert!(res.stats.converged);
+        assert_eq!(res.stats.iterations, 1);
+        assert_eq!(res.stats.bands_amplified, 0);
+        assert_eq!(res.subblock_gain, [0, 0, 0]);
+        assert!(!res.scalefac_scale);
+        // long array must stay zero (pure-short path).
+        assert_eq!(res.scalefactors.long, [0u8; LONG_SFB]);
+    }
+
+    #[test]
+    fn outer_loop_short_terminates_with_tiny_threshold() {
+        // Threshold zero ⇒ every cell with any baseline distortion
+        // exceeds it; the loop runs until cap-or-amplified termination.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let gc = short_template();
+        let res = outer_loop_search_short(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 0.0, 64);
+        assert!(!res.stats.converged);
+        assert!(res.stats.bands_amplified > 0);
+        assert!(res.stats.iterations >= 2);
+        // Returned scalefactors must respect the §C.1.5.4.3.6 caps.
+        for (sfb, row) in res.scalefactors.short.iter().enumerate() {
+            let cap = scalefac_short_upper_limit(sfb);
+            for (win, &sf_val) in row.iter().enumerate() {
+                assert!(
+                    sf_val <= cap,
+                    "sfb={sfb} win={win} sf={sf_val} exceeds §C.1.5.4.3.6 cap {cap}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outer_loop_short_amplifies_only_offending_cells() {
+        // Plant energy in exactly one (sfb, window) cell — sfb 1, window 1
+        // at 44.1 kHz. SHORT_STARTS_44 places sfb 1 at per-window lines
+        // [4, 8) (width 4); window 1's interleaved range starts at
+        // 3*4 + 1*4 = 16. Other cells stay zero.
+        let mut xr = [0.0f32; NUM_LINES];
+        for k in 0..4 {
+            xr[16 + k] = 60.0;
+        }
+        let gc = short_template();
+        let budget = 2000u64;
+
+        // Baseline distortion to calibrate the threshold.
+        let baseline_sf = ScaleFactors::default();
+        let baseline = run_inner_short(
+            &xr,
+            &gc,
+            &baseline_sf,
+            false,
+            [0, 0, 0],
+            44_100,
+            MpegVersion::Mpeg1,
+            budget,
+        );
+        let mut gc_b = gc;
+        gc_b.global_gain = baseline.global_gain;
+        let xr_back_b = requantize(
+            &baseline.is,
+            &gc_b,
+            &baseline_sf,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        let d_b = band_distortion_short(
+            &xr,
+            &xr_back_b,
+            &baseline_sf,
+            false,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        // Threshold just below the loudest cell's baseline distortion so
+        // only that cell is over threshold and is the only one amplified.
+        let max_cell = d_b
+            .iter()
+            .flat_map(|r| r.iter().copied())
+            .fold(0.0f64, f64::max);
+        assert!(max_cell > 0.0, "fixture failed to introduce any distortion");
+        let thr = max_cell * 0.5;
+        let res = outer_loop_search_short(&xr, &gc, 44_100, MpegVersion::Mpeg1, budget, thr, 32);
+        assert!(res.stats.bands_amplified >= 1);
+        // No cell whose baseline distortion was exactly zero should ever
+        // have been amplified — the loop's per-cell guard must prevent
+        // amplifying silent cells (mirrors the long-block invariant).
+        for (sfb, d_row) in d_b.iter().enumerate() {
+            for (win, &d) in d_row.iter().enumerate() {
+                if d == 0.0 && res.scalefactors.short[sfb][win] != 0 {
+                    panic!(
+                        "silent cell sfb={sfb} win={win} got amplified to {} (should stay 0)",
+                        res.scalefactors.short[sfb][win],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outer_loop_short_raises_subblock_gain_on_extreme_window() {
+        // Build a fixture where window 0 carries amplitudes too large for
+        // the §C.1.5.4.4.2 magnitude clamp at GAIN_MAX with default
+        // (subblock_gain == 0). The clamp's reach is bounded: with
+        // global_gain at 255, the gain factor `2^((255-210)/4)` ≈ 2435
+        // divides the input before the `^0.75` power, so the largest
+        // unclamped input magnitude is `8191^(4/3) · 2435 ≈ 4.4e8`.
+        // Plant 5e9 magnitudes in window 0 only — well above the
+        // GAIN_MAX reach — and confirm the loop bumps subblock_gain[0]
+        // above zero. Each subblock_gain[0]+=1 adds an extra factor 4
+        // to the divisor (`2^(8/4) = 4`), multiplying the reach by 4
+        // per step.
+        let mut xr = [0.0f32; NUM_LINES];
+        // Window 0 only: sfb 0..=5 at 44.1 kHz cover per-window lines
+        // [0, 4), [4, 8), [8, 12), [12, 16), [16, 22), [22, 30) (widths
+        // 4, 4, 4, 4, 6, 8 — sum 30). Window 0's interleaved lines for
+        // band sfb start at `3 * win_start + 0 * win_width = 3 * win_start`.
+        // Stuff sfb 0 win 0 lines (interleaved [0, 4)) and sfb 1 win 0
+        // lines (interleaved [12, 16)).
+        for slot in xr.iter_mut().take(4) {
+            *slot = 5.0e9; // sfb 0, win 0
+        }
+        for slot in xr.iter_mut().skip(12).take(4) {
+            *slot = 5.0e9; // sfb 1, win 0
+        }
+        let gc = short_template();
+        let res = outer_loop_search_short(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e30, 32);
+        // subblock_gain[0] must have been bumped off zero (the only
+        // window with over-cap energy). Windows 1 and 2 stay zero (no
+        // energy planted there ⇒ per_window_max_abs stays 0 ⇒ no bump).
+        assert!(
+            res.subblock_gain[0] > 0,
+            "subblock_gain[0] should have escalated; got {:?}",
+            res.subblock_gain,
+        );
+        assert_eq!(res.subblock_gain[1], 0);
+        assert_eq!(res.subblock_gain[2], 0);
+        // subblock_gain stays within the §2.4.2.7 3-bit field range.
+        for &sg in &res.subblock_gain {
+            assert!(sg <= 7);
+        }
+    }
+
+    #[test]
+    fn outer_loop_short_subblock_gain_stays_zero_on_quiet_input() {
+        // Modest amplitudes the magnitude clamp can fit at default
+        // subblock_gain — confirm the loop never bumps the 3-bit field.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 50.0;
+        }
+        let gc = short_template();
+        let res = outer_loop_search_short(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e30, 64);
+        assert_eq!(res.subblock_gain, [0, 0, 0]);
+    }
+
+    #[test]
+    fn outer_loop_short_default_preflag_off() {
+        // Spec invariant: preflag is never set for short blocks
+        // (§2.4.2.7). The result's `scalefactors.preflag` must stay
+        // `false` regardless of input.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.013).sin() * 100.0;
+        }
+        let gc = short_template();
+        let res = outer_loop_search_short(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e30, 64);
+        assert!(!res.scalefactors.preflag);
+    }
+
+    #[test]
+    fn outer_loop_short_escalates_scalefac_scale_when_cap_would_terminate() {
+        // §C.1.5.4.3 escalation path on the short-block loop: plant a
+        // single high-band cell with non-quantum-friendly residual
+        // energy so its post-quantization SSE stays above a tiny
+        // threshold across every amp step until that cell's §C.1.5.4.3.6
+        // cap fires. With every other cell quiet, only the one
+        // over-threshold cell ever amplifies; the only reachable
+        // termination is "cap exceeded" ⇒ the §C.1.5.4.3 escalation
+        // branch flips scalefac_scale to true.
+        //
+        // SHORT_STARTS_44 places sfb 11 at per-window lines [106, 136)
+        // (width 30); window 1's interleaved range starts at
+        // 3*106 + 1*30 = 348 and runs to 378. Plant a band of
+        // non-power-of-two values there.
+        let mut xr = [0.0f32; NUM_LINES];
+        for k in 0..30 {
+            xr[348 + k] = 800.0 + (k as f32) * 11.7;
+        }
+        let gc = short_template();
+        let baseline_sf = ScaleFactors::default();
+        let baseline = run_inner_short(
+            &xr,
+            &gc,
+            &baseline_sf,
+            false,
+            [0, 0, 0],
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+        );
+        let mut gc_b = gc;
+        gc_b.global_gain = baseline.global_gain;
+        let xr_back_b = requantize(
+            &baseline.is,
+            &gc_b,
+            &baseline_sf,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        let d_b = band_distortion_short(
+            &xr,
+            &xr_back_b,
+            &baseline_sf,
+            false,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        // The chosen cell (sfb 11, win 1) must carry meaningful baseline
+        // distortion for the fixture to exercise the escalation path.
+        assert!(
+            d_b[11][1] > 1.0e-6,
+            "fixture failed to load distortion into sfb 11 win 1 \
+             (d_b[11][1]={})",
+            d_b[11][1],
+        );
+        let thr = d_b[11][1] / 1.0e12;
+        let res = outer_loop_search_short(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, thr, 128);
+        assert!(
+            res.scalefac_scale,
+            "loop should have escalated to scalefac_scale = 1 \
+             (sfb 11 win 1 cap-would-exceed termination), got scale={} \
+             converged={} iters={} bands_amp={} sf_short={:?}",
+            res.scalefac_scale,
+            res.stats.converged,
+            res.stats.iterations,
+            res.stats.bands_amplified,
+            &res.scalefactors.short,
+        );
+        // All cells must stay within the §C.1.5.4.3.6 cap.
+        for (sfb, row) in res.scalefactors.short.iter().enumerate() {
+            let cap = scalefac_short_upper_limit(sfb);
+            for (win, &sf_val) in row.iter().enumerate() {
+                assert!(
+                    sf_val <= cap,
+                    "sfb={sfb} win={win} sf={sf_val} exceeds §C.1.5.4.3.6 cap {cap}",
+                );
+            }
+        }
     }
 }

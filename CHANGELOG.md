@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§C.1.5.4.3 outer-loop short-block analogue** (Phase 2 step 27).
+  `outer_loop_search_short` is the per-(sfb, window)
+  distortion-control iteration the auto-block-type dispatcher from
+  step 26 needs to run with the outer loop on for `block_type ==
+  Short`, `mixed_block_flag == false` granules. Mirrors
+  `outer_loop_search_long` with:
+  - `band_distortion_short(xr, xr_back, sf, scalefac_scale, sr,
+    ver)` returning the §C.1.5.4.3.3 distortion per `(sfb, window)`
+    cell. Each iteration marks every cell with `xfsf_s > xmin` and
+    amplifies the marked cells' `scalefac_s` by 1. Caps follow
+    §C.1.5.4.3.6 with `OUTER_LOOP_SCALEFAC_COMPRESS = 15`
+    (slen1 = 4, slen2 = 3): 15 for the slen1-range sfb 0..=5, 7 for
+    the slen2-range sfb 6..=11.
+  - A bounded per-window `subblock_gain` search: when
+    `search_magnitude_clamp` reports `satisfied == false`,
+    `per_window_max_abs` identifies the over-cap windows and bumps
+    each one's `subblock_gain[w]` by 1 (saturating at the §2.4.2.7
+    3-bit cap of 7), then restarts. Quiet windows stay at zero.
+  - `scalefac_scale = 0 → 1` escalation on cap-would-terminate, with
+    round-to-nearest halving of every in-progress `scalefac_s` (same
+    §C.1.5.4.3 path as the long-block loop). One event only.
+  - `preflag` stays `false` unconditionally (§2.4.2.7: "preflag is
+    never used if block_type == 2").
+
+  Pure-short only this round; mixed-block variant is a follow-up.
+  Integration into `Mp3Encoder::enable_auto_block_type` is a
+  separate step. Validated by 9 unit tests inside `outer_loop.rs`
+  covering termination paths, per-cell amplification isolation,
+  `subblock_gain` escalation on extreme amplitudes, quiet-input
+  invariance, preflag invariant, and the `scalefac_scale`
+  escalation branch on a cap-would-terminate fixture. No external
+  implementation consulted.
+
 - **Signal-driven auto block-type dispatch** (Phase 2 step 26).
   Replaces the global force-toggles with a per-granule decision
   driven by content. Two new modules carry the logic:
