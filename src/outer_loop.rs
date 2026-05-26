@@ -52,9 +52,15 @@
 //!
 //! # Scope limits
 //!
-//! * **Long blocks only.** Short / mixed blocks have a per-window
-//!   scalefactor table (`scalefac_s[sfb][win]`) and a different upper
-//!   limit; deferred until the encoder's block-type-switching step lands.
+//! * **Long-family only for this primitive.** The
+//!   [`outer_loop_search_long`] entry point covers
+//!   `block_type ∈ {Long, Start, End}` — they share part2 wire layout,
+//!   requantize formula, and region-split rule (see the function's
+//!   long-family acceptance doc). Pure-Short / mixed-Short have their
+//!   own primitives — [`outer_loop_search_short`] from r157 and
+//!   [`outer_loop_search_mixed`] from r159 — because their per-window
+//!   `scalefac_s[sfb][win]` table and per-window `subblock_gain[w]`
+//!   search differ structurally.
 //! * **Preemphasis (§C.1.5.4.3.4)** (round 148): after the first inner
 //!   loop call the loop checks the spec's suggested condition — "if in
 //!   all of the upper 4 scalefactor bands the actual distortion exceeds
@@ -270,12 +276,55 @@ pub fn band_distortion_long(
 }
 
 /// Run the §C.1.5.4.3 outer (distortion-control) iteration loop for one
-/// long-block granule-channel.
+/// **long-family** granule-channel.
+///
+/// The long-family covers `block_type ∈ {Long, Start, End}` (per
+/// ISO/IEC 11172-3 §2.4.2.7 "long blocks have block_type 0; the
+/// transition-windowed long-family blocks Start (1) and End/Stop (3)
+/// carry the same 21 long scalefactor bands"). The primitive accepts
+/// any of the three because every downstream step the loop touches
+/// reads identically for all of them:
+///
+/// * **Part2 scalefactor wire layout** (§2.4.2.7 + Table 3-B.5):
+///   [`crate::scalefactors::write_mpeg1_granule_channel`] dispatches on
+///   `block_type == Short`; any other carried value (Long, Start, End)
+///   reads the same 21-band `sf.long[0..21]` layout grouped by
+///   `mpeg1_long_band_slen` at the `scalefac_compress`-derived `slen1`
+///   / `slen2` widths. Cost per granule-channel at
+///   `scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS = 15`:
+///   `11·4 + 10·3 = 74` bits, independent of long / Start / End.
+/// * **Requantize formula** (§2.4.3.4.7.1): the long branch in
+///   [`crate::requantize::requantize`] also dispatches on
+///   `block_type == Short` alone, so the long-family `global_gain - 210`
+///   gain term + per-band `sf.long[sfb]` divisor applies uniformly. No
+///   `subblock_gain` term enters (that lives in the short branch).
+/// * **Inner-loop region split** (§C.1.5.4.4.6): [`subdivide`] in
+///   [`crate::inner_loop`] also dispatches on `block_type == Short`
+///   alone — Long / Start / End share the same `r0 ≈ big_values / 3`,
+///   `r2 ≈ big_values / 4` three-region split. (The carried
+///   `region0_count` / `region1_count` are unused inside the inner
+///   loop's exact-bit-count path.)
+/// * **§C.1.5.4.3.4 preflag**: the §C.1.5.4.3.4 preemphasis decision
+///   gates only on `block_type == Short` in [`quantize`] / [`requantize`]
+///   (it is disabled for short, allowed for everything else). Start /
+///   End inherit Long's preflag eligibility — the spec's PRETAB table
+///   (§Table B.6) applies to "long blocks", and the long-family
+///   transition skeletons carry the same 21 long scalefactor bands the
+///   pretab indexes.
+/// * **§C.1.5.4.3.6 caps**: identical (15 for `sfb ∈ [0, 10]`, 7 for
+///   `sfb ∈ [11, 20]`); these come from the `slen` field widths and
+///   `slen` is independent of `block_type` for the long-family wire
+///   layout.
 ///
 /// `xr` is the target spectrum (post-alias-reduction, encoder
-/// pre-quantization). `gc_template` carries the long-block configuration
-/// (`block_type = Long`, `window_switching_flag = false`, the chosen
-/// region split, the table_select skeleton); its `scalefac_compress`
+/// pre-quantization — alias reduction itself does not apply to Start /
+/// End in our forward path per the §2.4.3.4.10.1 mirroring, but the
+/// outer loop does not depend on that: it consumes whatever `xr` the
+/// caller supplies). `gc_template` carries the long-family
+/// configuration (`block_type ∈ {Long, Start, End}`, the chosen region
+/// split, the table_select skeleton); for Start / End,
+/// `window_switching_flag = true` is REQUIRED (the parser uses that bit
+/// to decide whether to read transition fields). Its `scalefac_compress`
 /// **MUST** be [`OUTER_LOOP_SCALEFAC_COMPRESS`] so the encoder can later
 /// write the chosen scalefactors back as part2 with non-zero `slen`. Its
 /// `global_gain` is irrelevant — the inner loop re-picks it on every
@@ -301,8 +350,22 @@ pub fn outer_loop_search_long(
     uniform_threshold: f64,
     max_iter: u32,
 ) -> OuterLoopResult {
-    debug_assert!(!gc_template.window_switching_flag);
-    debug_assert_eq!(gc_template.block_type, BlockType::Long);
+    // Long-family acceptance: Long with window_switching off, or
+    // Start / End with window_switching on. Pure-Short / mixed-Short
+    // have their own primitives ([`outer_loop_search_short`] /
+    // [`outer_loop_search_mixed`]) and must not reach here.
+    debug_assert!(
+        matches!(
+            (gc_template.block_type, gc_template.window_switching_flag),
+            (BlockType::Long, false) | (BlockType::Start, true) | (BlockType::End, true),
+        ),
+        "outer_loop_search_long: long-family only, got block_type={:?} window_switching_flag={}",
+        gc_template.block_type,
+        gc_template.window_switching_flag,
+    );
+    // Mixed-block flag is meaningful only for `block_type == Short`;
+    // for the long-family it must be off.
+    debug_assert!(!gc_template.mixed_block_flag);
 
     // §C.1.5.4.2.1: init scalefactors to zero, preflag off, scalefac_scale 0.
     let mut sf = ScaleFactors::default();
@@ -1855,6 +1918,158 @@ mod tests {
              (got preflag={} sf={:?})",
             res.preflag, &res.scalefactors.long,
         );
+    }
+
+    // =====================================================================
+    // Long-family transition-skeleton tests (Phase 2 step 30, r160)
+    // =====================================================================
+    //
+    // The `outer_loop_search_long` primitive accepts the long-family
+    // (`block_type ∈ {Long, Start, End}`) — Start / End share part2
+    // layout + requantize formula + region-split rule with Long. The
+    // tests below pin the contract by running representative fixtures
+    // through Start and End templates and asserting (a) the loop
+    // accepts the input and produces a finite result identical to the
+    // Long-template result (no behavioural drift across the relaxed
+    // debug_assert) and (b) the §2.4.2.7-default region split
+    // (`region0_count = 7`, `region1_count = 7`) used by the
+    // transition skeleton produces a structurally legal inner-loop
+    // bit-count.
+
+    fn transition_template(block_type: BlockType) -> GranuleChannel {
+        // Match `default_transition_gc` in `stream_encoder.rs` so the
+        // primitive sees exactly what the dispatcher hands it on auto
+        // block-type frames. region0/region1 set to 7/7, the
+        // §2.4.2.7-default window-switched long-family split.
+        debug_assert!(matches!(block_type, BlockType::Start | BlockType::End));
+        GranuleChannel {
+            part2_3_length: 0,
+            big_values: 0,
+            global_gain: 0,
+            scalefac_compress: OUTER_LOOP_SCALEFAC_COMPRESS,
+            window_switching_flag: true,
+            block_type,
+            mixed_block_flag: false,
+            table_select: [0; 3],
+            subblock_gain: [0; 3],
+            region0_count: 7,
+            region1_count: 7,
+            preflag: false,
+            scalefac_scale: false,
+            count1table_select: false,
+        }
+    }
+
+    #[test]
+    fn outer_loop_start_template_terminates_with_huge_threshold() {
+        // Mirror `outer_loop_terminates_with_huge_threshold`: with a
+        // threshold so large nothing exceeds it the loop converges on
+        // iteration 1 with zero amplification, exactly as for Long.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.013).sin() * 100.0;
+        }
+        let gc = transition_template(BlockType::Start);
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, 1500, 1.0e30, 64);
+        assert!(res.stats.converged);
+        assert_eq!(res.stats.iterations, 1);
+        assert_eq!(res.stats.bands_amplified, 0);
+    }
+
+    #[test]
+    fn outer_loop_end_template_terminates_with_huge_threshold() {
+        // Same as the Start mirror but with End (block_type 3). The
+        // long-family acceptance branch must treat both transition
+        // tags identically.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.017).cos() * 80.0;
+        }
+        let gc = transition_template(BlockType::End);
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, 1500, 1.0e30, 64);
+        assert!(res.stats.converged);
+        assert_eq!(res.stats.iterations, 1);
+        assert_eq!(res.stats.bands_amplified, 0);
+    }
+
+    #[test]
+    fn outer_loop_start_template_matches_long_template_on_identical_xr() {
+        // Behavioural identity: a Start template and a Long template
+        // running against the same `xr` + same budget + same
+        // threshold should produce IDENTICAL outer-loop results. The
+        // §C.1.5.4.3 loop body reads only `gc.scalefac_compress` /
+        // `gc.preflag` / `gc.scalefac_scale` (and the carried block
+        // type bit which the relaxed debug_assert lets Start through);
+        // every other downstream step (`run_inner`, `quantize`,
+        // `requantize`, `band_distortion_long`) dispatches on
+        // `block_type == Short` alone, so Start and Long must produce
+        // identical numerics — the whole point of accepting the long
+        // family in one primitive.
+        //
+        // NOTE: `inner_loop::subdivide` is region-count-agnostic for
+        // the long family (it derives a 1/3, 5/12, 1/4 split from
+        // `big_values` and ignores `region0_count` / `region1_count`),
+        // so the differing region defaults between Long
+        // (`region0_count = 20`) and Start/End (`region0_count = 7`)
+        // do not affect the exact-bit-count path the outer loop reads.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.013).sin() * 100.0 + ((i as f32) * 0.041).cos() * 50.0;
+        }
+        let gc_long = long_template();
+        let gc_start = transition_template(BlockType::Start);
+        let res_long =
+            outer_loop_search_long(&xr, &gc_long, 44_100, MpegVersion::Mpeg1, 2000, 1.0e-3, 64);
+        let res_start =
+            outer_loop_search_long(&xr, &gc_start, 44_100, MpegVersion::Mpeg1, 2000, 1.0e-3, 64);
+        assert_eq!(
+            res_long.scalefactors.long, res_start.scalefactors.long,
+            "long-family primitive must produce identical scalefactors for Long and Start \
+             on the same input",
+        );
+        assert_eq!(res_long.global_gain, res_start.global_gain);
+        assert_eq!(res_long.scalefac_scale, res_start.scalefac_scale);
+        assert_eq!(res_long.preflag, res_start.preflag);
+        assert_eq!(res_long.is, res_start.is);
+    }
+
+    #[test]
+    fn outer_loop_end_template_matches_long_template_on_identical_xr() {
+        // Symmetric to the Start identity test; End must also produce
+        // identical numerics to Long.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.013).sin() * 100.0;
+        }
+        let gc_long = long_template();
+        let gc_end = transition_template(BlockType::End);
+        let res_long =
+            outer_loop_search_long(&xr, &gc_long, 44_100, MpegVersion::Mpeg1, 2000, 1.0e-3, 64);
+        let res_end =
+            outer_loop_search_long(&xr, &gc_end, 44_100, MpegVersion::Mpeg1, 2000, 1.0e-3, 64);
+        assert_eq!(res_long.scalefactors.long, res_end.scalefactors.long);
+        assert_eq!(res_long.global_gain, res_end.global_gain);
+        assert_eq!(res_long.scalefac_scale, res_end.scalefac_scale);
+        assert_eq!(res_long.preflag, res_end.preflag);
+        assert_eq!(res_long.is, res_end.is);
+    }
+
+    #[test]
+    fn outer_loop_start_template_amplifies_under_tiny_threshold() {
+        // With an effectively-zero threshold every band exceeds it on
+        // the first pass — the loop must run multiple iterations and
+        // amplify > 0 bands before terminating (cap-or-all-amplified).
+        // This confirms the loop body runs through Start without
+        // getting stuck or short-circuiting.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.013).sin() * 100.0;
+        }
+        let gc = transition_template(BlockType::Start);
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, 1500, 0.0, 64);
+        assert!(!res.stats.converged);
+        assert!(res.stats.bands_amplified > 0);
+        assert!(res.stats.iterations >= 2);
     }
 
     // =====================================================================

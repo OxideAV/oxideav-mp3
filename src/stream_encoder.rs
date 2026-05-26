@@ -737,18 +737,19 @@ impl Mp3Encoder {
         if self.nch != 1 {
             return Err(StreamEncodeError::StereoUnsupported);
         }
-        // Outer loop is now compatible with auto block-type:
+        // Outer loop is now compatible with auto block-type for every
+        // block-type the auto scheduler ever emits:
         //   * Long granules — `outer_loop_search_long`
         //   * Short granules (`mixed_block_flag == false`) —
         //     `outer_loop_search_short`
-        //   * Start / End transition granules — fall back to the
-        //     fixed-gain inner-loop path (no outer-loop primitive for
-        //     long-family window-switched skeletons yet; their part2
-        //     scalefactor layout is the long-family one but the §2.4.2.7
-        //     coefficient distribution shifts mid-overlap, so the
-        //     uniform-`xmin` heuristic over-amplifies; revisit in a
-        //     follow-up round once the psy model can target transition
-        //     granules separately).
+        //   * Start / End transition granules — `outer_loop_search_long`
+        //     (the long-family primitive; see its doc on long-family
+        //     acceptance — same part2 wire layout, same requantize
+        //     formula, same region-split rule as `Long`). Added in
+        //     r160: Start / End were previously fixed-gain fallbacks.
+        // Mixed granules are unreachable from the auto scheduler this
+        // round (no Mixed transition in §C.1.5.2's
+        // `LONG → START → SHORT → STOP` path).
         // Mutually exclusive with the force-toggles; clear them.
         self.force_short_blocks = false;
         self.force_mixed_blocks = false;
@@ -1882,21 +1883,29 @@ impl Mp3Encoder {
                     11 * 4 + 10 * 3
                 };
                 let inner_budget_for_outer = per_gc_bits.saturating_sub(part2_bits_outer) as u64;
-                // The outer loop runs on the three block-type shapes
-                // covered by a primitive: Long (the original r144 path),
-                // pure-Short (`outer_loop_search_short`, r157), and mixed
-                // (`outer_loop_search_mixed`, r159). Start / End fall
-                // back to the fixed-gain inner-loop path with
-                // `scalefactor_compress = 0` (zero scalefactors) so the
-                // rest of the encoder stays shape-compatible with the
-                // side-info skeleton this (gr, ch) selected upstream.
+                // The outer loop runs on all four block-type shapes the
+                // encoder ever emits: long (r144 path,
+                // `outer_loop_search_long`), pure-short (r157
+                // `outer_loop_search_short`), mixed (r159
+                // `outer_loop_search_mixed`), and — new in r160 — the
+                // long-family transition skeletons Start (block_type 1)
+                // and End (block_type 3). Start / End share part2 wire
+                // layout, requantize formula, and region-split rule
+                // with Long (see `outer_loop_search_long`'s doc on
+                // long-family acceptance), so they reuse the same
+                // primitive with a relaxed debug_assert. No block-type
+                // ever falls back to the fixed-gain inner-loop-only
+                // path while the outer loop is enabled.
                 let outer_loop_eligible = matches!(
                     (
                         gc_template.window_switching_flag,
                         gc_template.block_type,
                         gc_template.mixed_block_flag,
                     ),
-                    (false, BlockType::Long, _) | (true, BlockType::Short, _)
+                    (false, BlockType::Long, _)
+                        | (true, BlockType::Short, _)
+                        | (true, BlockType::Start, false)
+                        | (true, BlockType::End, false)
                 );
                 let (sf, initial_gain, scalefac_scale_outer, subblock_gain_outer) =
                     match self.outer_loop_threshold {
@@ -1907,6 +1916,18 @@ impl Mp3Encoder {
                             let mut gc_for_ol = gc_template;
                             gc_for_ol.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
                             match gc_template.block_type {
+                                // Long-family — Long, Start, End share
+                                // a primitive. The Long arm runs on
+                                // every (`window_switching_flag = false`,
+                                // `block_type = Long`) granule; the
+                                // Start / End arms below it route the
+                                // long-family transition skeletons
+                                // (`window_switching_flag = true`,
+                                // `block_type ∈ {Start, End}`) onto the
+                                // same `outer_loop_search_long`
+                                // primitive (it accepts the long family
+                                // — see its doc on long-family
+                                // acceptance).
                                 BlockType::Long => {
                                     let res = outer_loop_search_long(
                                         &xr_pre,
@@ -2002,11 +2023,32 @@ impl Mp3Encoder {
                                         res.subblock_gain,
                                     )
                                 }
-                                // Unreachable: gating above forbids
-                                // Start / End from this arm.
+                                // Long-family transition skeletons —
+                                // route onto `outer_loop_search_long`
+                                // exactly like `BlockType::Long` above
+                                // (the primitive accepts the long
+                                // family). New in r160: Start / End
+                                // were previously fixed-gain
+                                // fallbacks; their part2 layout +
+                                // requantize formula is identical to
+                                // Long so the same primitive serves
+                                // all three.
                                 BlockType::Start | BlockType::End => {
-                                    debug_assert!(false, "outer-loop ineligible block_type");
-                                    (ScaleFactors::default(), 0u8, false, [0u8; 3])
+                                    let res = outer_loop_search_long(
+                                        &xr_pre,
+                                        &gc_for_ol,
+                                        self.sample_rate_hz,
+                                        self.version,
+                                        inner_budget_for_outer,
+                                        thr,
+                                        DEFAULT_OUTER_LOOP_MAX_ITER,
+                                    );
+                                    (
+                                        res.scalefactors,
+                                        res.global_gain,
+                                        res.scalefac_scale,
+                                        [0u8; 3],
+                                    )
                                 }
                             }
                         }

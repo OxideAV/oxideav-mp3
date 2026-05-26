@@ -8,6 +8,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§C.1.5.4.3 outer-loop long-family transition-skeleton wiring**
+  (Phase 2 step 30, r160). `outer_loop_search_long` widens from
+  pure-Long (`block_type == Long`, `window_switching_flag == false`)
+  to the full long-family `block_type ∈ {Long, Start, End}`. Start
+  (block_type 1) and End/Stop (block_type 3) carry the same 21 long
+  scalefactor bands as Long (§2.4.2.7 + Table 3-B.5), share the
+  §2.4.3.4.7.1 long-block requantize formula (no `subblock_gain`
+  term), and use the same §C.1.5.4.4.6 region split rule
+  (`region0_count` / `region1_count`-ignoring 1/3, 5/12, 1/4
+  partition driven by `big_values` alone), so a single primitive
+  covers all three correctly. Three details:
+  - **Debug-assert relaxation.** The pure-Long check at
+    `outer_loop_search_long`'s entry becomes a long-family check
+    accepting `(Long, false)`, `(Start, true)`, or `(End, true)`
+    and rejecting `mixed_block_flag` (which only applies to
+    `block_type == Short`).
+  - **Dispatcher widening.** `outer_loop_eligible` extends from
+    `(false, Long, _) | (true, Short, _)` to also include
+    `(true, Start, false) | (true, End, false)`. The
+    `BlockType::Start | BlockType::End` match arm — previously a
+    `debug_assert!(false)` unreachability marker — now routes onto
+    the same `outer_loop_search_long` call as `BlockType::Long`,
+    with `subblock_gain = [0; 3]` (no subblock_gain on the
+    long-family branch).
+  - **Auto block-type integration.** With `enable_auto_block_type`
+    + `new_with_outer_loop` both on, every block-type the §C.1.5.2
+    `LONG → START → SHORT → STOP → LONG` scheduler emits now runs
+    the outer loop. Previously Start / End granules fell back to
+    the fixed-gain inner-loop-only path with
+    `scalefac_compress = 0`; they now seed the
+    `OUTER_LOOP_SCALEFAC_COMPRESS = 15` signature on the wire and
+    carry the chosen per-band scalefactors as part2 at slen1 = 4 /
+    slen2 = 3.
+
+  Validated by 5 new unit tests in `outer_loop.rs` (Start/End
+  templates terminate on a huge threshold; behavioural identity
+  between Long, Start, and End templates on identical `xr` —
+  including scalefactors, `global_gain`, `scalefac_scale`,
+  `preflag`, and the full `is[576]` output; Start template amplifies
+  ≥ 1 band under a tiny threshold) and 2 new integration tests in
+  `tests/auto_block_type_roundtrip.rs` (every Start / End granule
+  carries the `scalefac_compress = 15` outer-loop wire signature on
+  the click-train stream; the resulting bytestream remains
+  demuxer-acceptable end-to-end). All Mp3 tests now: **554 pass**
+  (was 547 at r159; +5 unit + 2 integration).
+
 - **§C.1.5.4.3 outer-loop mixed-block analogue** (Phase 2 step 29).
   `outer_loop_search_mixed` composes the long-region per-band amplifier
   (sfb 0..=7) with the short-region per-(sfb, window) amplifier

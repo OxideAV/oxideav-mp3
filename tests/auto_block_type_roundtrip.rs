@@ -15,10 +15,12 @@
 //! 1. Sanity-checks the API surface (mono-only restriction, mutual
 //!    exclusion with the testing toggles, enable / disable round-trip).
 //!    As of r158 the outer-loop combination is *accepted* (Short
-//!    granules dispatch onto `outer_loop_search_short`, Start/End
-//!    granules fall back to the fixed-gain inner-loop path) — the
-//!    rejection assertion from r156 has been replaced by a positive
-//!    integration test that exercises both code paths.
+//!    granules dispatch onto `outer_loop_search_short`); as of r160
+//!    Start/End granules ALSO route into the outer loop via the
+//!    long-family primitive `outer_loop_search_long` (previously they
+//!    fell back to the fixed-gain inner-loop path). Every block-type
+//!    the auto scheduler emits now runs the §C.1.5.4.3 distortion
+//!    control loop.
 //! 2. Confirms that auto-block-type **default off** is the identity
 //!    transform: every granule of a sustained-tone stream still
 //!    emits a long block.
@@ -156,8 +158,10 @@ fn auto_block_type_mutually_exclusive_with_force_mixed() {
 fn auto_block_type_combines_with_outer_loop_and_roundtrips() {
     // r158 unblocked: `outer_loop_search_short` is now wired into the
     // encoder so the §C.1.5.4.3 distortion-control loop can run on the
-    // auto-block-type Short granules. Start/End transition skeletons
-    // fall back to the fixed-gain inner-loop path inside the encoder.
+    // auto-block-type Short granules. r160 follow-up: Start/End
+    // transition skeletons now also route into the outer loop via the
+    // long-family primitive `outer_loop_search_long` (no more fixed-gain
+    // fallback for any block-type the auto scheduler emits).
     //
     // The combined configuration must:
     //   * accept `enable_auto_block_type` on top of `new_with_outer_loop`
@@ -409,4 +413,146 @@ fn auto_block_type_stream_is_demuxer_accepted() {
         }
     }
     assert!(packets > 0, "demuxer accepted no packets from auto stream");
+}
+
+#[test]
+fn auto_block_type_outer_loop_dispatches_start_end_through_long_primitive() {
+    // r160 wiring: with both auto-block-type AND the outer loop
+    // enabled, the Start / End transition skeletons no longer fall
+    // back to the fixed-gain inner-loop-only path — they route into
+    // `outer_loop_search_long` (the long-family primitive). The
+    // observable on the wire is `scalefac_compress = 15` (the
+    // `OUTER_LOOP_SCALEFAC_COMPRESS` constant): the fixed-gain path
+    // writes `scalefac_compress = 0` (zero scalefactors), and any
+    // outer-loop path seeds 15 so the chosen per-band scalefactors
+    // can be transmitted at slen1 = 4 / slen2 = 3. This is the same
+    // distinguishability signature used by the r159 mixed-block
+    // wiring test in `mixed_block_encoder_roundtrip.rs`.
+    let mut enc = Mp3Encoder::new_with_outer_loop(
+        BR,
+        SR,
+        ChannelMode::SingleChannel,
+        /*uniform_threshold=*/ 1.0e-6,
+    )
+    .expect("outer-loop encoder build");
+    enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto + outer-loop accepted (r158)");
+
+    // Click-train PCM exercises the LONG → START → SHORT → END → LONG
+    // sequence so the dispatcher visits Start and End at least once.
+    let n = SR as usize;
+    let pcm = click_train_pcm(n, /*click_period=*/ 6600);
+    enc.push_samples(&pcm).expect("push pcm");
+    let mut bytes = Vec::new();
+    let _ = enc.finish(&mut bytes).expect("encoder finish");
+
+    let mut start_granules = 0usize;
+    let mut end_granules = 0usize;
+    let mut start_with_outer_loop = 0usize;
+    let mut end_with_outer_loop = 0usize;
+    for frame in FrameWalker::new(&bytes) {
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
+        for gr in 0..si.granule_count as usize {
+            for ch in 0..si.channels as usize {
+                let gc = &si.granules[gr][ch];
+                match gc.block_type {
+                    BlockType::Start => {
+                        assert!(
+                            gc.window_switching_flag,
+                            "Start block must carry window_switching_flag",
+                        );
+                        start_granules += 1;
+                        if gc.scalefac_compress == 15 {
+                            start_with_outer_loop += 1;
+                        }
+                    }
+                    BlockType::End => {
+                        assert!(
+                            gc.window_switching_flag,
+                            "End block must carry window_switching_flag",
+                        );
+                        end_granules += 1;
+                        if gc.scalefac_compress == 15 {
+                            end_with_outer_loop += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(
+        start_granules > 0,
+        "click-train auto+outer-loop did not engage Start at all"
+    );
+    assert!(
+        end_granules > 0,
+        "click-train auto+outer-loop did not engage End at all"
+    );
+    // The dispatch contract: every Start / End granule must run the
+    // outer loop (no fixed-gain fallback this round).
+    assert_eq!(
+        start_with_outer_loop,
+        start_granules,
+        "{}/{} Start granules failed the outer-loop wire signature \
+         (scalefac_compress == 15); the fixed-gain fallback path \
+         was unexpectedly taken",
+        start_granules - start_with_outer_loop,
+        start_granules,
+    );
+    assert_eq!(
+        end_with_outer_loop,
+        end_granules,
+        "{}/{} End granules failed the outer-loop wire signature \
+         (scalefac_compress == 15); the fixed-gain fallback path \
+         was unexpectedly taken",
+        end_granules - end_with_outer_loop,
+        end_granules,
+    );
+}
+
+#[test]
+fn auto_block_type_outer_loop_start_end_stream_is_demuxer_accepted() {
+    // End-to-end roundtrip: with Start / End now running through the
+    // outer loop, the assembled bytestream must remain a structurally
+    // valid MP3 (the demuxer reads every frame back without surprise).
+    // This guards against a hypothetical regression where the
+    // long-family primitive's chosen scalefactors don't round-trip
+    // through the part2 writer / scalefactor reader.
+    let mut enc = Mp3Encoder::new_with_outer_loop(
+        BR,
+        SR,
+        ChannelMode::SingleChannel,
+        /*uniform_threshold=*/ 1.0e-6,
+    )
+    .expect("outer-loop encoder build");
+    enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto + outer-loop accepted (r158)");
+
+    let n = SR as usize;
+    let pcm = click_train_pcm(n, /*click_period=*/ 6600);
+    enc.push_samples(&pcm).expect("push pcm");
+    let mut bytes = Vec::new();
+    let _ = enc.finish(&mut bytes).expect("encoder finish");
+
+    let cursor = Cursor::new(bytes);
+    let mut demux = Mp3Demuxer::open(Box::new(cursor)).expect("demuxer open");
+    let mut packets = 0usize;
+    loop {
+        match demux.next_packet() {
+            Ok(_pkt) => {
+                packets += 1;
+                if packets > 4_000 {
+                    break;
+                }
+            }
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demux next_packet: {e}"),
+        }
+    }
+    assert!(
+        packets > 0,
+        "demuxer accepted no packets from r160 transition-skeleton outer-loop stream",
+    );
 }

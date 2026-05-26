@@ -1501,18 +1501,60 @@ Mp3Demuxer accepts the new bitstream). Tests: 547 pass (was 532 at
 r158; +11 unit + 4 integration). No external implementation
 consulted.
 
+**Phase 2 step 30 (§C.1.5.4.3 outer-loop long-family transition-skeleton
+wiring)** widens `outer_loop_search_long` from pure-Long
+(`block_type == Long`, `window_switching_flag == false`) to the full
+long-family `block_type ∈ {Long, Start, End}`. Start (block_type 1)
+and End/Stop (block_type 3) carry the same 21 long scalefactor bands
+as Long (§2.4.2.7 + Table 3-B.5), share the §2.4.3.4.7.1 long-block
+requantize formula (no `subblock_gain` term), and use the same
+§C.1.5.4.4.6 region-split rule (the inner-loop SUBDIVIDE function
+dispatches on `block_type == Short` alone, so Long / Start / End all
+take the same 1/3, 5/12, 1/4 partition driven by `big_values`). The
+primitive therefore handles all three correctly with a relaxed
+debug-assert and no logic change inside the loop body.
+
+Stream-encoder wiring: `outer_loop_eligible` extends from
+`(false, Long, _) | (true, Short, _)` to also include
+`(true, Start, false) | (true, End, false)`. The
+`BlockType::Start | BlockType::End` match arm — previously a
+`debug_assert!(false)` unreachability marker because outer-loop
+gating forbade those tags — now routes onto the same
+`outer_loop_search_long` call as `BlockType::Long`, with
+`subblock_gain = [0; 3]` (no subblock_gain on the long-family
+branch). With `enable_auto_block_type` + `new_with_outer_loop` both
+on, every block-type the §C.1.5.2 `LONG → START → SHORT → STOP →
+LONG` scheduler emits now runs the outer loop. Previously Start /
+End granules fell back to the fixed-gain inner-loop-only path with
+`scalefac_compress = 0`; they now seed the
+`OUTER_LOOP_SCALEFAC_COMPRESS = 15` signature on the wire and carry
+the chosen per-band scalefactors as part2 at slen1 = 4 / slen2 = 3.
+
+Validated by 5 new unit tests in `outer_loop.rs` (Start/End
+templates terminate on a huge threshold; behavioural identity
+between Long, Start, and End templates on identical `xr` —
+including scalefactors, `global_gain`, `scalefac_scale`, `preflag`,
+and the full `is[576]` output; Start template amplifies ≥ 1 band
+under a tiny threshold) plus 2 new integration tests in
+`tests/auto_block_type_roundtrip.rs` (every Start / End granule on
+the click-train fixture carries the `scalefac_compress = 15`
+outer-loop wire signature, confirming the fixed-gain fallback path
+is no longer taken; the resulting bytestream remains
+Mp3Demuxer-acceptable end-to-end). Tests: 554 pass (was 547 at
+r159; +5 unit + 2 integration). No external implementation
+consulted.
+
 Remaining Phase 2 work: a real per-band psychoacoustic threshold (so
 the outer loop can spectrally redistribute bits without a hand-tuned
 constant), intensity-stereo encode (§2.4.3.4.9.3), multi-channel
-short / mixed block-type agreement (§2.4.3.4.9), an outer-loop
-primitive that targets the §C.1.5.2 Start / End transition
-skeletons (currently the auto + outer-loop integration falls back
-to fixed-gain on those two block types), auto-block-type integration
-with the new mixed primitive (the §C.1.5.2 state machine does not
-emit Mixed as a transition this round; mixed dispatch is reachable
-today only via the deterministic `force_mixed_blocks_for_testing`
-toggle), LSF encode, and stereo / LSF decode through the trait
-wrapper.
+short / mixed / auto-block-type agreement (§2.4.3.4.9
+cross-channel block-type agreement is the gap the force-short /
+force-mixed toggles and the auto path reject stereo on),
+auto-block-type integration with the new mixed primitive (the
+§C.1.5.2 state machine does not emit Mixed as a transition this
+round; mixed dispatch is reachable today only via the
+deterministic `force_mixed_blocks_for_testing` toggle), LSF encode,
+and stereo / LSF decode through the trait wrapper.
 
 ### Not yet implemented
 
@@ -1550,26 +1592,24 @@ outer-loop primitive `outer_loop_search_short` with per-(sfb,
 window) `scalefac_s` amplification and bounded `subblock_gain`
 search + auto-block-type × outer-loop integration so the auto
 scheduler runs `outer_loop_search_short` on Short granules and
-`outer_loop_search_long` on Long granules while Start / End
-transition skeletons fall back to fixed-gain + §C.1.5.4.3 mixed-block
-outer-loop primitive `outer_loop_search_mixed` composing the
-long-region amplifier over `sf.long[0..=7]` with the short-region
+`outer_loop_search_long` on Long / Start / End granules + §C.1.5.4.3
+mixed-block outer-loop primitive `outer_loop_search_mixed` composing
+the long-region amplifier over `sf.long[0..=7]` with the short-region
 per-(sfb, window) amplifier over `sf.short[3..=11][..]` and wiring
 into the stream encoder so `force_mixed_blocks_for_testing` +
 `new_with_outer_loop` runs the new distortion-control path on every
-granule)** — it still lacks
+granule + §C.1.5.4.3 long-family transition-skeleton wiring so
+`outer_loop_search_long` accepts `block_type ∈ {Long, Start, End}`
+and the auto + outer-loop dispatcher routes Start / End onto the
+same primitive (no more fixed-gain fallback for any block-type the
+scheduler emits))** — it still lacks
 the psychoacoustic model (so the outer loop's `xmin(sb)` is a
 uniform constant rather than per-band masking-aware),
 intensity-stereo encode (§2.4.3.4.9.3), multi-channel short /
 mixed / auto-block-type support (§2.4.3.4.9 cross-channel
 block-type agreement is the gap the force-short / force-mixed
-toggles and the new auto path reject stereo on), an outer-loop
-primitive that targets the §C.1.5.2 Start / End transition
-skeletons (currently the auto + outer-loop integration falls back
-to the fixed-gain inner-loop path for those two block types — the
-§2.4.2.7 coefficient distribution shifts mid-overlap and the
-uniform-`xmin` heuristic over-amplifies until a psy-aware
-threshold is wired in), auto-block-type integration with the new
+toggles and the new auto path reject stereo on),
+auto-block-type integration with the new
 mixed primitive (the §C.1.5.2 state machine does not emit Mixed as
 a transition this round; mixed dispatch is reachable today only via
 the deterministic `force_mixed_blocks_for_testing` toggle), and
