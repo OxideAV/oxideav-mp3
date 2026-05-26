@@ -341,11 +341,31 @@
 //! unchanged). The Xing / Info carrier frame stays CRC-free regardless
 //! of the toggle.
 //!
+//! The [`mixed_classifier`] module adds the encoder-side
+//! §2.4.3.4.10.3 **mixed-vs-pure-short PCM-domain classifier**
+//! (Phase 2 step 31, r161): the companion to the
+//! [`attack_detect::AttackDetector`] that decides on every
+//! scheduler-emitted Short granule whether to promote it to mixed
+//! (`block_type == 2`, `mixed_block_flag == 1`: lowest 2 subbands
+//! long, the rest short). The classifier applies a one-tap
+//! moving-average low-pass kernel and compares the per-subframe
+//! energies of the low-passed signal — a stable low band warrants
+//! the mixed carve-out, a bursting low band warrants pure-short.
+//! [`block_type_sm::BlockTypeStateMachine::step_with_mixed`] extends
+//! the scheduler with a per-call `prefer_mixed` parameter and
+//! returns `(BlockType, bool)`; the legacy
+//! [`block_type_sm::BlockTypeStateMachine::step`] delegates with
+//! `prefer_mixed = false`. [`Mp3Encoder::enable_auto_block_type_with_mixed`]
+//! is the opt-in entry point that wires the classifier into the
+//! stream-encoder pre-pass; the resulting mixed emissions take the
+//! same forward MDCT path as `force_mixed_blocks` and reuse the
+//! r159 [`outer_loop::outer_loop_search_mixed`] primitive via the
+//! `gc_template.mixed_block_flag` discriminator.
+//!
 //! The remaining Phase 2 work — the psychoacoustic model (so the
 //! threshold is per-band tonality-aware), scalefactor estimation
-//! (preemphasis amplification, intensity-stereo encode), short / mixed
-//! block-type switching, LSF / VBR decode, and LSF / true-VBR encode —
-//! is still a later round.
+//! (preemphasis amplification, intensity-stereo encode), LSF / VBR
+//! decode, and LSF / true-VBR encode — is still a later round.
 //!
 //! [`Encoder`]: oxideav_core::Encoder
 //!
@@ -371,6 +391,7 @@ pub mod imdct;
 pub mod inner_loop;
 pub mod main_data;
 pub mod mdct;
+pub mod mixed_classifier;
 pub mod outer_loop;
 pub mod quantize;
 pub mod reorder;
@@ -426,6 +447,9 @@ pub use main_data::{
 pub use mdct::{
     analysis_long_window, analysis_short_window, forward_overlap, mdct,
     window_long_family_analysis, window_short_analysis, MdctState,
+};
+pub use mixed_classifier::{
+    low_band_stability_ratio, low_pass_granule, MixedClassifier, DEFAULT_MIXED_LOW_BAND_STABILITY,
 };
 pub use outer_loop::{
     band_distortion_long, band_distortion_mixed_long, band_distortion_mixed_short,

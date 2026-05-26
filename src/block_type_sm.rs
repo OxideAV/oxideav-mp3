@@ -123,7 +123,41 @@ impl BlockTypeStateMachine {
     ///
     /// Returns the [`BlockType`] for the current granule. Updates the
     /// internal state in-place.
+    ///
+    /// This is the legacy entry point that never emits the mixed
+    /// flag (every short emission is pure-short). The
+    /// [`Self::step_with_mixed`] method extends the scheduler with a
+    /// mixed-vs-pure-short signal on the same transition geometry.
     pub fn step(&mut self, cur_attack: bool, next_attack: bool) -> BlockType {
+        self.step_with_mixed(cur_attack, next_attack, false).0
+    }
+
+    /// Advance the scheduler by one granule with an optional
+    /// mixed-vs-pure-short preference.
+    ///
+    /// Identical to [`Self::step`] in transition geometry — the
+    /// §C.1.5.2 `LONG → START → SHORT → STOP → LONG` envelope is
+    /// unchanged — except that when the scheduler emits
+    /// [`BlockType::Short`] **and** `prefer_mixed` is `true`, the
+    /// returned `mixed_flag` companion bool is set. Callers wire
+    /// this into the encoder's `mixed_block_flag` side-info field
+    /// (§2.4.2.7) which selects the §2.4.3.4.10.3 mixed-block
+    /// scalefactor-band layout (lowest 2 subbands long, the rest
+    /// short).
+    ///
+    /// The mixed flag is **always** `false` for any non-Short
+    /// emission: the §2.4.2.7 spec scopes `mixed_block_flag` to
+    /// `block_type == 2`, so a Long / Start / End granule cannot
+    /// carry it regardless of `prefer_mixed`. This keeps the
+    /// scheduler honest with the wire syntax.
+    ///
+    /// Returns `(block_type, mixed_flag)` for the current granule.
+    pub fn step_with_mixed(
+        &mut self,
+        cur_attack: bool,
+        next_attack: bool,
+        prefer_mixed: bool,
+    ) -> (BlockType, bool) {
         let emitted = match self.prev {
             BlockType::Long => {
                 // Long can transition to Start (preparing for a
@@ -170,7 +204,13 @@ impl BlockTypeStateMachine {
             }
         };
         self.prev = emitted;
-        emitted
+        // Per §2.4.2.7, `mixed_block_flag` is meaningful only when
+        // `block_type == 2` (Short). Suppress the flag on every
+        // other emission regardless of the caller's preference so
+        // the scheduler never produces a syntactically invalid
+        // (block_type, mixed_flag) pair.
+        let mixed_flag = prefer_mixed && matches!(emitted, BlockType::Short);
+        (emitted, mixed_flag)
     }
 }
 
@@ -295,6 +335,99 @@ mod tests {
         assert_eq!(sm.step(false, false), BlockType::End);
         // And the next is back to Long.
         assert_eq!(sm.step(false, false), BlockType::Long);
+    }
+
+    /// `step_with_mixed(_, _, false)` is byte-for-byte equivalent
+    /// to `step(_, _)` — the mixed flag is suppressed and the
+    /// transition geometry is unchanged.
+    #[test]
+    fn step_with_mixed_false_matches_step() {
+        let mut sm_a = BlockTypeStateMachine::new();
+        let mut sm_b = BlockTypeStateMachine::new();
+        // Build up a representative attack pattern: calm, lookahead
+        // attack, sustained burst, then calm.
+        let pattern = [
+            (false, true),
+            (true, true),
+            (true, false),
+            (false, false),
+            (false, false),
+        ];
+        for &(cur, nxt) in pattern.iter() {
+            let a = sm_a.step(cur, nxt);
+            let (b, mixed) = sm_b.step_with_mixed(cur, nxt, false);
+            assert_eq!(a, b, "block_type differs on (cur={cur}, next={nxt})");
+            assert!(!mixed, "mixed flag must be false when prefer_mixed=false");
+        }
+    }
+
+    /// `step_with_mixed(_, _, true)` propagates the mixed flag onto
+    /// every Short emission and suppresses it on every other
+    /// emission (Long / Start / End). This is the syntactic
+    /// invariant §2.4.2.7 requires: `mixed_block_flag` is only
+    /// meaningful for `block_type == 2`.
+    #[test]
+    fn step_with_mixed_true_sets_flag_only_on_short() {
+        let mut sm = BlockTypeStateMachine::new();
+        // Long → Start (flag must be false; Start is not Short)
+        let (bt, mixed) = sm.step_with_mixed(false, true, true);
+        assert_eq!(bt, BlockType::Start);
+        assert!(!mixed);
+        // Start → Short (flag must be true — caller asked for mixed)
+        let (bt, mixed) = sm.step_with_mixed(true, false, true);
+        assert_eq!(bt, BlockType::Short);
+        assert!(mixed);
+        // Short → End (flag must be false again)
+        let (bt, mixed) = sm.step_with_mixed(false, false, true);
+        assert_eq!(bt, BlockType::End);
+        assert!(!mixed);
+        // End → Long (flag must be false)
+        let (bt, mixed) = sm.step_with_mixed(false, false, true);
+        assert_eq!(bt, BlockType::Long);
+        assert!(!mixed);
+    }
+
+    /// A sustained burst with prefer_mixed=true emits Start, then
+    /// several Short-with-mixed, then End — each Short carries the
+    /// flag, Start and End do not.
+    #[test]
+    fn step_with_mixed_sustained_burst_flags_each_short() {
+        let mut sm = BlockTypeStateMachine::new();
+        let (bt, mixed) = sm.step_with_mixed(false, true, true);
+        assert_eq!(bt, BlockType::Start);
+        assert!(!mixed);
+        for _ in 0..3 {
+            let (bt, mixed) = sm.step_with_mixed(true, true, true);
+            assert_eq!(bt, BlockType::Short);
+            assert!(mixed);
+        }
+        let (bt, mixed) = sm.step_with_mixed(true, false, true);
+        assert_eq!(bt, BlockType::Short);
+        assert!(mixed);
+        let (bt, mixed) = sm.step_with_mixed(false, false, true);
+        assert_eq!(bt, BlockType::End);
+        assert!(!mixed);
+    }
+
+    /// `prefer_mixed` can vary per call, so the flag tracks the
+    /// preference of the call that *emits* the Short, not any
+    /// committed earlier setting.
+    #[test]
+    fn step_with_mixed_per_call_preference() {
+        let mut sm = BlockTypeStateMachine::new();
+        // prefer_mixed=false on the Start call → no flag on Start
+        // (trivially — Start is never flagged).
+        let (bt, mixed) = sm.step_with_mixed(false, true, false);
+        assert_eq!(bt, BlockType::Start);
+        assert!(!mixed);
+        // prefer_mixed=true on the Short call → flag set on Short.
+        let (bt, mixed) = sm.step_with_mixed(true, true, true);
+        assert_eq!(bt, BlockType::Short);
+        assert!(mixed);
+        // prefer_mixed=false on the next Short call → flag NOT set.
+        let (bt, mixed) = sm.step_with_mixed(true, false, false);
+        assert_eq!(bt, BlockType::Short);
+        assert!(!mixed);
     }
 
     /// After Stop, the next granule MUST be Long — even if the

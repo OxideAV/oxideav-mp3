@@ -502,6 +502,19 @@ struct AutoBlockTypeConfig {
     /// that spans frame boundaries still emits a single coherent
     /// `Long → Start → Short → Stop → Long` sequence.
     scheduler: Vec<crate::block_type_sm::BlockTypeStateMachine>,
+    /// Optional mixed-vs-pure-short classifier per channel. When
+    /// `Some`, each Short emission from the scheduler is candidate
+    /// for promotion to mixed (block_type 2 + mixed_block_flag = 1)
+    /// driven by the per-channel
+    /// [`crate::mixed_classifier::MixedClassifier`]'s low-band
+    /// stability ratio. When `None`, every Short is pure-short — the
+    /// pre-r161 auto behaviour. Configured via
+    /// [`Mp3Encoder::enable_auto_block_type_with_mixed`].
+    mixed_classifier: Option<Vec<crate::mixed_classifier::MixedClassifier>>,
+    /// Configured low-band stability threshold (cached for
+    /// inspection via [`Mp3Encoder::auto_block_type_mixed_threshold`];
+    /// `None` when no mixed classifier is wired).
+    mixed_threshold: Option<f64>,
 }
 
 /// Variable-bitrate config attached to [`Mp3Encoder`] by
@@ -770,7 +783,79 @@ impl Mp3Encoder {
             threshold: effective_threshold,
             detector,
             scheduler,
+            mixed_classifier: None,
+            mixed_threshold: None,
         });
+        Ok(())
+    }
+
+    /// Enable §C.1.5.2 auto block-type **with mixed-block
+    /// promotion** — the r161 extension to
+    /// [`Self::enable_auto_block_type`]. Identical lookahead /
+    /// detector / scheduler wiring, plus an additional
+    /// [`crate::mixed_classifier::MixedClassifier`] per channel that
+    /// decides — on every granule the scheduler emits as Short —
+    /// whether to promote it to a §2.4.3.4.10.3 mixed block
+    /// (`block_type == 2`, `mixed_block_flag == 1`: lowest 2
+    /// subbands long, the rest short) or keep it pure-short.
+    ///
+    /// The mixed classifier is a clean-room PCM-domain one-tap
+    /// low-pass + subframe-energy ratio. A small ratio means the
+    /// low band is stationary across the granule → the mixed
+    /// carve-out's long lowest subbands are appropriate (they keep
+    /// frequency resolution on the steady low-frequency content
+    /// while letting the upper subbands resolve the transient in
+    /// time). A large ratio means the low band is bursting too → a
+    /// pure-short block is preferred (every subband resolves the
+    /// burst in time). See [`crate::mixed_classifier`] for the
+    /// signal-driven heuristic in detail.
+    ///
+    /// `attack_threshold` is the same parameter
+    /// [`Self::enable_auto_block_type`] takes (subframe-energy /
+    /// running-ambient ratio that the loudest subframe must exceed
+    /// to be flagged as carrying an attack); pass
+    /// [`crate::attack_detect::DEFAULT_ATTACK_THRESHOLD`] for the
+    /// suggested default `10.0`.
+    /// `mixed_low_band_stability` is the mixed classifier's
+    /// max-to-min low-passed subframe-energy ratio that the granule
+    /// must stay at or below to be promoted to mixed; pass
+    /// [`crate::mixed_classifier::DEFAULT_MIXED_LOW_BAND_STABILITY`]
+    /// for the suggested default `4.0`. Both thresholds are checked
+    /// for non-finite / non-positive values and silently coerced to
+    /// their respective defaults.
+    ///
+    /// All [`Self::enable_auto_block_type`] restrictions apply
+    /// (mono-only, mutually exclusive with the force-toggles). Mixed
+    /// promotion is an *opt-in extension* — callers using
+    /// `enable_auto_block_type` keep the pre-r161 pure-short
+    /// behaviour.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamEncodeError::StereoUnsupported`] when the encoder's
+    /// channel count is > 1.
+    pub fn enable_auto_block_type_with_mixed(
+        &mut self,
+        attack_threshold: f64,
+        mixed_low_band_stability: f64,
+    ) -> Result<(), StreamEncodeError> {
+        // Reuse the plain path for detector / scheduler construction
+        // + the mono-only + force-toggle clearing it does, then
+        // augment the resulting config with the mixed classifier.
+        self.enable_auto_block_type(attack_threshold)?;
+        let mixed_classifier: Vec<_> = (0..self.nch)
+            .map(|_| {
+                crate::mixed_classifier::MixedClassifier::with_threshold(mixed_low_band_stability)
+            })
+            .collect();
+        let effective_mixed_threshold = mixed_classifier
+            .first()
+            .map(|c| c.threshold())
+            .unwrap_or(crate::mixed_classifier::DEFAULT_MIXED_LOW_BAND_STABILITY);
+        if let Some(ref mut cfg) = self.auto_block_type {
+            cfg.mixed_classifier = Some(mixed_classifier);
+            cfg.mixed_threshold = Some(effective_mixed_threshold);
+        }
         Ok(())
     }
 
@@ -787,6 +872,30 @@ impl Mp3Encoder {
     #[must_use]
     pub fn auto_block_type_threshold(&self) -> Option<f64> {
         self.auto_block_type.as_ref().map(|c| c.threshold)
+    }
+
+    /// `true` when [`Self::enable_auto_block_type_with_mixed`] is in
+    /// effect (a strict subset of [`Self::auto_block_type_enabled`]
+    /// — the mixed classifier is an opt-in extension on top of the
+    /// auto dispatch).
+    #[must_use]
+    pub fn auto_block_type_mixed_enabled(&self) -> bool {
+        self.auto_block_type
+            .as_ref()
+            .map(|c| c.mixed_classifier.is_some())
+            .unwrap_or(false)
+    }
+
+    /// The configured mixed-promotion low-band stability threshold
+    /// (max-to-min subframe-energy ratio of the low-passed PCM that
+    /// a granule must stay at or below to be promoted from
+    /// pure-short to mixed). `None` when
+    /// [`Self::enable_auto_block_type_with_mixed`] was not called.
+    #[must_use]
+    pub fn auto_block_type_mixed_threshold(&self) -> Option<f64> {
+        self.auto_block_type
+            .as_ref()
+            .and_then(|c| c.mixed_threshold)
     }
 
     /// Disable the [`Self::enable_auto_block_type`] auto dispatch
@@ -1375,6 +1484,15 @@ impl Mp3Encoder {
         // mixed for force-mixed). It also picks which
         // `default_*_gc()` skeleton becomes the side-info template
         // in pass 2.
+        // Parallel matrix to `block_type_per_gc`: `mixed_per_gc[gr][ch]
+        // == true` iff the corresponding emission is `BlockType::Short`
+        // AND the auto path's optional mixed classifier decided this
+        // granule warrants the §2.4.3.4.10.3 mixed-block carve-out.
+        // The flag is always `false` on long-family emissions and on
+        // any path that doesn't have the mixed classifier wired
+        // (force-toggles, default-long, plain
+        // `enable_auto_block_type`).
+        let mut mixed_per_gc: [[bool; 2]; GRANULES] = [[false; 2]; GRANULES];
         let block_type_per_gc: [[BlockType; 2]; GRANULES] =
             if let Some(ref mut cfg) = self.auto_block_type {
                 // Auto path: classify each of the 2 frame granules + 1
@@ -1416,11 +1534,32 @@ impl Mp3Encoder {
                     } else {
                         false
                     };
+                    // Optional mixed-vs-pure-short classification per
+                    // granule. The classifier is stateful (its one-tap
+                    // LP carries the previous granule's last sample
+                    // across boundaries), so we always advance it on
+                    // both granules to keep the seed continuous —
+                    // independent of whether the emission ends up
+                    // Short or not. The flag is consumed only when
+                    // the scheduler returns Short below; the
+                    // classifier itself doesn't know what the scheduler
+                    // will decide. The §2.4.2.7 mixed_block_flag is
+                    // valid only on Short emissions, which the
+                    // `step_with_mixed` contract enforces.
+                    let (m0, m1) = if let Some(ref mut classifiers) = cfg.mixed_classifier {
+                        let mm0 = classifiers[ch].classify_mixed(&pcm_g0);
+                        let mm1 = classifiers[ch].classify_mixed(&pcm_g1);
+                        (mm0, mm1)
+                    } else {
+                        (false, false)
+                    };
                     // Feed the scheduler in granule-major order.
-                    let bt0 = cfg.scheduler[ch].step(a0, a1);
-                    let bt1 = cfg.scheduler[ch].step(a1, a2);
+                    let (bt0, mixed0) = cfg.scheduler[ch].step_with_mixed(a0, a1, m0);
+                    let (bt1, mixed1) = cfg.scheduler[ch].step_with_mixed(a1, a2, m1);
                     out[0][ch] = bt0;
                     out[1][ch] = bt1;
+                    mixed_per_gc[0][ch] = mixed0;
+                    mixed_per_gc[1][ch] = mixed1;
                 }
                 out
             } else if self.force_short_blocks {
@@ -1523,6 +1662,64 @@ impl Mp3Encoder {
                     // is applied on Long / Start / End (decoder's
                     // §2.4.3.4.10.1 gate is `block_type == Short`).
                     match auto_bt {
+                        BlockType::Short if mixed_per_gc[gr][ch] => {
+                            // Auto-mixed forward path (r161): the
+                            // scheduler emitted Short AND the mixed
+                            // classifier judged the granule's low
+                            // band stable enough to warrant the
+                            // §2.4.3.4.10.3 carve-out. Subbands 0,1
+                            // take the 36-point long sine window
+                            // (lines 0..36); subbands 2..31 take the
+                            // three 12-point short windows. The
+                            // dispatch mirrors the `force_mixed_blocks`
+                            // branch below — same per-subband MDCT
+                            // state slots, same scale derivation,
+                            // same `forward_reorder` driver with a
+                            // mixed gc. The §C.1.5.4.3 mixed-block
+                            // outer-loop primitive
+                            // (`outer_loop_search_mixed`) already
+                            // exists from r159 and is selected by
+                            // the gc_template's mixed_block_flag
+                            // below.
+                            for sb in 0..2 {
+                                let mut current = [0.0f64; LONG_N / 2];
+                                for (t, slot) in current.iter_mut().enumerate() {
+                                    *slot = f64::from(inv[sb][t]);
+                                }
+                                let frame36 =
+                                    forward_overlap(&current, &mut self.mdct_state[ch][sb]);
+                                let windowed =
+                                    window_long_family_analysis(&frame36, BlockType::Long);
+                                let bins = mdct(&windowed, LONG_N);
+                                for (k, &b) in bins.iter().enumerate() {
+                                    xr[sb * 18 + k] = (b / 9.0) as f32;
+                                }
+                            }
+                            for sb in 2..32 {
+                                let mut current = [0.0f64; LONG_N / 2];
+                                for (t, slot) in current.iter_mut().enumerate() {
+                                    *slot = f64::from(inv[sb][t]);
+                                }
+                                let bins = crate::short_block::forward_short_mdct_subband(
+                                    &current,
+                                    &mut self.mdct_state[ch][sb],
+                                );
+                                let base = sb * 18;
+                                xr[base..base + 18].copy_from_slice(&bins);
+                            }
+                            let gc_mixed = default_mixed_gc();
+                            // No inverse alias reduction (same
+                            // rationale as the `force_mixed_blocks`
+                            // branch: `alias::alias_reduce` is gated
+                            // on `block_type == Short` only, and
+                            // returns unchanged for mixed too).
+                            xr_pre_per_gc[gr][ch] = crate::short_block::forward_reorder(
+                                &xr,
+                                &gc_mixed,
+                                self.sample_rate_hz,
+                                self.version,
+                            );
+                        }
                         BlockType::Short => {
                             for sb in 0..32 {
                                 let mut current = [0.0f64; LONG_N / 2];
@@ -1834,15 +2031,19 @@ impl Mp3Encoder {
                     // that matches the per-(gr, ch) chosen block type
                     // from the pre-pass above. Long stays on the
                     // default-long skeleton; Start/End take the
-                    // long-family transition skeleton; Short takes the
-                    // pure-short skeleton. Mixed is unreachable from
-                    // the auto scheduler this round (no Mixed
-                    // transition in the LONG→START→SHORT→STOP path).
+                    // long-family transition skeleton; Short takes
+                    // either the pure-short skeleton or the mixed
+                    // skeleton based on `mixed_per_gc[gr][ch]` from
+                    // the mixed classifier (r161:
+                    // `enable_auto_block_type_with_mixed`). Pre-r161
+                    // auto paths always have `mixed_per_gc` false →
+                    // pure-short, preserving prior behaviour.
                     match block_type_per_gc[gr][ch] {
                         BlockType::Long => default_long_gc(),
                         BlockType::Start | BlockType::End => {
                             default_transition_gc(block_type_per_gc[gr][ch])
                         }
+                        BlockType::Short if mixed_per_gc[gr][ch] => default_mixed_gc(),
                         BlockType::Short => default_short_gc(),
                     }
                 } else if self.force_short_blocks {

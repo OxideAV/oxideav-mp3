@@ -1544,16 +1544,73 @@ Mp3Demuxer-acceptable end-to-end). Tests: 554 pass (was 547 at
 r159; +5 unit + 2 integration). No external implementation
 consulted.
 
+**Phase 2 step 31 (§2.4.3.4.10.3 auto-block-type mixed-block
+promotion)** closes the long-standing "auto path can never emit
+Mixed" gap. The §C.1.5.2 LONG → START → SHORT → STOP → LONG
+scheduler is geometric — it cannot tell *whether* a Short emission
+should carve out the lowest 2 subbands as long (§2.4.3.4.10.3
+mixed) or treat every subband as short. The new
+[`mixed_classifier`] module decides per granule, from PCM alone, by
+applying a one-tap moving-average low-pass kernel
+`y[n] = (x[n] + x[n-1]) / 2` (transfer function `|cos(ω/2)|`, unity
+DC gain, nulls Nyquist) and comparing the per-subframe energies of
+the low-passed signal — if the max-to-min ratio stays at or below a
+caller-chosen threshold (default `4.0`) the low band is judged
+stationary across the granule and the mixed carve-out is
+appropriate; otherwise the granule is judged broadband-bursting and
+pure-short is preferred. The classifier is stateful only to carry
+the previous granule's last sample across boundaries (so the LP
+filter is continuous).
+
+`BlockTypeStateMachine::step_with_mixed(cur, next, prefer_mixed)`
+extends the scheduler with a per-call mixed-vs-pure-short preference;
+the returned `(block_type, mixed_flag)` pair sets the flag only on
+Short emissions (§2.4.2.7's syntactic invariant that
+`mixed_block_flag` is meaningful only for `block_type == 2`). The
+legacy `step` delegates with `prefer_mixed = false` so all prior
+callers keep their pure-short behaviour.
+
+`Mp3Encoder::enable_auto_block_type_with_mixed(attack_threshold,
+low_band_stability)` is the new opt-in entry point: same lookahead /
+detector / scheduler wiring as `enable_auto_block_type` plus a
+per-channel `MixedClassifier`. The pre-pass classifies every granule
+in parallel with the attack detector and feeds the boolean preference
+to `step_with_mixed`; the resulting `mixed_per_gc` matrix drives the
+forward MDCT branch and the `gc_template` selection. A Short emission
+with `mixed_per_gc=true` takes the same forward path as
+`force_mixed_blocks` (subbands 0..1 → 36-point long sine window;
+subbands 2..31 → three 12-point short windows; `default_mixed_gc()`
+template; no inverse alias reduction) and dispatches to the existing
+r159 `outer_loop_search_mixed` primitive via the
+`gc_template.mixed_block_flag` discriminator in the outer-loop
+branch — no further outer-loop wiring required.
+
+Validated by 10 new unit tests in `mixed_classifier.rs` (silent
+granule degenerate case; DC stability; high-frequency-only attack
+mixed-appropriate; broadband attack pure-short; cold-start
+conservative-pure-short boundary case; LP unity-DC and Nyquist-null
+checks; threshold validation; reset and prev_last tracking) plus 4
+new unit tests in `block_type_sm.rs` (`step_with_mixed(_,_,false)`
+matches `step` byte-for-byte; `prefer_mixed=true` sets the flag only
+on Short emissions; sustained-burst flag propagation; per-call
+preference toggling) plus 7 new integration tests in
+`tests/auto_block_type_mixed_roundtrip.rs` (stereo rejection
+inherited from plain auto; threshold round-trip; force-toggle
+clearing; plain auto path stays unmixed; low-band-DC + Nyquist-click
+stimulus engages ≥ 1 mixed granule while the plain auto path on the
+identical PCM emits zero mixed granules; pure-sine stays Long under
+mixed-auto; mixed-auto + outer-loop combination engages
+`outer_loop_search_mixed` end-to-end with `scalefac_compress = 15`
+on every mixed granule and Mp3Demuxer round-trip acceptance). Tests:
+575 pass (was 554 at r160; +14 unit + 7 integration). No external
+implementation consulted.
+
 Remaining Phase 2 work: a real per-band psychoacoustic threshold (so
 the outer loop can spectrally redistribute bits without a hand-tuned
 constant), intensity-stereo encode (§2.4.3.4.9.3), multi-channel
 short / mixed / auto-block-type agreement (§2.4.3.4.9
 cross-channel block-type agreement is the gap the force-short /
-force-mixed toggles and the auto path reject stereo on),
-auto-block-type integration with the new mixed primitive (the
-§C.1.5.2 state machine does not emit Mixed as a transition this
-round; mixed dispatch is reachable today only via the
-deterministic `force_mixed_blocks_for_testing` toggle), LSF encode,
+force-mixed toggles and the auto path reject stereo on), LSF encode,
 and stereo / LSF decode through the trait wrapper.
 
 ### Not yet implemented
@@ -1564,7 +1621,7 @@ scalefactor paths — are present; the wrapper is mono MPEG-1 only this
 round; the framing layer accepts MPEG-2.5 as of step 25 but the
 trait-wrapper audio-decode chain still rejects it pending the
 `MPEG-2.5-GAP.md` observer-trace items). The encoder is **Phase 1
-framing + Phase 2 steps 1–29 (forward MDCT primitive + analysis
+framing + Phase 2 steps 1–31 (forward MDCT primitive + analysis
 windowing + forward overlap split + polyphase analysis subband
 filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
@@ -1602,17 +1659,22 @@ granule + §C.1.5.4.3 long-family transition-skeleton wiring so
 `outer_loop_search_long` accepts `block_type ∈ {Long, Start, End}`
 and the auto + outer-loop dispatcher routes Start / End onto the
 same primitive (no more fixed-gain fallback for any block-type the
-scheduler emits))** — it still lacks
+scheduler emits) + §2.4.3.4.10.3 auto-block-type mixed-block
+promotion via the new clean-room PCM-domain `MixedClassifier`
+(one-tap low-pass + subframe-energy stability ratio) and the
+`BlockTypeStateMachine::step_with_mixed` extension, opt-in through
+`Mp3Encoder::enable_auto_block_type_with_mixed` and reusing the
+r159 `outer_loop_search_mixed` primitive via the
+`gc_template.mixed_block_flag` discriminator so mixed-promoted
+granules also run the §C.1.5.4.3 distortion-control loop)** — it
+still lacks
 the psychoacoustic model (so the outer loop's `xmin(sb)` is a
 uniform constant rather than per-band masking-aware),
 intensity-stereo encode (§2.4.3.4.9.3), multi-channel short /
 mixed / auto-block-type support (§2.4.3.4.9 cross-channel
 block-type agreement is the gap the force-short / force-mixed
-toggles and the new auto path reject stereo on),
-auto-block-type integration with the new
-mixed primitive (the §C.1.5.2 state machine does not emit Mixed as
-a transition this round; mixed dispatch is reachable today only via
-the deterministic `force_mixed_blocks_for_testing` toggle), and
+toggles and the auto path — with or without mixed promotion —
+reject stereo on), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's
 stream-level driver still rejects non-MPEG-1 streams; the

@@ -8,6 +8,66 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.3.4.10.3 auto-block-type mixed-block promotion** (Phase 2
+  step 31, r161). Closes the long-standing "auto path can never emit
+  Mixed" gap by adding a clean-room PCM-domain mixed-vs-pure-short
+  classifier that runs alongside the §C.1.5.2 attack detector + state
+  machine in `Mp3Encoder::enable_auto_block_type_with_mixed`.
+  - **`mixed_classifier` module.** New `MixedClassifier` applies a
+    one-tap moving-average low-pass kernel
+    `y[n] = (x[n] + x[n-1]) / 2` (transfer function `|cos(ω/2)|`,
+    unity DC gain, nulls Nyquist) to each granule's PCM and compares
+    the per-subframe energies of the low-passed signal. If the
+    max-to-min ratio stays at or below a caller-chosen threshold
+    (default `DEFAULT_MIXED_LOW_BAND_STABILITY = 4.0`) the low band
+    is judged stationary across the granule and the mixed carve-out
+    is appropriate; otherwise pure-short is preferred. The
+    classifier carries the previous granule's last sample across
+    boundaries so the LP filter is continuous.
+  - **`BlockTypeStateMachine::step_with_mixed`.** Extends the
+    scheduler with a per-call `prefer_mixed: bool` and returns
+    `(BlockType, bool)`. The mixed flag is set only on Short
+    emissions (§2.4.2.7's syntactic invariant that
+    `mixed_block_flag` is meaningful only for `block_type == 2`);
+    the legacy `step` delegates with `prefer_mixed = false` so all
+    prior callers keep their pure-short behaviour.
+  - **`Mp3Encoder::enable_auto_block_type_with_mixed`.** New opt-in
+    entry point with the same lookahead / detector / scheduler
+    wiring as `enable_auto_block_type` plus a per-channel
+    `MixedClassifier`. The pre-pass classifies every granule in
+    parallel with the attack detector and feeds the boolean
+    preference to `step_with_mixed`; the resulting `mixed_per_gc`
+    matrix drives the forward MDCT branch (subbands 0..1 take the
+    36-point long sine window, subbands 2..31 the three 12-point
+    short windows — same dispatch as `force_mixed_blocks`) and the
+    `gc_template` selection (`default_mixed_gc()` on mixed
+    emissions). The existing r159 `outer_loop_search_mixed`
+    primitive is reused via the `gc_template.mixed_block_flag`
+    discriminator in the outer-loop branch — no further outer-loop
+    wiring required. Mono-only and mutually exclusive with the
+    force-toggles, inherited from `enable_auto_block_type`.
+
+  Validated by 10 new unit tests in `mixed_classifier.rs` (silent
+  granule degenerate case; DC stability; high-frequency-only attack
+  judged mixed-appropriate; broadband attack judged pure-short;
+  cold-start conservative-pure-short boundary case; LP unity-DC
+  and Nyquist-null checks; threshold validation; reset and
+  prev_last tracking) plus 4 new unit tests in `block_type_sm.rs`
+  (`step_with_mixed(_,_,false)` matches `step` byte-for-byte;
+  `prefer_mixed=true` sets the flag only on Short emissions;
+  sustained-burst flag propagation; per-call preference toggling)
+  plus 7 new integration tests in
+  `tests/auto_block_type_mixed_roundtrip.rs` (stereo rejection;
+  threshold round-trip; force-toggle clearing; plain auto path
+  stays unmixed; low-band-DC + Nyquist-click stimulus engages ≥ 1
+  mixed granule while the plain auto path on the identical PCM
+  emits zero mixed granules; pure-sine stays Long under mixed-auto;
+  mixed-auto + outer-loop combination engages
+  `outer_loop_search_mixed` end-to-end with `scalefac_compress = 15`
+  on every mixed granule and Mp3Demuxer round-trip acceptance). All
+  Mp3 tests now: **575 pass** (was 554 at r160; +14 unit + 7
+  integration). No external implementation consulted.
+
 - **§C.1.5.4.3 outer-loop long-family transition-skeleton wiring**
   (Phase 2 step 30, r160). `outer_loop_search_long` widens from
   pure-Long (`block_type == Long`, `window_switching_flag == false`)
