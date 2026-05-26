@@ -263,3 +263,153 @@ fn decode_mp3_mono_short_aware(bytes: &[u8]) -> Vec<i16> {
     }
     out_pcm
 }
+
+/// Encode the same sine PCM with the §C.1.5.4.3 outer (distortion-
+/// control) loop wired through the mixed-block forward MDCT path
+/// (Phase 2 step 29). The encoder is built via
+/// `Mp3Encoder::new_with_outer_loop` + `force_mixed_blocks_for_testing(true)`
+/// so every granule lands on the mixed branch and the dispatcher
+/// routes the (gr, ch) pair onto `outer_loop_search_mixed`.
+fn encode_outer_loop_mixed(uniform_threshold: f64) -> Vec<u8> {
+    let n = SR as usize / 4; // 250 ms
+    let pcm = sine_pcm(n, 440.0, SR as f32, 0.5);
+    let mut enc =
+        Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, uniform_threshold)
+            .expect("encoder build");
+    enc.force_mixed_blocks_for_testing(true)
+        .expect("force_mixed toggle");
+    enc.push_samples(&pcm).expect("push pcm");
+    let mut out: Vec<u8> = Vec::new();
+    let _bytes = enc.finish(&mut out).expect("encoder finish");
+    out
+}
+
+#[test]
+fn force_mixed_plus_outer_loop_writes_scalefac_compress_15() {
+    // Phase 2 step 29: the `force_mixed_blocks_for_testing(true)` toggle
+    // composed with `Mp3Encoder::new_with_outer_loop` MUST run the
+    // mixed-block outer loop on every granule-channel. The wire
+    // signature of the new primitive (vs the previous round's
+    // fixed-gain fallback) is `scalefac_compress = 15` on every
+    // assembled granule — the outer loop seeds slen1 = 4 / slen2 = 3 so
+    // the §C.1.5.4.3.6 caps are 15 / 7 and the chosen scalefactors fit
+    // in the part2 field. Before r159 the dispatcher fell back to
+    // `scalefac_compress = 0` on mixed; the new code path is provably
+    // exercised only when the assembled granules show `scalefac_compress = 15`.
+    let bytes = encode_outer_loop_mixed(oxideav_mp3::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD);
+    let mut frames = 0usize;
+    let mut any_granule = false;
+    let mut all_outer_loop_compress = true;
+    for frame in FrameWalker::new(&bytes) {
+        frames += 1;
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
+        for gr in 0..si.granule_count as usize {
+            for ch in 0..si.channels as usize {
+                any_granule = true;
+                let gc = &si.granules[gr][ch];
+                // The mixed-block branch must still wear
+                // window_switching + Short + mixed_block_flag = 1.
+                assert!(gc.window_switching_flag);
+                assert_eq!(gc.block_type, BlockType::Short);
+                assert!(
+                    gc.mixed_block_flag,
+                    "force-mixed must keep mixed_block_flag"
+                );
+                if gc.scalefac_compress != 15 {
+                    all_outer_loop_compress = false;
+                }
+            }
+        }
+    }
+    assert!(frames > 0);
+    assert!(any_granule);
+    assert!(
+        all_outer_loop_compress,
+        "mixed-block outer-loop dispatch must emit scalefac_compress = 15 \
+         (the r159 primitive's part2 layout). Without this every (gr, ch) \
+         is still on the r158 fixed-gain fallback.",
+    );
+}
+
+#[test]
+fn force_mixed_plus_outer_loop_subblock_gain_bounded() {
+    // The mixed outer loop reuses the pure-short loop's bounded
+    // §2.4.2.7 subblock_gain search (3-bit field, range [0, 7]). On a
+    // gentle 440 Hz fixture nothing should escalate subblock_gain off
+    // zero, but more importantly: regardless of fixture, the field must
+    // ALWAYS stay within [0, 7] — the wire is 3 bits and a value > 7
+    // would be a clean-room invariant violation.
+    let bytes = encode_outer_loop_mixed(oxideav_mp3::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD);
+    for frame in FrameWalker::new(&bytes) {
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
+        for gr in 0..si.granule_count as usize {
+            for ch in 0..si.channels as usize {
+                let gc = &si.granules[gr][ch];
+                for (w, &sg) in gc.subblock_gain.iter().enumerate() {
+                    assert!(
+                        sg <= 7,
+                        "subblock_gain[{w}] = {sg} exceeds §2.4.2.7 3-bit field range",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn force_mixed_plus_outer_loop_roundtrips_to_finite_non_silent_pcm() {
+    // The outer-loop mixed encode must round-trip through the crate's
+    // own decode chain producing finite, non-silent PCM. This is the
+    // direct analogue of `force_mixed_stream_decodes_to_finite_non_silent_pcm`
+    // (r158 fixed-gain) for the new r159 distortion-control path.
+    let bytes = encode_outer_loop_mixed(oxideav_mp3::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD);
+    let recon = decode_mp3_mono_short_aware(&bytes);
+    assert!(!recon.is_empty(), "decoded PCM was empty");
+    let energy: f64 = recon
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        / recon.len() as f64;
+    assert!(
+        energy.is_finite() && energy > 0.0,
+        "decoded PCM had zero or non-finite energy ({energy})",
+    );
+    // Bounded waveform sanity check (same heuristic the r158 mixed test
+    // applies): at least some zero crossings — a pure 440 Hz sine
+    // crosses zero ~880 times per second.
+    let mut zero_crossings = 0usize;
+    for w in recon.windows(2) {
+        if (w[0] >= 0) != (w[1] >= 0) {
+            zero_crossings += 1;
+        }
+    }
+    assert!(
+        zero_crossings > 10,
+        "no audible zero crossings: {zero_crossings} (decode chain broken)",
+    );
+}
+
+#[test]
+fn force_mixed_plus_outer_loop_demuxer_accepts_stream() {
+    // The Mp3Demuxer (which parses headers + side-info on every frame)
+    // must accept every force-mixed-outer-loop frame. The new
+    // dispatcher path changes part2_3_length values; this guards
+    // against a frame-length / side-info mismatch breaking the
+    // demuxer's per-frame walk.
+    let bytes = encode_outer_loop_mixed(oxideav_mp3::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD);
+    let mut demux = Mp3Demuxer::open(Box::new(Cursor::new(bytes.clone()))).expect("demuxer open");
+    let mut frame_count = 0usize;
+    loop {
+        match demux.next_packet() {
+            Ok(_pkt) => frame_count += 1,
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demuxer next_packet: {e}"),
+        }
+    }
+    assert!(
+        frame_count > 0,
+        "demuxer surfaced zero frames on force-mixed-outer-loop stream",
+    );
+}

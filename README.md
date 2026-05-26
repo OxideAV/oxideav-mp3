@@ -1446,16 +1446,73 @@ dispatch path is provably exercised. Tests: 532 pass (same total as
 r157; the r156 rejection test was rewritten in place per guardrail
 #3).
 
+**Phase 2 step 29 (§C.1.5.4.3 outer-loop mixed-block analogue)**
+introduces `outer_loop_search_mixed` — the missing third
+distortion-control primitive after `outer_loop_search_long` (r144) and
+`outer_loop_search_short` (r157). For `block_type == Short`,
+`mixed_block_flag == true`, `window_switching_flag == true` granules
+the loop composes:
+
+* The long-region per-band amplifier over `sf.long[0..=7]` (8 long
+  scalefactor bands; long region covers exactly lines 0..36 at every
+  MPEG-1 sampling rate per `long_band_starts`).
+* The short-region per-(sfb, window) amplifier over
+  `sf.short[3..=11][..]` (27 cells; short SFB 0..=2 are absorbed by
+  the long-window portion since `short_band_starts[3] = 12` ⇒
+  interleaved line 36 = the long / short partition).
+
+§C.1.5.4.3.6 caps follow the mixed MPEG-1 part2 wire layout: every
+long band reads at `slen1` ⇒ cap 15 across `sfb 0..=7` (distinct from
+the pure-long path where `mpeg1_long_band_slen` would split at sfb 11);
+short region splits as cap 15 on `sfb 3..=5` (slen1) and cap 7 on
+`sfb 6..=11` (slen2). The §C.1.5.4.4.2 bounded `subblock_gain` search
+fires when the magnitude clamp fails on a window (each step divides
+that window's reconstruction by 4 per §2.4.3.4.7.1 short formula;
+saturates at the 3-bit field cap of 7); the long region's
+reconstruction does NOT use `subblock_gain`. The §C.1.5.4.3
+`scalefac_scale = 0 → 1` escalation halves every in-progress per-band
+scalefactor on BOTH regions so the coloured spectrum is preserved
+across the scale switch. `preflag` stays `false` (§2.4.2.7 disables
+preflag on every short-family granule including mixed).
+
+Stream-encoder wiring: `outer_loop_eligible` widens from
+`(false, Long, _) | (true, Short, false)` to
+`(false, Long, _) | (true, Short, _)`; the `BlockType::Short` dispatch
+arm now splits on `mixed_block_flag` and routes mixed onto
+`outer_loop_search_mixed`. Composing
+`Mp3Encoder::new_with_outer_loop(...)` with
+`force_mixed_blocks_for_testing(true)` drives every assembled granule
+through the new path. The wire signature is `scalefac_compress = 15`
+on every (gr, ch) (the r158 fallback wrote 0 — confirming
+distinguishability of the new path on the assembled bitstream).
+
+Validated by 11 new unit tests in `outer_loop.rs` (mixed constant-vs-
+spec alignment, distortion-helper identity + absorbed-band invariant,
+termination on huge / tiny threshold, region-isolation tests
+confirming the long amplifier fires only on long-region energy and
+the short amplifier only on short-region energy, `subblock_gain`
+quiet-input invariance, `subblock_gain` escalation on extreme
+window-0 amplitudes, the `scalefac_scale` escalation branch on a
+cap-would-terminate fixture) plus 4 new integration tests in
+`tests/mixed_block_encoder_roundtrip.rs` (scalefac_compress = 15 wire
+signature on every assembled (gr, ch); `subblock_gain` bounded ≤ 7;
+finite + non-silent PCM roundtrip via the short-aware decode chain;
+Mp3Demuxer accepts the new bitstream). Tests: 547 pass (was 532 at
+r158; +11 unit + 4 integration). No external implementation
+consulted.
+
 Remaining Phase 2 work: a real per-band psychoacoustic threshold (so
 the outer loop can spectrally redistribute bits without a hand-tuned
 constant), intensity-stereo encode (§2.4.3.4.9.3), multi-channel
-short / mixed block-type agreement (§2.4.3.4.9), the mixed-block
-outer-loop variant (layering long-block + short-block amplifiers
-across the 8-long-band + 9-short-band mixed layout), an outer-loop
+short / mixed block-type agreement (§2.4.3.4.9), an outer-loop
 primitive that targets the §C.1.5.2 Start / End transition
 skeletons (currently the auto + outer-loop integration falls back
-to fixed-gain on those two block types), LSF encode, and stereo /
-LSF decode through the trait wrapper.
+to fixed-gain on those two block types), auto-block-type integration
+with the new mixed primitive (the §C.1.5.2 state machine does not
+emit Mixed as a transition this round; mixed dispatch is reachable
+today only via the deterministic `force_mixed_blocks_for_testing`
+toggle), LSF encode, and stereo / LSF decode through the trait
+wrapper.
 
 ### Not yet implemented
 
@@ -1465,7 +1522,7 @@ scalefactor paths — are present; the wrapper is mono MPEG-1 only this
 round; the framing layer accepts MPEG-2.5 as of step 25 but the
 trait-wrapper audio-decode chain still rejects it pending the
 `MPEG-2.5-GAP.md` observer-trace items). The encoder is **Phase 1
-framing + Phase 2 steps 1–28 (forward MDCT primitive + analysis
+framing + Phase 2 steps 1–29 (forward MDCT primitive + analysis
 windowing + forward overlap split + polyphase analysis subband
 filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
@@ -1494,7 +1551,13 @@ window) `scalefac_s` amplification and bounded `subblock_gain`
 search + auto-block-type × outer-loop integration so the auto
 scheduler runs `outer_loop_search_short` on Short granules and
 `outer_loop_search_long` on Long granules while Start / End
-transition skeletons fall back to fixed-gain)** — it still lacks
+transition skeletons fall back to fixed-gain + §C.1.5.4.3 mixed-block
+outer-loop primitive `outer_loop_search_mixed` composing the
+long-region amplifier over `sf.long[0..=7]` with the short-region
+per-(sfb, window) amplifier over `sf.short[3..=11][..]` and wiring
+into the stream encoder so `force_mixed_blocks_for_testing` +
+`new_with_outer_loop` runs the new distortion-control path on every
+granule)** — it still lacks
 the psychoacoustic model (so the outer loop's `xmin(sb)` is a
 uniform constant rather than per-band masking-aware),
 intensity-stereo encode (§2.4.3.4.9.3), multi-channel short /
@@ -1506,10 +1569,11 @@ skeletons (currently the auto + outer-loop integration falls back
 to the fixed-gain inner-loop path for those two block types — the
 §2.4.2.7 coefficient distribution shifts mid-overlap and the
 uniform-`xmin` heuristic over-amplifies until a psy-aware
-threshold is wired in), the §C.1.5.4.3 short-block mixed-block
-analogue (which composes the long-block amplifier over the
-long-window bands 0..=7 with the new short-block amplifier over
-the short-window bands 3..=11), and LSF / MPEG-2.5 encode (the
+threshold is wired in), auto-block-type integration with the new
+mixed primitive (the §C.1.5.2 state machine does not emit Mixed as
+a transition this round; mixed dispatch is reachable today only via
+the deterministic `force_mixed_blocks_for_testing` toggle), and
+LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's
 stream-level driver still rejects non-MPEG-1 streams; the
 MPEG-2.5-specific scalefactor-band tables + Huffman table mapping

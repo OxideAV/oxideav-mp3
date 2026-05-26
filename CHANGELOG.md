@@ -8,6 +8,70 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§C.1.5.4.3 outer-loop mixed-block analogue** (Phase 2 step 29).
+  `outer_loop_search_mixed` composes the long-region per-band amplifier
+  (sfb 0..=7) with the short-region per-(sfb, window) amplifier
+  (sfb 3..=11) for `block_type == Short`, `mixed_block_flag == true`,
+  `window_switching_flag == true` granules — the missing third
+  primitive after `outer_loop_search_long` (r144) and
+  `outer_loop_search_short` (r157). Five details:
+  - **§C.1.5.4.3.6 caps under the mixed MPEG-1 part2 layout.** Every
+    long band reads at slen1 (cap 15 across sfb 0..=7) — distinct from
+    the pure-long path where `mpeg1_long_band_slen` would split at
+    sfb 11. Short region splits as cap 15 on sfb 3..=5 (slen1) and
+    cap 7 on sfb 6..=11 (slen2). New `MIXED_SCALEFAC_L_MAX`,
+    `MIXED_FIRST_SHORT_SFB`, `MIXED_LAST_LONG_SFB` constants document
+    the layout that mirrors
+    `crate::scalefactors::write_mpeg1_granule_channel`'s mixed branch.
+  - **Per-band distortion** `band_distortion_mixed_long` and
+    `band_distortion_mixed_short` compute the §C.1.5.4.3.3 SSE only on
+    the cells the mixed layout actually carries (long sfb 0..=7,
+    short sfb 3..=11). Cells outside those ranges stay 0.0 so the
+    amplifier never touches them. The long helper omits the `PRETAB`
+    term `band_distortion_long` carries (§2.4.2.7 disables preflag on
+    every short-family granule including mixed).
+  - **Bounded `subblock_gain` search** reuses the pure-short loop's
+    §C.1.5.4.4.2 magnitude-clamp follow-up — the short region's
+    per-window magnitudes are what the clamp fails on, and bumping
+    `subblock_gain[w]` divides window `w`'s reconstruction by 4 per
+    step (saturating at the §2.4.2.7 3-bit cap of 7). The long
+    region's reconstruction does NOT use `subblock_gain`
+    (§2.4.3.4.7.1: the subblock_gain term only appears in the short
+    reconstruction branch).
+  - **`scalefac_scale = 0 → 1` escalation** halves every in-progress
+    per-band scalefactor on BOTH regions (`sf.long[0..=7]` and
+    `sf.short[3..=11][..]`) so the coloured spectrum is preserved
+    across the scale switch; one event only.
+  - **Stream encoder wiring.** `outer_loop_eligible` widened from
+    `(false, Long, _) | (true, Short, false)` to
+    `(false, Long, _) | (true, Short, _)`; the `BlockType::Short`
+    match arm splits on `mixed_block_flag` and routes mixed onto
+    `outer_loop_search_mixed`. Composing
+    `Mp3Encoder::new_with_outer_loop(...)` with
+    `force_mixed_blocks_for_testing(true)` now drives every assembled
+    granule through the new path; the wire signature is
+    `scalefac_compress = 15` on every (gr, ch) (was 0 under the r158
+    fixed-gain fallback).
+
+  Validated by 11 new unit tests inside `outer_loop.rs` (mixed
+  constant-vs-spec alignment, mixed band-distortion identity +
+  absorbed-band invariant, mixed termination paths for huge / tiny
+  threshold, region-isolation tests confirming the long amplifier
+  fires only on long-region energy and the short amplifier only on
+  short-region energy, `subblock_gain` quiet-input invariance,
+  `subblock_gain` escalation on extreme window-0 amplitudes, the
+  `scalefac_scale` escalation branch on a cap-would-terminate fixture)
+  plus 4 new integration tests in
+  `tests/mixed_block_encoder_roundtrip.rs` covering the new force-mixed
+  + outer-loop dispatch (scalefac_compress = 15 wire signature on
+  every (gr, ch), subblock_gain field bounded ≤ 7, finite + non-silent
+  PCM roundtrip via the short-aware decode chain, and Mp3Demuxer
+  acceptance of the new bitstream). Tests: 547 pass (was 532 at r158;
+  +11 unit + 4 integration). No external implementation consulted;
+  every rule is derived from §C.1.5.4.3 / §2.4.2.7 / §2.4.3.4.7.1 of
+  ISO/IEC 11172-3:1993 and from this crate's own r144 / r157
+  primitives. No `[package] version` bump.
+
 - **Auto block-type × outer-loop integration** (Phase 2 step 28).
   Wires the r157 `outer_loop_search_short` primitive into
   `Mp3Encoder::assemble_frame_with_lookahead`, completing the missing

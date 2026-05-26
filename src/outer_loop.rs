@@ -614,14 +614,20 @@ struct InnerInvocation {
 //
 // # `mixed_block_flag == 1` scope
 //
-// Excluded from this round. Mixed blocks have 8 long-window scalefactor
-// bands plus 9 short-window bands (sfb 3..=11) × 3 windows, with the
-// §C.1.5.4.3.6 cap remapped (15 for sfb 0..=17, 7 for the rest per the
-// spec's mixed-block text). The mixed analogue is a follow-up that
-// composes the long-block amplifier (over the long-window bands 0..=7)
-// with this short-block amplifier (over the short-window bands 3..=11);
-// it is mechanically straightforward but its own piece of work and is
-// dispatched as a separate round.
+// Covered by [`outer_loop_search_mixed`] below (Phase 2 step 29). Mixed
+// blocks compose the long-block amplifier over long-window bands `sfb
+// 0..=7` (the only long bands carried by mixed blocks: lines 0..36 cover
+// long SFB 0..=7 at every MPEG-1 sampling rate; see
+// [`crate::requantize::long_band_starts`]) with the short-block
+// amplifier over short-window bands `sfb 3..=11` (sfb 0..=2 are
+// absorbed into the long-window portion). The §C.1.5.4.3.6 caps follow
+// our `scalefac_compress = 15` (slen1 = 4, slen2 = 3): under the mixed
+// MPEG-1 part2 layout (§2.4.2.7 / [`crate::scalefactors::write_mpeg1_granule_channel`])
+// every long sfb is read at slen1 ⇒ cap 15 across `sfb 0..=7`; the short
+// region splits as `sfb 3..=5` at slen1 ⇒ cap 15, `sfb 6..=11` at slen2
+// ⇒ cap 7. `preflag` stays `false` (the §C.1.5.4.3.4 preemphasis branch
+// is gated on `block_type != Short`, and mixed blocks still wear
+// `block_type == Short` on the wire).
 //
 // # Acknowledgement
 //
@@ -1019,6 +1025,469 @@ struct InnerShortInvocation {
     /// `false`, the caller bumps `subblock_gain[w]` on the window(s) that
     /// still exceed the cap.
     magnitude_clamped: bool,
+}
+
+// =========================================================================
+// Mixed-block outer loop (Phase 2 step 29)
+// =========================================================================
+//
+// §C.1.5.4.3 with the §2.4.2.7 mixed-block reading. A `block_type ==
+// Short`, `mixed_block_flag == 1` granule carries the two lowest
+// polyphase subbands (lines 0..36) as a *long* block plus the remaining
+// 30 subbands (lines 36..576) as three windowed short blocks. The
+// per-band scalefactors split as:
+//
+//   * **Long region.** `scalefac_l[sfb]` for `sfb ∈ [0, 7]` (exactly 8
+//     bands — at every MPEG-1 sampling rate the long-band starts
+//     `[0,4,8,12,16,20,24,30,36,…]` place sfb 8 at line 36, so the 36
+//     long lines fill sfb 0..=7 with no remainder; see
+//     [`crate::requantize::long_band_starts`]).
+//   * **Short region.** `scalefac_s[sfb][w]` for `sfb ∈ [3, 11]` and
+//     `w ∈ [0, 3)` (27 cells). Short sfb 0..=2 are absorbed by the
+//     long-window portion — short_band_starts entry 3 is 12, i.e.
+//     interleaved line 36 (= 3 × 12), which lines up with the long /
+//     short partition.
+//
+// # §C.1.5.4.3.6 caps under the mixed MPEG-1 part2 layout
+//
+// The §2.4.1.7 MPEG-1 part2 wire layout for mixed blocks reads every
+// long band at `slen1` (NOT `mpeg1_long_band_slen` which would split
+// 0..6 / 6..21 — that table only applies to pure long granules) and
+// reads short bands sfb 3..6 at slen1, sfb 6..12 at slen2. Under our
+// `OUTER_LOOP_SCALEFAC_COMPRESS = 15` ⇒ `(slen1, slen2) = (4, 3)`:
+//
+//   * Long region: cap 15 for every `sfb ∈ [0, 7]`.
+//   * Short region: cap 15 for `sfb ∈ [3, 5]`, cap 7 for `sfb ∈ [6, 11]`.
+//
+// See [`crate::scalefactors::write_mpeg1_granule_channel`] for the
+// authoritative wire layout this primitive's caps mirror.
+//
+// # `subblock_gain` and `scalefac_scale` semantics
+//
+// Same as the pure-short loop:
+//
+//   * `subblock_gain[w]` is raised off zero (saturating at the §2.4.2.7
+//     3-bit cap of 7) whenever the §C.1.5.4.4.2 magnitude clamp fails on
+//     window `w`. The mixed bitstream still applies `subblock_gain[w]`
+//     to every short-region line of window `w` (lines `36..576` interleaved
+//     `[sfb][win][k]`) — the long region's lines 0..36 ignore it
+//     (§2.4.3.4.7.1: subblock_gain term only on the short reconstruction
+//     branch).
+//   * `scalefac_scale` escalates once from 0 → 1 when an amplification
+//     step would push any cell past its §C.1.5.4.3.6 cap. The halving
+//     step applies to BOTH `sf.long[0..=7]` and `sf.short[3..=11][..]`
+//     so the coloured spectrum is preserved across the scale switch on
+//     both regions.
+//
+// # `preflag`
+//
+// §2.4.2.7 disables preflag on every short-family granule (mixed blocks
+// included — `block_type == 2` on the wire). The result's
+// `scalefactors.preflag` stays `false`.
+//
+// # Acknowledgement
+//
+// No external implementation was consulted. The mixed amplifier is a
+// straight composition of the two existing primitives' per-band step,
+// with the §C.1.5.4.3.6 cap mapping derived directly from
+// `write_mpeg1_granule_channel`'s mixed branch.
+
+/// Long-region scalefactor cap for mixed blocks under
+/// `OUTER_LOOP_SCALEFAC_COMPRESS`: every long band in the mixed layout
+/// is read at `slen1 = 4` so the cap is `2^4 − 1 = 15` for all
+/// `sfb ∈ [0, 7]`. Differs from the pure-long path where
+/// `mpeg1_long_band_slen` splits at sfb 11.
+pub const MIXED_SCALEFAC_L_MAX: u8 = 15;
+
+/// First short scalefactor band carried by a mixed granule (sfb 0..=2 are
+/// absorbed by the long-window portion; see §2.4.2.7 +
+/// [`crate::requantize::short_band_starts`] entry 3 = 12 ⇒ interleaved
+/// line 36 = the long / short partition).
+pub const MIXED_FIRST_SHORT_SFB: usize = 3;
+
+/// Last long scalefactor band carried by a mixed granule (long region
+/// spans lines 0..36 ⇒ sfb 0..=7 at every MPEG-1 sampling rate).
+pub const MIXED_LAST_LONG_SFB: usize = 7;
+
+/// Compute the per-(sfb, window) actual short-block distortion for the
+/// short region of a mixed block: `sfb ∈ [MIXED_FIRST_SHORT_SFB, SHORT_SFB)`,
+/// `win ∈ [0, SHORT_WINDOWS)`. Cells with `sfb < MIXED_FIRST_SHORT_SFB`
+/// are left at 0.0 (not part of the mixed short region).
+///
+/// Mirrors [`band_distortion_short`] for the cells the mixed layout
+/// actually carries; the cell indexing is identical to the pure-short
+/// `short_band_starts` interleave, since the §2.4.3.4.8 reorder lives
+/// downstream of this stage in both cases.
+#[must_use]
+pub fn band_distortion_mixed_short(
+    xr: &[f32; NUM_LINES],
+    xr_back: &[f32; NUM_LINES],
+    sf: &ScaleFactors,
+    scalefac_scale: bool,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) -> [[f64; SHORT_WINDOWS]; SHORT_SFB] {
+    use crate::requantize::scalefac_multiplier;
+    let starts = short_band_starts(sample_rate_hz, version);
+    let mult = f64::from(scalefac_multiplier(scalefac_scale));
+    let mut out = [[0.0f64; SHORT_WINDOWS]; SHORT_SFB];
+    for sfb in MIXED_FIRST_SHORT_SFB..SHORT_SFB {
+        let win_start = starts[sfb];
+        let win_width = starts[sfb + 1] - starts[sfb];
+        if win_width == 0 {
+            continue;
+        }
+        for (win, slot) in out[sfb].iter_mut().enumerate() {
+            let base = 3 * win_start + win * win_width;
+            let mut sse = 0.0f64;
+            let mut count = 0u32;
+            for k in 0..win_width {
+                let i = base + k;
+                if i >= NUM_LINES {
+                    break;
+                }
+                let d = f64::from(xr[i].abs()) - f64::from(xr_back[i].abs());
+                sse += d * d;
+                count += 1;
+            }
+            if count == 0 {
+                continue;
+            }
+            let bw = f64::from(count);
+            let sf_val = f64::from(sf.short[sfb][win]);
+            let scale = (2.0 * mult * sf_val).exp2();
+            *slot = (sse / bw) * scale;
+        }
+    }
+    out
+}
+
+/// Compute the per-band long-region distortion for the *long* region of a
+/// mixed block (sfb 0..=7 only). Mirrors [`band_distortion_long`] but only
+/// the first 8 entries are filled; entries 8..=20 stay 0.0 (no long-region
+/// lines in the mixed layout above the long / short partition).
+///
+/// The mixed long region never carries preflag (§2.4.2.7 disables it for
+/// short-family granules; the wire layout doesn't even transmit a
+/// `preflag` bit for window-switched granules — `parse_side_info` only
+/// reads it from the long-block branch), so the `PRETAB` term from
+/// `band_distortion_long` is omitted.
+#[must_use]
+pub fn band_distortion_mixed_long(
+    xr: &[f32; NUM_LINES],
+    xr_back: &[f32; NUM_LINES],
+    sf: &ScaleFactors,
+    scalefac_scale: bool,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) -> [f64; LONG_SFB] {
+    use crate::requantize::scalefac_multiplier;
+    let starts = long_band_starts(sample_rate_hz, version);
+    let mult = f64::from(scalefac_multiplier(scalefac_scale));
+    let mut out = [0.0f64; LONG_SFB];
+    for sfb in 0..=MIXED_LAST_LONG_SFB {
+        let lo = starts[sfb];
+        let hi = starts[sfb + 1].min(NUM_LINES);
+        if hi <= lo {
+            continue;
+        }
+        let mut sse = 0.0f64;
+        for i in lo..hi {
+            let d = f64::from(xr[i].abs()) - f64::from(xr_back[i].abs());
+            sse += d * d;
+        }
+        let bw = (hi - lo) as f64;
+        let sf_val = f64::from(sf.long[sfb]);
+        let scale = (2.0 * mult * sf_val).exp2();
+        out[sfb] = (sse / bw) * scale;
+    }
+    out
+}
+
+/// Outcome of a mixed-block outer-loop search for one granule-channel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OuterLoopMixedResult {
+    /// Chosen scalefactors. `long[0..=7]` carries the mixed long region;
+    /// `long[8..]` stays zero (no transmitted long bands above sfb 7 in
+    /// the mixed layout). `short[3..=11][..]` carries the mixed short
+    /// region; `short[0..=2]` stays zero (absorbed by the long-window
+    /// portion).
+    pub scalefactors: ScaleFactors,
+    /// Chosen `global_gain` from the last inner-loop pass.
+    pub global_gain: u8,
+    /// Chosen per-window `subblock_gain[w]` (§2.4.2.7 3-bit field).
+    /// Raised off zero only when the §C.1.5.4.4.2 magnitude clamp could
+    /// not fit window `w` under 8191.
+    pub subblock_gain: [u8; SHORT_WINDOWS],
+    /// Chosen `is[576]` quantized buffer.
+    pub is: [i32; NUM_LINES],
+    /// `scalefac_scale` flag (§2.4.2.7). Starts at `false`; escalated to
+    /// `true` at most once via the §C.1.5.4.3 cap-relief branch.
+    pub scalefac_scale: bool,
+    /// Iteration accounting (same shape as [`OuterLoopStats`]). The
+    /// `bands_amplified` field counts cells across BOTH the long region
+    /// (sfb 0..=7) AND the short region cells (sfb 3..=11, 3 windows
+    /// each).
+    pub stats: OuterLoopStats,
+}
+
+/// Run the §C.1.5.4.3 outer (distortion-control) iteration loop for one
+/// **mixed** (`block_type == Short`, `mixed_block_flag == true`,
+/// `window_switching_flag == true`) granule-channel.
+///
+/// Composes the long-region amplifier (per-band sfb 0..=7) with the
+/// short-region per-(sfb, window) amplifier (sfb 3..=11) plus a bounded
+/// `subblock_gain` search triggered when the §C.1.5.4.4.2 magnitude
+/// clamp can't fit a window under 8191. `gc_template.scalefac_compress`
+/// MUST be [`OUTER_LOOP_SCALEFAC_COMPRESS`] so the part2 layout matches
+/// what [`crate::scalefactors::write_mpeg1_granule_channel`] emits for
+/// mixed blocks (8·slen1 + 3·3·slen1 + 6·3·slen2 = 122 bits per
+/// granule-channel; cap 15 across the long region, cap 15 on short
+/// sfb 3..=5, cap 7 on short sfb 6..=11).
+///
+/// `uniform_threshold` is `xmin(sb)` applied uniformly across every cell
+/// (long-region band as a single cell; short-region cells as
+/// per-(sfb, window) tuples) — the psychoacoustic model is deferred.
+/// `max_iter` caps the outer loop at a finite count.
+#[must_use]
+pub fn outer_loop_search_mixed(
+    xr: &[f32; NUM_LINES],
+    gc_template: &GranuleChannel,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    per_gc_bit_budget: u64,
+    uniform_threshold: f64,
+    max_iter: u32,
+) -> OuterLoopMixedResult {
+    debug_assert!(gc_template.window_switching_flag);
+    debug_assert_eq!(gc_template.block_type, BlockType::Short);
+    debug_assert!(gc_template.mixed_block_flag);
+
+    // §C.1.5.4.2.1 init: scalefactors zero, scalefac_scale 0,
+    // subblock_gain zero. preflag stays false (never set for short
+    // family, mixed included; §2.4.2.7).
+    let mut sf = ScaleFactors::default();
+    // Per-cell amplification trackers: 8 long cells (sfb 0..=7) +
+    // 9 × 3 short cells (sfb 3..=11, win 0..=2). Stored as a single
+    // count: tracker is fully addressed by the union of the two
+    // structured trackers below.
+    let mut amplified_long = [false; 8];
+    let mut amplified_short = [[false; SHORT_WINDOWS]; SHORT_SFB];
+    let mut scalefac_scale = false;
+    let mut escalated_once = false;
+    let mut subblock_gain: [u8; SHORT_WINDOWS] = [0, 0, 0];
+
+    // Saved last-good state. `last_good_*` always satisfies the spec's
+    // "previous in-range" requirement (§C.1.5.4.3.1).
+    let mut last_good_sf = sf;
+    let mut last_good_scale = scalefac_scale;
+    let mut last_good_sg = subblock_gain;
+    let mut last_good_inner = run_inner_short(
+        xr,
+        gc_template,
+        &sf,
+        scalefac_scale,
+        subblock_gain,
+        sample_rate_hz,
+        version,
+        per_gc_bit_budget,
+    );
+
+    let mut iterations: u32 = 1;
+    let converged;
+    let mut cells_amplified_total: u32 = 0;
+
+    loop {
+        let inner = run_inner_short(
+            xr,
+            gc_template,
+            &sf,
+            scalefac_scale,
+            subblock_gain,
+            sample_rate_hz,
+            version,
+            per_gc_bit_budget,
+        );
+
+        // Decode-side reconstruction at the *current* state. The
+        // [`crate::requantize::requantize`] mixed branch unfolds the
+        // long region (sf.long[0..=7]) then the short region
+        // (sf.short[3..=11][..]) per §2.4.3.4.7.1, so the per-cell SSE
+        // below is computed against the same coloured-domain spectrum
+        // the decoder will reconstruct.
+        let mut gc_full = *gc_template;
+        gc_full.global_gain = inner.global_gain;
+        gc_full.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
+        gc_full.scalefac_scale = scalefac_scale;
+        gc_full.subblock_gain = subblock_gain;
+        gc_full.preflag = false;
+        let xr_back = requantize(&inner.is, &gc_full, &sf, sample_rate_hz, version);
+
+        // Compute distortion separately on the two regions so the
+        // amplifier can update the right scalefactor array on the right
+        // cells without re-walking the §2.4.3.4.7.1 line mapping.
+        let xfsf_l =
+            band_distortion_mixed_long(xr, &xr_back, &sf, scalefac_scale, sample_rate_hz, version);
+        let xfsf_s =
+            band_distortion_mixed_short(xr, &xr_back, &sf, scalefac_scale, sample_rate_hz, version);
+
+        // §C.1.5.4.4.2 magnitude-clamp follow-up: identical to the
+        // pure-short path — the short region's per-window magnitudes are
+        // what the magnitude clamp can fail on, and bumping
+        // `subblock_gain[w]` divides window `w`'s reconstruction by
+        // `2^(8/4) = 4` so the magnitudes drop by the same factor. The
+        // long region's reconstruction does NOT use `subblock_gain`, so
+        // a long-region max over the cap (rare; the long region carries
+        // only the two lowest polyphase subbands) is left to the global
+        // gain to handle.
+        if !inner.magnitude_clamped {
+            let per_win = per_window_max_abs(&inner.is, sample_rate_hz, version);
+            let mut bumped = false;
+            for w in 0..SHORT_WINDOWS {
+                if per_win[w] > crate::inner_loop::BIG_VALUES_LIMIT && subblock_gain[w] < 7 {
+                    subblock_gain[w] += 1;
+                    bumped = true;
+                }
+            }
+            if bumped {
+                iterations += 1;
+                if iterations >= max_iter {
+                    converged = false;
+                    last_good_sf = sf;
+                    last_good_scale = scalefac_scale;
+                    last_good_sg = subblock_gain;
+                    last_good_inner = inner;
+                    break;
+                }
+                continue;
+            }
+        }
+
+        // Identify cells over threshold + cap-would-exceed candidates.
+        let mut any_over = false;
+        let mut would_exceed_cap = false;
+        // Long-region scan.
+        for (sfb, &d) in xfsf_l.iter().enumerate().take(MIXED_LAST_LONG_SFB + 1) {
+            if d > uniform_threshold {
+                any_over = true;
+                let next = u16::from(sf.long[sfb]) + 1;
+                if next > u16::from(MIXED_SCALEFAC_L_MAX) {
+                    would_exceed_cap = true;
+                }
+            }
+        }
+        // Short-region scan.
+        for (sfb, xfsf_row) in xfsf_s
+            .iter()
+            .enumerate()
+            .take(SHORT_SFB)
+            .skip(MIXED_FIRST_SHORT_SFB)
+        {
+            let cap = scalefac_short_upper_limit(sfb);
+            for (win, &d) in xfsf_row.iter().enumerate() {
+                if d > uniform_threshold {
+                    any_over = true;
+                    let next = u16::from(sf.short[sfb][win]) + 1;
+                    if next > u16::from(cap) {
+                        would_exceed_cap = true;
+                    }
+                }
+            }
+        }
+
+        // §C.1.5.4.3.6 termination paths.
+        if !any_over {
+            converged = true;
+            last_good_sf = sf;
+            last_good_scale = scalefac_scale;
+            last_good_sg = subblock_gain;
+            last_good_inner = inner;
+            break;
+        }
+        if would_exceed_cap && !escalated_once {
+            // §C.1.5.4.3 escalation: switch to `scalefac_scale = 1`.
+            // Halve every in-progress per-band scalefactor on BOTH
+            // regions (mult doubles 0.5 → 1.0 ⇒ halving preserves the
+            // coloured spectrum). Reset the per-cell amplified tracker
+            // so the doubled-step amplifications can re-fire.
+            scalefac_scale = true;
+            escalated_once = true;
+            for v in sf.long.iter_mut().take(MIXED_LAST_LONG_SFB + 1) {
+                *v = (*v).div_ceil(2);
+            }
+            for row in sf.short.iter_mut().skip(MIXED_FIRST_SHORT_SFB) {
+                for v in row.iter_mut() {
+                    *v = (*v).div_ceil(2);
+                }
+            }
+            amplified_long = [false; 8];
+            amplified_short = [[false; SHORT_WINDOWS]; SHORT_SFB];
+            iterations += 1;
+            continue;
+        }
+        // (a) all cells already amplified, (b) cap exceeded after one
+        // escalation event, (c) defensive iteration cap.
+        let all_long_amp = amplified_long.iter().all(|&a| a);
+        let all_short_amp = amplified_short
+            .iter()
+            .skip(MIXED_FIRST_SHORT_SFB)
+            .take(SHORT_SFB - MIXED_FIRST_SHORT_SFB)
+            .all(|row| row.iter().all(|&a| a));
+        let all_amplified = all_long_amp && all_short_amp;
+        if would_exceed_cap || all_amplified || iterations >= max_iter {
+            converged = false;
+            break;
+        }
+
+        // Save current state as the new last-good before amplifying.
+        last_good_sf = sf;
+        last_good_scale = scalefac_scale;
+        last_good_sg = subblock_gain;
+        last_good_inner = inner;
+
+        // §C.1.5.4.3.5 amplification — long region, sfb 0..=7.
+        for (sfb, &d) in xfsf_l.iter().enumerate().take(MIXED_LAST_LONG_SFB + 1) {
+            if d > uniform_threshold && sf.long[sfb] < MIXED_SCALEFAC_L_MAX {
+                sf.long[sfb] = sf.long[sfb].saturating_add(1);
+                if !amplified_long[sfb] {
+                    amplified_long[sfb] = true;
+                    cells_amplified_total += 1;
+                }
+            }
+        }
+        // §C.1.5.4.3.5 amplification — short region, sfb 3..=11.
+        for (sfb, xfsf_row) in xfsf_s
+            .iter()
+            .enumerate()
+            .take(SHORT_SFB)
+            .skip(MIXED_FIRST_SHORT_SFB)
+        {
+            let cap = scalefac_short_upper_limit(sfb);
+            for (win, &d) in xfsf_row.iter().enumerate() {
+                if d > uniform_threshold && sf.short[sfb][win] < cap {
+                    sf.short[sfb][win] = sf.short[sfb][win].saturating_add(1);
+                    if !amplified_short[sfb][win] {
+                        amplified_short[sfb][win] = true;
+                        cells_amplified_total += 1;
+                    }
+                }
+            }
+        }
+        iterations += 1;
+    }
+
+    OuterLoopMixedResult {
+        scalefactors: last_good_sf,
+        global_gain: last_good_inner.global_gain,
+        subblock_gain: last_good_sg,
+        is: last_good_inner.is,
+        scalefac_scale: last_good_scale,
+        stats: OuterLoopStats {
+            iterations,
+            bands_amplified: cells_amplified_total,
+            converged,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1704,6 +2173,443 @@ mod tests {
                 assert!(
                     sf_val <= cap,
                     "sfb={sfb} win={win} sf={sf_val} exceeds §C.1.5.4.3.6 cap {cap}",
+                );
+            }
+        }
+    }
+
+    // =====================================================================
+    // Mixed-block outer loop tests (Phase 2 step 29)
+    // =====================================================================
+
+    fn mixed_template() -> GranuleChannel {
+        GranuleChannel {
+            part2_3_length: 0,
+            big_values: 0,
+            global_gain: 0,
+            scalefac_compress: OUTER_LOOP_SCALEFAC_COMPRESS,
+            window_switching_flag: true,
+            block_type: BlockType::Short,
+            mixed_block_flag: true,
+            table_select: [0; 3],
+            subblock_gain: [0; 3],
+            // Mixed blocks use the §2.4.2.7 fixed region split (long
+            // region covers exactly the first 36 lines = sfb 0..=7); the
+            // §C.1.5.4.4.6 huffman boundaries on mixed match the
+            // pure-short defaults so we reuse them here.
+            region0_count: 8,
+            region1_count: 0,
+            preflag: false,
+            scalefac_scale: false,
+            count1table_select: false,
+        }
+    }
+
+    #[test]
+    fn mixed_first_short_sfb_aligns_with_partition() {
+        // §2.4.2.7 mixed: long region covers lines 0..36. The
+        // [`crate::requantize::short_band_starts`] entry for our chosen
+        // first short sfb (3) must be 12 = 36 / 3 windows so the short
+        // region starts exactly where the long region ends.
+        assert_eq!(MIXED_FIRST_SHORT_SFB, 3);
+        // Same invariant for every supported sampling rate.
+        for sr in [32_000u32, 44_100, 48_000] {
+            let starts = short_band_starts(sr, MpegVersion::Mpeg1);
+            assert_eq!(
+                starts[MIXED_FIRST_SHORT_SFB], 12,
+                "mixed short region must start at per-window line 12 (interleaved 36) at sr {sr}",
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_long_last_sfb_covers_36_lines() {
+        // The §2.4.2.7 long region of a mixed block ends at line 36 ⇒
+        // exactly sfb 0..=7 at every supported MPEG-1 sampling rate.
+        // [`crate::requantize::long_band_starts`] entry 8 must be 36.
+        assert_eq!(MIXED_LAST_LONG_SFB, 7);
+        for sr in [32_000u32, 44_100, 48_000] {
+            let starts = long_band_starts(sr, MpegVersion::Mpeg1);
+            assert_eq!(
+                starts[MIXED_LAST_LONG_SFB + 1],
+                36,
+                "mixed long region must end at line 36 at sr {sr}",
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_band_distortion_zero_when_perfect() {
+        // Identity reconstruction ⇒ zero distortion on every cell of
+        // both regions. The mixed helpers only populate cells the layout
+        // actually carries (long sfb 0..=7, short sfb 3..=11); the rest
+        // stays zero, which is the desired sentinel for the loop.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let xr_back = xr;
+        let sf = ScaleFactors::default();
+        let d_l = band_distortion_mixed_long(&xr, &xr_back, &sf, false, 44_100, MpegVersion::Mpeg1);
+        for (sfb, v) in d_l.iter().enumerate() {
+            assert!(
+                *v < 1e-12,
+                "mixed-long sfb={sfb} expected zero distortion, got {v}",
+            );
+        }
+        let d_s =
+            band_distortion_mixed_short(&xr, &xr_back, &sf, false, 44_100, MpegVersion::Mpeg1);
+        for (sfb, row) in d_s.iter().enumerate() {
+            for (win, v) in row.iter().enumerate() {
+                assert!(
+                    *v < 1e-12,
+                    "mixed-short sfb={sfb} win={win} expected zero distortion, got {v}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_band_distortion_skips_absorbed_short_bands() {
+        // The mixed-short helper must leave `sfb < MIXED_FIRST_SHORT_SFB`
+        // at 0.0 even when xr has energy there — those bands are
+        // absorbed by the long-window portion of a mixed granule and the
+        // short-region distortion metric should never reference them.
+        let mut xr = [0.0f32; NUM_LINES];
+        for slot in xr.iter_mut().take(36) {
+            *slot = 100.0; // long region only
+        }
+        let mut xr_back = [0.0f32; NUM_LINES];
+        // Plant a fake reconstruction with a large residual on the would-
+        // be sfb 0..=2 cells. The helper must STILL report zero there.
+        for slot in xr_back.iter_mut().take(36) {
+            *slot = 50.0;
+        }
+        let sf = ScaleFactors::default();
+        let d_s =
+            band_distortion_mixed_short(&xr, &xr_back, &sf, false, 44_100, MpegVersion::Mpeg1);
+        for (sfb, row) in d_s.iter().enumerate().take(MIXED_FIRST_SHORT_SFB) {
+            for (win, &v) in row.iter().enumerate() {
+                assert_eq!(
+                    v, 0.0,
+                    "mixed-short helper leaked into absorbed sfb={sfb} win={win}: {v}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outer_loop_mixed_terminates_with_huge_threshold() {
+        // Threshold so large nothing exceeds it ⇒ converge on the first
+        // iteration with no amplification, no subblock_gain bumps, no
+        // escalation. Long, short, and subblock_gain all stay zero.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let gc = mixed_template();
+        let res = outer_loop_search_mixed(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e30, 64);
+        assert!(res.stats.converged);
+        assert_eq!(res.stats.iterations, 1);
+        assert_eq!(res.stats.bands_amplified, 0);
+        assert_eq!(res.subblock_gain, [0, 0, 0]);
+        assert!(!res.scalefac_scale);
+        assert!(!res.scalefactors.preflag, "mixed never sets preflag");
+        // Long region cells we never amplified should be zero.
+        for &v in res.scalefactors.long.iter() {
+            assert_eq!(v, 0);
+        }
+        // Short region cells we never amplified should be zero.
+        for row in res.scalefactors.short.iter() {
+            for &v in row.iter() {
+                assert_eq!(v, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn outer_loop_mixed_terminates_with_tiny_threshold() {
+        // Threshold zero ⇒ every cell with any baseline distortion is
+        // over-threshold; the loop runs until cap-or-amplified
+        // termination. The returned scalefactors must respect the
+        // §C.1.5.4.3.6 caps on both regions (15 across long sfb 0..=7;
+        // 15 on short sfb 3..=5; 7 on short sfb 6..=11).
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let gc = mixed_template();
+        let res = outer_loop_search_mixed(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 0.0, 64);
+        assert!(!res.stats.converged);
+        assert!(res.stats.bands_amplified > 0);
+        assert!(res.stats.iterations >= 2);
+        for sfb in 0..=MIXED_LAST_LONG_SFB {
+            assert!(
+                res.scalefactors.long[sfb] <= MIXED_SCALEFAC_L_MAX,
+                "long sfb={sfb} sf={} exceeds mixed long cap {MIXED_SCALEFAC_L_MAX}",
+                res.scalefactors.long[sfb],
+            );
+        }
+        for sfb in MIXED_FIRST_SHORT_SFB..SHORT_SFB {
+            let cap = scalefac_short_upper_limit(sfb);
+            for (win, &v) in res.scalefactors.short[sfb].iter().enumerate() {
+                assert!(
+                    v <= cap,
+                    "short sfb={sfb} win={win} sf={v} exceeds §C.1.5.4.3.6 cap {cap}",
+                );
+            }
+        }
+        // preflag stays false for the mixed family.
+        assert!(!res.scalefactors.preflag);
+    }
+
+    #[test]
+    fn outer_loop_mixed_amplifies_long_region_when_only_long_band_loaded() {
+        // Plant energy in a single long-region band (sfb 1 covers
+        // [4, 8) at 44.1 kHz) with values quantization will dirty.
+        // The mixed loop must amplify that band and leave the short
+        // region untouched.
+        let mut xr = [0.0f32; NUM_LINES];
+        xr[5] = 80.0;
+        xr[6] = 73.5;
+        let gc = mixed_template();
+        let budget = 2000u64;
+        // Baseline distortion to set a tight threshold.
+        let baseline_sf = ScaleFactors::default();
+        let baseline = run_inner_short(
+            &xr,
+            &gc,
+            &baseline_sf,
+            false,
+            [0, 0, 0],
+            44_100,
+            MpegVersion::Mpeg1,
+            budget,
+        );
+        let mut gc_b = gc;
+        gc_b.global_gain = baseline.global_gain;
+        let xr_back_b = requantize(
+            &baseline.is,
+            &gc_b,
+            &baseline_sf,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        let d_b_l = band_distortion_mixed_long(
+            &xr,
+            &xr_back_b,
+            &baseline_sf,
+            false,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        let max_band = d_b_l.iter().cloned().fold(0.0f64, f64::max);
+        assert!(
+            max_band > 0.0,
+            "fixture failed to load long-region distortion"
+        );
+        let thr = max_band * 0.5;
+        let res = outer_loop_search_mixed(&xr, &gc, 44_100, MpegVersion::Mpeg1, budget, thr, 32);
+        assert!(res.stats.bands_amplified >= 1);
+        // The short region carried zero energy ⇒ zero distortion ⇒ no
+        // amplification fired on any short cell. Any non-zero short
+        // scalefactor would be a bug.
+        for sfb in MIXED_FIRST_SHORT_SFB..SHORT_SFB {
+            for (win, &v) in res.scalefactors.short[sfb].iter().enumerate() {
+                assert_eq!(
+                    v, 0,
+                    "short sfb={sfb} win={win} amplified spuriously to {v} (no energy planted)",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outer_loop_mixed_amplifies_short_region_when_only_short_cell_loaded() {
+        // Plant energy in a single short-region cell (sfb 4, window 1).
+        // At 44.1 kHz SHORT_STARTS_44 places sfb 4 at per-window lines
+        // [16, 22); window 1 interleaved range starts at 3*16 + 22 - 16
+        // wait: base = 3*win_start + win*win_width = 3*16 + 1*6 = 54.
+        // Plant a band of values there.
+        let mut xr = [0.0f32; NUM_LINES];
+        for k in 0..6 {
+            xr[54 + k] = 80.0 + (k as f32) * 3.5;
+        }
+        let gc = mixed_template();
+        let budget = 2000u64;
+        let baseline_sf = ScaleFactors::default();
+        let baseline = run_inner_short(
+            &xr,
+            &gc,
+            &baseline_sf,
+            false,
+            [0, 0, 0],
+            44_100,
+            MpegVersion::Mpeg1,
+            budget,
+        );
+        let mut gc_b = gc;
+        gc_b.global_gain = baseline.global_gain;
+        let xr_back_b = requantize(
+            &baseline.is,
+            &gc_b,
+            &baseline_sf,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        let d_b_s = band_distortion_mixed_short(
+            &xr,
+            &xr_back_b,
+            &baseline_sf,
+            false,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        let max_cell = d_b_s
+            .iter()
+            .flat_map(|r| r.iter().copied())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_cell > 0.0,
+            "fixture failed to load short-region distortion"
+        );
+        let thr = max_cell * 0.5;
+        let res = outer_loop_search_mixed(&xr, &gc, 44_100, MpegVersion::Mpeg1, budget, thr, 32);
+        assert!(res.stats.bands_amplified >= 1);
+        // No long-region scalefactor should be non-zero (no energy in
+        // lines 0..36).
+        for sfb in 0..=MIXED_LAST_LONG_SFB {
+            assert_eq!(
+                res.scalefactors.long[sfb], 0,
+                "long sfb={sfb} amplified spuriously to {} (no energy planted)",
+                res.scalefactors.long[sfb],
+            );
+        }
+    }
+
+    #[test]
+    fn outer_loop_mixed_subblock_gain_stays_zero_on_quiet_input() {
+        // Magnitudes the clamp can satisfy at default subblock_gain ⇒
+        // never bumped. Mirrors `outer_loop_short_subblock_gain_stays_zero_on_quiet_input`.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 50.0;
+        }
+        let gc = mixed_template();
+        let res = outer_loop_search_mixed(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e30, 64);
+        assert_eq!(res.subblock_gain, [0, 0, 0]);
+    }
+
+    #[test]
+    fn outer_loop_mixed_raises_subblock_gain_on_extreme_window() {
+        // Same fixture shape as the pure-short analogue. The
+        // `magnitude_clamped` follow-up is identical between the two
+        // primitives — both call into [`per_window_max_abs`] over the
+        // short_band_starts layout — so a window-0-only over-cap fixture
+        // must escalate subblock_gain[0] off zero. The mixed long region
+        // is irrelevant here (no energy planted in lines 0..36).
+        let mut xr = [0.0f32; NUM_LINES];
+        // sfb 1 win 0 covers interleaved lines [12, 16) at 44.1 kHz
+        // (3 * 4 + 0 * 4 = 12). The pure-short fixture loads exactly
+        // this range; we mirror it.
+        for slot in xr.iter_mut().skip(12).take(4) {
+            *slot = 5.0e9;
+        }
+        // Add more window-0 energy at sfb 3 win 0 (start = 3*12 + 0*4 = 36).
+        // This is inside the mixed short region.
+        for slot in xr.iter_mut().skip(36).take(4) {
+            *slot = 5.0e9;
+        }
+        let gc = mixed_template();
+        let res = outer_loop_search_mixed(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e30, 32);
+        assert!(
+            res.subblock_gain[0] > 0,
+            "subblock_gain[0] should have escalated; got {:?}",
+            res.subblock_gain,
+        );
+        assert_eq!(res.subblock_gain[1], 0);
+        assert_eq!(res.subblock_gain[2], 0);
+        for &sg in &res.subblock_gain {
+            assert!(sg <= 7);
+        }
+    }
+
+    #[test]
+    fn outer_loop_mixed_escalates_scalefac_scale_when_cap_would_terminate() {
+        // §C.1.5.4.3 escalation path. Plant non-quantum-friendly energy
+        // in a single high-band short cell so it stays over a tiny
+        // threshold across every amplification step until that cell's
+        // §C.1.5.4.3.6 cap (7 for sfb >= 6) fires. With every other
+        // cell quiet, only that cell ever amplifies ⇒ the only
+        // reachable termination is "cap exceeded" ⇒ escalation flips
+        // scalefac_scale to true.
+        let mut xr = [0.0f32; NUM_LINES];
+        // sfb 11 win 1 at 44.1 kHz: per-window [106, 136); base =
+        // 3*106 + 1*30 = 348; width 30.
+        for k in 0..30 {
+            xr[348 + k] = 800.0 + (k as f32) * 11.7;
+        }
+        let gc = mixed_template();
+        let baseline_sf = ScaleFactors::default();
+        let baseline = run_inner_short(
+            &xr,
+            &gc,
+            &baseline_sf,
+            false,
+            [0, 0, 0],
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+        );
+        let mut gc_b = gc;
+        gc_b.global_gain = baseline.global_gain;
+        let xr_back_b = requantize(
+            &baseline.is,
+            &gc_b,
+            &baseline_sf,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        let d_b = band_distortion_mixed_short(
+            &xr,
+            &xr_back_b,
+            &baseline_sf,
+            false,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        assert!(
+            d_b[11][1] > 1.0e-6,
+            "fixture failed to load distortion into sfb 11 win 1 (d_b[11][1]={})",
+            d_b[11][1],
+        );
+        let thr = d_b[11][1] / 1.0e12;
+        let res = outer_loop_search_mixed(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, thr, 128);
+        assert!(
+            res.scalefac_scale,
+            "mixed loop should have escalated scalefac_scale to 1, got scale={} \
+             converged={} iters={} bands_amp={} sf_short={:?} sf_long={:?}",
+            res.scalefac_scale,
+            res.stats.converged,
+            res.stats.iterations,
+            res.stats.bands_amplified,
+            &res.scalefactors.short,
+            &res.scalefactors.long,
+        );
+        // All cells must stay within their respective caps.
+        for sfb in 0..=MIXED_LAST_LONG_SFB {
+            assert!(
+                res.scalefactors.long[sfb] <= MIXED_SCALEFAC_L_MAX,
+                "long sfb={sfb} sf={} exceeds mixed long cap",
+                res.scalefactors.long[sfb],
+            );
+        }
+        for sfb in MIXED_FIRST_SHORT_SFB..SHORT_SFB {
+            let cap = scalefac_short_upper_limit(sfb);
+            for (win, &v) in res.scalefactors.short[sfb].iter().enumerate() {
+                assert!(
+                    v <= cap,
+                    "short sfb={sfb} win={win} sf={v} exceeds cap {cap}",
                 );
             }
         }

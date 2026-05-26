@@ -71,7 +71,8 @@ use crate::main_data::{
 };
 use crate::mdct::{forward_overlap, mdct, window_long_family_analysis, MdctState, LONG_N};
 use crate::outer_loop::{
-    outer_loop_search_long, outer_loop_search_short, OUTER_LOOP_SCALEFAC_COMPRESS,
+    outer_loop_search_long, outer_loop_search_mixed, outer_loop_search_short,
+    OUTER_LOOP_SCALEFAC_COMPRESS,
 };
 use crate::quantize::quantize;
 use crate::scalefactors::{FrameScaleFactors, ScaleFactors};
@@ -1881,21 +1882,21 @@ impl Mp3Encoder {
                     11 * 4 + 10 * 3
                 };
                 let inner_budget_for_outer = per_gc_bits.saturating_sub(part2_bits_outer) as u64;
-                // The outer loop only runs on the two block-type shapes
-                // covered by a primitive today: Long (the original r144
-                // path) and pure-Short (`outer_loop_search_short`, r157).
-                // Start / End / mixed-Short fall back to the fixed-gain
-                // inner-loop path with `scalefactor_compress = 0` (zero
-                // scalefactors) so the rest of the encoder stays
-                // shape-compatible with the side-info skeleton this
-                // (gr, ch) selected upstream.
+                // The outer loop runs on the three block-type shapes
+                // covered by a primitive: Long (the original r144 path),
+                // pure-Short (`outer_loop_search_short`, r157), and mixed
+                // (`outer_loop_search_mixed`, r159). Start / End fall
+                // back to the fixed-gain inner-loop path with
+                // `scalefactor_compress = 0` (zero scalefactors) so the
+                // rest of the encoder stays shape-compatible with the
+                // side-info skeleton this (gr, ch) selected upstream.
                 let outer_loop_eligible = matches!(
                     (
                         gc_template.window_switching_flag,
                         gc_template.block_type,
                         gc_template.mixed_block_flag,
                     ),
-                    (false, BlockType::Long, _) | (true, BlockType::Short, false)
+                    (false, BlockType::Long, _) | (true, BlockType::Short, _)
                 );
                 let (sf, initial_gain, scalefac_scale_outer, subblock_gain_outer) =
                     match self.outer_loop_threshold {
@@ -1940,7 +1941,7 @@ impl Mp3Encoder {
                                         [0u8; 3],
                                     )
                                 }
-                                BlockType::Short => {
+                                BlockType::Short if !gc_template.mixed_block_flag => {
                                     // Pure-short outer loop (§C.1.5.4.3
                                     // analogue) — r157
                                     // `outer_loop_search_short`. Reports
@@ -1968,6 +1969,39 @@ impl Mp3Encoder {
                                         res.subblock_gain,
                                     )
                                 }
+                                BlockType::Short => {
+                                    // Mixed-block outer loop (§C.1.5.4.3
+                                    // analogue) — r159
+                                    // `outer_loop_search_mixed`. Composes
+                                    // the long-region amplifier over
+                                    // sf.long[0..=7] with the short-region
+                                    // per-(sfb, window) amplifier over
+                                    // sf.short[3..=11][..]; reports per-
+                                    // window `subblock_gain` like the
+                                    // pure-short loop. Preflag stays
+                                    // `false` (§2.4.2.7 disables preflag
+                                    // on every short-family granule
+                                    // including mixed). The MPEG-1 part2
+                                    // wire layout for mixed reads
+                                    // `sf.long[0..8]` at slen1 then
+                                    // `sf.short[3..12][..]` (see
+                                    // `write_mpeg1_granule_channel`).
+                                    let res = outer_loop_search_mixed(
+                                        &xr_pre,
+                                        &gc_for_ol,
+                                        self.sample_rate_hz,
+                                        self.version,
+                                        inner_budget_for_outer,
+                                        thr,
+                                        DEFAULT_OUTER_LOOP_MAX_ITER,
+                                    );
+                                    (
+                                        res.scalefactors,
+                                        res.global_gain,
+                                        res.scalefac_scale,
+                                        res.subblock_gain,
+                                    )
+                                }
                                 // Unreachable: gating above forbids
                                 // Start / End from this arm.
                                 BlockType::Start | BlockType::End => {
@@ -1980,8 +2014,8 @@ impl Mp3Encoder {
                             // Fixed-gain inner-loop path. Reached when
                             // (a) outer loop disabled, or (b) outer
                             // loop enabled but block type is Start /
-                            // End / mixed-Short and no outer-loop
-                            // primitive covers that shape yet.
+                            // End and no outer-loop primitive covers
+                            // that shape yet.
                             let sf = ScaleFactors::default();
                             // VBR-mode gain choice: skip the bit-budget
                             // gain search. Without a psychoacoustic model
