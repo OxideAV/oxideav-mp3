@@ -102,7 +102,7 @@ pub struct Mp3Tags {
 /// Xing / Info VBR information frame.
 ///
 /// "Xing" magic indicates a true VBR file; "Info" magic indicates a
-/// CBR file that LAME-style encoders nevertheless decorate with the
+/// CBR file that some encoders nevertheless decorate with the
 /// same structure for compatibility with VBR-aware seeking. The two
 /// payload layouts are identical — the magic alone selects the tag —
 /// so we collapse them to one type with an [`XingTagId`] discriminant.
@@ -137,7 +137,7 @@ pub enum XingTagId {
     /// Encoder believes the stream is variable-bitrate.
     Xing,
     /// Encoder believes the stream is constant-bitrate but still
-    /// emitted the info-frame layout (LAME convention).
+    /// emitted the info-frame layout (by historical convention).
     Info,
 }
 
