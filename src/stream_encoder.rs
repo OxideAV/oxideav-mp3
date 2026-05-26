@@ -68,6 +68,14 @@ use crate::scalefactors::{FrameScaleFactors, ScaleFactors};
 use crate::side_info::{BlockType, GranuleChannel, SideInfo, GRANULES};
 use crate::{make_silent_header, write_header, write_side_info, EncodeError};
 
+/// MPEG-1 Layer III bitrate ladder (ISO/IEC 11172-3 §2.4.2.3, Table
+/// 2-B.1 row "Layer III, version 1"). Used by the encoder's VBR path
+/// to enumerate the 14 fixed bitrates a per-frame `bitrate_index` may
+/// select. Indices `0` (free format) and `15` (forbidden) are excluded.
+pub const MPEG1_L3_BITRATE_LADDER_KBPS: [u32; 14] = [
+    32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+];
+
 /// Default outer-loop per-band noise threshold (the uniform `xmin[sb]`
 /// the loop tests `xfsf(sb)` against). With our scalefactor amplification
 /// step `√2` per increment and the colored-domain `xfsf` metric (per
@@ -119,6 +127,23 @@ pub enum StreamEncodeError {
     /// Caller chose an MPEG-2 LSF sample rate (16 / 22.05 / 24 kHz);
     /// LSF is deferred to a later round.
     LsfUnsupported,
+    /// VBR configuration is malformed: `min_kbps` / `max_kbps` are not
+    /// both on the §2.4.2.3 ladder, are reversed, or `max_kbps`
+    /// exceeds the encoder's constructor-time `bitrate_kbps`.
+    InvalidVbrConfig,
+    /// VBR mode: a frame's assembled main-data does not fit in the
+    /// max-bitrate-index slot. Raise `max_kbps` (or the constructor
+    /// bitrate) and retry. The carried `(frame_index, main_data_len,
+    /// max_slot_bytes)` triple identifies the overflowing frame.
+    VbrSlotTooSmall {
+        /// Zero-based index of the offending audio frame.
+        frame_index: usize,
+        /// Number of main-data bytes the frame's quantization
+        /// produced.
+        main_data_len: usize,
+        /// Slot capacity at the configured `max_index`.
+        max_slot_bytes: usize,
+    },
 }
 
 impl core::fmt::Display for StreamEncodeError {
@@ -134,6 +159,17 @@ impl core::fmt::Display for StreamEncodeError {
             StreamEncodeError::LsfUnsupported => {
                 f.write_str("only MPEG-1 sample rates are supported in this round")
             }
+            StreamEncodeError::InvalidVbrConfig => {
+                f.write_str("VBR config: min/max kbps off-ladder or out of range")
+            }
+            StreamEncodeError::VbrSlotTooSmall {
+                frame_index,
+                main_data_len,
+                max_slot_bytes,
+            } => write!(
+                f,
+                "VBR: frame {frame_index} main_data {main_data_len} B does not fit max-index slot {max_slot_bytes} B"
+            ),
         }
     }
 }
@@ -201,6 +237,38 @@ pub struct Mp3Encoder {
     /// pre-counting samples) can supply them in the spec and the
     /// writer will use them verbatim.
     xing_template: Option<crate::xing_info::XingTagSpec>,
+
+    /// When `Some`, [`Mp3Encoder::finish`] picks a per-frame
+    /// `bitrate_index` from the §2.4.2.3 ladder rather than emitting
+    /// every audio frame at the constructor-time `bitrate_kbps`. The
+    /// chosen index is the smallest ladder entry within the
+    /// `[min_kbps, max_kbps]` window whose slot is large enough to hold
+    /// the frame's assembled main-data (using the same zero-pad /
+    /// no-reservoir schedule as the CBR path).
+    ///
+    /// Carrier-frame and per-granule quantization budget still use the
+    /// constructor-time bitrate as the maximum (`bitrate_kbps` should
+    /// equal or exceed `max_kbps`) so the inner loop's bit-budget gain
+    /// search runs against the largest slot the stream will emit; the
+    /// VBR step is a post-hoc selection of the smallest ladder index
+    /// each frame's main-data actually fits in.
+    vbr: Option<VbrConfig>,
+}
+
+/// Variable-bitrate config attached to [`Mp3Encoder`] by
+/// [`Mp3Encoder::enable_vbr`].
+#[derive(Debug, Clone, Copy)]
+struct VbrConfig {
+    /// Minimum per-frame bitrate index (1..=14 on the §2.4.2.3 ladder).
+    /// A frame whose main-data is so small it could fit a smaller slot
+    /// is still emitted at this index — the floor protects decoders
+    /// that scan for a "typical" frame size at probe time.
+    min_index: u8,
+    /// Maximum per-frame bitrate index (1..=14). `min_index <=
+    /// max_index <= constructor_index`. A frame whose main-data
+    /// exceeds the max-index slot is rejected
+    /// ([`StreamEncodeError::VbrSlotTooSmall`]).
+    max_index: u8,
 }
 
 #[derive(Debug)]
@@ -252,7 +320,56 @@ impl Mp3Encoder {
             frames: Vec::new(),
             outer_loop_threshold: None,
             xing_template: None,
+            vbr: None,
         })
+    }
+
+    /// Enable per-frame **variable-bitrate** index selection.
+    ///
+    /// When enabled, [`Mp3Encoder::finish`] picks each audio frame's
+    /// `bitrate_index` from the §2.4.2.3 Layer III ladder in the
+    /// `[min_kbps, max_kbps]` range — the smallest index whose slot is
+    /// large enough to hold that frame's assembled main-data
+    /// (zero-padded; no cross-frame reservoir). Frames whose main-data
+    /// is below the `min_kbps` slot still emit at `min_kbps` (the
+    /// per-frame slot grows to the floor; the trailing bytes are
+    /// zero-fill); frames whose main-data exceeds the `max_kbps` slot
+    /// fail with [`StreamEncodeError::VbrSlotTooSmall`].
+    ///
+    /// The constructor-time `bitrate_kbps` still controls (a) the
+    /// per-granule-channel inner-loop bit budget (the loop targets
+    /// "fits the constructor slot" so the analysis isn't biased toward
+    /// any specific VBR rate) and (b) the size of the optional Xing
+    /// carrier frame, so callers should pick a constructor bitrate
+    /// equal to (or exceeding) `max_kbps`.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamEncodeError::InvalidVbrConfig`] when:
+    /// * `min_kbps` or `max_kbps` is not a value on
+    ///   [`MPEG1_L3_BITRATE_LADDER_KBPS`];
+    /// * `min_kbps > max_kbps`;
+    /// * `max_kbps` exceeds the constructor-time `bitrate_kbps` (the
+    ///   carrier / inner-loop budget would no longer cover the chosen
+    ///   max).
+    pub fn enable_vbr(&mut self, min_kbps: u32, max_kbps: u32) -> Result<(), StreamEncodeError> {
+        let min_idx = ladder_index(min_kbps).ok_or(StreamEncodeError::InvalidVbrConfig)?;
+        let max_idx = ladder_index(max_kbps).ok_or(StreamEncodeError::InvalidVbrConfig)?;
+        if min_idx > max_idx {
+            return Err(StreamEncodeError::InvalidVbrConfig);
+        }
+        let ctor_kbps = self
+            .header_template
+            .bitrate_kbps
+            .ok_or(StreamEncodeError::InvalidVbrConfig)?;
+        if max_kbps > ctor_kbps {
+            return Err(StreamEncodeError::InvalidVbrConfig);
+        }
+        self.vbr = Some(VbrConfig {
+            min_index: min_idx,
+            max_index: max_idx,
+        });
+        Ok(())
     }
 
     /// Enable Xing / Info VBR information-frame emission.
@@ -388,10 +505,24 @@ impl Mp3Encoder {
     /// the actual main-data writer may exceed it by a few bits because
     /// the granule-channel's part2 (scalefactors) is excluded from
     /// this budget (zero with our all-zero scalefactor config).
+    ///
+    /// In VBR mode this is the **max-index** slot's bits — the analysis
+    /// must not produce more bits than the largest slot the
+    /// per-frame VBR selector can ever emit. Frames whose actual
+    /// distortion-shaped output is smaller still cause the VBR step to
+    /// pick a smaller bitrate index; the budget is the upper bound on
+    /// per-granule-channel bits, not a target to fill.
     fn per_gc_bit_budget(&self) -> usize {
-        let frame_len = self.header_template.frame_len().unwrap_or(0);
         let si_bytes = side_info_byte_len(self.nch);
-        let slot_bytes = frame_len.saturating_sub(4 + si_bytes);
+        // VBR caps per-granule bits at the max-index slot; CBR caps at
+        // the constructor slot.
+        let slot_bytes = match self.vbr {
+            Some(cfg) => ladder_slot_capacity(self.sample_rate_hz, cfg.max_index, si_bytes, true),
+            None => {
+                let frame_len = self.header_template.frame_len().unwrap_or(0);
+                frame_len.saturating_sub(4 + si_bytes)
+            }
+        };
         let denom = GRANULES.saturating_mul(self.nch).max(1);
         // Hold back a small margin (16 bits) per granule-channel for
         // the assembler's last partial-byte pad and any rounding.
@@ -531,14 +662,18 @@ impl Mp3Encoder {
                     }
                     None => {
                         let sf = ScaleFactors::default();
-                        let res_budget = search_bit_budget(
-                            &xr_pre,
-                            &gc_template,
-                            &sf,
-                            self.sample_rate_hz,
-                            self.version,
-                            per_gc_bits as u64,
-                        );
+                        // VBR-mode gain choice: skip the bit-budget
+                        // gain search. Without a psychoacoustic model
+                        // the budget search would saturate the chosen
+                        // VBR max-index slot regardless of content
+                        // complexity — defeating the point of letting
+                        // the encoder pick a smaller per-frame bitrate.
+                        // The magnitude-clamp gain alone (the smallest
+                        // gain with `max|is| ≤ 8191`) is the natural
+                        // content-driven quality floor and lets the
+                        // per-frame VBR-index selector see a true
+                        // content-dependent main-data size. CBR keeps
+                        // the dual search; the VBR path uses clamp-only.
                         let res_clamp = search_magnitude_clamp(
                             &xr_pre,
                             &gc_template,
@@ -546,7 +681,20 @@ impl Mp3Encoder {
                             self.sample_rate_hz,
                             self.version,
                         );
-                        (sf, res_budget.global_gain.max(res_clamp.global_gain))
+                        let initial_gain = if self.vbr.is_some() {
+                            res_clamp.global_gain
+                        } else {
+                            let res_budget = search_bit_budget(
+                                &xr_pre,
+                                &gc_template,
+                                &sf,
+                                self.sample_rate_hz,
+                                self.version,
+                                per_gc_bits as u64,
+                            );
+                            res_budget.global_gain.max(res_clamp.global_gain)
+                        };
+                        (sf, initial_gain)
                     }
                 };
                 let mut global_gain = initial_gain;
@@ -688,21 +836,53 @@ impl Mp3Encoder {
         let sr64 = u64::from(self.sample_rate_hz);
         let rem = (144 * bitrate_bps) % sr64;
         let mut acc: u64 = 0;
-        for f in frames.into_iter() {
-            let pad = if rem == 0 {
-                false
-            } else {
-                acc += rem;
-                if acc >= sr64 {
-                    acc -= sr64;
-                    true
-                } else {
-                    false
-                }
-            };
+        for (i, f) in frames.into_iter().enumerate() {
             let mut hdr = f.header;
-            hdr.padding = pad;
-            let frame_len = hdr.frame_len().expect("CBR frame_len");
+            let frame_len = if let Some(vbr_cfg) = self.vbr {
+                // True-VBR: pick the smallest §2.4.2.3 ladder index in
+                // `[min_index, max_index]` whose slot bytes are at
+                // least the assembled main-data length. The chosen
+                // header carries that bitrate; the reservoir step
+                // still zero-pads the slot remainder, so the on-wire
+                // schedule is per-frame "no carry-over" — every
+                // `main_data_begin == 0`.
+                let need = f.main_data.len();
+                let (idx_kbps, idx_byte) = pick_vbr_bitrate(self.sample_rate_hz, vbr_cfg, need)
+                    .ok_or(StreamEncodeError::VbrSlotTooSmall {
+                        frame_index: i,
+                        main_data_len: need,
+                        max_slot_bytes: ladder_slot_capacity(
+                            self.sample_rate_hz,
+                            vbr_cfg.max_index,
+                            si_bytes,
+                            /*padded=*/ true,
+                        ),
+                    })?;
+                hdr.bitrate_index = idx_byte;
+                hdr.bitrate_kbps = Some(idx_kbps);
+                // VBR sub-step: choose padding to fit `need` exactly
+                // when one extra byte rounds the slot up to ≥ need.
+                let unpadded = hdr.frame_len().expect("VBR frame_len");
+                let unpadded_slot = unpadded - 4 - si_bytes;
+                hdr.padding = unpadded_slot < need;
+                hdr.frame_len().expect("VBR frame_len after pad")
+            } else {
+                // CBR: Bresenham padding ladder against the
+                // constructor bitrate.
+                let pad = if rem == 0 {
+                    false
+                } else {
+                    acc += rem;
+                    if acc >= sr64 {
+                        acc -= sr64;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                hdr.padding = pad;
+                hdr.frame_len().expect("CBR frame_len")
+            };
             // CRC-free: no 2-byte CRC field.
             let slot = frame_len - 4 - si_bytes;
             headers.push(hdr);
@@ -712,8 +892,11 @@ impl Mp3Encoder {
             frame_lens.push(frame_len);
         }
         // Sanity: never expect the per-frame length to drop below the
-        // base length.
-        debug_assert!(frame_lens.iter().all(|&l| l >= base_frame_len));
+        // base length (CBR only — VBR may legitimately pick a smaller
+        // bitrate index than the constructor).
+        if self.vbr.is_none() {
+            debug_assert!(frame_lens.iter().all(|&l| l >= base_frame_len));
+        }
 
         // Step 2: run the bit-reservoir scheduler.
         //
@@ -757,12 +940,20 @@ impl Mp3Encoder {
         // sees after the carrier.
         let audio_frame_count = scheduled.len() as u32;
         let mut audio_total_bytes: u64 = 0;
-        for (i, sch) in scheduled.iter().enumerate() {
+        // Per-frame cumulative byte offsets within the audio region,
+        // measured from offset 0 = start of the FIRST audio frame
+        // (i.e. immediately after the optional Xing carrier). Length
+        // is `audio_frame_count + 1`: entry `i` is the start offset of
+        // audio frame `i`; the final entry is the total byte count.
+        // These offsets drive the Xing TOC computation below.
+        let mut cum_audio_offsets: Vec<u64> = Vec::with_capacity(scheduled.len() + 1);
+        cum_audio_offsets.push(0);
+        for sch in scheduled.iter() {
             // frame_len = 4 (header) + si_bytes + slot.len() per
             // construction; computing it from frame_lens[i] is the
             // same arithmetic.
-            let _ = i; // unused but kept for parity with the emission loop.
             audio_total_bytes += 4 + si_bytes as u64 + sch.slot.len() as u64;
+            cum_audio_offsets.push(audio_total_bytes);
         }
         let audio_total_bytes_u32: u32 = audio_total_bytes.try_into().unwrap_or(u32::MAX);
 
@@ -780,8 +971,8 @@ impl Mp3Encoder {
         let mut written = 0usize;
         if let Some(template) = xing_template {
             use crate::xing_info::{build_info_frame, flag_bit, XingTagSpec};
-            // Fill in unresolved frames / bytes fields per the flag
-            // bits. Pre-set fields take precedence.
+            // Fill in unresolved frames / bytes / toc fields per the
+            // flag bits. Pre-set fields take precedence.
             let mut spec = XingTagSpec {
                 id: template.id,
                 flags: template.flags,
@@ -795,6 +986,9 @@ impl Mp3Encoder {
             }
             if spec.flags & flag_bit::BYTES != 0 && spec.bytes.is_none() {
                 spec.bytes = Some(audio_total_bytes_u32);
+            }
+            if spec.flags & flag_bit::TOC != 0 && spec.toc.is_none() {
+                spec.toc = Some(compute_xing_toc(&cum_audio_offsets, audio_total_bytes));
             }
             // Carrier header: same as the audio header template but
             // unpadded (so its size equals the base CBR frame length).
@@ -1082,6 +1276,90 @@ fn side_info_byte_len(nch: usize) -> usize {
     } else {
         32
     }
+}
+
+/// Resolve an MPEG-1 Layer III bitrate (kbit/s) to its position
+/// (1..=14) on the §2.4.2.3 ladder. Returns `None` for an off-ladder
+/// value (free format `0`, forbidden `15`, or any kbps not in
+/// [`MPEG1_L3_BITRATE_LADDER_KBPS`]).
+fn ladder_index(kbps: u32) -> Option<u8> {
+    MPEG1_L3_BITRATE_LADDER_KBPS
+        .iter()
+        .position(|&v| v == kbps)
+        .map(|i| (i + 1) as u8)
+}
+
+/// Compute the main-data slot byte capacity for the §2.4.2.3 ladder
+/// `bitrate_index` (1..=14) at the given `sample_rate_hz`, after
+/// subtracting the 4-byte header and `si_bytes` side-info bytes (no
+/// CRC). When `padded` is true, the slot includes the one-byte padding
+/// slot the per-frame `padding` bit absorbs.
+fn ladder_slot_capacity(
+    sample_rate_hz: u32,
+    bitrate_index: u8,
+    si_bytes: usize,
+    padded: bool,
+) -> usize {
+    let kbps = MPEG1_L3_BITRATE_LADDER_KBPS[(bitrate_index - 1) as usize];
+    let bps = u64::from(kbps) * 1000;
+    let sr = u64::from(sample_rate_hz);
+    let unpadded = (144 * bps / sr) as usize;
+    let frame_len = unpadded + usize::from(padded);
+    frame_len.saturating_sub(4 + si_bytes)
+}
+
+/// Pick the smallest §2.4.2.3 ladder index in `[cfg.min_index,
+/// cfg.max_index]` whose slot — possibly with the per-frame padding
+/// byte — can hold `need` bytes of main-data. Returns the chosen
+/// `(kbps, ladder_index)` or `None` when even the max index's padded
+/// slot is insufficient.
+fn pick_vbr_bitrate(sample_rate_hz: u32, cfg: VbrConfig, need: usize) -> Option<(u32, u8)> {
+    let si_bytes = 17; // mono-only this round; matches side_info_byte_len(1).
+    for idx in cfg.min_index..=cfg.max_index {
+        // Try unpadded first, then padded — the per-frame padding bit
+        // adds one byte to the slot at the same `bitrate_index`. For
+        // VBR with min_kbps == max_kbps this preserves the CBR
+        // Bresenham padding behaviour roughly (padding is enabled only
+        // when needed).
+        let cap_padded = ladder_slot_capacity(sample_rate_hz, idx, si_bytes, true);
+        if cap_padded >= need {
+            let kbps = MPEG1_L3_BITRATE_LADDER_KBPS[(idx - 1) as usize];
+            return Some((kbps, idx));
+        }
+    }
+    None
+}
+
+/// Compute the Xing `toc[100]` field for a stream whose per-audio-frame
+/// cumulative byte offsets are in `cum_offsets` (length =
+/// `audio_frame_count + 1`; entry 0 = 0; entry N = `total_bytes`).
+///
+/// `toc[i] = floor(256 * audio_offset_for_percentile(i) / total_bytes)`
+/// for `i in 0..100`, where `audio_offset_for_percentile(i)` is the
+/// byte offset of the audio frame whose **start** is closest to the
+/// playback position `i / 100`. Each TOC entry is constrained to fit
+/// in one byte (0..=255), so a `total_bytes == 0` stream emits an
+/// all-zero TOC.
+fn compute_xing_toc(cum_offsets: &[u64], total_bytes: u64) -> [u8; 100] {
+    let mut toc = [0u8; 100];
+    if total_bytes == 0 || cum_offsets.len() < 2 {
+        return toc;
+    }
+    let n_frames = cum_offsets.len() - 1;
+    for (i, slot) in toc.iter_mut().enumerate() {
+        // The percentile maps to a frame INDEX, not a byte offset:
+        // walking by frames matches how a tag-aware seeker uses the
+        // TOC (look up `toc[idx]`, then start decoding the frame
+        // whose offset is `bytes * toc[idx] / 256`). Pick the frame
+        // start nearest to `i/100` of the total audio frames.
+        let frame_idx = ((i as u64) * (n_frames as u64) / 100) as usize;
+        let frame_idx = frame_idx.min(n_frames - 1);
+        let offset = cum_offsets[frame_idx];
+        // floor(256 * offset / total_bytes), capped at 255.
+        let scaled = (256u64 * offset) / total_bytes;
+        *slot = scaled.min(255) as u8;
+    }
+    toc
 }
 
 /// Defensive: clamp every `is[i]` magnitude to `bound`, preserving sign.

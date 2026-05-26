@@ -397,7 +397,8 @@ pub use side_info::{
 };
 pub use stereo::process_stereo;
 pub use stream_encoder::{
-    Mp3Encoder, StreamEncodeError, SAMPLES_PER_FRAME_MPEG1, SAMPLES_PER_GRANULE,
+    Mp3Encoder, StreamEncodeError, MPEG1_L3_BITRATE_LADDER_KBPS, SAMPLES_PER_FRAME_MPEG1,
+    SAMPLES_PER_GRANULE,
 };
 pub use synth::{n_coefficient, synth_granule, synth_row, SynthState, D_TABLE, PCM_PER_GRANULE};
 pub use xing_info::{

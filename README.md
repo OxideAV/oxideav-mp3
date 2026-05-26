@@ -814,19 +814,49 @@ agrees with `FrameWalker` re-counting the audio region, pre-filled
 template fields are written verbatim, and `Mp3Demuxer::open` reports
 the same Xing tag on the in-memory stream.
 
+**Phase 2 step 14 (true-VBR per-frame bitrate selection + Xing TOC
+auto-fill)** extends the r142 Xing emission with a content-driven
+`bitrate_index` per audio frame. `Mp3Encoder::enable_vbr(min_kbps,
+max_kbps)` activates the path: every frame's quantization runs the
+magnitude-clamp inner-loop gain alone (no bit-budget chase against a
+fixed target — that would saturate the constructor slot regardless of
+content), and `finish` then picks the smallest §2.4.2.3 ladder index
+in `[min_kbps, max_kbps]` whose slot can hold the assembled main-data
+(plus one optional padding byte). Frames overflowing the max-index
+slot surface `StreamEncodeError::VbrSlotTooSmall { frame_index, … }`;
+`enable_vbr` itself rejects off-ladder values, reversed windows, and
+maxima above the constructor bitrate (`InvalidVbrConfig`). When the
+caller also `enable_xing_info`'s a template with
+`flag_bit::TOC` set and `toc: None`, the writer fills the 100-entry
+seek table from the post-encode per-frame cumulative byte offsets
+(`toc[i] = floor(256 · audio_offset_for_percentile(i) / total_bytes)`,
+clamped to `255`) — so `Mp3Demuxer`'s `seek_to` path resolves
+percentile lookups on a real VBR stream the same way it does on
+fixtures. Validated end-to-end by `tests/vbr_roundtrip.rs` (13
+tests): all four `enable_vbr` reject paths, silence-stream landing on
+the min-index, mixed-content emitting ≥2 distinct bitrates,
+`FrameWalker` consuming the varying-length stream cleanly, the
+demuxer's `next_packet` loop draining every audio frame without
+error, auto-filled TOC monotone non-decreasing with `toc[0] == 0`
+and tail ≥ 200, BYTES field matching the walker's audio-region byte
+sum, and the degenerate `[K, K]` window emitting structurally
+identical frames to the CBR-at-K path. `MPEG1_L3_BITRATE_LADDER_KBPS`
+is re-exported for callers that need to enumerate the 14 selectable
+ladder values.
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), preemphasis (§C.1.5.4.3.4) and `scalefac_scale = 1`
-escalation, short / mixed block-type switching, stereo / LSF / VBR
-encode, stereo / LSF decode through the trait wrapper — is still a
-later round.
+escalation, short / mixed block-type switching, stereo / LSF encode,
+stereo / LSF decode through the trait wrapper — is still a later
+round.
 
 ### Not yet implemented
 
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–13 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–14 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -834,11 +864,12 @@ primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
 §2.4.1.7 main-data assembly + §2.4.2.7 cross-frame bit-reservoir
 scheduling with `main_data_begin > 0` + stream-level PCM → MP3 driver
 + §C.1.5.4.3 outer (distortion-control) loop + `oxideav_core::Encoder`
-trait wiring + opt-in Xing / Info VBR information-frame emission)** —
-it still lacks the psychoacoustic model (so the outer loop's
-`xmin(sb)` is a uniform constant rather than per-band masking-aware),
-preemphasis / `scalefac_scale = 1` escalation, short / mixed
-block-type switching, and stereo / LSF / true-VBR encode.
+trait wiring + opt-in Xing / Info VBR information-frame emission +
+true-VBR per-frame bitrate + Xing TOC auto-fill)** — it still lacks
+the psychoacoustic model (so the outer loop's `xmin(sb)` is a uniform
+constant rather than per-band masking-aware), preemphasis /
+`scalefac_scale = 1` escalation, short / mixed block-type switching,
+and stereo / LSF encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

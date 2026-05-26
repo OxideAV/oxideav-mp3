@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Mp3Encoder::enable_vbr(min_kbps, max_kbps)` — opt-in true-VBR
+  per-frame `bitrate_index` selection (Phase 2 step 14). With VBR
+  active, the per-granule-channel inner-loop gain search runs the
+  magnitude-clamp path alone (no bit-budget chase against a fixed
+  budget — that path would saturate the constructor slot regardless
+  of content), and `finish` picks for each audio frame the smallest
+  §2.4.2.3 ladder index in `[min_kbps, max_kbps]` whose slot can hold
+  the assembled main-data plus one optional padding byte. `enable_vbr`
+  itself rejects off-ladder bitrates, reversed windows, and maxima
+  above the constructor (`StreamEncodeError::InvalidVbrConfig`);
+  frames overflowing the max-index slot at `finish` time surface
+  `StreamEncodeError::VbrSlotTooSmall { frame_index, main_data_len,
+  max_slot_bytes }`. Pairs naturally with `enable_xing_info` —
+  see below.
+- Xing `toc[100]` auto-fill: when `Mp3Encoder::enable_xing_info`'s
+  template flags `xing_flag_bit::TOC` and `toc: None`, `finish`
+  computes the 100-entry seek table from per-frame cumulative byte
+  offsets: `toc[i] = floor(256 · audio_offset_for_percentile(i) /
+  total_bytes)`, clamped to `255`. Each entry's offset uses the audio
+  frame whose START is closest to playback fraction `i / 100`, the
+  same convention `Mp3Demuxer::seek_to` reads on the way back.
+  `Some(toc)` template values are written verbatim (no overwrite).
+- `tests/vbr_roundtrip.rs` integration suite (13 tests): off-ladder /
+  reversed / max-above-ctor / `[K, K]` configs, silence-stream landing
+  on min-index, mixed-content yielding ≥2 distinct bitrates,
+  `FrameWalker` consuming the varying-length stream cleanly,
+  `Mp3Demuxer::next_packet` draining every audio frame without error,
+  Xing TOC monotone non-decreasing (`toc[0] == 0`, tail ≥ 200), the
+  auto-filled BYTES field matching the walker's audio-region byte
+  sum, and the `Mp3Demuxer::xing()` view reporting the TOC flag
+  exactly as written.
+- `MPEG1_L3_BITRATE_LADDER_KBPS: [u32; 14]` re-export — the 14
+  selectable ladder values (32 / 40 / 48 / 56 / 64 / 80 / 96 / 112 /
+  128 / 160 / 192 / 224 / 256 / 320 kbps) callers can enumerate when
+  picking `min_kbps` / `max_kbps`.
+- `StreamEncodeError::InvalidVbrConfig` and
+  `StreamEncodeError::VbrSlotTooSmall { frame_index, main_data_len,
+  max_slot_bytes }` variants for VBR misconfiguration / overflow
+  diagnosis.
+
 - `xing_info` module — encoder-side inverse of
   `demuxer::parse_xing_info`. `XingTagSpec` specifies a Xing / Info
   VBR-information-frame payload (magic + flag word + up to four
