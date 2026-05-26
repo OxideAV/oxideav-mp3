@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Independent-stereo encode** (Phase 2 step 16):
+  `Mp3Encoder::new` now accepts `ChannelMode::Stereo` and
+  `ChannelMode::DualChannel` in addition to `ChannelMode::SingleChannel`.
+  Both two-channel modes encode each channel independently — no
+  joint-stereo coupling — and emit a standard MPEG-1 Layer III stereo
+  frame: header `mode = '00'` (stereo) or `'10'` (dual-channel),
+  `mode_extension = '00'`, 32-byte side-information block, and the
+  §2.4.1.7 `main_data()` loop walks `for (gr=0..2) for (ch=0..nch)`
+  emitting each granule-channel's part2 + part3 independently. Inputs
+  are interleaved S16 (`[L0, R0, L1, R1, …]`); the upstream
+  `Mp3Encoder::push_samples` deinterleaves the caller's stream into
+  per-channel pending buffers and assembles a frame as soon as both
+  channels carry a full 1152-sample granule pair. The
+  `oxideav_core::Encoder` trait wrapper (`codec_encoder::make_encoder`)
+  is widened in lockstep: `params.channels = 2` → `ChannelMode::Stereo`;
+  the wrapper's `frame_to_i16` validator expects `samples × channels ×
+  2` bytes per `AudioFrame`. `ChannelMode::JointStereo` remains rejected
+  with `StreamEncodeError::StereoUnsupported` (MS / intensity coupling
+  on the encode side is deferred to a later round; the decoder's
+  `process_stereo` primitive already handles both methods for
+  incoming joint-stereo bitstreams). Validated by
+  `tests/stereo_encoder_roundtrip.rs`: a 1 s 440 Hz (L) / 880 Hz (R)
+  sine encoded at 192 kbit/s round-trips through the in-tree decoder
+  at per-channel PSNR **L = 85.13 dB** and **R = 80.42 dB**, with a
+  single-bin DFT probe showing zero cross-channel leakage (each
+  channel's tone energy is >1200× the other channel's). Plus two
+  stereo unit tests on the trait wrapper (`stereo_flush_drains_to_
+  complete_mp3_frames`, `stereo_send_frame_rejects_wrong_byte_count`).
+
 - `Mp3Encoder::with_protection_bit(enabled)` — opt-in §2.4.3.1 CRC-16
   frame protection (Phase 2 step 15). When `enabled = true`, every
   emitted audio frame carries the 2-byte CRC check word in the slot

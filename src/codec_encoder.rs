@@ -37,9 +37,13 @@
 //!
 //! ## Scope
 //!
-//! Mirrors the scope of the underlying [`Mp3Encoder`] (Round 138/139):
+//! Mirrors the scope of the underlying [`Mp3Encoder`]:
 //!
-//! * **Mono only.** `channels == 1`.
+//! * **Mono or stereo (independent channels).** `channels == 1` →
+//!   header `mode = '11'`; `channels == 2` → header `mode = '00'`
+//!   (independent stereo). Each channel of a stereo input is encoded
+//!   independently — there is no joint-stereo MS / intensity coupling
+//!   at the encoder side this round.
 //! * **MPEG-1 only.** Sample rates 32 / 44.1 / 48 kHz.
 //! * **CBR.** Caller picks a bitrate from the §2.4.2.3 Layer III ladder.
 //! * **Long blocks, fixed-gain or outer-loop.** Same two encoder
@@ -47,7 +51,8 @@
 //!   fixed-gain path, [`make_encoder_with_outer_loop`] the
 //!   distortion-control loop.
 //!
-//! Stereo / MPEG-2 LSF / VBR / short-block switching remain followups.
+//! Joint-stereo (MS / intensity) / MPEG-2 LSF / VBR / short-block
+//! switching remain followups.
 
 use std::collections::VecDeque;
 
@@ -104,12 +109,22 @@ fn make_encoder_inner(
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("oxideav-mp3: channels required"))?;
-    if channels != 1 {
-        return Err(Error::invalid(format!(
-            "oxideav-mp3: encoder supports mono only (channels={channels})"
-        )));
-    }
-    let mode = ChannelMode::SingleChannel;
+    // Map `channels` → ISO/IEC 11172-3 §2.4.2.3 `mode`:
+    //  * `1` → `SingleChannel` (`mode = '11'`), 17-byte side info.
+    //  * `2` → `Stereo` (`mode = '00'`), 32-byte side info, two
+    //          independent channels (no joint-stereo coupling this
+    //          round; `mode_extension` stays `'00'`).
+    // Joint-stereo (`mode = '01'`) needs an encoder-side MS / intensity
+    // analysis stage that is out of scope.
+    let mode = match channels {
+        1 => ChannelMode::SingleChannel,
+        2 => ChannelMode::Stereo,
+        _ => {
+            return Err(Error::invalid(format!(
+                "oxideav-mp3: encoder supports 1 or 2 channels (channels={channels})"
+            )));
+        }
+    };
     // Default the bitrate when absent. 128 kbit/s is the standard
     // mono / 44.1 kHz reference; it's a valid entry on the §2.4.2.3
     // ladder for every MPEG-1 sample rate the encoder supports.
@@ -138,6 +153,7 @@ fn make_encoder_inner(
         inner,
         out_params,
         sample_rate,
+        channels as usize,
     )))
 }
 
@@ -156,6 +172,11 @@ pub struct Mp3CoreEncoder {
     inner: Option<Mp3Encoder>,
     output: CodecParameters,
     sample_rate: u32,
+    /// Number of channels in the input PCM the wrapper accepts (`1`
+    /// or `2`). Drives the interleaved-bytes validation in
+    /// [`Mp3CoreEncoder::frame_to_i16`] and is the unit `samples_in`
+    /// counts on (per-channel).
+    channels: usize,
     /// Pending packets carved out of the encoder's flushed byte
     /// stream. Each [`Encoder::receive_packet`] call pops one.
     pending_packets: VecDeque<Packet>,
@@ -176,6 +197,7 @@ impl std::fmt::Debug for Mp3CoreEncoder {
             .field("codec_id", &self.codec_id)
             .field("inner_present", &self.inner.is_some())
             .field("sample_rate", &self.sample_rate)
+            .field("channels", &self.channels)
             .field("pending_packets", &self.pending_packets.len())
             .field("samples_in", &self.samples_in)
             .field("eof", &self.eof)
@@ -189,41 +211,49 @@ impl Mp3CoreEncoder {
         inner: Mp3Encoder,
         output: CodecParameters,
         sample_rate: u32,
+        channels: usize,
     ) -> Self {
         Self {
             codec_id,
             inner: Some(inner),
             output,
             sample_rate,
+            channels,
             pending_packets: VecDeque::new(),
             samples_in: 0,
             eof: false,
         }
     }
 
-    /// Decode an [`AudioFrame`]'s raw bytes into a mono `i16` PCM
-    /// vector. Accepts interleaved S16 (`data.len() == 1`) and
-    /// single-plane planar S16P (`data.len() == 1`, mono is its own
-    /// planar layout). Errors on multi-plane / multi-channel input
-    /// (stereo encode is out of scope for this round).
-    fn frame_to_mono_i16(&self, frame: &AudioFrame) -> Result<Vec<i16>> {
+    /// Decode an [`AudioFrame`]'s raw bytes into the interleaved
+    /// `i16` PCM the underlying [`Mp3Encoder::push_samples`] expects
+    /// (`[L0, R0, L1, R1, …]` for stereo, `[s0, s1, s2, …]` for mono).
+    ///
+    /// Interleaved S16 (`SampleFormat::S16`) carries the LR pairs in a
+    /// single plane (`data.len() == 1`); the raw bytes are already in
+    /// the layout the inner encoder consumes, so this helper just
+    /// validates the plane / byte counts and decodes little-endian
+    /// `i16`. Mono is its own degenerate interleaving (one sample per
+    /// frame position).
+    fn frame_to_i16(&self, frame: &AudioFrame, channels: usize) -> Result<Vec<i16>> {
         let samples = frame.samples as usize;
         if frame.data.len() != 1 {
             return Err(Error::invalid(format!(
-                "oxideav-mp3: encoder expects mono (1 plane), got {} planes",
+                "oxideav-mp3: encoder expects interleaved S16 (1 plane), got {} planes",
                 frame.data.len()
             )));
         }
         let bytes = &frame.data[0];
-        if bytes.len() != samples * 2 {
+        let expected_bytes = samples * channels * 2;
+        if bytes.len() != expected_bytes {
+            let got = bytes.len();
             return Err(Error::invalid(format!(
-                "oxideav-mp3: frame data len {} != {} expected for {samples} mono S16 samples",
-                bytes.len(),
-                samples * 2
+                "oxideav-mp3: frame data len {got} != {expected_bytes} expected for {samples} samples × {channels} ch S16"
             )));
         }
-        let mut out = Vec::with_capacity(samples);
-        for i in 0..samples {
+        let total = samples * channels;
+        let mut out = Vec::with_capacity(total);
+        for i in 0..total {
             let lo = bytes[i * 2];
             let hi = bytes[i * 2 + 1];
             out.push(i16::from_le_bytes([lo, hi]));
@@ -248,7 +278,7 @@ impl Encoder for Mp3CoreEncoder {
         let Frame::Audio(a) = frame else {
             return Err(Error::invalid("oxideav-mp3: encoder requires audio frame"));
         };
-        let pcm = self.frame_to_mono_i16(a)?;
+        let pcm = self.frame_to_i16(a, self.channels)?;
         let inner = self
             .inner
             .as_mut()
@@ -363,10 +393,26 @@ mod tests {
     }
 
     #[test]
-    fn make_encoder_rejects_stereo() {
+    fn make_encoder_accepts_stereo() {
+        // channels == 2 → ChannelMode::Stereo (no joint-stereo
+        // coupling). The wrapper should build successfully and report
+        // `channels = 2` on its output parameters.
         let mut p = CodecParameters::audio(CodecId::new("mp3"));
         p.sample_rate = Some(44_100);
         p.channels = Some(2);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(192_000);
+        let enc = make_encoder(&p).expect("make_encoder stereo");
+        assert_eq!(enc.output_params().channels, Some(2));
+    }
+
+    #[test]
+    fn make_encoder_rejects_more_than_two_channels() {
+        // Joint-stereo / multi-channel modes are out of scope: only
+        // 1 (mono) and 2 (independent stereo) are accepted.
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(3);
         assert!(make_encoder(&p).is_err());
     }
 
@@ -502,6 +548,96 @@ mod tests {
                 .map(|c| c.as_str()),
             Some("mp3"),
         );
+    }
+
+    /// Build interleaved S16 LR bytes for two independent sine tones.
+    fn sine_s16_stereo(
+        n: usize,
+        freq_l: f32,
+        freq_r: f32,
+        sample_rate_hz: f32,
+        amp: f32,
+    ) -> Vec<u8> {
+        let two_pi = 2.0 * std::f32::consts::PI;
+        let scale = amp * (i16::MAX as f32);
+        let mut out = Vec::with_capacity(n * 2 * 2);
+        for i in 0..n {
+            let t = i as f32 / sample_rate_hz;
+            let vl = (two_pi * freq_l * t).sin() * scale;
+            let vr = (two_pi * freq_r * t).sin() * scale;
+            let sl = vl.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            let sr = vr.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            out.extend_from_slice(&sl.to_le_bytes());
+            out.extend_from_slice(&sr.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn stereo_flush_drains_to_complete_mp3_frames() {
+        // Drive ~3 frames of 440/880 Hz LR sine through the stereo
+        // trait wrapper. Every emitted packet must (a) start with the
+        // 12-bit sync, (b) carry `mode = '00'` (stereo) in its
+        // header's byte 3 (mode field is bits 7..6 of byte 3 →
+        // shift-right-6 == 0).
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(2);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(192_000);
+        let mut enc = make_encoder(&p).expect("stereo make_encoder");
+
+        let pcm = sine_s16_stereo(SAMPLES_PER_FRAME_MPEG1 * 3, 440.0, 880.0, 44_100.0, 0.5);
+        let frame = AudioFrame {
+            samples: (SAMPLES_PER_FRAME_MPEG1 * 3) as u32,
+            pts: None,
+            data: vec![pcm],
+        };
+        enc.send_frame(&Frame::Audio(frame)).unwrap();
+        enc.flush().unwrap();
+
+        let mut packets: Vec<Packet> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(pkt) => packets.push(pkt),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(
+            (3..=4).contains(&packets.len()),
+            "unexpected stereo packet count {}",
+            packets.len()
+        );
+        for pkt in &packets {
+            assert!(pkt.data.len() >= 4);
+            assert_eq!(pkt.data[0], 0xFF);
+            assert_eq!(pkt.data[1] & 0xE0, 0xE0);
+            // Header byte 3 layout (§2.4.2.3): bits 7..6 = mode.
+            // Stereo mode '00' → top two bits are zero.
+            assert_eq!(pkt.data[3] & 0xC0, 0x00, "expected stereo mode '00'");
+        }
+    }
+
+    #[test]
+    fn stereo_send_frame_rejects_wrong_byte_count() {
+        // Stereo wrapper expects `samples × 2 × 2` bytes per frame
+        // (LR interleaved S16). Submitting `samples × 2` (the mono
+        // byte count) should error.
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(2);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(192_000);
+        let mut enc = make_encoder(&p).expect("stereo make_encoder");
+        // Pass mono-sized bytes claiming the stereo sample count.
+        let bad = sine_s16(SAMPLES_PER_FRAME_MPEG1, 440.0, 44_100.0, 0.5);
+        let frame = AudioFrame {
+            samples: SAMPLES_PER_FRAME_MPEG1 as u32,
+            pts: None,
+            data: vec![bad],
+        };
+        assert!(enc.send_frame(&Frame::Audio(frame)).is_err());
     }
 
     #[test]

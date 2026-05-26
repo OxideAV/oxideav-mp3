@@ -121,8 +121,11 @@ pub enum StreamEncodeError {
     Huffman(String),
     /// Underlying I/O error from the destination `Write`.
     Io(io::Error),
-    /// Caller chose a stereo / dual-channel mode; this round writes
-    /// mono streams only.
+    /// Caller chose [`ChannelMode::JointStereo`]; this round does not
+    /// implement the joint-stereo MS / intensity coupling on the
+    /// encode side. Use [`ChannelMode::Stereo`] (or
+    /// [`ChannelMode::DualChannel`]) for two-channel content; both
+    /// encode the channels independently and are supported.
     StereoUnsupported,
     /// Caller chose an MPEG-2 LSF sample rate (16 / 22.05 / 24 kHz);
     /// LSF is deferred to a later round.
@@ -153,9 +156,8 @@ impl core::fmt::Display for StreamEncodeError {
             StreamEncodeError::Reservoir(e) => write!(f, "reservoir: {e}"),
             StreamEncodeError::Huffman(e) => write!(f, "huffman emit: {e}"),
             StreamEncodeError::Io(e) => write!(f, "io: {e}"),
-            StreamEncodeError::StereoUnsupported => {
-                f.write_str("only mono streams are supported in this round")
-            }
+            StreamEncodeError::StereoUnsupported => f
+                .write_str("ChannelMode::JointStereo not supported (use Stereo or DualChannel)"),
             StreamEncodeError::LsfUnsupported => {
                 f.write_str("only MPEG-1 sample rates are supported in this round")
             }
@@ -204,14 +206,17 @@ pub struct Mp3Encoder {
     version: MpegVersion,
     nch: usize,
 
-    /// Polyphase analysis shift register (per channel; this round mono
-    /// so length 1).
+    /// Polyphase analysis shift register, one per channel.
     analysis_state: Vec<AnalysisState>,
     /// Per-channel per-subband forward-MDCT overlap state (32 subbands
     /// × `nch` channels).
     mdct_state: Vec<Vec<MdctState>>,
-    /// PCM pending in the current half-frame buffer (mono only).
-    pending_pcm: Vec<f32>,
+    /// PCM pending in the current half-frame buffer, one [`Vec`] per
+    /// channel (length `nch`). Mono encoders carry a single buffer;
+    /// stereo encoders deinterleave the caller's interleaved S16 input
+    /// into the two per-channel buffers in
+    /// [`Mp3Encoder::push_samples`].
+    pending_pcm: Vec<Vec<f32>>,
 
     /// Per-frame assembled output for the deferred reservoir
     /// scheduling pass.
@@ -289,13 +294,35 @@ struct PendingFrame {
 }
 
 impl Mp3Encoder {
-    /// Build a new encoder for the given sample rate + bitrate. Only
-    /// mono streams and MPEG-1 sample rates (32 / 44.1 / 48 kHz) are
-    /// supported in this round.
+    /// Build a new encoder for the given sample rate + bitrate.
+    ///
+    /// Supported channel modes:
+    ///
+    /// * [`ChannelMode::SingleChannel`] — one channel; header
+    ///   `mode = '11'`, side info 17 bytes (MPEG-1).
+    /// * [`ChannelMode::Stereo`] — two independent channels; header
+    ///   `mode = '00'`. Each granule's two channels are encoded
+    ///   independently (no joint-stereo MS / intensity coupling); the
+    ///   header `mode_extension` carries `'00'` per ISO/IEC 11172-3
+    ///   §2.4.2.3. Side info is 32 bytes (MPEG-1).
+    /// * [`ChannelMode::DualChannel`] — two independent channels (e.g.
+    ///   bilingual programmes); header `mode = '10'`. Bitstream layout
+    ///   is identical to `Stereo` from the encoder's standpoint —
+    ///   two channels coded independently with no joint-stereo
+    ///   coupling — so this mode shares the same encode path; the
+    ///   difference is purely the carried mode bit.
+    /// * [`ChannelMode::JointStereo`] is **not** accepted: the joint
+    ///   methods (MS, intensity) require an encoder-side stereo
+    ///   analysis stage that this round does not implement.
+    ///
+    /// Sample rates: 32 / 44.1 / 48 kHz (MPEG-1 only; MPEG-2 / 2.5 LSF
+    /// remains deferred).
     ///
     /// # Errors
     ///
-    /// * [`StreamEncodeError::StereoUnsupported`] for a non-mono mode.
+    /// * [`StreamEncodeError::StereoUnsupported`] for
+    ///   [`ChannelMode::JointStereo`] (the only unsupported mode this
+    ///   round).
     /// * [`StreamEncodeError::LsfUnsupported`] for a non-MPEG-1
     ///   sample rate.
     /// * [`StreamEncodeError::Header`] for a bad bitrate /
@@ -306,7 +333,12 @@ impl Mp3Encoder {
         sample_rate_hz: u32,
         mode: ChannelMode,
     ) -> Result<Self, StreamEncodeError> {
-        if mode != ChannelMode::SingleChannel {
+        // Reject joint-stereo: MS / intensity coupling needs an
+        // encoder-side stereo analysis stage that is out of scope for
+        // this round. Stereo / dual-channel encode each channel
+        // independently, so they share the mono code path with
+        // `nch == 2`.
+        if matches!(mode, ChannelMode::JointStereo) {
             return Err(StreamEncodeError::StereoUnsupported);
         }
         let header_template = make_silent_header(bitrate_kbps, sample_rate_hz, mode)
@@ -319,6 +351,7 @@ impl Mp3Encoder {
         let mdct_state = (0..nch)
             .map(|_| (0..32usize).map(|_| MdctState::new()).collect::<Vec<_>>())
             .collect::<Vec<_>>();
+        let pending_pcm = (0..nch).map(|_| Vec::new()).collect();
         Ok(Mp3Encoder {
             header_template,
             sample_rate_hz,
@@ -326,7 +359,7 @@ impl Mp3Encoder {
             nch,
             analysis_state,
             mdct_state,
-            pending_pcm: Vec::new(),
+            pending_pcm,
             frames: Vec::new(),
             outer_loop_threshold: None,
             xing_template: None,
@@ -494,9 +527,18 @@ impl Mp3Encoder {
         Ok(enc)
     }
 
-    /// Push `n` PCM samples (mono, `i16`). The encoder buffers them
-    /// internally and assembles whole MP3 frames as soon as
-    /// `SAMPLES_PER_FRAME_MPEG1 = 1152` accumulate.
+    /// Push PCM samples (`i16`). For mono encoders the input is a
+    /// straight `[s0, s1, s2, …]` sample stream; for stereo /
+    /// dual-channel encoders the input is **interleaved** LR pairs
+    /// (`[L0, R0, L1, R1, …]`). The encoder splits the interleaved
+    /// stream into its per-channel buffers and assembles whole MP3
+    /// frames as soon as each per-channel buffer has accumulated
+    /// `SAMPLES_PER_FRAME_MPEG1 = 1152` samples.
+    ///
+    /// The interleaved length is therefore expected to be a multiple
+    /// of `nch` (1 for mono, 2 for stereo); a trailing partial pair is
+    /// accepted but the trailing odd sample is dropped at flush time
+    /// to keep the per-channel buffers aligned.
     ///
     /// # Errors
     ///
@@ -505,17 +547,33 @@ impl Mp3Encoder {
     /// [`StreamEncodeError::Huffman`]; bit-budget errors are deferred
     /// until [`Mp3Encoder::finish`]).
     pub fn push_samples(&mut self, samples: &[i16]) -> Result<(), StreamEncodeError> {
-        // Convert i16 → f32 in `[-1.0, 1.0]` range and append to
-        // pending PCM.
+        // Convert i16 → f32 in `[-1.0, 1.0]` range and deinterleave
+        // into the per-channel pending buffers.
         const SCALE: f32 = 1.0 / 32_768.0;
-        self.pending_pcm
-            .extend(samples.iter().map(|&s| f32::from(s) * SCALE));
+        let nch = self.nch;
+        // For mono the deinterleave is the identity (one channel,
+        // one buffer). For stereo (nch == 2) the input is LR-paired;
+        // pair index `i` writes to `pending_pcm[i % nch]`.
+        for (i, &s) in samples.iter().enumerate() {
+            let ch = i % nch;
+            self.pending_pcm[ch].push(f32::from(s) * SCALE);
+        }
 
-        while self.pending_pcm.len() >= SAMPLES_PER_FRAME_MPEG1 {
-            let mut frame_pcm = vec![0.0f32; SAMPLES_PER_FRAME_MPEG1];
-            frame_pcm.copy_from_slice(&self.pending_pcm[..SAMPLES_PER_FRAME_MPEG1]);
-            self.pending_pcm.drain(..SAMPLES_PER_FRAME_MPEG1);
-            self.assemble_frame(&frame_pcm)?;
+        // Assemble frames as long as EVERY channel's pending buffer
+        // holds at least one full granule-frame worth of samples.
+        while self
+            .pending_pcm
+            .iter()
+            .all(|buf| buf.len() >= SAMPLES_PER_FRAME_MPEG1)
+        {
+            let mut per_ch_frame_pcm: Vec<Vec<f32>> = Vec::with_capacity(nch);
+            for buf in self.pending_pcm.iter_mut() {
+                let mut take = vec![0.0f32; SAMPLES_PER_FRAME_MPEG1];
+                take.copy_from_slice(&buf[..SAMPLES_PER_FRAME_MPEG1]);
+                buf.drain(..SAMPLES_PER_FRAME_MPEG1);
+                per_ch_frame_pcm.push(take);
+            }
+            self.assemble_frame(&per_ch_frame_pcm)?;
         }
         Ok(())
     }
@@ -533,16 +591,24 @@ impl Mp3Encoder {
     ///   retry).
     /// * [`StreamEncodeError::Io`] from the sink writes.
     pub fn finish<W: Write>(mut self, sink: &mut W) -> Result<usize, StreamEncodeError> {
-        // Tail-flush: any leftover samples shorter than a full frame
-        // are zero-padded so the last 1152 samples worth of audio are
-        // still emitted.
-        if !self.pending_pcm.is_empty() {
-            let mut tail = vec![0.0f32; SAMPLES_PER_FRAME_MPEG1];
-            for (i, &v) in self.pending_pcm.iter().enumerate() {
-                tail[i] = v;
+        // Tail-flush: any leftover per-channel samples shorter than a
+        // full frame are zero-padded so the last 1152 samples per
+        // channel are still emitted. If any channel has non-empty
+        // pending PCM, every channel emits a (potentially padded)
+        // tail frame so the per-channel buffers stay aligned.
+        let any_pending = self.pending_pcm.iter().any(|b| !b.is_empty());
+        if any_pending {
+            let nch = self.nch;
+            let mut per_ch_tail: Vec<Vec<f32>> = Vec::with_capacity(nch);
+            for buf in self.pending_pcm.iter_mut() {
+                let mut tail = vec![0.0f32; SAMPLES_PER_FRAME_MPEG1];
+                for (i, &v) in buf.iter().enumerate() {
+                    tail[i] = v;
+                }
+                buf.clear();
+                per_ch_tail.push(tail);
             }
-            self.pending_pcm.clear();
-            self.assemble_frame(&tail)?;
+            self.assemble_frame(&per_ch_tail)?;
         }
         self.flush_to(sink)
     }
@@ -585,16 +651,20 @@ impl Mp3Encoder {
             .saturating_sub(16)
     }
 
-    /// Internal: turn `frame_pcm[0..1152]` (mono) into one assembled
-    /// `PendingFrame` and append it to the scheduling queue.
+    /// Internal: turn `per_ch_frame_pcm[ch][0..1152]` (deinterleaved,
+    /// one buffer per channel) into one assembled `PendingFrame` and
+    /// append it to the scheduling queue.
     // The (gr, ch) double-loop mirrors the §2.4.1.7 `main_data()`
     // ordering exactly; the index variables are also used as
     // scratch-array subscripts (`gc_data[gr][ch]`,
     // `side_info.granules[gr][ch]`, etc.), so the explicit `for ch in
     // 0..self.nch` reads more clearly than an iterator chain.
     #[allow(clippy::needless_range_loop)]
-    fn assemble_frame(&mut self, frame_pcm: &[f32]) -> Result<(), StreamEncodeError> {
-        debug_assert_eq!(frame_pcm.len(), SAMPLES_PER_FRAME_MPEG1);
+    fn assemble_frame(&mut self, per_ch_frame_pcm: &[Vec<f32>]) -> Result<(), StreamEncodeError> {
+        debug_assert_eq!(per_ch_frame_pcm.len(), self.nch);
+        for buf in per_ch_frame_pcm.iter() {
+            debug_assert_eq!(buf.len(), SAMPLES_PER_FRAME_MPEG1);
+        }
 
         // ---- Build the side-info skeleton (all-long, zero scalefactors) ----
         let mut side_info = SideInfo {
@@ -616,7 +686,8 @@ impl Mp3Encoder {
         // ---- Per-granule per-channel analysis + quantization ----
         for gr in 0..GRANULES {
             for ch in 0..self.nch {
-                let gr_pcm = &frame_pcm[gr * SAMPLES_PER_GRANULE..(gr + 1) * SAMPLES_PER_GRANULE];
+                let gr_pcm =
+                    &per_ch_frame_pcm[ch][gr * SAMPLES_PER_GRANULE..(gr + 1) * SAMPLES_PER_GRANULE];
                 let mut pcm_arr = [0.0f32; SAMPLES_PER_GRANULE];
                 pcm_arr.copy_from_slice(gr_pcm);
 

@@ -749,9 +749,11 @@ roundtrips at ~86 dB matching the fixed-gain baseline. The fixed-gain
 The `codec_encoder` module ships **Phase 2 step 12** — the
 runtime-context `oxideav_core::Encoder` trait wiring on top of
 `Mp3Encoder`. `Mp3CoreEncoder` is a frame-to-packet adaptor:
-`send_frame` accepts mono S16 PCM, `flush()` runs the bit-reservoir
-schedule, and `receive_packet` drains one MP3 frame at a time (PTS and
-duration stamped in `1 / sample_rate` units). Two direct factories —
+`send_frame` accepts mono or independent-stereo S16 PCM (`channels =
+1` or `2`; the stereo path was widened in Phase 2 step 16),
+`flush()` runs the bit-reservoir schedule, and `receive_packet`
+drains one MP3 frame at a time (PTS and duration stamped in
+`1 / sample_rate` units). Two direct factories —
 `codec_encoder::make_encoder` (fixed-gain) and
 `codec_encoder::make_encoder_with_outer_loop` (distortion-control
 loop) — match the `oxideav-core` `EncoderFactory` signature.
@@ -869,19 +871,51 @@ round-trip the decoder transparently. Validated by `crc_roundtrip.rs`
 (3 integration tests) + 6 unit tests on the CRC primitive + 4 unit
 tests on the encoder toggle.
 
+**Phase 2 step 16 (stereo through the encoder trait)** widens
+`Mp3Encoder::new` to accept `ChannelMode::Stereo` and
+`ChannelMode::DualChannel` and routes the existing per-channel
+filterbank + MDCT + quantizer + Huffman pipeline through `nch == 2`
+unchanged. The two channels are encoded **independently**: header
+`mode = '00'` (or `'10'` for dual-channel), `mode_extension = '00'`
+(neither MS nor intensity), 32-byte MPEG-1 side-info block, and the
+§2.4.1.7 `main_data()` loop walks `for (gr=0..2) for (ch=0..nch)`
+emitting each granule-channel's part2 + part3 independently. The
+upstream `pending_pcm` field becomes a `Vec<Vec<f32>>` (one PCM
+buffer per channel); `push_samples` deinterleaves the caller's
+`[L0, R0, L1, R1, …]` interleaved S16 input into the per-channel
+buffers and assembles a frame as soon as both channels carry a full
+1152-sample granule pair. The same widening lands in the
+`oxideav_core::Encoder` trait wrapper: `codec_encoder::make_encoder`
+now maps `params.channels = 2` → `ChannelMode::Stereo`, and the
+`Mp3CoreEncoder::frame_to_i16` adapter validates `samples × channels
+× 2` bytes per `AudioFrame`. `ChannelMode::JointStereo` remains
+rejected (MS / intensity coupling on the encode side requires an
+encoder-side stereo analysis stage — out of scope this round; the
+decoder's `process_stereo` primitive already handles both methods
+for incoming joint-stereo bitstreams). Validated by
+`tests/stereo_encoder_roundtrip.rs`: a 1 s 440 Hz / 880 Hz LR sine
+encoded at 192 kbit/s and round-tripped through the in-tree decoder
+produces **per-channel PSNR L = 85.1 dB / R = 80.4 dB** (the L
+channel matches the mono ~86 dB baseline; the R channel sits within
+a few dB of it under the same fixed-gain inner-loop budget). A
+single-bin DFT probe confirms zero cross-channel leakage (L energy
+at 440 Hz is ~1250× the L energy at 880 Hz, and symmetrically for R)
+— the two channels round-trip as fully independent signals through
+the encoder.
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), preemphasis (§C.1.5.4.3.4) and `scalefac_scale = 1`
-escalation, short / mixed block-type switching, stereo / LSF encode,
-stereo / LSF decode through the trait wrapper — is still a later
-round.
+escalation, short / mixed block-type switching, joint-stereo (MS /
+intensity) encode, LSF encode, stereo / LSF decode through the trait
+wrapper — is still a later round.
 
 ### Not yet implemented
 
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–15 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–16 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -891,11 +925,12 @@ scheduling with `main_data_begin > 0` + stream-level PCM → MP3 driver
 + §C.1.5.4.3 outer (distortion-control) loop + `oxideav_core::Encoder`
 trait wiring + opt-in Xing / Info VBR information-frame emission +
 true-VBR per-frame bitrate + Xing TOC auto-fill + opt-in §2.4.3.1
-CRC-16 frame protection)** — it still lacks the psychoacoustic model
-(so the outer loop's `xmin(sb)` is a uniform constant rather than
-per-band masking-aware), preemphasis / `scalefac_scale = 1`
-escalation, short / mixed block-type switching, and stereo / LSF
-encode.
+CRC-16 frame protection + independent-stereo (`ChannelMode::Stereo` /
+`ChannelMode::DualChannel`) encode through the trait wrapper)** — it
+still lacks the psychoacoustic model (so the outer loop's `xmin(sb)` is
+a uniform constant rather than per-band masking-aware), preemphasis /
+`scalefac_scale = 1` escalation, short / mixed block-type switching,
+joint-stereo (MS / intensity) encode, and LSF encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
