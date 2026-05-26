@@ -292,11 +292,24 @@
 //! container demuxer AND both codec factories (encoder + decoder) on a
 //! single `CodecInfo` registration.
 //!
+//! The [`xing_info`] module adds the encoder-side **Xing / Info VBR
+//! information-frame** emission (Phase 2 step 13) — the inverse of
+//! [`demuxer::parse_xing_info`]. [`xing_info::XingTagSpec`] and
+//! [`xing_info::build_xing_info_payload`] write the magic + flag word
+//! together with up to four optional fields (`frames`, `bytes`,
+//! `toc[100]`, `quality`); [`xing_info::build_info_frame`] bakes the
+//! payload into a complete CBR carrier frame (a silent Layer III frame
+//! whose main-data slot starts with the magic).
+//! [`Mp3Encoder::enable_xing_info`] is the opt-in toggle that prepends
+//! the carrier as the first frame of the [`Mp3Encoder::finish`]
+//! output, filling in `frames` / `bytes` from post-encode totals when
+//! the corresponding flag bit is set and the template field is `None`.
+//!
 //! The remaining Phase 2 work — the psychoacoustic model (so the
 //! threshold is per-band tonality-aware), scalefactor estimation
 //! (preemphasis / `scalefac_scale = 1` escalation), short / mixed
 //! block-type switching, stereo / LSF / VBR decode, and stereo / LSF /
-//! VBR encode — is still a later round.
+//! true-VBR encode — is still a later round.
 //!
 //! [`Encoder`]: oxideav_core::Encoder
 //!
@@ -328,6 +341,7 @@ pub mod side_info;
 pub mod stereo;
 pub mod stream_encoder;
 pub mod synth;
+pub mod xing_info;
 
 pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
 pub use analysis::{analyze_granule, analyze_row, m_coefficient, AnalysisState, C_TABLE, X_LEN};
@@ -386,6 +400,10 @@ pub use stream_encoder::{
     Mp3Encoder, StreamEncodeError, SAMPLES_PER_FRAME_MPEG1, SAMPLES_PER_GRANULE,
 };
 pub use synth::{n_coefficient, synth_granule, synth_row, SynthState, D_TABLE, PCM_PER_GRANULE};
+pub use xing_info::{
+    build_info_frame, build_xing_info_payload, flag_bit as xing_flag_bit, XingEmitError,
+    XingTagSpec, MAX_PAYLOAD_BYTES as XING_MAX_PAYLOAD_BYTES,
+};
 
 use oxideav_core::RuntimeContext;
 

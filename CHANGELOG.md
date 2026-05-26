@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `xing_info` module — encoder-side inverse of
+  `demuxer::parse_xing_info`. `XingTagSpec` specifies a Xing / Info
+  VBR-information-frame payload (magic + flag word + up to four
+  optional fields: `frames`, `bytes`, `toc[100]`, `quality`);
+  `build_xing_info_payload` writes the byte run that goes immediately
+  after the side-info bytes of an MPEG audio frame, in increasing
+  flag-bit order (the exact order `parse_xing_info` consumes them on
+  the reader side). `build_info_frame` bakes the payload into a
+  complete on-wire CBR **carrier** frame — a silent Layer III frame
+  (every `part2_3_length == 0`, `big_values == 0`) whose main-data
+  slot starts with the Xing / Info magic + flagged fields. Layout
+  verified against `docs/audio/mp3/fixtures/layer3-with-xing-vbri-tag/`
+  + `layer3-with-id3v2-tag/` fixtures + `trace.txt` and the symmetric
+  `parse_xing_info` reader (13 unit tests). Decoders that ignore the
+  tag still see a structurally valid silent leading frame.
+- `Mp3Encoder::enable_xing_info(template)` — opt-in toggle that
+  prepends a Xing / Info carrier frame to `finish`'s output. The
+  template carries the magic + flag word + any pre-known optional
+  fields; `finish` fills in `frames` / `bytes` from the post-encode
+  totals when those flag bits are set and the template field is
+  `None`. The carrier itself is not counted in either total — both
+  refer to the audio region that follows, matching the demuxer's
+  first-frame-skip path. Pre-filled template fields are written
+  verbatim (the encoder never overwrites a `Some(_)`).
+- `tests/xing_info_roundtrip.rs` integration suite (7 tests): the
+  carrier is the first frame, carries the right magic at the expected
+  offset (4 bytes header + side-info bytes), `parse_xing_info`
+  recovers the writer's intent field-for-field (both `Xing` and
+  `Info` magic), the encoder's `bytes` accounting agrees with
+  `FrameWalker` re-counting the audio region (including padded
+  frames), pre-filled template fields are written verbatim,
+  `Mp3Demuxer::open` reports the same Xing tag on the in-memory
+  stream, and the carrier-without-template path produces an
+  audio-only stream identical to the prior r141 behaviour (no Xing
+  magic anywhere in the leading frame).
+- Public re-exports in `lib.rs`: `build_info_frame`,
+  `build_xing_info_payload`, `XingTagSpec`, `XingEmitError`,
+  `xing_flag_bit` (the `flag_bit::{FRAMES, BYTES, TOC, QUALITY,
+  ALL_FOUR}` module), `XING_MAX_PAYLOAD_BYTES`.
+
 - `codec_decoder` module — the symmetric counterpart to the r140
   `codec_encoder` wiring: `Mp3CoreDecoder` implements
   `oxideav_core::Decoder` for mono MPEG-1 Layer III, parsing each

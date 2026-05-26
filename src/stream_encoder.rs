@@ -44,9 +44,13 @@
 //! # What this module deliberately does **not** do
 //!
 //! No psychoacoustic model, no outer noise-shaping loop, no stereo (LSF
-//! / joint), no VBR, no Xing/Info VBR tag, no ID3v2 frontmatter, no
-//! short-block / mixed-block window switching, no CRC. All deferred to
-//! later rounds.
+//! / joint), no VBR, no ID3v2 frontmatter, no short-block /
+//! mixed-block window switching, no CRC. All deferred to later rounds.
+//!
+//! Xing / Info VBR-info frame emission is **opt-in** as of round 142:
+//! call [`Mp3Encoder::enable_xing_info`] before [`Mp3Encoder::finish`]
+//! to prepend one carrier frame with the magic + per-stream totals to
+//! the on-wire output. See [`crate::xing_info`] for layout details.
 
 use std::io::{self, Write};
 
@@ -183,6 +187,20 @@ pub struct Mp3Encoder {
     /// the uniform `xmin[sb]` threshold applied to every long-block
     /// scalefactor band.
     outer_loop_threshold: Option<f64>,
+
+    /// When `Some`, [`Mp3Encoder::finish`] prepends a Xing / Info VBR
+    /// information frame ([`crate::xing_info::build_info_frame`]) to
+    /// the on-wire output. The carrier is a silent Layer III frame
+    /// whose main-data slot starts with the Xing / Info magic plus the
+    /// flagged fields. Two of those fields — `frames` and `bytes` —
+    /// can only be known after the rest of the stream is encoded, so
+    /// this struct stores the **template** spec and the writer fills
+    /// in the post-encode totals at `finish` time when the
+    /// corresponding flag bits are set and the template field is
+    /// `None`. A caller that already knows the totals (e.g. by
+    /// pre-counting samples) can supply them in the spec and the
+    /// writer will use them verbatim.
+    xing_template: Option<crate::xing_info::XingTagSpec>,
 }
 
 #[derive(Debug)]
@@ -233,7 +251,48 @@ impl Mp3Encoder {
             pending_pcm: Vec::new(),
             frames: Vec::new(),
             outer_loop_threshold: None,
+            xing_template: None,
         })
+    }
+
+    /// Enable Xing / Info VBR information-frame emission.
+    ///
+    /// When set, [`Mp3Encoder::finish`] prepends a Xing / Info carrier
+    /// frame (one §2.4.2.3 silent Layer III frame) to the output, with
+    /// the magic + flagged fields written into the carrier's main-data
+    /// slot per [`crate::xing_info::build_info_frame`]. The carrier
+    /// frame is sized identically to one regular CBR audio frame at
+    /// this encoder's configured bitrate / sample rate.
+    ///
+    /// The `template` carries the Xing / Info magic, the flag word, and
+    /// any pre-known optional fields. Two fields — `frames` and `bytes`
+    /// — are typically not known until the rest of the stream is
+    /// encoded:
+    ///
+    /// * If the corresponding flag bit
+    ///   ([`crate::xing_info::flag_bit::FRAMES`] /
+    ///   [`crate::xing_info::flag_bit::BYTES`]) is set **and** the
+    ///   template's field is `None`, [`Mp3Encoder::finish`] computes
+    ///   the field at flush time (frame count = number of audio frames
+    ///   following the carrier; byte count = total bytes of audio
+    ///   following the carrier).
+    /// * If the field is already `Some(_)` in the template, the
+    ///   provided value is written verbatim.
+    /// * If the flag bit is clear, the field is omitted regardless of
+    ///   the template's value (the
+    ///   [`crate::xing_info::build_xing_info_payload`] flag/field
+    ///   consistency check still applies — the template's optional
+    ///   fields must match its flag bits).
+    ///
+    /// The `toc` / `quality` fields, when flagged, must already be
+    /// populated on the template; the encoder does not synthesise a
+    /// seek table or a quality score.
+    ///
+    /// Typical recipe: pass an "Info" template (CBR seeker-compatible
+    /// shape) with `flags = FRAMES | BYTES` and the two `Option`s
+    /// `None`. The encoder fills both in at flush time.
+    pub fn enable_xing_info(&mut self, template: crate::xing_info::XingTagSpec) {
+        self.xing_template = Some(template);
     }
 
     /// Build an encoder identical to [`Mp3Encoder::new`] but with the
@@ -592,10 +651,12 @@ impl Mp3Encoder {
 
     /// Internal: run the reservoir scheduler over every buffered frame
     /// and write the resulting on-wire byte sequence to `sink`.
-    fn flush_to<W: Write>(self, sink: &mut W) -> Result<usize, StreamEncodeError> {
+    fn flush_to<W: Write>(mut self, sink: &mut W) -> Result<usize, StreamEncodeError> {
         if self.frames.is_empty() {
             return Ok(0);
         }
+        // Pull the Xing template out before consuming `self.frames`.
+        let xing_template = self.xing_template.take();
 
         // Step 1: pick per-frame padding to absorb fractional bytes,
         // and compute each frame's main-data slot capacity.
@@ -690,9 +751,63 @@ impl Mp3Encoder {
         let scheduled = schedule_reservoir(&res_frames, &mut side_infos)
             .map_err(StreamEncodeError::Reservoir)?;
 
-        // Step 3: emit each frame as header (4 bytes) + side_info
-        // (`si_bytes` bytes) + slot (variable bytes).
+        // Pre-compute the audio totals BEFORE emission so the Xing
+        // carrier frame (if any) can carry frame-count / byte-count
+        // fields whose values describe the audio region the demuxer
+        // sees after the carrier.
+        let audio_frame_count = scheduled.len() as u32;
+        let mut audio_total_bytes: u64 = 0;
+        for (i, sch) in scheduled.iter().enumerate() {
+            // frame_len = 4 (header) + si_bytes + slot.len() per
+            // construction; computing it from frame_lens[i] is the
+            // same arithmetic.
+            let _ = i; // unused but kept for parity with the emission loop.
+            audio_total_bytes += 4 + si_bytes as u64 + sch.slot.len() as u64;
+        }
+        let audio_total_bytes_u32: u32 = audio_total_bytes.try_into().unwrap_or(u32::MAX);
+
+        // Step 3a: optional Xing / Info carrier frame.
+        //
+        // Inserted as the FIRST frame of the output. It is a silent
+        // Layer III frame sized to the unpadded base CBR frame length
+        // (so consumer demuxers and seekers see a regular leading
+        // frame), with the Xing / Info magic + flagged fields patched
+        // over the leading bytes of its main-data slot. The carrier
+        // frame is itself NOT counted in `frames` / `bytes` (those
+        // refer to the audio region that follows, per the symmetric
+        // [`crate::demuxer::parse_xing_info`] reader on the demuxer's
+        // first-frame skip path).
         let mut written = 0usize;
+        if let Some(template) = xing_template {
+            use crate::xing_info::{build_info_frame, flag_bit, XingTagSpec};
+            // Fill in unresolved frames / bytes fields per the flag
+            // bits. Pre-set fields take precedence.
+            let mut spec = XingTagSpec {
+                id: template.id,
+                flags: template.flags,
+                frames: template.frames,
+                bytes: template.bytes,
+                toc: template.toc,
+                quality: template.quality,
+            };
+            if spec.flags & flag_bit::FRAMES != 0 && spec.frames.is_none() {
+                spec.frames = Some(audio_frame_count);
+            }
+            if spec.flags & flag_bit::BYTES != 0 && spec.bytes.is_none() {
+                spec.bytes = Some(audio_total_bytes_u32);
+            }
+            // Carrier header: same as the audio header template but
+            // unpadded (so its size equals the base CBR frame length).
+            let mut carrier_hdr = self.header_template;
+            carrier_hdr.padding = false;
+            let carrier = build_info_frame(&carrier_hdr, &spec)
+                .map_err(|e| StreamEncodeError::Huffman(e.to_string()))?;
+            sink.write_all(&carrier)?;
+            written += carrier.len();
+        }
+
+        // Step 3b: emit each audio frame as header (4 bytes) +
+        // side_info (`si_bytes` bytes) + slot (variable bytes).
         for (i, sch) in scheduled.iter().enumerate() {
             let hbytes = write_header(&headers[i]);
             sink.write_all(&hbytes)?;

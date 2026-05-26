@@ -782,6 +782,38 @@ same input bytes (sample-for-sample match), and 250 ms of sine yields
 the expected count of `AudioFrame`s with 1152 samples/channel and
 monotonic PTS.
 
+The `xing_info` module ships **Phase 2 step 13** — the encode-side
+inverse of the demuxer's existing `parse_xing_info`. `XingTagSpec`
+specifies a Xing / Info VBR information-frame payload (magic + flag
+word + up to four optional fields: `frames`, `bytes`, `toc[100]`,
+`quality`); `build_xing_info_payload` writes the byte run that goes
+immediately after the side-info bytes of an MPEG audio frame; and
+`build_info_frame` bakes the payload into a complete on-wire CBR
+carrier frame (a silent Layer III frame whose main-data slot starts
+with the Xing/Info magic and trails zero-fill out to
+`Mp3FrameHeader::frame_len`). The carrier is a structurally-valid
+Layer III frame — `part2_3_length == 0` and `big_values == 0` on
+every granule-channel — so decoders that ignore the tag still see a
+valid silent leading frame and reconstruct silence from it. Layout
+verified against the on-disk `docs/audio/mp3/fixtures/layer3-with-xing-vbri-tag/`
++ `layer3-with-id3v2-tag/` fixtures + `trace.txt` and the symmetric
+`parse_xing_info` reader.
+
+The `Mp3Encoder` ships an opt-in `enable_xing_info(template)` method
+that prepends the carrier frame to its `finish` output. The template
+carries the magic + flag word + any pre-known fields; `finish` fills
+in `frames` / `bytes` from the post-encode totals when those flag
+bits are set and the template field is `None`. The carrier itself is
+not counted in either total — both refer to the audio region that
+follows, matching the demuxer's first-frame-skip behaviour. Validated
+end-to-end by `tests/xing_info_roundtrip.rs` (7 tests): the carrier
+is the first frame, it carries the right magic at the expected
+offset, `parse_xing_info` recovers the writer's intent field-for-field
+(both `Xing` and `Info` magic), the encoder's `bytes` accounting
+agrees with `FrameWalker` re-counting the audio region, pre-filled
+template fields are written verbatim, and `Mp3Demuxer::open` reports
+the same Xing tag on the in-memory stream.
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
 constant), preemphasis (§C.1.5.4.3.4) and `scalefac_scale = 1`
@@ -794,7 +826,7 @@ later round.
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–11 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–13 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -802,10 +834,11 @@ primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
 §2.4.1.7 main-data assembly + §2.4.2.7 cross-frame bit-reservoir
 scheduling with `main_data_begin > 0` + stream-level PCM → MP3 driver
 + §C.1.5.4.3 outer (distortion-control) loop + `oxideav_core::Encoder`
-trait wiring)** — it still lacks the psychoacoustic model (so the
-outer loop's `xmin(sb)` is a uniform constant rather than per-band
-masking-aware), preemphasis / `scalefac_scale = 1` escalation, short /
-mixed block-type switching, and stereo / LSF / VBR encode.
+trait wiring + opt-in Xing / Info VBR information-frame emission)** —
+it still lacks the psychoacoustic model (so the outer loop's
+`xmin(sb)` is a uniform constant rather than per-band masking-aware),
+preemphasis / `scalefac_scale = 1` escalation, short / mixed
+block-type switching, and stereo / LSF / true-VBR encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
