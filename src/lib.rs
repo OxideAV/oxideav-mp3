@@ -259,6 +259,22 @@
 //! ("psychoacoustic model deferred"). [`Mp3Encoder::new_with_outer_loop`]
 //! routes the stream encoder through the outer loop with the
 //! corresponding fixed `scalefac_compress = 15` (`slen1=4`, `slen2=3`).
+//! As of round 147 the loop also implements §C.1.5.4.3's
+//! **`scalefac_scale` escalation** ("If after some iterations the
+//! maximum length of the scalefactors would be exceeded … then
+//! scalefac-scale is increased to the value 1 thus increasing the
+//! possible dynamic range of the scalefactors. In this case the actual
+//! scalefactors and frequency lines have to be corrected accordingly"):
+//! when an amp step would push a band past its §C.1.5.4.3.6 cap and
+//! `scalefac_scale` is still 0, the loop switches to `scalefac_scale =
+//! 1` (multiplier 1.0 instead of 0.5, twice the per-step boost) AND
+//! halves every in-progress per-band scalefactor (rounded), preserving
+//! the colouring factor `2^(mult·sf)` across the switch; the
+//! `amplified[]` tracker resets and the loop continues. The escalation
+//! fires at most once; the chosen `scalefac_scale` is surfaced on
+//! [`outer_loop::OuterLoopResult`] and propagated by the stream encoder
+//! into the granule-channel's side-info bit so the decoder applies the
+//! matching multiplier.
 //!
 //! The [`codec_encoder`] module adds Phase 2 step 12: the
 //! runtime-context [`Encoder`] trait wiring on top of [`Mp3Encoder`].
@@ -321,9 +337,9 @@
 //!
 //! The remaining Phase 2 work — the psychoacoustic model (so the
 //! threshold is per-band tonality-aware), scalefactor estimation
-//! (preemphasis / `scalefac_scale = 1` escalation), short / mixed
-//! block-type switching, stereo / LSF / VBR decode, and stereo / LSF /
-//! true-VBR encode — is still a later round.
+//! (preemphasis amplification, intensity-stereo encode), short / mixed
+//! block-type switching, LSF / VBR decode, and LSF / true-VBR encode —
+//! is still a later round.
 //!
 //! [`Encoder`]: oxideav_core::Encoder
 //!

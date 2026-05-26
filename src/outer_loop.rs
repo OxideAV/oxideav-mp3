@@ -60,12 +60,24 @@
 //!   scalefactor bands" exceeding threshold after the first inner pass;
 //!   we leave `preflag = false` so the band-by-band amplification is the
 //!   only noise-shaping lever.
-//! * **No `scalefac_scale = 1` escalation.** The spec allows raising
-//!   `scalefac_scale` to 1 when the scalefactor range overflows; this
-//!   round terminates instead. With `scalefac_compress = 15` and
-//!   `scalefac_scale = 0` (our choice) the dynamic range is the spec's
-//!   smallest, which is conservative — the outer loop saturates earlier
-//!   than a real encoder would.
+//! * **`scalefac_scale = 1` escalation** (round 147): when an
+//!   amplification step would push a band's scalefactor past its
+//!   §C.1.5.4.3.6 cap (15 for `sfb ∈ [0, 10]`, 7 for `sfb ∈ [11, 20]`)
+//!   AND the loop is still in `scalefac_scale = 0` mode, the loop
+//!   escalates to `scalefac_scale = 1` per §C.1.5.4.3 ("If after some
+//!   iterations the maximum length of the scalefactors would be
+//!   exceeded … then scalefac-scale is increased to the value 1 thus
+//!   increasing the possible dynamic range of the scalefactors. In this
+//!   case the actual scalefactors and frequency lines have to be
+//!   corrected accordingly"). The escalation halves every in-progress
+//!   per-band scalefactor (round-to-nearest) so that the per-band
+//!   colouring factor `2^(mult·scalefac(sb))` is preserved across the
+//!   scale switch (mult doubles from 0.5 to 1.0; halving sf keeps the
+//!   product unchanged), then resets the per-band `amplified[]` flags
+//!   and resumes the loop. Each subsequent §C.1.5.4.3.5 amplification
+//!   step is then worth 2× as much energy boost. Only one escalation
+//!   ever fires (the spec sets only two distinct `scalefac_scale`
+//!   values).
 //!
 //! No external implementation was consulted; every rule is taken from
 //! the §C.1.5.4.3 / §C.1.5.4.3.x text and Figure C.9.b.
@@ -138,6 +150,14 @@ pub struct OuterLoopResult {
     /// The chosen `is[576]` quantized buffer matching the returned
     /// `scalefactors` + `global_gain`.
     pub is: [i32; NUM_LINES],
+    /// `scalefac_scale` flag (§2.4.2.7): `false` ⇒ multiplier 0.5
+    /// (√2 per scalefactor step); `true` ⇒ multiplier 1.0 (2× per step,
+    /// twice the dynamic range). The §C.1.5.4.3 outer loop sets this to
+    /// `true` when the scalefactor-cap would otherwise terminate the
+    /// loop and additional dynamic range is available. The caller MUST
+    /// propagate this into the granule-channel's `scalefac_scale` bit
+    /// before re-quantizing or writing the side-info.
+    pub scalefac_scale: bool,
     /// Iteration accounting.
     pub stats: OuterLoopStats,
 }
@@ -256,15 +276,22 @@ pub fn outer_loop_search_long(
     // §C.1.5.4.2.1: init scalefactors to zero, preflag off, scalefac_scale 0.
     let mut sf = ScaleFactors::default();
     let mut amplified = [false; LONG_SFB];
+    // §C.1.5.4.3 escalation state. The spec mandates starting at
+    // scalefac_scale = 0 and escalating to 1 at most once when the cap
+    // would terminate the loop.
+    let mut scalefac_scale = false;
+    let mut escalated_once = false;
 
     // Saved last-good state. The spec saves scalefactors BEFORE each
     // amplification, so that if the next iteration trips a termination
     // condition the encoder transmits the previous (in-range) state.
     let mut last_good_sf = sf;
+    let mut last_good_scale = scalefac_scale;
     let mut last_good_inner = run_inner(
         xr,
         gc_template,
         &sf,
+        scalefac_scale,
         sample_rate_hz,
         version,
         per_gc_bit_budget,
@@ -280,6 +307,7 @@ pub fn outer_loop_search_long(
             xr,
             gc_template,
             &sf,
+            scalefac_scale,
             sample_rate_hz,
             version,
             per_gc_bit_budget,
@@ -290,7 +318,7 @@ pub fn outer_loop_search_long(
         gc_full.global_gain = inner.global_gain;
         gc_full.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
         gc_full.preflag = false;
-        gc_full.scalefac_scale = false;
+        gc_full.scalefac_scale = scalefac_scale;
         let xr_back = requantize(&inner.is, &gc_full, &sf, sample_rate_hz, version);
         let xfsf = band_distortion_long(
             xr,
@@ -320,13 +348,47 @@ pub fn outer_loop_search_long(
             // The CURRENT sf + inner is the keep-state.
             converged = true;
             last_good_sf = sf;
+            last_good_scale = scalefac_scale;
             last_good_inner = inner;
             break;
+        }
+        if would_exceed_cap && !escalated_once {
+            // §C.1.5.4.3 escalation: switch to scalefac_scale = 1 so the
+            // dynamic range doubles. The coloring factor is
+            //   2^(mult·sf)
+            // with mult = 0.5 (scale = 0) → 1.0 (scale = 1). To preserve
+            // the *current* coloured spectrum across the switch ("the
+            // actual scalefactors and frequency lines have to be
+            // corrected accordingly"), halve every in-progress per-band
+            // scalefactor (round-to-nearest: (x + 1) / 2 with integer
+            // arithmetic). After this:
+            //   * the next §C.1.5.4.3.5 amplification step is worth 2×
+            //     as much energy boost,
+            //   * the cap headroom is restored (a halved 15 ⇒ 8 leaves
+            //     room for 7 more amp steps, each twice as strong).
+            // The "amplified" tracker is reset because the new step is
+            // a different quantity and the loop's "every band amplified"
+            // termination should re-arm against the larger steps.
+            // last_good_* are NOT updated here: they already represent
+            // the best in-range state under the previous scale and
+            // remain a valid fallback if the rest of the loop trips.
+            scalefac_scale = true;
+            escalated_once = true;
+            for v in sf.long.iter_mut() {
+                // Round-to-nearest halving: (x + 1) / 2 expressed via
+                // `div_ceil(x, 2)` for clippy's manual_div_ceil lint.
+                *v = (*v).div_ceil(2);
+            }
+            amplified = [false; LONG_SFB];
+            iterations += 1;
+            continue;
         }
         if would_exceed_cap || amplified.iter().all(|&a| a) || iterations >= max_iter {
             // Any of the three §C.1.5.4.3.6 termination conditions:
             //   (a) all bands already amplified
             //   (b) amplification of any band would exceed upper limit
+            //       (after escalation has already fired, or in any
+            //       short-block / mixed path that lacks escalation)
             //   (c) defensive iteration cap
             // The spec instructs to restore the saved (last-good) state,
             // which is what last_good_sf / last_good_inner already hold.
@@ -336,6 +398,7 @@ pub fn outer_loop_search_long(
 
         // Save current state as the new last-good before amplifying.
         last_good_sf = sf;
+        last_good_scale = scalefac_scale;
         last_good_inner = inner;
 
         // §C.1.5.4.3.5: amplify the offending bands by one step each.
@@ -358,6 +421,7 @@ pub fn outer_loop_search_long(
         scalefactors: last_good_sf,
         global_gain: last_good_inner.global_gain,
         is: last_good_inner.is,
+        scalefac_scale: last_good_scale,
         stats: OuterLoopStats {
             iterations,
             bands_amplified: bands_amplified_total,
@@ -378,6 +442,7 @@ fn run_inner(
     xr: &[f32; NUM_LINES],
     gc_template: &GranuleChannel,
     sf: &ScaleFactors,
+    scalefac_scale: bool,
     sample_rate_hz: u32,
     version: MpegVersion,
     per_gc_bit_budget: u64,
@@ -385,7 +450,7 @@ fn run_inner(
     let mut gc = *gc_template;
     gc.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
     gc.preflag = false;
-    gc.scalefac_scale = false;
+    gc.scalefac_scale = scalefac_scale;
     let res_budget = search_bit_budget(xr, &gc, sf, sample_rate_hz, version, per_gc_bit_budget);
     let res_clamp = search_magnitude_clamp(xr, &gc, sf, sample_rate_hz, version);
     let gg = res_budget.global_gain.max(res_clamp.global_gain);
@@ -498,6 +563,126 @@ mod tests {
     }
 
     #[test]
+    fn outer_loop_does_not_escalate_when_threshold_easily_met() {
+        // A high threshold lets the loop converge on the very first
+        // pass — no amplification, no escalation, scalefac_scale stays
+        // false. This pins the §C.1.5.4.3 default behaviour: escalation
+        // is conditional on the cap being hit, not the default state.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.013).sin() * 100.0;
+        }
+        let gc = long_template();
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, 1.0e30, 64);
+        assert!(res.stats.converged);
+        assert_eq!(res.stats.bands_amplified, 0);
+        assert!(
+            !res.scalefac_scale,
+            "loop must not escalate scalefac_scale when no band exceeds threshold",
+        );
+    }
+
+    #[test]
+    fn outer_loop_escalates_scalefac_scale_when_cap_would_terminate() {
+        // The §C.1.5.4.3 escalation path is exercised by a fixture that
+        // (a) puts non-trivial energy ONLY in a single high-band (so
+        // only that band exceeds threshold and the "all bands
+        // amplified" termination cannot fire), and (b) drives that
+        // band's per-iteration amplification past its §C.1.5.4.3.6 cap
+        // (7 for sfb 11..=20). With every other band quiet
+        // (distortion = 0), the amplified[] tracker only ever flips for
+        // the one over-threshold band; the only termination path
+        // reachable is "amplification of this band would exceed cap" →
+        // the new code-path enters the §C.1.5.4.3 escalation.
+        //
+        // 44.1 kHz long-band sfb 19 covers lines [464, 540) per Table
+        // 3-B.8. Plant several non-quantum-friendly values in that
+        // range so quantization introduces residual error, then
+        // calibrate the threshold to a tiny fraction of the baseline
+        // distortion. This guarantees sfb 19 is always over-threshold
+        // through every amp step until its cap (7) fires.
+        let mut xr = [0.0f32; NUM_LINES];
+        // Fill a single high-band (sfb 19 at 44.1 kHz covers lines
+        // [288, 342) per Table 3-B.8b) with broadband high-energy data
+        // so the inner loop must use a coarse global_gain to fit the
+        // budget — guaranteeing non-trivial post-quantization residual
+        // in that band.
+        for (offset, slot) in xr[288..342].iter_mut().enumerate() {
+            *slot = 1000.0 + (offset as f32) * 13.7;
+        }
+        let gc = long_template();
+
+        // Calibrate threshold to baseline sfb-19 distortion / a big
+        // factor so each amp step (which shrinks distortion by ~2× per
+        // √2 boost) still leaves sfb 19 above threshold for at least 7
+        // cycles. Other bands have zero baseline distortion, so they
+        // never amplify (only sfb 19 is ever over threshold).
+        let baseline_sf = ScaleFactors::default();
+        let baseline = run_inner(
+            &xr,
+            &gc,
+            &baseline_sf,
+            false,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+        );
+        let mut gc_b = gc;
+        gc_b.global_gain = baseline.global_gain;
+        let xr_back_b = requantize(
+            &baseline.is,
+            &gc_b,
+            &baseline_sf,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        let d_b = band_distortion_long(
+            &xr,
+            &xr_back_b,
+            &baseline_sf,
+            false,
+            44_100,
+            MpegVersion::Mpeg1,
+        );
+        // sfb 19 must carry the lion's share of the baseline distortion
+        // — otherwise the fixture isn't isolating the high band.
+        assert!(
+            d_b[19] > 1.0e-4,
+            "fixture failed to load distortion into sfb 19 (d_b[19]={})",
+            d_b[19],
+        );
+        // Threshold tiny relative to baseline so sfb 19 stays
+        // over-threshold across the seven amplification steps it takes
+        // to hit its cap (7 for high-bands).
+        let thr = d_b[19] / 1.0e12;
+
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, thr, 128);
+        assert!(
+            res.scalefac_scale,
+            "loop should have escalated to scalefac_scale = 1 \
+             (sfb 19 cap-would-exceed termination), got scale={} \
+             converged={} iters={} bands_amp={} sf={:?} d_b={:?}",
+            res.scalefac_scale,
+            res.stats.converged,
+            res.stats.iterations,
+            res.stats.bands_amplified,
+            &res.scalefactors.long,
+            &d_b,
+        );
+        // The loop terminated with last-good state. Bands that
+        // amplified must still be within the §C.1.5.4.3.6 cap (the
+        // escalation halved them and any post-escalation amps would
+        // saturate at the cap rather than exceed it).
+        for (sfb, &sf_val) in res.scalefactors.long.iter().enumerate() {
+            let cap = scalefac_long_upper_limit(sfb);
+            assert!(
+                sf_val <= cap,
+                "sfb={sfb} sf={sf_val} exceeds §C.1.5.4.3.6 cap {cap}",
+            );
+        }
+    }
+
+    #[test]
     fn outer_loop_amplifies_only_offending_bands() {
         // The §C.1.5.4.3.5 amplification step only touches bands whose
         // distortion exceeds `xmin(sb)`. With a threshold tuned just
@@ -513,7 +698,15 @@ mod tests {
 
         // Baseline distortion to calibrate threshold.
         let baseline_sf = ScaleFactors::default();
-        let baseline = run_inner(&xr, &gc, &baseline_sf, 44_100, MpegVersion::Mpeg1, budget);
+        let baseline = run_inner(
+            &xr,
+            &gc,
+            &baseline_sf,
+            false,
+            44_100,
+            MpegVersion::Mpeg1,
+            budget,
+        );
         let mut gc_b = gc;
         gc_b.global_gain = baseline.global_gain;
         let xr_back_b = requantize(

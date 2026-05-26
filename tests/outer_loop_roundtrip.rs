@@ -374,6 +374,43 @@ fn outer_loop_strictly_higher_psnr_than_fixed_gain_on_multi_tone() {
 }
 
 #[test]
+fn outer_loop_tight_threshold_emits_valid_stream() {
+    // Round-147 regression guard: the §C.1.5.4.3 escalation path
+    // (scalefac_scale 0→1) is exercised when the uniform threshold is
+    // tight enough that the loop's normal "no band over threshold"
+    // termination cannot fire. The unit-test
+    // `outer_loop_escalates_scalefac_scale_when_cap_would_terminate`
+    // pins the escalation under a controlled spectral fixture
+    // (isolated high-band, sfb 19). This integration test confirms
+    // the full encode-decode pipeline still produces a valid byte
+    // stream and a finite-PSNR self-decode when the same tight
+    // threshold is fed through the stream encoder — i.e. whatever
+    // mix of escalated and non-escalated granule-channels the inner
+    // analysis filterbank's MDCT spreads onto the spectrum, every
+    // emitted frame remains a parseable Layer III frame whose
+    // side-info `scalefac_scale` bit and decoder's matching
+    // multiplier (1.0 vs 0.5) round-trip coherently.
+    let pcm = sine_pcm(PCM_LEN_SAMPLES, 1760.0, 0.4);
+    let bytes = encode_with(
+        || {
+            Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, 1.0e-30)
+                .expect("encoder build")
+        },
+        &pcm,
+    );
+    assert_demuxes(&bytes);
+
+    // The escalated stream must still decode to finite PCM.
+    let recon = decode_mp3_mono(&bytes);
+    let p = aligned_psnr(&pcm, &recon);
+    eprintln!("tight-threshold self-decode PSNR = {p:.2} dB");
+    assert!(
+        p.is_finite() && p > 0.0,
+        "tight-threshold stream produced bad PSNR: {p} dB",
+    );
+}
+
+#[test]
 fn outer_loop_silence_decodes_to_near_zero() {
     // All-zero input → all-zero output (within FP precision + warmup):
     // every band's distortion is exactly 0, so the loop converges on

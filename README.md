@@ -746,6 +746,32 @@ fixed-gain 73.7 dB → outer-loop 74.0 dB); the single-tone sine
 roundtrips at ~86 dB matching the fixed-gain baseline. The fixed-gain
 `Mp3Encoder::new` path is preserved as the debug / reference route.
 
+As of round 147 the loop also implements §C.1.5.4.3's
+**`scalefac_scale 0 → 1` escalation**. When a §C.1.5.4.3.5
+amplification step would push a band's `scalefac_l[sb]` past the
+§C.1.5.4.3.6 cap and the loop is still in `scalefac_scale = 0` mode,
+the loop now switches to `scalefac_scale = 1` (multiplier 1.0 instead
+of 0.5 — twice the per-step boost), halves every in-progress per-band
+scalefactor with round-to-nearest integer arithmetic so the colouring
+factor `2^(mult·sf)` is preserved across the switch, resets the
+`amplified[]` first-touch tracker, and resumes the loop. Each
+subsequent amp step is then worth 2× as much energy boost. The
+escalation fires at most once per granule-channel (the spec defines
+only two `scalefac_scale` values); the chosen flag is reported on
+`OuterLoopResult::scalefac_scale` and propagated by the stream encoder
+into the side-info `scalefac_scale` bit so the decoder's matching
+multiplier recovers a coherent reconstruction. Validated by the
+unit-test
+`outer_loop::tests::outer_loop_escalates_scalefac_scale_when_cap_would_terminate`
+(isolated-sfb fixture, threshold calibrated so the loop's only
+termination path is cap-would-exceed ⇒ `res.scalefac_scale == true`)
+and by the integration test
+`outer_loop_tight_threshold_emits_valid_stream` (1.0e-30 uniform
+threshold ⇒ encoder still emits a parseable stream that self-decodes
+at finite PSNR). The pre-existing multi-tone PSNR regression test
+passes unchanged — for that fixture the cap is never tripped, so the
+escalation is a no-op there.
+
 The `codec_encoder` module ships **Phase 2 step 12** — the
 runtime-context `oxideav_core::Encoder` trait wiring on top of
 `Mp3Encoder`. `Mp3CoreEncoder` is a frame-to-packet adaptor:
@@ -972,13 +998,14 @@ trait wiring + opt-in Xing / Info VBR information-frame emission +
 true-VBR per-frame bitrate + Xing TOC auto-fill + opt-in §2.4.3.1
 CRC-16 frame protection + independent-stereo (`ChannelMode::Stereo` /
 `ChannelMode::DualChannel`) encode through the trait wrapper +
-§2.4.3.4.9.2 joint-stereo MS encode)** — it still lacks the
-psychoacoustic model (so the outer loop's `xmin(sb)` is a uniform
-constant rather than per-band masking-aware), an encoder-side decision
-to gate MS per-band on signal correlation (currently always-on when
-the MS constructor is used), intensity-stereo encode (§2.4.3.4.9.3),
-preemphasis / `scalefac_scale = 1` escalation, short / mixed
-block-type switching, and LSF encode.
+§2.4.3.4.9.2 joint-stereo MS encode + §C.1.5.4.3 `scalefac_scale 0→1`
+escalation in the outer loop)** — it still lacks the psychoacoustic
+model (so the outer loop's `xmin(sb)` is a uniform constant rather
+than per-band masking-aware), an encoder-side decision to gate MS
+per-band on signal correlation (currently always-on when the MS
+constructor is used), intensity-stereo encode (§2.4.3.4.9.3),
+preemphasis (§C.1.5.4.3.4) amplification, short / mixed block-type
+switching, and LSF encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

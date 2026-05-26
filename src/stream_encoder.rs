@@ -923,7 +923,7 @@ impl Mp3Encoder {
                 // part3 budget shrinks by that amount.
                 let part2_bits_outer: usize = 11 * 4 + 10 * 3;
                 let inner_budget_for_outer = per_gc_bits.saturating_sub(part2_bits_outer) as u64;
-                let (sf, initial_gain) = match self.outer_loop_threshold {
+                let (sf, initial_gain, scalefac_scale_outer) = match self.outer_loop_threshold {
                     Some(thr) => {
                         // Outer loop seeds scalefac_compress = 15 so the
                         // chosen per-band scalefactors can be written
@@ -939,7 +939,13 @@ impl Mp3Encoder {
                             thr,
                             DEFAULT_OUTER_LOOP_MAX_ITER,
                         );
-                        (res.scalefactors, res.global_gain)
+                        // The outer loop reports whether it escalated to
+                        // scalefac_scale = 1 (§C.1.5.4.3 dynamic-range
+                        // doubling) — propagate that into the
+                        // granule-channel so the re-quantize below and
+                        // the side-info write below pick up the matching
+                        // multiplier (1.0 vs 0.5).
+                        (res.scalefactors, res.global_gain, res.scalefac_scale)
                     }
                     None => {
                         let sf = ScaleFactors::default();
@@ -975,7 +981,9 @@ impl Mp3Encoder {
                             );
                             res_budget.global_gain.max(res_clamp.global_gain)
                         };
-                        (sf, initial_gain)
+                        // No outer loop ⇒ no escalation; scalefac_scale
+                        // stays 0 for the fixed-gain path.
+                        (sf, initial_gain, false)
                     }
                 };
                 let mut global_gain = initial_gain;
@@ -1008,7 +1016,14 @@ impl Mp3Encoder {
                     gc.global_gain = global_gain;
                     gc.scalefac_compress = scalefac_compress;
                     gc.preflag = false;
-                    gc.scalefac_scale = false;
+                    // §C.1.5.4.3 escalation: when the outer loop reports
+                    // scalefac_scale = 1, the re-quantize step here MUST
+                    // use the same multiplier (1.0 vs 0.5) — otherwise
+                    // the encoder's quantized `is[]` would be coloured
+                    // against a different per-band exponent than what
+                    // the side-info bit later instructs the decoder to
+                    // requantize with.
+                    gc.scalefac_scale = scalefac_scale_outer;
                     is = quantize(&xr_pre, &gc, &sf, self.sample_rate_hz, self.version);
                     clamp_above(&mut is, 8191);
                     split = partition_split(&is);

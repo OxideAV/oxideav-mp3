@@ -8,6 +8,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§C.1.5.4.3 `scalefac_scale` escalation in the outer loop**
+  (Phase 2 step 18): the §C.1.5.4.3 outer (distortion-control) loop
+  now implements the spec's `scalefac_scale 0 → 1` switch ("If after
+  some iterations the maximum length of the scalefactors would be
+  exceeded … then scalefac-scale is increased to the value 1 thus
+  increasing the possible dynamic range of the scalefactors. In this
+  case the actual scalefactors and frequency lines have to be
+  corrected accordingly"). When a §C.1.5.4.3.5 amplification step
+  would push a band's `scalefac_l[sb]` past the §C.1.5.4.3.6 cap
+  (15 for `sfb ∈ [0, 10]`, 7 for `sfb ∈ [11, 20]`) and the loop is
+  still in `scalefac_scale = 0` mode, the loop now: (a) sets
+  `scalefac_scale = 1` (multiplier 1.0 instead of 0.5 — twice the
+  per-step boost, twice the dynamic range), (b) halves every
+  in-progress per-band scalefactor with round-to-nearest integer
+  arithmetic so the colouring factor `2^(mult·sf)` is preserved
+  across the switch, (c) resets the `amplified[]` first-touch tracker
+  so the post-escalation amps are tracked separately, and (d) resumes
+  the loop. Each subsequent §C.1.5.4.3.5 amp step is then worth 2× as
+  much energy boost. The escalation fires at most once per
+  granule-channel (the spec defines only two `scalefac_scale` values),
+  after which the next cap-would-exceed condition terminates the loop
+  in the usual §C.1.5.4.3.6 "restore last-good state" form. The
+  chosen `scalefac_scale` is now reported on
+  `OuterLoopResult::scalefac_scale` and the `Mp3Encoder` stream-encode
+  path propagates it into the granule-channel's side-info
+  `scalefac_scale` bit so the decoder's
+  `requantize::scalefac_multiplier` picks the matching 1.0 vs 0.5
+  exponent. Validated by `outer_loop::tests::
+  outer_loop_escalates_scalefac_scale_when_cap_would_terminate`
+  (isolated sfb-19 fixture, threshold calibrated to baseline / 1e12 ⇒
+  cap-would-exceed termination fires ⇒ `res.scalefac_scale == true`),
+  by `outer_loop::tests::outer_loop_does_not_escalate_when_threshold_easily_met`
+  (high threshold, no amps, `scalefac_scale` stays false), and by
+  `tests/outer_loop_roundtrip.rs::outer_loop_tight_threshold_emits_valid_stream`
+  (end-to-end: 1.0e-30 uniform threshold ⇒ encoder emits a parseable
+  stream that self-decodes at finite PSNR). The pre-existing
+  `outer_loop_strictly_higher_psnr_than_fixed_gain_on_multi_tone` PSNR
+  regression test still passes with escalation in place — for the
+  multi-tone fixture the existing cap is never tripped, so escalation
+  is a no-op there. Spec gap: the §C.1.5.4.3 text does not specify
+  the rounding convention for halving the existing scalefactors when
+  scale switches; this implementation uses round-to-nearest integer
+  ((x+1)/2). The choice is invariant for the spec's stated invariant
+  ("scalefactors and frequency lines have to be corrected
+  accordingly") because both round-down and round-half-up preserve
+  the per-band coloured product to within one log step, and the next
+  amp iteration immediately corrects any residual.
+
 - **Joint-stereo MS encode** (Phase 2 step 17):
   `Mp3Encoder::new_joint_stereo_ms(bitrate_kbps, sample_rate_hz)` builds
   an opt-in two-channel encoder that applies the ISO/IEC 11172-3:1993
