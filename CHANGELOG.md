@@ -8,6 +8,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Joint-stereo MS encode** (Phase 2 step 17):
+  `Mp3Encoder::new_joint_stereo_ms(bitrate_kbps, sample_rate_hz)` builds
+  an opt-in two-channel encoder that applies the ISO/IEC 11172-3:1993
+  §2.4.3.4.9.2 forward mid/side matrix `M = (L+R)/√2`, `S = (L-R)/√2`
+  to each granule's post-MDCT (post-`inverse_alias_reduce`) `(L, R)`
+  spectra before quantization. `M` is then coded into the channel-0
+  slot, `S` into the channel-1 slot, and every emitted audio frame
+  carries header `mode = '01'` (joint stereo) with
+  `mode_extension = '10'` (ms_stereo on, intensity_stereo off) per
+  §2.4.2.3. The decoder reverses the matrix via the existing
+  `process_stereo` primitive driven by the same `mode_extension` bits.
+  The matrix is its own inverse (a 2-D rotation by 45°), so in the
+  absence of quantization error the round-trip is identity. The
+  decoder pipeline order is `requantize → process_stereo →
+  alias_reduce → imdct`, so the encoder applies the forward MS
+  transform at the matching point (between `inverse_alias_reduce` and
+  the quantize loop) — added as a pass-1/pass-2 split in
+  `assemble_frame`. MS is applied to the **entire** spectrum
+  (§2.4.3.4.9.2: "When MS-stereo is enabled but intensity stereo is
+  not, the entire spectrum is decoded in MS-stereo"); intensity-stereo
+  encode (§2.4.3.4.9.3) remains deferred. Both granules share the
+  same Long block type (the only type this encoder emits this round),
+  satisfying the §2.4.3.4.9 "both channels of a granule must share the
+  same block type when MS is enabled" requirement automatically.
+  `Mp3Encoder::ms_stereo_enabled()` reports the per-encoder flag.
+  The trait wrapper gains
+  `codec_encoder::make_encoder_joint_stereo_ms(params)` which builds
+  the same `Mp3CoreEncoder` adapter around the joint-stereo
+  constructor; `params.channels` must be 2 (mono cannot be joint
+  stereo). Validated by `tests/joint_stereo_ms_roundtrip.rs`:
+  end-to-end self-decode on a 1 s 440 Hz tone panned 70/30 toward L at
+  192 kbit/s produces **per-channel PSNR L = 84.2 dB / R = 85.2 dB**,
+  with a 90/10 strong-pan input recovering `|L|` strictly more than
+  3× `|R|` through the round-trip — confirming the encoder's MS
+  forward and the decoder's MS inverse compose to identity within
+  quantization. Plus 2 unit tests on the trait factory
+  (joint-stereo wire-bits + mono rejection).
+
 - **Independent-stereo encode** (Phase 2 step 16):
   `Mp3Encoder::new` now accepts `ChannelMode::Stereo` and
   `ChannelMode::DualChannel` in addition to `ChannelMode::SingleChannel`.

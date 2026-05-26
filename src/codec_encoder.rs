@@ -99,6 +99,60 @@ pub fn make_encoder_with_outer_loop(
     make_encoder_inner(params, Some(uniform_threshold))
 }
 
+/// Build a boxed MPEG-1 Audio Layer III stereo CBR [`Encoder`] in
+/// **joint-stereo MS** mode (ISO/IEC 11172-3:1993 §2.4.3.4.9.2).
+///
+/// Wraps [`Mp3Encoder::new_joint_stereo_ms`]. `params.channels` must be
+/// 2 (joint stereo is by definition a two-channel encoding). The
+/// emitted stream carries header `mode = '01'` (joint stereo) with
+/// `mode_extension = '10'` (ms_stereo on, intensity_stereo off) per
+/// §2.4.2.3 on every audio frame.
+///
+/// # Errors
+///
+/// Returns [`Error::invalid`] when `params.channels != 2` (mono cannot
+/// be joint-stereo), [`Error::invalid`] when `sample_rate` is missing,
+/// and [`Error::other`] when the underlying
+/// [`Mp3Encoder::new_joint_stereo_ms`] rejects the bitrate / sample
+/// rate combination.
+pub fn make_encoder_joint_stereo_ms(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| Error::invalid("oxideav-mp3: sample_rate required"))?;
+    let channels = params
+        .channels
+        .ok_or_else(|| Error::invalid("oxideav-mp3: channels required"))?;
+    if channels != 2 {
+        return Err(Error::invalid(format!(
+            "oxideav-mp3: joint-stereo MS requires channels == 2 (got {channels})"
+        )));
+    }
+    let bitrate_bps = params.bit_rate.unwrap_or(192_000);
+    if bitrate_bps == 0 || bitrate_bps > 1_000_000 {
+        return Err(Error::invalid(format!(
+            "oxideav-mp3: bit_rate {bitrate_bps} out of range"
+        )));
+    }
+    let bitrate_kbps = (bitrate_bps / 1000) as u32;
+    let inner = Mp3Encoder::new_joint_stereo_ms(bitrate_kbps, sample_rate)
+        .map_err(|e| Error::other(format!("oxideav-mp3: joint-stereo MS build: {e}")))?;
+
+    let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+    out_params.sample_rate = Some(sample_rate);
+    out_params.channels = Some(2);
+    out_params.sample_format = Some(SampleFormat::S16);
+    out_params.bit_rate = Some(u64::from(bitrate_kbps) * 1000);
+    out_params.tag = Some(CodecTag::wave_format(WAVE_FORMAT_MP3));
+
+    Ok(Box::new(Mp3CoreEncoder::new(
+        CodecId::new(CODEC_ID_STR),
+        inner,
+        out_params,
+        sample_rate,
+        2,
+    )))
+}
+
 fn make_encoder_inner(
     params: &CodecParameters,
     outer_loop_threshold: Option<f64>,
@@ -646,5 +700,56 @@ mod tests {
         let enc =
             make_encoder_with_outer_loop(&p, DEFAULT_OUTER_LOOP_THRESHOLD).expect("outer-loop");
         assert_eq!(enc.codec_id().as_str(), "mp3");
+    }
+
+    #[test]
+    fn make_encoder_joint_stereo_ms_builds_and_emits_joint_frames() {
+        // Build the joint-stereo MS factory, push correlated stereo
+        // PCM through send_frame, and check every emitted packet
+        // carries `mode = '01'` (joint stereo) with
+        // `mode_extension = '10'` (MS only).
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(2);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(192_000);
+        let mut enc = make_encoder_joint_stereo_ms(&p).expect("ms factory");
+
+        let pcm = sine_s16_stereo(SAMPLES_PER_FRAME_MPEG1 * 3, 440.0, 440.0, 44_100.0, 0.5);
+        let frame = AudioFrame {
+            samples: (SAMPLES_PER_FRAME_MPEG1 * 3) as u32,
+            pts: None,
+            data: vec![pcm],
+        };
+        enc.send_frame(&Frame::Audio(frame)).unwrap();
+        enc.flush().unwrap();
+
+        let mut packets = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        assert!(packets.len() >= 3, "packet count {}", packets.len());
+        for pkt in &packets {
+            assert_eq!(pkt.data[0], 0xFF);
+            assert_eq!(pkt.data[1] & 0xE0, 0xE0);
+            // mode '01' (joint stereo).
+            assert_eq!(pkt.data[3] & 0xC0, 0x40, "expected mode '01'");
+            // mode_extension '10' (MS only).
+            assert_eq!(pkt.data[3] & 0x30, 0x20, "expected mode_ext '10'");
+        }
+    }
+
+    #[test]
+    fn make_encoder_joint_stereo_ms_rejects_mono() {
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(1);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(128_000);
+        assert!(make_encoder_joint_stereo_ms(&p).is_err());
     }
 }

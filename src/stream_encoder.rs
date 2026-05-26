@@ -43,9 +43,15 @@
 //!
 //! # What this module deliberately does **not** do
 //!
-//! No psychoacoustic model, no outer noise-shaping loop, no stereo (LSF
-//! / joint), no VBR, no ID3v2 frontmatter, no short-block /
-//! mixed-block window switching, no CRC. All deferred to later rounds.
+//! No psychoacoustic model, no outer noise-shaping loop, no LSF, no
+//! ID3v2 frontmatter, no short-block / mixed-block window switching,
+//! and no intensity-stereo encode. **Joint-stereo MS** encode is opt-in
+//! as of round 146 ([`Mp3Encoder::new_joint_stereo_ms`]): the encoder
+//! computes the §2.4.3.4.9.2 forward MS matrix `M = (L+R)/√2`,
+//! `S = (L-R)/√2` on each granule-pair's full post-MDCT spectrum and
+//! emits header `mode = '01'` with `mode_extension = '10'` (ms_stereo
+//! on, intensity_stereo off). The intensity-stereo coupling
+//! (§2.4.3.4.9.3) remains deferred.
 //!
 //! Xing / Info VBR-info frame emission is **opt-in** as of round 142:
 //! call [`Mp3Encoder::enable_xing_info`] before [`Mp3Encoder::finish`]
@@ -55,7 +61,7 @@
 use std::io::{self, Write};
 
 use crate::analysis::{analyze_granule, AnalysisState};
-use crate::frame::{ChannelMode, Mp3FrameHeader, MpegVersion};
+use crate::frame::{ChannelMode, ModeExtension, Mp3FrameHeader, MpegVersion};
 use crate::huffman::{choose_best_count1_table, partition_split, NUM_LINES};
 use crate::inner_loop::{search_bit_budget, search_magnitude_clamp, GAIN_MAX, GAIN_MIN};
 use crate::main_data::{
@@ -121,11 +127,12 @@ pub enum StreamEncodeError {
     Huffman(String),
     /// Underlying I/O error from the destination `Write`.
     Io(io::Error),
-    /// Caller chose [`ChannelMode::JointStereo`]; this round does not
-    /// implement the joint-stereo MS / intensity coupling on the
-    /// encode side. Use [`ChannelMode::Stereo`] (or
-    /// [`ChannelMode::DualChannel`]) for two-channel content; both
-    /// encode the channels independently and are supported.
+    /// Caller chose [`ChannelMode::JointStereo`] on a constructor that
+    /// does not arm joint-stereo coupling on the encode side. Use
+    /// [`Mp3Encoder::new_joint_stereo_ms`] for §2.4.3.4.9.2 MS-stereo
+    /// encode, or use [`ChannelMode::Stereo`] / [`ChannelMode::DualChannel`]
+    /// for independent two-channel content; intensity stereo encode
+    /// (§2.4.3.4.9.3) remains unsupported.
     StereoUnsupported,
     /// Caller chose an MPEG-2 LSF sample rate (16 / 22.05 / 24 kHz);
     /// LSF is deferred to a later round.
@@ -156,8 +163,9 @@ impl core::fmt::Display for StreamEncodeError {
             StreamEncodeError::Reservoir(e) => write!(f, "reservoir: {e}"),
             StreamEncodeError::Huffman(e) => write!(f, "huffman emit: {e}"),
             StreamEncodeError::Io(e) => write!(f, "io: {e}"),
-            StreamEncodeError::StereoUnsupported => f
-                .write_str("ChannelMode::JointStereo not supported (use Stereo or DualChannel)"),
+            StreamEncodeError::StereoUnsupported => f.write_str(
+                "ChannelMode::JointStereo not supported on this constructor (use Mp3Encoder::new_joint_stereo_ms, Stereo, or DualChannel)",
+            ),
             StreamEncodeError::LsfUnsupported => {
                 f.write_str("only MPEG-1 sample rates are supported in this round")
             }
@@ -268,6 +276,19 @@ pub struct Mp3Encoder {
     /// matching every previous round's behaviour. Toggle via
     /// [`Mp3Encoder::with_protection_bit`].
     crc_enabled: bool,
+
+    /// When `true`, the encoder is in §2.4.3.4.9.2 MS-stereo joint mode:
+    /// for every granule it transforms the post-MDCT L/R spectra into
+    /// the M/S pair (`M = (L+R)/√2`, `S = (L-R)/√2`), quantizes
+    /// `(M, S)` in the channel-0 / channel-1 slots, and writes header
+    /// `mode = '01'` (joint stereo) with `mode_extension = '10'`
+    /// (ms_stereo on, intensity_stereo off). The decoder reverses the
+    /// matrix via [`crate::process_stereo`] driven by the
+    /// `mode_extension` bits. Set by [`Mp3Encoder::new_joint_stereo_ms`];
+    /// requires `nch == 2`. Intensity-stereo coupling
+    /// (§2.4.3.4.9.3) is not implemented on the encode side; this flag
+    /// only enables the MS half of joint stereo.
+    ms_stereo: bool,
 }
 
 /// Variable-bitrate config attached to [`Mp3Encoder`] by
@@ -365,7 +386,84 @@ impl Mp3Encoder {
             xing_template: None,
             vbr: None,
             crc_enabled: false,
+            ms_stereo: false,
         })
+    }
+
+    /// Build a joint-stereo encoder that emits §2.4.3.4.9.2 **MS-stereo**
+    /// frames (ISO/IEC 11172-3:1993 joint mode with `mode_extension = '10'`).
+    ///
+    /// The encoder buffers interleaved `[L0, R0, L1, R1, …]` `i16` PCM,
+    /// runs the analysis filterbank + forward MDCT + inverse alias
+    /// reduction independently per channel as in the
+    /// [`ChannelMode::Stereo`] path, and then — before quantization —
+    /// transforms each granule's two post-MDCT spectra `(L, R)` into the
+    /// normalized mid/side pair
+    ///
+    /// ```text
+    /// M[i] = (L[i] + R[i]) / √2
+    /// S[i] = (L[i] - R[i]) / √2
+    /// ```
+    ///
+    /// per ISO/IEC 11172-3 §2.4.3.4.9.2. `M` is then quantized into the
+    /// channel-0 (left) slot, `S` into the channel-1 (right) slot, and
+    /// the emitted frame header carries `mode = '01'` (joint stereo)
+    /// with `mode_extension = '10'` (ms_stereo on, intensity_stereo
+    /// off). A conformant decoder (including this crate's own
+    /// [`crate::process_stereo`]) reads the `mode_extension` bits and
+    /// applies the inverse `L = (M+S)/√2`, `R = (M-S)/√2` matrix to
+    /// recover `(L, R)`.
+    ///
+    /// The MS matrix is its own inverse (a 2-D rotation by 45°), so the
+    /// `(L, R) → (M, S)` step and the decoder's `(M, S) → (L, R)`
+    /// step compose to identity in the absence of quantization error.
+    /// For correlated stereo content (`L ≈ R`) the side channel
+    /// concentrates near zero, which the existing inner-loop bit-budget
+    /// gain search exploits — quieter spectra need a lower `global_gain`
+    /// to fit the per-granule-channel budget, raising overall SNR.
+    ///
+    /// MS is applied to the **entire** spectrum (§2.4.3.4.9.2: "When
+    /// MS-stereo is enabled but intensity stereo is not, the entire
+    /// spectrum is decoded in MS-stereo"). The intensity-stereo half of
+    /// joint stereo (§2.4.3.4.9.3) remains unimplemented on the encode
+    /// side. Both granules of a frame share the same block type (Long,
+    /// for this round), satisfying the §2.4.3.4.9 "both channels of a
+    /// granule must share the same block type when MS is enabled"
+    /// requirement automatically.
+    ///
+    /// `mode` is hard-coded to [`ChannelMode::JointStereo`]; pass
+    /// `bitrate_kbps` / `sample_rate_hz` per the MPEG-1 Layer III ladder.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Mp3Encoder::new`] but rejects [`ChannelMode::JointStereo`]
+    /// for the underlying header-build is never re-checked here (the
+    /// constructor sets it itself).
+    pub fn new_joint_stereo_ms(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+    ) -> Result<Self, StreamEncodeError> {
+        // Build through the independent-stereo path so the channel
+        // count, header indices, per-channel analysis/MDCT state, and
+        // pending-PCM buffers are all configured for two channels. Then
+        // upgrade the header template to joint-stereo + MS and flip the
+        // ms_stereo flag.
+        let mut enc = Self::new(bitrate_kbps, sample_rate_hz, ChannelMode::Stereo)?;
+        enc.header_template.mode = ChannelMode::JointStereo;
+        enc.header_template.mode_extension = ModeExtension {
+            intensity_stereo: false,
+            ms_stereo: true,
+            raw: 0b10,
+        };
+        enc.ms_stereo = true;
+        Ok(enc)
+    }
+
+    /// `true` when the encoder is configured for §2.4.3.4.9.2 MS-stereo
+    /// joint mode (see [`Mp3Encoder::new_joint_stereo_ms`]).
+    #[must_use]
+    pub fn ms_stereo_enabled(&self) -> bool {
+        self.ms_stereo
     }
 
     /// Opt in to the ISO/IEC 11172-3 §2.4.3.1 CRC-16 frame protection.
@@ -683,7 +781,25 @@ impl Mp3Encoder {
         };
         let mut gc_data: [[GranuleChannelData; 2]; 2] = Default::default();
 
-        // ---- Per-granule per-channel analysis + quantization ----
+        // ---- Pass 1: per-(gr, ch) analysis → xr_pre ----
+        //
+        // Each entry is the spectrum that goes into the quantizer for
+        // (granule `gr`, channel `ch`). For independent stereo / mono
+        // this is the post-`inverse_alias_reduce` bins of the channel's
+        // PCM run; for MS-stereo joint mode (§2.4.3.4.9.2) the
+        // L/R pair of every granule is rewritten in place as
+        // `(M = (L+R)/√2, S = (L-R)/√2)` between pass 1 and pass 2 (the
+        // matrix is its own inverse, so the decoder's
+        // `process_stereo` recovers L/R).
+        //
+        // The decoder pipeline order is `requantize → reorder → stereo
+        // → alias → IMDCT`. The encoder inverts:
+        // `MDCT_fwd → alias_inv → stereo_inv (MS forward) → quantize`,
+        // so the MS step belongs between `inverse_alias_reduce` and the
+        // quantize loop — which is exactly the pass-1/pass-2 split here.
+        let mut xr_pre_per_gc: Vec<Vec<[f32; NUM_LINES]>> = (0..GRANULES)
+            .map(|_| (0..self.nch).map(|_| [0.0f32; NUM_LINES]).collect())
+            .collect();
         for gr in 0..GRANULES {
             for ch in 0..self.nch {
                 let gr_pcm =
@@ -748,7 +864,48 @@ impl Mp3Encoder {
                 // For long blocks (our scope) we apply the inverse
                 // here so the decoder's forward alias-reduction
                 // recovers the post-MDCT bins.
-                let xr_pre = inverse_alias_reduce(&xr);
+                xr_pre_per_gc[gr][ch] = inverse_alias_reduce(&xr);
+            }
+        }
+
+        // ---- Pass 1.5: optional §2.4.3.4.9.2 forward MS matrix ----
+        //
+        // For MS-stereo joint mode rewrite each granule's L/R xr pair
+        // into the normalized mid/side pair:
+        //   M[i] = (L[i] + R[i]) / √2     (carried in the channel-0 slot)
+        //   S[i] = (L[i] - R[i]) / √2     (carried in the channel-1 slot)
+        // The decoder's `process_stereo` (driven by `mode_extension =
+        // '10'`) applies the inverse `L = (M+S)/√2`, `R = (M-S)/√2`.
+        // The matrix is its own inverse (a 2-D rotation by 45°), so a
+        // lossless quantizer would recover L/R exactly.
+        //
+        // Apply the matrix to the **entire** 576-line spectrum
+        // (§2.4.3.4.9.2: "When MS-stereo is enabled but intensity
+        // stereo is not, the entire spectrum is decoded in MS-stereo");
+        // the intensity-bound logic only kicks in when intensity stereo
+        // is also active, which this round's encoder never emits.
+        if self.ms_stereo && self.nch == 2 {
+            const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+            for gr in 0..GRANULES {
+                // Split the per-channel borrow without copying both
+                // arrays: `split_at_mut(1)` gives us `[L]` and `[R]`
+                // as disjoint slices, then we index into them.
+                let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
+                let left = &mut left_slice[0];
+                let right = &mut right_slice[0];
+                for i in 0..NUM_LINES {
+                    let l = left[i];
+                    let r = right[i];
+                    left[i] = (l + r) * INV_SQRT2;
+                    right[i] = (l - r) * INV_SQRT2;
+                }
+            }
+        }
+
+        // ---- Pass 2: per-(gr, ch) quantization + side-info build ----
+        for gr in 0..GRANULES {
+            for ch in 0..self.nch {
+                let xr_pre = xr_pre_per_gc[gr][ch];
 
                 // Pick the smallest global_gain + scalefactor configuration.
                 // Two paths:

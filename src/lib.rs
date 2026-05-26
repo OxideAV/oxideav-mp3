@@ -361,7 +361,9 @@ pub mod xing_info;
 pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
 pub use analysis::{analyze_granule, analyze_row, m_coefficient, AnalysisState, C_TABLE, X_LEN};
 pub use codec_decoder::{make_decoder, register_codecs, Mp3CoreDecoder};
-pub use codec_encoder::{make_encoder, make_encoder_with_outer_loop, Mp3CoreEncoder};
+pub use codec_encoder::{
+    make_encoder, make_encoder_joint_stereo_ms, make_encoder_with_outer_loop, Mp3CoreEncoder,
+};
 pub use crc::{crc16_bits, crc16_layer3, INITIAL_STATE as CRC_INITIAL_STATE};
 pub use demuxer::{
     open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer, Mp3Tags, XingTag,

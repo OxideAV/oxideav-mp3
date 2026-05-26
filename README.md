@@ -903,11 +903,56 @@ at 440 Hz is ~1250× the L energy at 880 Hz, and symmetrically for R)
 — the two channels round-trip as fully independent signals through
 the encoder.
 
+**Phase 2 step 17 (joint-stereo MS encode)** adds an opt-in MS-stereo
+constructor `Mp3Encoder::new_joint_stereo_ms(bitrate, sample_rate)`.
+After per-channel analysis filterbank + forward MDCT + inverse alias
+reduction (the existing independent-stereo pipeline of step 16), and
+**before** the inner-loop quantization, each granule's `(L, R)` xr
+pair is rewritten in place into the normalized mid/side pair per
+ISO/IEC 11172-3:1993 §2.4.3.4.9.2:
+
+```text
+M[i] = (L[i] + R[i]) / √2
+S[i] = (L[i] - R[i]) / √2
+```
+
+`M` is then quantized into the channel-0 slot, `S` into the channel-1
+slot, and the emitted header carries `mode = '01'` (joint stereo)
+with `mode_extension = '10'` (ms_stereo on, intensity_stereo off) per
+§2.4.2.3. A conformant decoder — including this crate's own
+`process_stereo` driven by the same `mode_extension` bits — applies
+the inverse `L = (M+S)/√2`, `R = (M-S)/√2` to recover the L/R pair.
+The matrix is its own inverse (a 2-D rotation by 45°), so in the
+absence of quantization error the round-trip is identity. The decode
+pipeline order is `requantize → process_stereo → alias_reduce →
+imdct`, so the encoder applies the forward MS transform at the
+matching point (between `inverse_alias_reduce` and the quantize
+loop). MS is applied to the **entire** spectrum (§2.4.3.4.9.2: "When
+MS-stereo is enabled but intensity stereo is not, the entire
+spectrum is decoded in MS-stereo"); intensity-stereo encode
+(§2.4.3.4.9.3) remains deferred. Both granules share the same Long
+block type (the only type this encoder emits this round), satisfying
+the §2.4.3.4.9 "both channels of a granule must share the same block
+type when MS is enabled" requirement automatically. The trait
+wrapper gains `codec_encoder::make_encoder_joint_stereo_ms(params)`
+that builds the same `Mp3CoreEncoder` adapter against the
+joint-stereo constructor. Validated by
+`tests/joint_stereo_ms_roundtrip.rs`: 4 integration tests covering
+(a) end-to-end self-decode on a 1 s 440 Hz tone panned 70/30 toward
+L at 192 kbit/s — **per-channel PSNR L = 84.2 dB / R = 85.2 dB**;
+(b) silence round-trip with the joint header bits preserved;
+(c) first-frame wire-byte layout (mode bits `'01'`, mode_ext bits
+`'10'`); (d) pan preservation through the MS round-trip (a 90/10
+input recovers `|L|` strictly more than 3× `|R|`) — plus 2 unit
+tests on the trait factory (mode bits + mono rejection).
+
 The remaining Phase 2 work — a real per-band psychoacoustic threshold
 (so the loop can spectrally redistribute bits without a hand-tuned
-constant), preemphasis (§C.1.5.4.3.4) and `scalefac_scale = 1`
-escalation, short / mixed block-type switching, joint-stereo (MS /
-intensity) encode, LSF encode, stereo / LSF decode through the trait
+constant), an encoder-side decision to gate MS on per-band signal
+correlation (currently always-on when the constructor is used),
+intensity-stereo encode (§2.4.3.4.9.3), preemphasis (§C.1.5.4.3.4)
+and `scalefac_scale = 1` escalation, short / mixed block-type
+switching, LSF encode, stereo / LSF decode through the trait
 wrapper — is still a later round.
 
 ### Not yet implemented
@@ -915,7 +960,7 @@ wrapper — is still a later round.
 Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
 underlying primitives — `process_stereo` and the LSF side-info /
 scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round). The encoder is **Phase 1 framing + Phase 2 steps 1–16 (forward
+round). The encoder is **Phase 1 framing + Phase 2 steps 1–17 (forward
 MDCT primitive + analysis windowing + forward overlap split +
 polyphase analysis subband filterbank + §2.4.3.4.7 quantization
 primitive + §C.1.5.4.4 inner-loop `global_gain` search + exact
@@ -926,11 +971,14 @@ scheduling with `main_data_begin > 0` + stream-level PCM → MP3 driver
 trait wiring + opt-in Xing / Info VBR information-frame emission +
 true-VBR per-frame bitrate + Xing TOC auto-fill + opt-in §2.4.3.1
 CRC-16 frame protection + independent-stereo (`ChannelMode::Stereo` /
-`ChannelMode::DualChannel`) encode through the trait wrapper)** — it
-still lacks the psychoacoustic model (so the outer loop's `xmin(sb)` is
-a uniform constant rather than per-band masking-aware), preemphasis /
-`scalefac_scale = 1` escalation, short / mixed block-type switching,
-joint-stereo (MS / intensity) encode, and LSF encode.
+`ChannelMode::DualChannel`) encode through the trait wrapper +
+§2.4.3.4.9.2 joint-stereo MS encode)** — it still lacks the
+psychoacoustic model (so the outer loop's `xmin(sb)` is a uniform
+constant rather than per-band masking-aware), an encoder-side decision
+to gate MS per-band on signal correlation (currently always-on when
+the MS constructor is used), intensity-stereo encode (§2.4.3.4.9.3),
+preemphasis / `scalefac_scale = 1` escalation, short / mixed
+block-type switching, and LSF encode.
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==
