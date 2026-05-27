@@ -73,23 +73,56 @@ fn encode(force_short: bool) -> Vec<u8> {
 }
 
 #[test]
-fn force_short_blocks_rejected_on_stereo_encoder() {
-    // The toggle is intentionally mono-only this round; multi-channel
-    // short-block encode needs the §2.4.3.4.9 cross-channel
-    // block-type-agreement wiring deferred to a follow-up.
-    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+fn force_short_blocks_rejected_on_ms_stereo_encoder() {
+    // §2.4.3.4.9 requires both channels of an MS-stereo granule to
+    // share `block_type` / `window_switching_flag` /
+    // `mixed_block_flag`. That cross-channel-MS agreement wiring is
+    // deferred to a follow-up, so this toggle still rejects encoders
+    // built via `Mp3Encoder::new_joint_stereo_ms`.
+    let mut enc = Mp3Encoder::new_joint_stereo_ms(BR, SR).expect("MS-stereo encoder build");
     assert!(!enc.force_short_blocks_enabled());
     let err = enc
         .force_short_blocks_for_testing(true)
-        .expect_err("stereo + force-short should be rejected");
+        .expect_err("MS-stereo + force-short should be rejected");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("Mp3Encoder::new_joint_stereo_ms")
-            || msg.contains("Stereo")
-            || msg.contains("JointStereo"),
-        "unexpected error message: {msg}"
-    );
+    assert!(!msg.is_empty(), "error must have a message");
     assert!(!enc.force_short_blocks_enabled(), "flag must stay off");
+}
+
+#[test]
+fn force_short_blocks_rejected_on_ms_auto_stereo_encoder() {
+    // The MS/LR auto picker (`new_joint_stereo_auto`) emits MS-stereo
+    // on any frame whose side-energy ratio passes the threshold; the
+    // §2.4.3.4.9 cross-channel constraint still applies on those
+    // frames, so the toggle rejects this constructor too.
+    let mut enc = Mp3Encoder::new_joint_stereo_auto(BR, SR).expect("MS-auto encoder build");
+    assert!(!enc.force_short_blocks_enabled());
+    let err = enc
+        .force_short_blocks_for_testing(true)
+        .expect_err("MS-auto + force-short should be rejected");
+    let msg = format!("{err}");
+    assert!(!msg.is_empty(), "error must have a message");
+    assert!(!enc.force_short_blocks_enabled(), "flag must stay off");
+}
+
+#[test]
+fn force_short_blocks_accepted_on_independent_stereo_encoder() {
+    // r162 widened the toggle to accept independent stereo
+    // (`ChannelMode::Stereo` / `DualChannel`). The §2.4.3.4.9
+    // cross-channel agreement constraint only binds when MS-stereo is
+    // active; independent stereo carries per-channel side-info
+    // verbatim per §2.4.1.7 / §2.4.2.7, so each channel can
+    // independently take the same forced `block_type`.
+    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+    enc.force_short_blocks_for_testing(true)
+        .expect("force-short toggle accepted on independent stereo");
+    assert!(enc.force_short_blocks_enabled());
+
+    let mut enc2 =
+        Mp3Encoder::new(BR, SR, ChannelMode::DualChannel).expect("dual-channel encoder build");
+    enc2.force_short_blocks_for_testing(true)
+        .expect("force-short toggle accepted on dual-channel");
+    assert!(enc2.force_short_blocks_enabled());
 }
 
 #[test]
@@ -184,6 +217,102 @@ fn force_short_stream_decodes_to_finite_non_silent_pcm() {
     assert!(
         zero_crossings > 10,
         "no audible zero crossings: {zero_crossings} (decode chain probably broken)"
+    );
+}
+
+/// Synthesise interleaved stereo `[L0, R0, L1, R1, …]` `i16` PCM of
+/// two independent sine tones (left at `f_l`, right at `f_r`). Useful
+/// for the r162 independent-stereo force-short round-trip — the
+/// per-channel content differs so a channel-mix bug in the encoder
+/// would be observable in the demuxer / decode chain.
+fn stereo_sine_pcm(
+    n_per_channel: usize,
+    f_l: f32,
+    f_r: f32,
+    sample_rate_hz: f32,
+    amp: f32,
+) -> Vec<i16> {
+    use std::f32::consts::PI;
+    let two_pi = 2.0 * PI;
+    let mut out = Vec::with_capacity(n_per_channel * 2);
+    let scale = amp * (i16::MAX as f32);
+    for i in 0..n_per_channel {
+        let t = i as f32 / sample_rate_hz;
+        let l = (two_pi * f_l * t).sin() * scale;
+        let r = (two_pi * f_r * t).sin() * scale;
+        out.push(l.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+        out.push(r.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+    }
+    out
+}
+
+#[test]
+fn force_short_blocks_on_independent_stereo_writes_short_side_info_both_channels() {
+    // r162: independent-stereo force-short must apply Short on both
+    // channels of every granule (per-channel side-info, no MS
+    // coupling). Verifies the per-channel block-type matrix is wired
+    // through the encode loop end-to-end.
+    let n = SR as usize / 4;
+    let pcm = stereo_sine_pcm(n, 440.0, 660.0, SR as f32, 0.5);
+    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+    enc.force_short_blocks_for_testing(true)
+        .expect("force-short on independent stereo");
+    enc.push_samples(&pcm).expect("push stereo pcm");
+    let mut bytes: Vec<u8> = Vec::new();
+    let _ = enc.finish(&mut bytes).expect("encoder finish");
+
+    let mut frames = 0usize;
+    let mut total_gcs = 0usize;
+    let mut short_both = true;
+    for frame in FrameWalker::new(&bytes) {
+        frames += 1;
+        let hdr = parse_header(&frame.data[..4]).expect("header parse");
+        assert_eq!(
+            hdr.channel_count(),
+            2,
+            "stereo encoder must emit 2-channel frames"
+        );
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
+        assert_eq!(si.channels, 2, "stereo si carries 2 channels");
+        for gr in 0..si.granule_count as usize {
+            for ch in 0..si.channels as usize {
+                total_gcs += 1;
+                let gc = &si.granules[gr][ch];
+                if !gc.window_switching_flag
+                    || gc.block_type != BlockType::Short
+                    || gc.mixed_block_flag
+                {
+                    short_both = false;
+                }
+            }
+        }
+    }
+    assert!(frames > 0, "stereo force-short emitted no frames");
+    assert!(
+        total_gcs >= 4,
+        "stereo force-short emitted < 4 granule-channels (was {total_gcs})"
+    );
+    assert!(
+        short_both,
+        "stereo force-short emitted a non-short granule-channel"
+    );
+
+    // Demuxer round-trip: the wire layout (header + per-channel
+    // side-info + main-data) must round-trip through the public
+    // demuxer just like the mono path.
+    let mut demux =
+        Mp3Demuxer::open(Box::new(Cursor::new(bytes.clone()))).expect("stereo demuxer open");
+    let mut packet_count = 0usize;
+    loop {
+        match demux.next_packet() {
+            Ok(_pkt) => packet_count += 1,
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("stereo demuxer next_packet: {e}"),
+        }
+    }
+    assert!(
+        packet_count > 0,
+        "stereo demuxer surfaced zero packets on force-short stream"
     );
 }
 

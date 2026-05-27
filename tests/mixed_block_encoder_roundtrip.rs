@@ -60,23 +60,121 @@ fn encode(force_mixed: bool) -> Vec<u8> {
 }
 
 #[test]
-fn force_mixed_blocks_rejected_on_stereo_encoder() {
-    // The toggle is intentionally mono-only this round; multi-channel
-    // mixed-block encode needs the §2.4.3.4.9 cross-channel
-    // block-type-agreement wiring deferred to a follow-up.
-    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+fn force_mixed_blocks_rejected_on_ms_stereo_encoder() {
+    // §2.4.3.4.9 requires both channels of an MS-stereo granule to
+    // share `block_type` / `window_switching_flag` /
+    // `mixed_block_flag`. That cross-channel-MS agreement wiring is
+    // deferred to a follow-up, so this toggle still rejects encoders
+    // built via `Mp3Encoder::new_joint_stereo_ms`.
+    let mut enc = Mp3Encoder::new_joint_stereo_ms(BR, SR).expect("MS-stereo encoder build");
     assert!(!enc.force_mixed_blocks_enabled());
     let err = enc
         .force_mixed_blocks_for_testing(true)
-        .expect_err("stereo + force-mixed should be rejected");
+        .expect_err("MS-stereo + force-mixed should be rejected");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("Mp3Encoder::new_joint_stereo_ms")
-            || msg.contains("Stereo")
-            || msg.contains("JointStereo"),
-        "unexpected error message: {msg}"
-    );
+    assert!(!msg.is_empty(), "error must have a message");
     assert!(!enc.force_mixed_blocks_enabled(), "flag must stay off");
+}
+
+#[test]
+fn force_mixed_blocks_rejected_on_ms_auto_stereo_encoder() {
+    let mut enc = Mp3Encoder::new_joint_stereo_auto(BR, SR).expect("MS-auto encoder build");
+    assert!(!enc.force_mixed_blocks_enabled());
+    let err = enc
+        .force_mixed_blocks_for_testing(true)
+        .expect_err("MS-auto + force-mixed should be rejected");
+    assert!(!format!("{err}").is_empty(), "error must have a message");
+    assert!(!enc.force_mixed_blocks_enabled(), "flag must stay off");
+}
+
+#[test]
+fn force_mixed_blocks_accepted_on_independent_stereo_encoder() {
+    // r162: independent stereo is per-channel side-info verbatim
+    // (§2.4.1.7 / §2.4.2.7) — both channels can independently take
+    // the forced mixed block.
+    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+    enc.force_mixed_blocks_for_testing(true)
+        .expect("force-mixed on independent stereo");
+    assert!(enc.force_mixed_blocks_enabled());
+
+    let mut enc2 =
+        Mp3Encoder::new(BR, SR, ChannelMode::DualChannel).expect("dual-channel encoder build");
+    enc2.force_mixed_blocks_for_testing(true)
+        .expect("force-mixed on dual-channel");
+    assert!(enc2.force_mixed_blocks_enabled());
+}
+
+#[test]
+fn force_mixed_blocks_on_independent_stereo_writes_mixed_side_info_both_channels() {
+    // Round-trip: encode 250 ms of stereo (different per-channel
+    // tones) with force-mixed and confirm every emitted
+    // granule-channel carries `window_switching_flag = 1`,
+    // `block_type = Short`, `mixed_block_flag = 1`. Also confirm the
+    // bytes round-trip through Mp3Demuxer (wire-layout sanity).
+    use std::f32::consts::PI;
+    let n = SR as usize / 4;
+    let mut pcm = Vec::with_capacity(n * 2);
+    let scale = 0.5 * (i16::MAX as f32);
+    for i in 0..n {
+        let t = i as f32 / SR as f32;
+        let l = (2.0 * PI * 220.0 * t).sin() * scale;
+        let r = (2.0 * PI * 440.0 * t).sin() * scale;
+        pcm.push(l.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+        pcm.push(r.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+    }
+    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+    enc.force_mixed_blocks_for_testing(true)
+        .expect("force-mixed accepted on independent stereo");
+    enc.push_samples(&pcm).expect("push stereo pcm");
+    let mut bytes: Vec<u8> = Vec::new();
+    let _ = enc.finish(&mut bytes).expect("encoder finish");
+
+    let mut frames = 0usize;
+    let mut total_gcs = 0usize;
+    let mut mixed_only = true;
+    for frame in FrameWalker::new(&bytes) {
+        frames += 1;
+        let hdr = parse_header(&frame.data[..4]).expect("header parse");
+        assert_eq!(
+            hdr.channel_count(),
+            2,
+            "stereo encoder must emit 2-channel frames"
+        );
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
+        for gr in 0..si.granule_count as usize {
+            for ch in 0..si.channels as usize {
+                total_gcs += 1;
+                let gc = &si.granules[gr][ch];
+                if !gc.window_switching_flag
+                    || gc.block_type != BlockType::Short
+                    || !gc.mixed_block_flag
+                {
+                    mixed_only = false;
+                }
+            }
+        }
+    }
+    assert!(frames > 0, "stereo force-mixed emitted no frames");
+    assert!(
+        total_gcs >= 4,
+        "stereo force-mixed emitted < 4 gc (was {total_gcs})"
+    );
+    assert!(mixed_only, "stereo force-mixed emitted a non-mixed gc");
+
+    let mut demux =
+        Mp3Demuxer::open(Box::new(Cursor::new(bytes.clone()))).expect("stereo demuxer open");
+    let mut packets = 0usize;
+    loop {
+        match demux.next_packet() {
+            Ok(_pkt) => packets += 1,
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("stereo demuxer next_packet: {e}"),
+        }
+    }
+    assert!(
+        packets > 0,
+        "stereo demuxer accepted no force-mixed packets"
+    );
 }
 
 #[test]

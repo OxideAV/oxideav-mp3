@@ -432,12 +432,15 @@ pub struct Mp3Encoder {
     ///
     /// Restrictions in this round:
     ///
-    /// * **Mono only.** Stereo / joint-stereo / dual-channel + mixed is
-    ///   intentionally rejected by
-    ///   [`Mp3Encoder::force_mixed_blocks_for_testing`] for the same
-    ///   reason the force-short flag is mono-only: the §2.4.3.4.9
-    ///   cross-channel block-type-agreement wiring is a follow-up
-    ///   round.
+    /// * **MS-stereo not supported (r162 widening).** Mono and
+    ///   independent stereo ([`ChannelMode::Stereo`] /
+    ///   [`ChannelMode::DualChannel`]) accept the toggle; MS-stereo
+    ///   joint modes ([`Mp3Encoder::new_joint_stereo_ms`] /
+    ///   [`Mp3Encoder::new_joint_stereo_auto`]) still reject because
+    ///   §2.4.3.4.9 requires both channels of an MS-stereo granule to
+    ///   share `block_type` / `window_switching_flag` /
+    ///   `mixed_block_flag`, and that cross-channel-MS agreement
+    ///   wiring is the next follow-up.
     /// * **No outer loop.** The fixed-gain inner-loop-only path runs
     ///   for mixed blocks identically to the way it runs for long and
     ///   short.
@@ -471,10 +474,15 @@ pub struct Mp3Encoder {
     /// as a final frame with a zero-padded lookahead, equivalent to
     /// "no attack ahead").
     ///
-    /// **Mono-only restriction.** Auto block-type for stereo / joint
-    /// / dual-channel needs the §2.4.3.4.9 cross-channel block-type
-    /// agreement wiring deferred to a follow-up, so this toggle
-    /// rejects multi-channel encoders. Mutually exclusive with both
+    /// **Channel-mode restriction.** Relaxed in r162 to accept
+    /// independent stereo ([`ChannelMode::Stereo`] /
+    /// [`ChannelMode::DualChannel`]) in addition to mono — the
+    /// per-channel scheduler vector picks each channel's §C.1.5.2
+    /// transition state independently, mirroring §2.4.1.7 / §2.4.2.7
+    /// which carry per-channel side-info verbatim. MS-stereo joint
+    /// modes still rejected; they require the §2.4.3.4.9
+    /// cross-channel agreement wiring deferred to a follow-up.
+    /// Mutually exclusive with both
     /// [`Self::force_short_blocks_for_testing`] and
     /// [`Self::force_mixed_blocks_for_testing`].
     ///
@@ -486,8 +494,12 @@ pub struct Mp3Encoder {
 /// Per-channel auto-block-type state for [`Mp3Encoder`]. Holds the
 /// stateful attack detector + the block-type scheduler that
 /// translate the per-granule attack flags into the §C.1.5.2 transition
-/// geometry. One detector + one scheduler per channel; the mono-only
-/// restriction is enforced at API time so `nch == 1` here.
+/// geometry. One detector + one scheduler per channel; r162 widened
+/// this to accept independent stereo (`nch == 2`, no MS-stereo
+/// coupling) by running an independent scheduler per channel — each
+/// channel of an independent-stereo granule picks its own §C.1.5.2
+/// transition state. MS-stereo joint modes remain rejected at API
+/// time so this struct never holds an MS-stereo configuration.
 #[derive(Debug, Clone)]
 struct AutoBlockTypeConfig {
     /// Attack-detection ratio threshold (per-subframe energy over the
@@ -620,28 +632,61 @@ impl Mp3Encoder {
         })
     }
 
+    /// `true` when the encoder is in a §2.4.3.4.9.2 MS-stereo joint mode
+    /// — either the unconditional MS path
+    /// ([`Mp3Encoder::new_joint_stereo_ms`], `self.ms_stereo == true`)
+    /// or the per-frame MS/LR picker
+    /// ([`Mp3Encoder::new_joint_stereo_auto`],
+    /// `self.ms_auto_threshold.is_some()`). The four block-type
+    /// override toggles (force-short, force-mixed, auto, auto+mixed)
+    /// reject these modes because §2.4.3.4.9 requires both channels of
+    /// an MS-stereo granule to share the same `block_type` /
+    /// `window_switching_flag` / `mixed_block_flag`, and the
+    /// cross-channel-MS agreement wiring lands in a separate
+    /// follow-up. Independent two-channel modes
+    /// ([`ChannelMode::Stereo`] / [`ChannelMode::DualChannel`] without
+    /// joint coupling) carry per-channel side-info verbatim and have
+    /// no such constraint, so they are accepted as of r162.
+    #[must_use]
+    fn ms_joint_stereo_active(&self) -> bool {
+        self.ms_stereo || self.ms_auto_threshold.is_some()
+    }
+
     /// Force every assembled granule onto the §2.4.2.7 short-block
     /// (`block_type = 2`) encode path; see the
     /// [`Self::force_short_blocks`] field for the per-granule
     /// behavioural contract.
     ///
-    /// Mono-only restriction: short-block encode for stereo / joint /
-    /// dual-channel needs §2.4.3.4.9 cross-channel block-type
-    /// agreement wiring that lands in a follow-up round, so this
-    /// toggle rejects multi-channel encoders.
+    /// Channel-mode restriction (relaxed in r162): the §2.4.3.4.9
+    /// MS-stereo requirement that both channels of a granule share
+    /// the same `block_type` / `window_switching_flag` /
+    /// `mixed_block_flag` only applies when MS-stereo is active. This
+    /// toggle therefore accepts:
+    ///
+    /// * mono ([`ChannelMode::SingleChannel`], `nch == 1`),
+    /// * independent stereo ([`ChannelMode::Stereo`] /
+    ///   [`ChannelMode::DualChannel`] — `nch == 2`, no joint coupling,
+    ///   each channel's side-info is carried verbatim per
+    ///   §2.4.1.7 / §2.4.2.7).
+    ///
+    /// It still rejects encoders built via
+    /// [`Mp3Encoder::new_joint_stereo_ms`] /
+    /// [`Mp3Encoder::new_joint_stereo_auto`] until the cross-channel-MS
+    /// block-type agreement wiring lands.
     ///
     /// # Errors
     ///
-    /// [`StreamEncodeError::StereoUnsupported`] when the encoder's
-    /// channel count is > 1 (the dispatch tag is reused — the actual
-    /// case is "force-short combined with multi-channel," but the
-    /// existing error variant captures the same "channel layout
-    /// unsupported by this opt-in" semantics).
+    /// [`StreamEncodeError::StereoUnsupported`] when the encoder is in
+    /// an MS-stereo joint mode (per [`Self::ms_joint_stereo_active`]).
+    /// The dispatch tag is reused — the actual case is "force-short
+    /// combined with MS-stereo," but the existing error variant
+    /// captures the same "channel layout unsupported by this opt-in"
+    /// semantics.
     pub fn force_short_blocks_for_testing(
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
-        if enabled && self.nch != 1 {
+        if enabled && self.ms_joint_stereo_active() {
             return Err(StreamEncodeError::StereoUnsupported);
         }
         if enabled {
@@ -669,24 +714,24 @@ impl Mp3Encoder {
     /// [`Self::force_mixed_blocks`] field for the per-granule
     /// behavioural contract.
     ///
-    /// Restrictions (mirrored from the field doc):
+    /// Channel-mode restriction (relaxed in r162; see
+    /// [`Self::force_short_blocks_for_testing`] for the §2.4.3.4.9
+    /// rationale): mono and independent stereo accepted;
+    /// MS-stereo joint modes rejected.
     ///
-    /// * Mono only — same §2.4.3.4.9 cross-channel agreement gap that
-    ///   force-short hits.
-    /// * Mutually exclusive with [`Self::force_short_blocks_for_testing`].
+    /// Mutually exclusive with [`Self::force_short_blocks_for_testing`].
     ///   Enabling this resets `force_short_blocks` to `false` so a
     ///   single granule cannot ask for both at once.
     ///
     /// # Errors
     ///
-    /// [`StreamEncodeError::StereoUnsupported`] when the encoder's
-    /// channel count is > 1 (matches the
-    /// [`Self::force_short_blocks_for_testing`] policy).
+    /// [`StreamEncodeError::StereoUnsupported`] when the encoder is in
+    /// an MS-stereo joint mode (per [`Self::ms_joint_stereo_active`]).
     pub fn force_mixed_blocks_for_testing(
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
-        if enabled && self.nch != 1 {
+        if enabled && self.ms_joint_stereo_active() {
             return Err(StreamEncodeError::StereoUnsupported);
         }
         if enabled {
@@ -733,10 +778,17 @@ impl Mp3Encoder {
     ///
     /// Restrictions:
     ///
-    /// * **Mono-only.** Stereo / joint / dual-channel auto needs the
-    ///   §2.4.3.4.9 cross-channel block-type agreement wiring that
-    ///   lands in a follow-up round; this toggle rejects multi-channel
-    ///   encoders.
+    /// * **Channel-mode.** Relaxed in r162: accepted on mono and
+    ///   independent stereo ([`ChannelMode::Stereo`] /
+    ///   [`ChannelMode::DualChannel`]); still rejected on MS-stereo
+    ///   joint modes ([`Mp3Encoder::new_joint_stereo_ms`] /
+    ///   [`Mp3Encoder::new_joint_stereo_auto`]) because
+    ///   §2.4.3.4.9 requires both channels of an MS-stereo granule to
+    ///   share the same `block_type`. The auto path runs one
+    ///   independent detector + scheduler per channel (the
+    ///   [`AutoBlockTypeConfig`] vectors are sized to `nch`), so
+    ///   each channel of an independent-stereo granule picks its own
+    ///   §C.1.5.2 transition state.
     /// * **Mutually exclusive with the force-toggles.** Enabling auto
     ///   clears [`Self::force_short_blocks`] and
     ///   [`Self::force_mixed_blocks`] (the testing toggles), and vice
@@ -744,10 +796,10 @@ impl Mp3Encoder {
     ///
     /// # Errors
     ///
-    /// [`StreamEncodeError::StereoUnsupported`] when the encoder's
-    /// channel count is > 1.
+    /// [`StreamEncodeError::StereoUnsupported`] when the encoder is in
+    /// an MS-stereo joint mode (per [`Self::ms_joint_stereo_active`]).
     pub fn enable_auto_block_type(&mut self, threshold: f64) -> Result<(), StreamEncodeError> {
-        if self.nch != 1 {
+        if self.ms_joint_stereo_active() {
             return Err(StreamEncodeError::StereoUnsupported);
         }
         // Outer loop is now compatible with auto block-type for every
@@ -825,23 +877,29 @@ impl Mp3Encoder {
     /// their respective defaults.
     ///
     /// All [`Self::enable_auto_block_type`] restrictions apply
-    /// (mono-only, mutually exclusive with the force-toggles). Mixed
-    /// promotion is an *opt-in extension* — callers using
+    /// (MS-stereo joint modes rejected, mutually exclusive with the
+    /// force-toggles); as of r162 independent stereo
+    /// ([`ChannelMode::Stereo`] / [`ChannelMode::DualChannel`]) is
+    /// accepted (one mixed classifier per channel). Mixed promotion
+    /// is an *opt-in extension* — callers using
     /// `enable_auto_block_type` keep the pre-r161 pure-short
     /// behaviour.
     ///
     /// # Errors
     ///
-    /// [`StreamEncodeError::StereoUnsupported`] when the encoder's
-    /// channel count is > 1.
+    /// [`StreamEncodeError::StereoUnsupported`] when the encoder is in
+    /// an MS-stereo joint mode (per [`Self::ms_joint_stereo_active`]).
     pub fn enable_auto_block_type_with_mixed(
         &mut self,
         attack_threshold: f64,
         mixed_low_band_stability: f64,
     ) -> Result<(), StreamEncodeError> {
         // Reuse the plain path for detector / scheduler construction
-        // + the mono-only + force-toggle clearing it does, then
-        // augment the resulting config with the mixed classifier.
+        // + the MS-stereo reject + force-toggle clearing it does,
+        // then augment the resulting config with the mixed classifier
+        // (one classifier per channel; the per-channel vector is
+        // independent so each channel of an independent-stereo
+        // granule classifies its own low-band stability).
         self.enable_auto_block_type(attack_threshold)?;
         let mixed_classifier: Vec<_> = (0..self.nch)
             .map(|_| {
@@ -1466,9 +1524,11 @@ impl Mp3Encoder {
         // for the granule, chosen by one of three policies:
         //
         // * **Force toggles** (`force_short_blocks` / `force_mixed_blocks`):
-        //   every granule of every channel takes the forced type.
-        //   Mono-only by API restriction; this branch is the
-        //   r151..r153 path.
+        //   every granule of every channel takes the forced type. As
+        //   of r162 this branch accepts independent stereo too
+        //   (each channel's side-info carries the same forced
+        //   block_type, which §2.4.1.7 / §2.4.2.7 permit verbatim).
+        //   MS-stereo is still rejected at API time.
         // * **Auto** (`auto_block_type.is_some()`): the
         //   [`crate::attack_detect::AttackDetector`] classifies each
         //   granule (and the lookahead granule) and the
@@ -1497,8 +1557,12 @@ impl Mp3Encoder {
             if let Some(ref mut cfg) = self.auto_block_type {
                 // Auto path: classify each of the 2 frame granules + 1
                 // lookahead granule per channel, then feed the scheduler.
-                // Channel-0 only this round (mono restriction enforced at
-                // `enable_auto_block_type`).
+                // r162 widened this to iterate every channel — for
+                // independent stereo each channel runs an independent
+                // detector + scheduler, picking its own §C.1.5.2
+                // transition state. The MS-stereo agreement constraint
+                // is enforced at API time (MS-stereo rejects the auto
+                // toggle), so the per-channel independence is safe.
                 let mut out: [[BlockType; 2]; GRANULES] = [[BlockType::Long; 2]; GRANULES];
                 for ch in 0..self.nch {
                     // 3 attack flags: gr0, gr1, lookahead (gr2 of the
@@ -1605,8 +1669,8 @@ impl Mp3Encoder {
                 //   forward alias-reduction recovers the post-MDCT
                 //   bins.
                 //
-                // * **Short block** (`force_short_blocks` on; mono-only
-                //   in this round per
+                // * **Short block** (`force_short_blocks` on; r162
+                //   accepts mono + independent stereo per
                 //   [`Mp3Encoder::force_short_blocks_for_testing`]):
                 //   three independent 12-point MDCTs per subband over
                 //   the lapped 36-sample frame
@@ -1619,8 +1683,9 @@ impl Mp3Encoder {
                 //   `[sfb][win][k]` interleave the §2.4.1.7 part3
                 //   Huffman path expects.
                 //
-                // * **Mixed block** (`force_mixed_blocks` on; mono-only;
-                //   see [`Mp3Encoder::force_mixed_blocks_for_testing`]):
+                // * **Mixed block** (`force_mixed_blocks` on; r162
+                //   accepts mono + independent stereo per
+                //   [`Mp3Encoder::force_mixed_blocks_for_testing`]):
                 //   the long-block forward path runs on subbands 0 and 1
                 //   (lines 0..36), the short-block forward path runs on
                 //   subbands 2..31. No alias reduction (decoder treats

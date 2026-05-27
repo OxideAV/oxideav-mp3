@@ -81,20 +81,56 @@ fn click_train_pcm(total_samples: usize, click_period: usize) -> Vec<i16> {
 }
 
 #[test]
-fn auto_block_type_rejected_on_stereo_encoder() {
-    // Same mono-only restriction as the force-toggles: cross-channel
-    // block-type agreement (§2.4.3.4.9) is deferred to a follow-up.
-    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+fn auto_block_type_rejected_on_ms_stereo_encoder() {
+    // r162: the rejection is now scoped to MS-stereo joint modes
+    // (§2.4.3.4.9 requires both channels of an MS-stereo granule to
+    // share `block_type`; the cross-channel-MS agreement wiring is
+    // deferred). Independent stereo is accepted in the
+    // `auto_block_type_accepted_on_independent_stereo` test below.
+    let mut enc = Mp3Encoder::new_joint_stereo_ms(BR, SR).expect("MS-stereo encoder build");
     assert!(!enc.auto_block_type_enabled());
     let err = enc
         .enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
-        .expect_err("stereo + auto should be rejected");
+        .expect_err("MS-stereo + auto should be rejected");
     let msg = format!("{err}");
     assert!(!msg.is_empty(), "error must have a message");
     assert!(
         !enc.auto_block_type_enabled(),
         "flag must stay off after error"
     );
+}
+
+#[test]
+fn auto_block_type_rejected_on_ms_auto_stereo_encoder() {
+    let mut enc = Mp3Encoder::new_joint_stereo_auto(BR, SR).expect("MS-auto encoder build");
+    assert!(!enc.auto_block_type_enabled());
+    let err = enc
+        .enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect_err("MS-auto + auto should be rejected");
+    assert!(!format!("{err}").is_empty(), "error must have a message");
+    assert!(!enc.auto_block_type_enabled(), "flag must stay off");
+}
+
+#[test]
+fn auto_block_type_accepted_on_independent_stereo() {
+    // r162: independent stereo (no MS coupling) accepts the auto
+    // toggle. Each channel runs its own detector + scheduler so the
+    // per-channel side-info carries an independent §C.1.5.2 transition
+    // sequence.
+    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+    enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto accepted on independent stereo");
+    assert!(enc.auto_block_type_enabled());
+    assert_eq!(
+        enc.auto_block_type_threshold(),
+        Some(DEFAULT_ATTACK_THRESHOLD)
+    );
+
+    let mut enc2 =
+        Mp3Encoder::new(BR, SR, ChannelMode::DualChannel).expect("dual-channel encoder build");
+    enc2.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto accepted on dual-channel");
+    assert!(enc2.auto_block_type_enabled());
 }
 
 #[test]
@@ -413,6 +449,101 @@ fn auto_block_type_stream_is_demuxer_accepted() {
         }
     }
     assert!(packets > 0, "demuxer accepted no packets from auto stream");
+}
+
+#[test]
+fn auto_block_type_on_independent_stereo_runs_per_channel_scheduler() {
+    // r162: on independent stereo every channel runs an independent
+    // detector + scheduler. Drive the left channel with a click train
+    // and the right channel with a sustained sine — the encoder must:
+    //   1. emit valid frames (demuxer round-trip),
+    //   2. emit at least one Start AND/OR Short granule somewhere in
+    //      the left-channel column (witness the click-driven left
+    //      detector engaged the §C.1.5.2 transition),
+    //   3. emit Long throughout the right-channel column (witness the
+    //      right detector saw no attack).
+    // The second + third assertions together are what makes this an
+    // *independent-per-channel* witness rather than a generic "auto
+    // works on stereo" smoke test.
+    use std::f32::consts::PI;
+    let n = SR as usize;
+    let click_period = 6_600usize;
+    let mut pcm: Vec<i16> = Vec::with_capacity(n * 2);
+    let scale = 0.5 * (i16::MAX as f32);
+    // Build the click pattern for left, sine for right, interleaved.
+    let mut next_click_pos = click_period;
+    for i in 0..n {
+        // Left channel: silence except for a 64-sample full-scale
+        // alternating burst at click_period intervals.
+        let l_burst = if i >= next_click_pos && i < next_click_pos + 64 {
+            let s = i - next_click_pos;
+            let v = if s % 2 == 0 { 30_000i16 } else { -30_000i16 };
+            if s + 1 == 64 {
+                next_click_pos += click_period;
+            }
+            v
+        } else {
+            0i16
+        };
+        // Right channel: sustained 440 Hz sine.
+        let t = i as f32 / SR as f32;
+        let r = (2.0 * PI * 440.0 * t).sin() * scale;
+        pcm.push(l_burst);
+        pcm.push(r.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+    }
+
+    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+    enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto accepted on independent stereo");
+    enc.push_samples(&pcm).expect("push stereo pcm");
+    let mut bytes: Vec<u8> = Vec::new();
+    let _ = enc.finish(&mut bytes).expect("encoder finish");
+
+    let mut frames = 0usize;
+    let mut left_non_long = 0usize;
+    let mut right_long = 0usize;
+    let mut right_total = 0usize;
+    for frame in FrameWalker::new(&bytes) {
+        frames += 1;
+        let hdr = parse_header(&frame.data[..4]).expect("header parse");
+        assert_eq!(hdr.channel_count(), 2);
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
+        for gr in 0..si.granule_count as usize {
+            // Channel 0 (left): driven by click train, expect Start / Short.
+            let left = &si.granules[gr][0];
+            if left.window_switching_flag && left.block_type != BlockType::Long {
+                left_non_long += 1;
+            }
+            // Channel 1 (right): driven by sustained sine, expect Long.
+            let right = &si.granules[gr][1];
+            right_total += 1;
+            if !right.window_switching_flag && right.block_type == BlockType::Long {
+                right_long += 1;
+            }
+        }
+    }
+    assert!(frames > 0, "stereo auto emitted no frames");
+    assert!(
+        left_non_long > 0,
+        "left-channel click train never engaged a non-Long granule \
+         (per-channel scheduler may not be hooked up)"
+    );
+    assert!(
+        right_total > 0 && right_long == right_total,
+        "right-channel sine should stay Long throughout (was {right_long}/{right_total})"
+    );
+
+    let mut demux =
+        Mp3Demuxer::open(Box::new(Cursor::new(bytes.clone()))).expect("stereo demuxer open");
+    let mut packets = 0usize;
+    loop {
+        match demux.next_packet() {
+            Ok(_pkt) => packets += 1,
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("stereo demuxer next_packet: {e}"),
+        }
+    }
+    assert!(packets > 0, "stereo auto demuxer accepted no packets");
 }
 
 #[test]

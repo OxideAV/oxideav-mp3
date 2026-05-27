@@ -1605,12 +1605,68 @@ on every mixed granule and Mp3Demuxer round-trip acceptance). Tests:
 575 pass (was 554 at r160; +14 unit + 7 integration). No external
 implementation consulted.
 
+**Phase 2 step 32 (§2.4.3.4.9 independent-stereo widening of the
+block-type override toggles)** narrows the long-standing
+"force-short / force-mixed / auto / auto-mixed are mono-only"
+restriction to its actual spec basis. The §2.4.3.4.9 same-block-type
+requirement only binds when **MS-stereo** is active (the joint-mode
+matrix `M = (L+R)/√2`, `S = (L-R)/√2` rotates the L/R pair before
+quantize, and the decoder needs both halves to share window
+geometry); independent stereo ([`ChannelMode::Stereo`] /
+[`ChannelMode::DualChannel`]) carries per-channel side-info verbatim
+per §2.4.1.7 / §2.4.2.7 and has no such constraint. The four
+override entry points are therefore widened:
+
+- `force_short_blocks_for_testing(true)`
+- `force_mixed_blocks_for_testing(true)`
+- `enable_auto_block_type(threshold)`
+- `enable_auto_block_type_with_mixed(attack, low_band_stability)`
+
+now accept mono **and** independent stereo (`nch == 2` without joint
+coupling) and still reject MS-stereo joint modes built via
+`Mp3Encoder::new_joint_stereo_ms` / `Mp3Encoder::new_joint_stereo_auto`.
+The gate is the new private `Mp3Encoder::ms_joint_stereo_active`
+predicate (`self.ms_stereo || self.ms_auto_threshold.is_some()`),
+which captures both the unconditional MS path and the per-frame
+MS/LR auto-picker. The MS-stereo gap remains the §2.4.3.4.9
+follow-up; force-mode + MS-stereo and auto + MS-stereo continue to
+return `StreamEncodeError::StereoUnsupported`.
+
+The downstream encode loop was already per-(gr, ch): the
+`block_type_per_gc[gr][ch]` matrix has iterated `0..self.nch` since
+r156, the auto path's `AutoBlockTypeConfig` already sized its
+detector / scheduler / mixed-classifier vectors to `nch`, and the
+MDCT / gc-template / outer-loop branches all index per-channel. The
+only change to the encode pipeline is the API-time guard relaxation
++ updated comments on the §C.1.5.2 / §2.4.3.4.9.2 reasoning. The
+per-channel scheduler independence means independent-stereo auto
+behaves correctly without further wiring: a click train on the left
+and a sustained sine on the right produces non-Long granules on
+channel 0 and Long-only on channel 1 in the same frame.
+
+Validated by 11 new integration tests: 3 in
+`short_block_encoder_roundtrip.rs` (MS-stereo + force-short
+rejected, MS-auto + force-short rejected, independent-stereo +
+force-short accepted including a per-channel side-info wire check
+on a stereo click+sine stimulus and Mp3Demuxer round-trip); 4 in
+`mixed_block_encoder_roundtrip.rs` (MS-stereo + force-mixed
+rejected, MS-auto + force-mixed rejected, independent-stereo +
+force-mixed accepted, and a stereo force-mixed end-to-end wire +
+demuxer test on a 220 Hz / 440 Hz interleaved stimulus); 3 in
+`auto_block_type_roundtrip.rs` (MS-stereo + auto rejected, MS-auto
++ auto rejected, independent-stereo + auto accepted, plus a
+per-channel scheduler witness that pushes a click train on the
+left and a sustained sine on the right and asserts non-Long
+granules in channel 0 but Long-only in channel 1); and 3 in
+`auto_block_type_mixed_roundtrip.rs` (mirrors of the above for
+`enable_auto_block_type_with_mixed`). Tests: 586 pass (was 575 at
+r161; +11 integration). No external implementation consulted.
+
 Remaining Phase 2 work: a real per-band psychoacoustic threshold (so
 the outer loop can spectrally redistribute bits without a hand-tuned
-constant), intensity-stereo encode (§2.4.3.4.9.3), multi-channel
-short / mixed / auto-block-type agreement (§2.4.3.4.9
-cross-channel block-type agreement is the gap the force-short /
-force-mixed toggles and the auto path reject stereo on), LSF encode,
+constant), intensity-stereo encode (§2.4.3.4.9.3), §2.4.3.4.9
+cross-channel-MS block-type agreement (the gap the force-mode and
+auto toggles still reject MS-stereo joint modes on), LSF encode,
 and stereo / LSF decode through the trait wrapper.
 
 ### Not yet implemented
@@ -1621,7 +1677,7 @@ scalefactor paths — are present; the wrapper is mono MPEG-1 only this
 round; the framing layer accepts MPEG-2.5 as of step 25 but the
 trait-wrapper audio-decode chain still rejects it pending the
 `MPEG-2.5-GAP.md` observer-trace items). The encoder is **Phase 1
-framing + Phase 2 steps 1–31 (forward MDCT primitive + analysis
+framing + Phase 2 steps 1–32 (forward MDCT primitive + analysis
 windowing + forward overlap split + polyphase analysis subband
 filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
@@ -1666,15 +1722,21 @@ promotion via the new clean-room PCM-domain `MixedClassifier`
 `Mp3Encoder::enable_auto_block_type_with_mixed` and reusing the
 r159 `outer_loop_search_mixed` primitive via the
 `gc_template.mixed_block_flag` discriminator so mixed-promoted
-granules also run the §C.1.5.4.3 distortion-control loop)** — it
+granules also run the §C.1.5.4.3 distortion-control loop +
+§2.4.3.4.9 independent-stereo widening of the block-type override
+toggles so `force_short_blocks_for_testing`,
+`force_mixed_blocks_for_testing`, `enable_auto_block_type`, and
+`enable_auto_block_type_with_mixed` accept
+`ChannelMode::Stereo` / `ChannelMode::DualChannel` in addition to
+mono, gated by the new `Mp3Encoder::ms_joint_stereo_active`
+predicate so only MS-stereo joint modes still reject)** — it
 still lacks
 the psychoacoustic model (so the outer loop's `xmin(sb)` is a
 uniform constant rather than per-band masking-aware),
-intensity-stereo encode (§2.4.3.4.9.3), multi-channel short /
-mixed / auto-block-type support (§2.4.3.4.9 cross-channel
-block-type agreement is the gap the force-short / force-mixed
-toggles and the auto path — with or without mixed promotion —
-reject stereo on), and
+intensity-stereo encode (§2.4.3.4.9.3), MS-stereo + short / mixed /
+auto-block-type support (the §2.4.3.4.9 cross-channel-MS agreement
+wiring the override toggles still reject `new_joint_stereo_ms` /
+`new_joint_stereo_auto` on), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's
 stream-level driver still rejects non-MPEG-1 streams; the

@@ -83,8 +83,11 @@ fn lf_dc_with_hf_click_train(total_samples: usize, click_period: usize) -> Vec<i
 }
 
 #[test]
-fn enable_auto_block_type_with_mixed_rejected_on_stereo() {
-    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+fn enable_auto_block_type_with_mixed_rejected_on_ms_stereo() {
+    // r162: rejection now scoped to MS-stereo joint modes only;
+    // independent stereo is accepted (see
+    // `enable_auto_block_type_with_mixed_accepted_on_independent_stereo`).
+    let mut enc = Mp3Encoder::new_joint_stereo_ms(BR, SR).expect("MS-stereo encoder build");
     assert!(!enc.auto_block_type_enabled());
     assert!(!enc.auto_block_type_mixed_enabled());
     let err = enc
@@ -92,10 +95,55 @@ fn enable_auto_block_type_with_mixed_rejected_on_stereo() {
             DEFAULT_ATTACK_THRESHOLD,
             DEFAULT_MIXED_LOW_BAND_STABILITY,
         )
-        .expect_err("stereo + mixed-auto should be rejected (same as plain auto)");
+        .expect_err("MS-stereo + mixed-auto should be rejected");
     let _ = format!("{err}");
     assert!(!enc.auto_block_type_enabled());
     assert!(!enc.auto_block_type_mixed_enabled());
+}
+
+#[test]
+fn enable_auto_block_type_with_mixed_rejected_on_ms_auto_stereo() {
+    let mut enc = Mp3Encoder::new_joint_stereo_auto(BR, SR).expect("MS-auto encoder build");
+    let err = enc
+        .enable_auto_block_type_with_mixed(
+            DEFAULT_ATTACK_THRESHOLD,
+            DEFAULT_MIXED_LOW_BAND_STABILITY,
+        )
+        .expect_err("MS-auto + mixed-auto should be rejected");
+    assert!(!format!("{err}").is_empty());
+    assert!(!enc.auto_block_type_enabled());
+    assert!(!enc.auto_block_type_mixed_enabled());
+}
+
+#[test]
+fn enable_auto_block_type_with_mixed_accepted_on_independent_stereo() {
+    // r162: independent stereo accepts the mixed-auto toggle (one
+    // detector + scheduler + classifier per channel, all independent).
+    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::Stereo).expect("stereo encoder build");
+    enc.enable_auto_block_type_with_mixed(
+        DEFAULT_ATTACK_THRESHOLD,
+        DEFAULT_MIXED_LOW_BAND_STABILITY,
+    )
+    .expect("mixed-auto accepted on independent stereo");
+    assert!(enc.auto_block_type_enabled());
+    assert!(enc.auto_block_type_mixed_enabled());
+    assert_eq!(
+        enc.auto_block_type_threshold(),
+        Some(DEFAULT_ATTACK_THRESHOLD)
+    );
+    assert_eq!(
+        enc.auto_block_type_mixed_threshold(),
+        Some(DEFAULT_MIXED_LOW_BAND_STABILITY)
+    );
+
+    let mut enc2 =
+        Mp3Encoder::new(BR, SR, ChannelMode::DualChannel).expect("dual-channel encoder build");
+    enc2.enable_auto_block_type_with_mixed(
+        DEFAULT_ATTACK_THRESHOLD,
+        DEFAULT_MIXED_LOW_BAND_STABILITY,
+    )
+    .expect("mixed-auto accepted on dual-channel");
+    assert!(enc2.auto_block_type_mixed_enabled());
 }
 
 #[test]

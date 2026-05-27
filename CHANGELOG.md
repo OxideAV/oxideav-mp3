@@ -8,6 +8,60 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.3.4.9 independent-stereo widening of the block-type override
+  toggles** (Phase 2 step 32, r162). Narrows the long-standing
+  "force-short / force-mixed / auto / auto-mixed are mono-only"
+  restriction to its actual spec basis. The §2.4.3.4.9 same-block-type
+  requirement only binds on MS-stereo joint modes (the matrix
+  `M = (L+R)/√2`, `S = (L-R)/√2` rotates L/R before quantize and the
+  decoder needs both halves to share window geometry); independent
+  stereo (`ChannelMode::Stereo` / `ChannelMode::DualChannel` without
+  joint coupling) carries per-channel side-info verbatim per
+  §2.4.1.7 / §2.4.2.7 and has no such constraint.
+  - **New private predicate** `Mp3Encoder::ms_joint_stereo_active(&self)
+    -> bool` returns `self.ms_stereo || self.ms_auto_threshold.is_some()`
+    — true when an MS-stereo joint mode is configured (built via
+    `new_joint_stereo_ms` or `new_joint_stereo_auto`).
+  - **API guard relaxation.** The four block-type override entry
+    points reject the encoder only when `ms_joint_stereo_active()`
+    is true, instead of when `nch != 1`:
+    - `Mp3Encoder::force_short_blocks_for_testing`
+    - `Mp3Encoder::force_mixed_blocks_for_testing`
+    - `Mp3Encoder::enable_auto_block_type`
+    - `Mp3Encoder::enable_auto_block_type_with_mixed`
+  - **No encode-pipeline changes** beyond the guard + comment updates.
+    The downstream loop was already per-(gr, ch): the
+    `block_type_per_gc[gr][ch]` matrix has iterated `0..self.nch`
+    since r156, `AutoBlockTypeConfig` already sized its detector /
+    scheduler / mixed-classifier vectors to `nch`, and the MDCT /
+    gc-template / outer-loop branches all index per-channel. Per-
+    channel scheduler independence means independent-stereo auto
+    behaves correctly without further wiring: a click train on the
+    left and a sustained sine on the right produces non-Long
+    granules on channel 0 and Long-only on channel 1 in the same
+    frame.
+  - **MS-stereo gap unchanged.** `new_joint_stereo_ms` /
+    `new_joint_stereo_auto` encoders still return
+    `StreamEncodeError::StereoUnsupported` from the four toggles
+    pending the §2.4.3.4.9 cross-channel-MS agreement wiring.
+
+  Validated by 11 new integration tests across
+  `tests/short_block_encoder_roundtrip.rs`,
+  `tests/mixed_block_encoder_roundtrip.rs`,
+  `tests/auto_block_type_roundtrip.rs`, and
+  `tests/auto_block_type_mixed_roundtrip.rs`: MS-stereo and MS-auto
+  rejection for each of the four toggles; independent-stereo and
+  dual-channel acceptance for each; and end-to-end stereo wire +
+  `Mp3Demuxer` round-trip tests covering force-short, force-mixed,
+  and a per-channel auto-scheduler witness that drives the left
+  channel with a click train and the right with a sustained sine,
+  then asserts the emitted side-info carries non-Long granules in
+  channel 0 but stays Long-only in channel 1. Existing
+  rejected-on-stereo tests were rewritten to reject MS-stereo joint
+  modes (still failing per §2.4.3.4.9) rather than independent
+  stereo. Tests: 586 pass (was 575 at r161; +11 integration). No
+  external implementation consulted.
+
 - **§2.4.3.4.10.3 auto-block-type mixed-block promotion** (Phase 2
   step 31, r161). Closes the long-standing "auto path can never emit
   Mixed" gap by adding a clean-room PCM-domain mixed-vs-pure-short
