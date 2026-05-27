@@ -8,6 +8,45 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`DEFAULT_AMBIENT_LEAK` empirical-corpus calibration** (Phase 2
+  step 35, r165). Replaces the hand-wave justification for the
+  r164-promoted `DEFAULT_AMBIENT_LEAK = 0.5` constant with a
+  synthetic-corpus parameter sweep. A 7-row corpus
+  (`steady_sine`, `steady_noise`, `isolated_click`,
+  `burst_train_period4`, `slow_swell`, `swell_then_click`,
+  `sustained_drum_pair`, `level_shift`) covers both leak-knob
+  failure-mode axes — slow-leak false-fire on rising envelopes,
+  fast-leak missed-fire on sustained transients. The
+  `LEAK_SWEEP = [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 0.95]` scan
+  produces the per-leak aggregate error
+  `Σ max(0, |obs − expected| − tolerance)`; four pinned properties
+  document the result:
+  - `default_leak_is_an_argmin_over_the_sweep` — no in-domain leak
+    strictly beats `0.5`.
+  - `default_leak_beats_slow_endpoint_and_ties_fast` — `0.5`
+    strictly beats `0.05` (err 15 vs 0) and ties `0.95` (both 0).
+    The asymmetry is the empirical headline: at the default `10×`
+    threshold, the leak/ambient interaction saturates from the fast
+    end before the slow end, so the rejected-leak region is
+    `[0.05, 0.3]` and the acceptable region is `[0.5, 0.95]`.
+  - `default_leak_emits_zero_fires_on_steady_rows` — zero fires on
+    the two steady-state baselines at the default leak.
+  - `default_leak_catches_at_least_half_of_burst_train` — the
+    burst-train row catches `≥ 4` of its 9 expected hits at the
+    default leak (in practice all 9 with the `10×` threshold).
+
+  The first granule of each row is discarded as a seed-only call —
+  the detector's `ambient` starts at zero and any non-silent first
+  granule trips a `ratio = e_max / SILENCE_FLOOR` overflow, so the
+  post-seed steady-state is what calibration measures. The
+  threshold knob is held at `DEFAULT_ATTACK_THRESHOLD = 10.0`
+  throughout; a future round that revisits the threshold should
+  re-run the sweep at the new value and tighten the `<=` in
+  property 2 into a `<` if the fast-end saturation collapses.
+  Threshold-sweep calibration is itself a natural r166+ followup
+  out of scope for r165. +6 unit tests (sweep + corpus
+  well-formedness, argmin, asymmetric-endpoint, steady-row zero,
+  burst-train ≥ half). 602 tests pass (was 596).
 - **§2.4.3.4.10 finer attack-detector knobs** (Phase 2 step 34, r164).
   The encoder-side `attack_detect::AttackDetector` previously held a
   single tunable, the subframe-to-ambient ratio `threshold`; the

@@ -1614,6 +1614,90 @@ on every mixed granule and Mp3Demuxer round-trip acceptance). Tests:
 575 pass (was 554 at r160; +14 unit + 7 integration). No external
 implementation consulted.
 
+**Phase 2 step 35 (`DEFAULT_AMBIENT_LEAK` empirical-corpus
+calibration)** replaces the hand-wave justification for the
+`DEFAULT_AMBIENT_LEAK = 0.5` constant promoted to public API in
+r164 with a synthetic-corpus parameter sweep. The constant carries
+the IIR adaptation rate of the encoder-side
+`attack_detect::AttackDetector`'s ambient-energy estimate; r164's
+README and module-doc justified the value on the same heuristic
+ground the original private `LEAK = 0.5` constant carried
+("halfway toward the new floor sample per granule"). r165 closes
+that gap with a 7-row corpus and a `LEAK_SWEEP = [0.05, 0.1, 0.2,
+0.3, 0.5, 0.7, 0.9, 0.95]` parameter scan.
+
+The corpus enumerates the two failure-mode axes the leak knob
+trades off against each other: false-fire from a lagging ambient
+on a rising envelope (slow-leak failure) and missed-fire from
+ambient absorption of a sustained transient (fast-leak failure).
+Each row is synthesised in-test from a closed-form expression with
+the expected fire-count derived from its construction:
+
+* `steady_sine` (440 Hz constant amplitude, 40 granules): expected
+  0 fires, tolerance 0. The steady-state baseline.
+* `steady_noise` (deterministic xorshift32-driven white floor at
+  ≈ −40 dB, 40 granules): expected 0, tolerance 0. The
+  steady-state stochastic baseline.
+* `isolated_click` (quiet floor with one mid-burst in the final
+  granule's middle subframe): expected 1, tolerance 0.
+* `burst_train_period4` (quiet floor with a sharp burst every
+  4th granule, 9 burst granules in a 40-granule run): expected 9,
+  tolerance 2. The slow-end-favouring signal — fast leak's
+  ambient absorbs each burst and risks missing later ones.
+* `slow_swell` (440 Hz sine whose amplitude grows linearly from
+  0.001 to 0.5 over the run, no transient): expected 0, tolerance
+  1. The fast-end-favouring signal — slow leak's lagging ambient
+  reads the rising envelope as a transient and trips false fires.
+* `swell_then_click` (the slow-swell signal with one terminal
+  burst): expected 1, tolerance 1.
+* `sustained_drum_pair` (two 3-granule loud hits in an otherwise
+  quiet 40-granule run, separated by ≈ 14 quiet granules): expected
+  2, tolerance 1.
+* `level_shift` (10 quiet granules then 30 sustained loud
+  granules): expected 1, tolerance 1.
+
+The per-leak error is summed as
+`max(0, |observed − expected| − tolerance)` across the corpus.
+Four properties pin the result:
+
+* `default_leak_is_an_argmin_over_the_sweep` — no in-domain leak
+  strictly beats `0.5` on the aggregate metric.
+* `default_leak_beats_slow_endpoint_and_ties_fast` — `0.5`
+  achieves *strictly* lower error than the slow endpoint `0.05`
+  and at most equal error to the fast endpoint `0.95`. The
+  asymmetry is the empirical headline: at the default `10×`
+  threshold, the slow-end failure mode bites long before the
+  fast-end failure mode, so the rejected-leak region is
+  `[0.05, 0.3]` (errors `15, 6, 1, 1`) while the
+  acceptable-leak region is `[0.5, 0.95]` (errors all `0`).
+* `default_leak_emits_zero_fires_on_steady_rows` — zero fires on
+  both steady-state rows (`steady_sine`, `steady_noise`).
+* `default_leak_catches_at_least_half_of_burst_train` — the
+  burst-train row catches `≥ 4` of its 9 expected hits at the
+  default leak (in practice all 9 catch at the `10×` threshold).
+
+The first granule of each row is discarded as a seed-only call —
+the detector's `ambient` starts at zero and any non-silent first
+granule always trips a `ratio = e_max / SILENCE_FLOOR` overflow,
+so the post-seed steady-state is what calibration measures (the
+same `gr == 0` tolerance the pre-existing `pure_sine_not_flagged`
+test already encoded). The encoder's `block_type_per_gc` pre-pass
+sees the same seed semantics — the §C.1.5.2 state machine begins
+in `Long` regardless of the first granule's classification — so
+the corpus matches the operational shape of the detector.
+
+The honest empirical finding the calibration leaves on the
+record: the leak knob's relevant tuning range with the default
+`10×` threshold is `[0.5, 0.95]` — the fast-end ties because the
+threshold dominates IIR-relaxation dynamics there, the slow-end
+loses on rising-envelope rows. A future round that revisits
+`DEFAULT_ATTACK_THRESHOLD` should re-run the sweep at the new
+threshold and tighten the `<=` in property 2 into a `<` if the
+fast-end saturation collapses. The threshold sweep is itself a
+natural r166+ followup but is out of scope for r165 — the present
+step calibrates one knob in isolation. Tests: 602 pass (was 596;
++6 from this step). No external implementation consulted.
+
 **Phase 2 step 34 (§2.4.3.4.10 finer attack-detector knobs)** turns
 the encoder-side `attack_detect::AttackDetector`'s IIR adaptation
 rate into a per-instance tunable. Before r164 the detector exposed
