@@ -83,36 +83,34 @@ fn lf_dc_with_hf_click_train(total_samples: usize, click_period: usize) -> Vec<i
 }
 
 #[test]
-fn enable_auto_block_type_with_mixed_rejected_on_ms_stereo() {
-    // r162: rejection now scoped to MS-stereo joint modes only;
-    // independent stereo is accepted (see
-    // `enable_auto_block_type_with_mixed_accepted_on_independent_stereo`).
+fn enable_auto_block_type_with_mixed_accepted_on_ms_stereo() {
+    // r163: MS-stereo now accepts the mixed-auto toggle. The
+    // per-channel mixed-classifier vector mirrors the per-channel
+    // detector vector; on MS-stereo the per-granule classifier flags
+    // are OR-folded together before stepping the shared scheduler,
+    // so the §2.4.3.4.9 agreement holds over `mixed_block_flag` too.
     let mut enc = Mp3Encoder::new_joint_stereo_ms(BR, SR).expect("MS-stereo encoder build");
     assert!(!enc.auto_block_type_enabled());
     assert!(!enc.auto_block_type_mixed_enabled());
-    let err = enc
-        .enable_auto_block_type_with_mixed(
-            DEFAULT_ATTACK_THRESHOLD,
-            DEFAULT_MIXED_LOW_BAND_STABILITY,
-        )
-        .expect_err("MS-stereo + mixed-auto should be rejected");
-    let _ = format!("{err}");
-    assert!(!enc.auto_block_type_enabled());
-    assert!(!enc.auto_block_type_mixed_enabled());
+    enc.enable_auto_block_type_with_mixed(
+        DEFAULT_ATTACK_THRESHOLD,
+        DEFAULT_MIXED_LOW_BAND_STABILITY,
+    )
+    .expect("mixed-auto accepted on MS-stereo (r163)");
+    assert!(enc.auto_block_type_enabled());
+    assert!(enc.auto_block_type_mixed_enabled());
 }
 
 #[test]
-fn enable_auto_block_type_with_mixed_rejected_on_ms_auto_stereo() {
+fn enable_auto_block_type_with_mixed_accepted_on_ms_auto_stereo() {
     let mut enc = Mp3Encoder::new_joint_stereo_auto(BR, SR).expect("MS-auto encoder build");
-    let err = enc
-        .enable_auto_block_type_with_mixed(
-            DEFAULT_ATTACK_THRESHOLD,
-            DEFAULT_MIXED_LOW_BAND_STABILITY,
-        )
-        .expect_err("MS-auto + mixed-auto should be rejected");
-    assert!(!format!("{err}").is_empty());
-    assert!(!enc.auto_block_type_enabled());
-    assert!(!enc.auto_block_type_mixed_enabled());
+    enc.enable_auto_block_type_with_mixed(
+        DEFAULT_ATTACK_THRESHOLD,
+        DEFAULT_MIXED_LOW_BAND_STABILITY,
+    )
+    .expect("mixed-auto accepted on MS-auto (r163)");
+    assert!(enc.auto_block_type_enabled());
+    assert!(enc.auto_block_type_mixed_enabled());
 }
 
 #[test]

@@ -637,16 +637,20 @@ impl Mp3Encoder {
     /// ([`Mp3Encoder::new_joint_stereo_ms`], `self.ms_stereo == true`)
     /// or the per-frame MS/LR picker
     /// ([`Mp3Encoder::new_joint_stereo_auto`],
-    /// `self.ms_auto_threshold.is_some()`). The four block-type
-    /// override toggles (force-short, force-mixed, auto, auto+mixed)
-    /// reject these modes because §2.4.3.4.9 requires both channels of
-    /// an MS-stereo granule to share the same `block_type` /
-    /// `window_switching_flag` / `mixed_block_flag`, and the
-    /// cross-channel-MS agreement wiring lands in a separate
-    /// follow-up. Independent two-channel modes
-    /// ([`ChannelMode::Stereo`] / [`ChannelMode::DualChannel`] without
-    /// joint coupling) carry per-channel side-info verbatim and have
-    /// no such constraint, so they are accepted as of r162.
+    /// `self.ms_auto_threshold.is_some()`).
+    ///
+    /// Used as the "do we need cross-channel block-type agreement?"
+    /// predicate in `encode_frame`'s pre-pass. r163 wired the
+    /// agreement: when this returns `true`, the encoder reduces
+    /// `block_type_per_gc[gr][L]` and `[gr][R]` to a single shared
+    /// `(block_type, mixed_flag)` per granule before MDCT dispatch by
+    /// running a single shared §C.1.5.2 scheduler driven by the OR of
+    /// per-channel attack flags (auto path) or by emitting the
+    /// trivially-agreed `[Short; 2]` (force-short / force-mixed
+    /// paths). The four block-type override toggles (force-short,
+    /// force-mixed, auto, auto+mixed) now accept MS-stereo joint
+    /// modes; the predicate is retained for the per-pass agreement
+    /// branch and for documentation of which mode is active.
     #[must_use]
     fn ms_joint_stereo_active(&self) -> bool {
         self.ms_stereo || self.ms_auto_threshold.is_some()
@@ -657,38 +661,26 @@ impl Mp3Encoder {
     /// [`Self::force_short_blocks`] field for the per-granule
     /// behavioural contract.
     ///
-    /// Channel-mode restriction (relaxed in r162): the §2.4.3.4.9
-    /// MS-stereo requirement that both channels of a granule share
-    /// the same `block_type` / `window_switching_flag` /
-    /// `mixed_block_flag` only applies when MS-stereo is active. This
-    /// toggle therefore accepts:
-    ///
-    /// * mono ([`ChannelMode::SingleChannel`], `nch == 1`),
-    /// * independent stereo ([`ChannelMode::Stereo`] /
-    ///   [`ChannelMode::DualChannel`] — `nch == 2`, no joint coupling,
-    ///   each channel's side-info is carried verbatim per
-    ///   §2.4.1.7 / §2.4.2.7).
-    ///
-    /// It still rejects encoders built via
-    /// [`Mp3Encoder::new_joint_stereo_ms`] /
-    /// [`Mp3Encoder::new_joint_stereo_auto`] until the cross-channel-MS
-    /// block-type agreement wiring lands.
+    /// Channel-mode acceptance (widened in r163): every channel layout
+    /// the encoder supports — mono ([`ChannelMode::SingleChannel`],
+    /// `nch == 1`), independent stereo ([`ChannelMode::Stereo`] /
+    /// [`ChannelMode::DualChannel`]), and MS-stereo joint modes
+    /// ([`Mp3Encoder::new_joint_stereo_ms`] /
+    /// [`Mp3Encoder::new_joint_stereo_auto`]) — accepts the toggle.
+    /// Force-short trivially satisfies the §2.4.3.4.9 MS agreement
+    /// constraint because every (gr, ch) tile emits the same
+    /// `BlockType::Short`.
     ///
     /// # Errors
     ///
-    /// [`StreamEncodeError::StereoUnsupported`] when the encoder is in
-    /// an MS-stereo joint mode (per [`Self::ms_joint_stereo_active`]).
-    /// The dispatch tag is reused — the actual case is "force-short
-    /// combined with MS-stereo," but the existing error variant
-    /// captures the same "channel layout unsupported by this opt-in"
-    /// semantics.
+    /// Returns `Ok` for every channel layout this round; the
+    /// previous round's [`StreamEncodeError::StereoUnsupported`]
+    /// guard was dropped when the cross-channel-MS agreement wiring
+    /// landed (r163).
     pub fn force_short_blocks_for_testing(
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
-        if enabled && self.ms_joint_stereo_active() {
-            return Err(StreamEncodeError::StereoUnsupported);
-        }
         if enabled {
             // Mixed and pure-short are mutually exclusive: a granule is
             // long, short, or mixed. Enabling pure-short clears mixed.
@@ -714,10 +706,13 @@ impl Mp3Encoder {
     /// [`Self::force_mixed_blocks`] field for the per-granule
     /// behavioural contract.
     ///
-    /// Channel-mode restriction (relaxed in r162; see
+    /// Channel-mode acceptance (widened in r163; see
     /// [`Self::force_short_blocks_for_testing`] for the §2.4.3.4.9
-    /// rationale): mono and independent stereo accepted;
-    /// MS-stereo joint modes rejected.
+    /// rationale): every channel layout the encoder supports — mono,
+    /// independent stereo, and MS-stereo joint modes — accepts the
+    /// toggle. Force-mixed trivially satisfies the §2.4.3.4.9
+    /// MS-agreement constraint because every (gr, ch) tile emits the
+    /// same `(BlockType::Short, mixed_block_flag = true)` pair.
     ///
     /// Mutually exclusive with [`Self::force_short_blocks_for_testing`].
     ///   Enabling this resets `force_short_blocks` to `false` so a
@@ -725,15 +720,13 @@ impl Mp3Encoder {
     ///
     /// # Errors
     ///
-    /// [`StreamEncodeError::StereoUnsupported`] when the encoder is in
-    /// an MS-stereo joint mode (per [`Self::ms_joint_stereo_active`]).
+    /// Returns `Ok` for every channel layout this round; the
+    /// previous round's [`StreamEncodeError::StereoUnsupported`]
+    /// guard was dropped in r163.
     pub fn force_mixed_blocks_for_testing(
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
-        if enabled && self.ms_joint_stereo_active() {
-            return Err(StreamEncodeError::StereoUnsupported);
-        }
         if enabled {
             // Mixed and pure-short are mutually exclusive: a granule is
             // long, short, or mixed. Enabling mixed clears short.
@@ -778,17 +771,20 @@ impl Mp3Encoder {
     ///
     /// Restrictions:
     ///
-    /// * **Channel-mode.** Relaxed in r162: accepted on mono and
+    /// * **Channel-mode.** Widened in r163: accepted on mono,
     ///   independent stereo ([`ChannelMode::Stereo`] /
-    ///   [`ChannelMode::DualChannel`]); still rejected on MS-stereo
-    ///   joint modes ([`Mp3Encoder::new_joint_stereo_ms`] /
-    ///   [`Mp3Encoder::new_joint_stereo_auto`]) because
-    ///   §2.4.3.4.9 requires both channels of an MS-stereo granule to
-    ///   share the same `block_type`. The auto path runs one
-    ///   independent detector + scheduler per channel (the
-    ///   [`AutoBlockTypeConfig`] vectors are sized to `nch`), so
-    ///   each channel of an independent-stereo granule picks its own
-    ///   §C.1.5.2 transition state.
+    ///   [`ChannelMode::DualChannel`]), AND MS-stereo joint modes
+    ///   ([`Mp3Encoder::new_joint_stereo_ms`] /
+    ///   [`Mp3Encoder::new_joint_stereo_auto`]). Independent stereo
+    ///   runs one detector + scheduler per channel (each channel
+    ///   picks its own §C.1.5.2 transition state). MS-stereo runs
+    ///   per-channel detectors (so each channel keeps a coherent
+    ///   ambient estimate) but folds the per-channel attack flags via
+    ///   logical OR into a single shared scheduler before stepping —
+    ///   that scheduler's emission is mirrored across both channels,
+    ///   so the §2.4.3.4.9 "both channels of an MS-stereo granule
+    ///   share the same `block_type` /
+    ///   `window_switching_flag`" agreement holds by construction.
     /// * **Mutually exclusive with the force-toggles.** Enabling auto
     ///   clears [`Self::force_short_blocks`] and
     ///   [`Self::force_mixed_blocks`] (the testing toggles), and vice
@@ -796,12 +792,10 @@ impl Mp3Encoder {
     ///
     /// # Errors
     ///
-    /// [`StreamEncodeError::StereoUnsupported`] when the encoder is in
-    /// an MS-stereo joint mode (per [`Self::ms_joint_stereo_active`]).
+    /// Returns `Ok` for every channel layout this round; the
+    /// previous round's [`StreamEncodeError::StereoUnsupported`]
+    /// guard was dropped in r163.
     pub fn enable_auto_block_type(&mut self, threshold: f64) -> Result<(), StreamEncodeError> {
-        if self.ms_joint_stereo_active() {
-            return Err(StreamEncodeError::StereoUnsupported);
-        }
         // Outer loop is now compatible with auto block-type for every
         // block-type the auto scheduler ever emits:
         //   * Long granules — `outer_loop_search_long`
@@ -877,18 +871,21 @@ impl Mp3Encoder {
     /// their respective defaults.
     ///
     /// All [`Self::enable_auto_block_type`] restrictions apply
-    /// (MS-stereo joint modes rejected, mutually exclusive with the
-    /// force-toggles); as of r162 independent stereo
-    /// ([`ChannelMode::Stereo`] / [`ChannelMode::DualChannel`]) is
-    /// accepted (one mixed classifier per channel). Mixed promotion
-    /// is an *opt-in extension* — callers using
-    /// `enable_auto_block_type` keep the pre-r161 pure-short
-    /// behaviour.
+    /// (mutually exclusive with the force-toggles); as of r163 every
+    /// channel layout is accepted, including MS-stereo joint modes
+    /// (the per-channel mixed classifier vector mirrors the per-
+    /// channel detector vector; on MS-stereo the per-granule
+    /// classifier flags are OR-folded together before stepping the
+    /// single shared scheduler, so the §2.4.3.4.9 agreement holds
+    /// over `mixed_block_flag` too). Mixed promotion is an *opt-in
+    /// extension* — callers using `enable_auto_block_type` keep the
+    /// pre-r161 pure-short behaviour.
     ///
     /// # Errors
     ///
-    /// [`StreamEncodeError::StereoUnsupported`] when the encoder is in
-    /// an MS-stereo joint mode (per [`Self::ms_joint_stereo_active`]).
+    /// Returns `Ok` for every channel layout this round; the
+    /// previous round's [`StreamEncodeError::StereoUnsupported`]
+    /// guard was dropped in r163.
     pub fn enable_auto_block_type_with_mixed(
         &mut self,
         attack_threshold: f64,
@@ -1553,77 +1550,166 @@ impl Mp3Encoder {
         // (force-toggles, default-long, plain
         // `enable_auto_block_type`).
         let mut mixed_per_gc: [[bool; 2]; GRANULES] = [[false; 2]; GRANULES];
+        let ms_agreement_active = self.ms_joint_stereo_active() && self.nch == 2;
         let block_type_per_gc: [[BlockType; 2]; GRANULES] =
             if let Some(ref mut cfg) = self.auto_block_type {
                 // Auto path: classify each of the 2 frame granules + 1
                 // lookahead granule per channel, then feed the scheduler.
-                // r162 widened this to iterate every channel — for
-                // independent stereo each channel runs an independent
-                // detector + scheduler, picking its own §C.1.5.2
-                // transition state. The MS-stereo agreement constraint
-                // is enforced at API time (MS-stereo rejects the auto
-                // toggle), so the per-channel independence is safe.
+                //
+                // Two channel-coupling regimes (r163):
+                //
+                // * **Independent** (mono, `ChannelMode::Stereo`,
+                //   `ChannelMode::DualChannel`): each channel runs an
+                //   independent detector + scheduler. The per-channel
+                //   §C.1.5.2 transition states never need to match —
+                //   §2.4.1.7 / §2.4.2.7 carry side-info per channel
+                //   verbatim. The matrix `block_type_per_gc[gr][ch]`
+                //   can hold a different value for each channel.
+                //
+                // * **MS-stereo** (`new_joint_stereo_ms` or
+                //   `new_joint_stereo_auto`, the
+                //   `ms_agreement_active` branch): §2.4.3.4.9 requires
+                //   both channels of a granule to share the same
+                //   `block_type` / `window_switching_flag` /
+                //   `mixed_block_flag`, because the §2.4.3.4.9.2 MS
+                //   matrix `M = (L+R)/√2`, `S = (L-R)/√2` rotates L/R
+                //   before quantize and the decoder needs both halves
+                //   to share window geometry. The per-channel attack
+                //   detectors are still run (each channel keeps a
+                //   coherent ambient estimate so a quiet channel
+                //   doesn't drag the loud channel's threshold around),
+                //   but their per-granule attack flags are folded via
+                //   logical OR into the channel-0 scheduler and the
+                //   channel-0 scheduler's emission is mirrored across
+                //   both channels of the granule. The channel-1
+                //   scheduler is bypassed — it stays at default and
+                //   carries no state. If either channel demands a
+                //   Short, the granule emits Short on both; same for
+                //   the mixed-block-flag promotion. This is the
+                //   "safe upper envelope" agreement: it accepts more
+                //   short bursts than a per-channel sequence would
+                //   (each channel sees the other's transients) but
+                //   never under-resolves a real transient on either
+                //   side, and produces a self-consistent §C.1.5.2
+                //   sequence across the shared scheduler. Symmetric in
+                //   L↔R: an attack on either channel triggers the
+                //   transition for both.
                 let mut out: [[BlockType; 2]; GRANULES] = [[BlockType::Long; 2]; GRANULES];
-                for ch in 0..self.nch {
-                    // 3 attack flags: gr0, gr1, lookahead (gr2 of the
-                    // virtual three-granule window). Lookahead is empty
-                    // at end-of-stream — treat that as "no attack ahead".
-                    let mut pcm_g0 = [0.0f32; SAMPLES_PER_GRANULE];
-                    let mut pcm_g1 = [0.0f32; SAMPLES_PER_GRANULE];
-                    let mut pcm_g2 = [0.0f32; SAMPLES_PER_GRANULE];
-                    pcm_g0.copy_from_slice(&per_ch_frame_pcm[ch][0..SAMPLES_PER_GRANULE]);
-                    pcm_g1.copy_from_slice(
-                        &per_ch_frame_pcm[ch][SAMPLES_PER_GRANULE..2 * SAMPLES_PER_GRANULE],
-                    );
-                    let look = &per_ch_lookahead_pcm[ch];
-                    if !look.is_empty() {
-                        let n = look.len().min(SAMPLES_PER_GRANULE);
-                        pcm_g2[..n].copy_from_slice(&look[..n]);
+                if ms_agreement_active {
+                    // Per-channel attack-flag computation. Each channel's
+                    // detector still classifies its own PCM so the
+                    // ambient estimate stays meaningful for that
+                    // channel (a sudden L burst doesn't get hidden by
+                    // R's running ambient).
+                    let mut a0 = false;
+                    let mut a1 = false;
+                    let mut a2 = false;
+                    let mut m0 = false;
+                    let mut m1 = false;
+                    for ch in 0..self.nch {
+                        let mut pcm_g0 = [0.0f32; SAMPLES_PER_GRANULE];
+                        let mut pcm_g1 = [0.0f32; SAMPLES_PER_GRANULE];
+                        let mut pcm_g2 = [0.0f32; SAMPLES_PER_GRANULE];
+                        pcm_g0.copy_from_slice(&per_ch_frame_pcm[ch][0..SAMPLES_PER_GRANULE]);
+                        pcm_g1.copy_from_slice(
+                            &per_ch_frame_pcm[ch][SAMPLES_PER_GRANULE..2 * SAMPLES_PER_GRANULE],
+                        );
+                        let look = &per_ch_lookahead_pcm[ch];
+                        if !look.is_empty() {
+                            let n = look.len().min(SAMPLES_PER_GRANULE);
+                            pcm_g2[..n].copy_from_slice(&look[..n]);
+                        }
+                        // OR the per-channel classifications so the
+                        // shared scheduler sees a transient on either
+                        // side. Always advance the detector on both
+                        // granules to keep its ambient state coherent.
+                        a0 |= cfg.detector[ch].classify(&pcm_g0);
+                        a1 |= cfg.detector[ch].classify(&pcm_g1);
+                        let lookahead_present = !look.is_empty();
+                        if lookahead_present {
+                            let mut det_peek = cfg.detector[ch].clone();
+                            a2 |= det_peek.classify(&pcm_g2);
+                        }
+                        if let Some(ref mut classifiers) = cfg.mixed_classifier {
+                            m0 |= classifiers[ch].classify_mixed(&pcm_g0);
+                            m1 |= classifiers[ch].classify_mixed(&pcm_g1);
+                        }
                     }
-                    let a0 = cfg.detector[ch].classify(&pcm_g0);
-                    let a1 = cfg.detector[ch].classify(&pcm_g1);
-                    let lookahead_present = !look.is_empty();
-                    // Lookahead PCM may itself be empty (end-of-stream)
-                    // or all-zero (zero-padded tail-flush). In either
-                    // case we feed the scheduler `next_attack = false`
-                    // so the burst geometry closes cleanly with a Stop.
-                    // We do NOT classify a zero-padded buffer because
-                    // that would inject a spurious silent-floor sample
-                    // into the detector's ambient estimate; instead we
-                    // peek non-destructively by cloning the detector and
-                    // discard the resulting state.
-                    let a2 = if lookahead_present {
-                        let mut det_peek = cfg.detector[ch].clone();
-                        det_peek.classify(&pcm_g2)
-                    } else {
-                        false
-                    };
-                    // Optional mixed-vs-pure-short classification per
-                    // granule. The classifier is stateful (its one-tap
-                    // LP carries the previous granule's last sample
-                    // across boundaries), so we always advance it on
-                    // both granules to keep the seed continuous —
-                    // independent of whether the emission ends up
-                    // Short or not. The flag is consumed only when
-                    // the scheduler returns Short below; the
-                    // classifier itself doesn't know what the scheduler
-                    // will decide. The §2.4.2.7 mixed_block_flag is
-                    // valid only on Short emissions, which the
-                    // `step_with_mixed` contract enforces.
-                    let (m0, m1) = if let Some(ref mut classifiers) = cfg.mixed_classifier {
-                        let mm0 = classifiers[ch].classify_mixed(&pcm_g0);
-                        let mm1 = classifiers[ch].classify_mixed(&pcm_g1);
-                        (mm0, mm1)
-                    } else {
-                        (false, false)
-                    };
-                    // Feed the scheduler in granule-major order.
-                    let (bt0, mixed0) = cfg.scheduler[ch].step_with_mixed(a0, a1, m0);
-                    let (bt1, mixed1) = cfg.scheduler[ch].step_with_mixed(a1, a2, m1);
-                    out[0][ch] = bt0;
-                    out[1][ch] = bt1;
-                    mixed_per_gc[0][ch] = mixed0;
-                    mixed_per_gc[1][ch] = mixed1;
+                    // Single shared scheduler (we use channel-0's
+                    // slot; channel-1's scheduler is left at default
+                    // and carries no state in the MS-stereo regime).
+                    let (bt0, mixed0) = cfg.scheduler[0].step_with_mixed(a0, a1, m0);
+                    let (bt1, mixed1) = cfg.scheduler[0].step_with_mixed(a1, a2, m1);
+                    out[0][0] = bt0;
+                    out[0][1] = bt0;
+                    out[1][0] = bt1;
+                    out[1][1] = bt1;
+                    mixed_per_gc[0][0] = mixed0;
+                    mixed_per_gc[0][1] = mixed0;
+                    mixed_per_gc[1][0] = mixed1;
+                    mixed_per_gc[1][1] = mixed1;
+                } else {
+                    for ch in 0..self.nch {
+                        // 3 attack flags: gr0, gr1, lookahead (gr2 of the
+                        // virtual three-granule window). Lookahead is empty
+                        // at end-of-stream — treat that as "no attack ahead".
+                        let mut pcm_g0 = [0.0f32; SAMPLES_PER_GRANULE];
+                        let mut pcm_g1 = [0.0f32; SAMPLES_PER_GRANULE];
+                        let mut pcm_g2 = [0.0f32; SAMPLES_PER_GRANULE];
+                        pcm_g0.copy_from_slice(&per_ch_frame_pcm[ch][0..SAMPLES_PER_GRANULE]);
+                        pcm_g1.copy_from_slice(
+                            &per_ch_frame_pcm[ch][SAMPLES_PER_GRANULE..2 * SAMPLES_PER_GRANULE],
+                        );
+                        let look = &per_ch_lookahead_pcm[ch];
+                        if !look.is_empty() {
+                            let n = look.len().min(SAMPLES_PER_GRANULE);
+                            pcm_g2[..n].copy_from_slice(&look[..n]);
+                        }
+                        let a0 = cfg.detector[ch].classify(&pcm_g0);
+                        let a1 = cfg.detector[ch].classify(&pcm_g1);
+                        let lookahead_present = !look.is_empty();
+                        // Lookahead PCM may itself be empty (end-of-stream)
+                        // or all-zero (zero-padded tail-flush). In either
+                        // case we feed the scheduler `next_attack = false`
+                        // so the burst geometry closes cleanly with a Stop.
+                        // We do NOT classify a zero-padded buffer because
+                        // that would inject a spurious silent-floor sample
+                        // into the detector's ambient estimate; instead we
+                        // peek non-destructively by cloning the detector and
+                        // discard the resulting state.
+                        let a2 = if lookahead_present {
+                            let mut det_peek = cfg.detector[ch].clone();
+                            det_peek.classify(&pcm_g2)
+                        } else {
+                            false
+                        };
+                        // Optional mixed-vs-pure-short classification per
+                        // granule. The classifier is stateful (its one-tap
+                        // LP carries the previous granule's last sample
+                        // across boundaries), so we always advance it on
+                        // both granules to keep the seed continuous —
+                        // independent of whether the emission ends up
+                        // Short or not. The flag is consumed only when
+                        // the scheduler returns Short below; the
+                        // classifier itself doesn't know what the scheduler
+                        // will decide. The §2.4.2.7 mixed_block_flag is
+                        // valid only on Short emissions, which the
+                        // `step_with_mixed` contract enforces.
+                        let (m0, m1) = if let Some(ref mut classifiers) = cfg.mixed_classifier {
+                            let mm0 = classifiers[ch].classify_mixed(&pcm_g0);
+                            let mm1 = classifiers[ch].classify_mixed(&pcm_g1);
+                            (mm0, mm1)
+                        } else {
+                            (false, false)
+                        };
+                        // Feed the scheduler in granule-major order.
+                        let (bt0, mixed0) = cfg.scheduler[ch].step_with_mixed(a0, a1, m0);
+                        let (bt1, mixed1) = cfg.scheduler[ch].step_with_mixed(a1, a2, m1);
+                        out[0][ch] = bt0;
+                        out[1][ch] = bt1;
+                        mixed_per_gc[0][ch] = mixed0;
+                        mixed_per_gc[1][ch] = mixed1;
+                    }
                 }
                 out
             } else if self.force_short_blocks {

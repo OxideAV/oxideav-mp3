@@ -8,6 +8,64 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.3.4.9 cross-channel-MS block-type agreement** (Phase 2 step
+  33, r163). Closes the gap r162 left open by widening the four
+  block-type override toggles (force-short, force-mixed, auto,
+  auto-mixed) onto MS-stereo joint modes. The §2.4.3.4.9 same-block-
+  type / same-window-switching-flag / same-mixed-block-flag agreement
+  is enforced **inside** the encode pre-pass instead of via an API
+  reject.
+  - **API guard removal.** All four toggle entry points now return
+    `Ok` for every channel layout the encoder supports — mono,
+    independent stereo, AND MS-stereo joint modes. The previous
+    `StreamEncodeError::StereoUnsupported` MS-stereo rejection is
+    gone from `force_short_blocks_for_testing`,
+    `force_mixed_blocks_for_testing`, `enable_auto_block_type`, and
+    (via delegation) `enable_auto_block_type_with_mixed`.
+  - **Force-short / force-mixed paths.** Trivially satisfy the
+    §2.4.3.4.9 agreement: every (gr, ch) tile emits the same
+    `BlockType::Short` from `[[BlockType::Short; 2]; GRANULES]`, and
+    force-mixed sets `mixed_block_flag = true` uniformly via
+    `default_mixed_gc()` on both channel slots. No new code path
+    needed beyond comment / doc updates.
+  - **Auto / auto-mixed paths.** Add an `ms_agreement_active` branch
+    inside the `block_type_per_gc` pre-pass: when MS-stereo is on,
+    each channel's PCM is classified by its own detector (so the
+    ambient estimate stays meaningful per channel — a quiet channel
+    doesn't drag the loud one's threshold around), but the
+    per-channel attack flags + mixed-classifier flags are folded via
+    logical OR into a single shared scheduler. The scheduler's
+    per-granule `(BlockType, mixed)` emission is mirrored across
+    both channel slots of `block_type_per_gc[gr]` and
+    `mixed_per_gc[gr]`. The independent-stereo behaviour from r162
+    is preserved (each channel runs its own scheduler) for
+    `ChannelMode::Stereo` / `DualChannel`. The shared scheduler
+    bypasses `scheduler[1]` entirely so its state doesn't drift.
+  - **Agreement-rule rationale.** OR-fold is the "safe upper
+    envelope": an attack on either L or R triggers the §C.1.5.2
+    transition for both. It accepts more short bursts than a
+    hypothetical per-channel sequence would (each channel sees the
+    other's transients) but never under-resolves a real transient
+    on either side, and produces a self-consistent §C.1.5.2 sequence
+    across one shared scheduler — no half-formed
+    `Start-without-Short` chains the way two independently-stepped
+    schedulers might if their attack flags disagreed. Symmetric in
+    L↔R by construction.
+
+  Validated by 8 new integration tests and 5 rewrites. The rewrites
+  replace the r162 "MS-stereo + toggle → rejected" assertions with
+  their "accepted" counterparts. The new tests add wire-level
+  §2.4.3.4.9 agreement witnesses: MS-stereo + force-short emits
+  agreed Short side-info on both channels of every granule (220 /
+  440 Hz interleaved stimulus); MS-stereo + force-mixed similarly
+  emits agreed mixed side-info; MS-stereo + auto produces agreed
+  per-channel side-info AND responds to a click train on the LEFT
+  channel by emitting transition granules (witness that the OR-fold
+  engages the shared scheduler when an attack hits either channel,
+  not just both). All emit valid `Mp3Demuxer`-acceptable bitstreams.
+  Tests: 589 pass (was 586 at r162; +3 net = +8 new − 5 rewrites).
+  No external implementation consulted.
+
 - **§2.4.3.4.9 independent-stereo widening of the block-type override
   toggles** (Phase 2 step 32, r162). Narrows the long-standing
   "force-short / force-mixed / auto / auto-mixed are mono-only"

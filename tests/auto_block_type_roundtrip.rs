@@ -81,34 +81,31 @@ fn click_train_pcm(total_samples: usize, click_period: usize) -> Vec<i16> {
 }
 
 #[test]
-fn auto_block_type_rejected_on_ms_stereo_encoder() {
-    // r162: the rejection is now scoped to MS-stereo joint modes
-    // (§2.4.3.4.9 requires both channels of an MS-stereo granule to
-    // share `block_type`; the cross-channel-MS agreement wiring is
-    // deferred). Independent stereo is accepted in the
-    // `auto_block_type_accepted_on_independent_stereo` test below.
+fn auto_block_type_accepted_on_ms_stereo_encoder() {
+    // r163 (§2.4.3.4.9 cross-channel-MS block-type agreement): the
+    // auto toggle now accepts MS-stereo joint modes. The shared
+    // scheduler folds per-channel attack flags via logical OR before
+    // stepping (so an attack on either channel triggers the
+    // transition for both), and the scheduler's emission is mirrored
+    // across both channel slots of `block_type_per_gc[gr]`.
     let mut enc = Mp3Encoder::new_joint_stereo_ms(BR, SR).expect("MS-stereo encoder build");
     assert!(!enc.auto_block_type_enabled());
-    let err = enc
-        .enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
-        .expect_err("MS-stereo + auto should be rejected");
-    let msg = format!("{err}");
-    assert!(!msg.is_empty(), "error must have a message");
-    assert!(
-        !enc.auto_block_type_enabled(),
-        "flag must stay off after error"
+    enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto toggle accepted on MS-stereo (r163)");
+    assert!(enc.auto_block_type_enabled());
+    assert_eq!(
+        enc.auto_block_type_threshold(),
+        Some(DEFAULT_ATTACK_THRESHOLD)
     );
 }
 
 #[test]
-fn auto_block_type_rejected_on_ms_auto_stereo_encoder() {
+fn auto_block_type_accepted_on_ms_auto_stereo_encoder() {
     let mut enc = Mp3Encoder::new_joint_stereo_auto(BR, SR).expect("MS-auto encoder build");
     assert!(!enc.auto_block_type_enabled());
-    let err = enc
-        .enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
-        .expect_err("MS-auto + auto should be rejected");
-    assert!(!format!("{err}").is_empty(), "error must have a message");
-    assert!(!enc.auto_block_type_enabled(), "flag must stay off");
+    enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto toggle accepted on MS-auto (r163)");
+    assert!(enc.auto_block_type_enabled());
 }
 
 #[test]
@@ -544,6 +541,88 @@ fn auto_block_type_on_independent_stereo_runs_per_channel_scheduler() {
         }
     }
     assert!(packets > 0, "stereo auto demuxer accepted no packets");
+}
+
+#[test]
+fn auto_block_type_on_ms_stereo_agrees_per_granule_and_responds_to_either_channel() {
+    // r163 (§2.4.3.4.9 cross-channel-MS block-type agreement): on
+    // MS-stereo + auto, the shared scheduler OR-folds per-channel
+    // attack flags before stepping; the per-granule emission is
+    // mirrored across both channel slots, so every granule's L and R
+    // side-info must agree on `window_switching_flag` / `block_type`
+    // / `mixed_block_flag`. The witness PCM puts a click train on
+    // the LEFT channel and a sustained sine on the RIGHT: the OR-
+    // fold means the right channel's side-info must follow the left
+    // channel into Start / Short transitions (an attack on either
+    // channel triggers the transition for both — the asymmetric
+    // "right only" baseline from the independent-stereo path would
+    // be wrong here).
+    use std::f32::consts::PI;
+    let n = SR as usize;
+    let click_period = 6_600usize;
+    let mut pcm: Vec<i16> = Vec::with_capacity(n * 2);
+    let scale = 0.5 * (i16::MAX as f32);
+    let mut next_click_pos = click_period;
+    for i in 0..n {
+        let l_burst = if i >= next_click_pos && i < next_click_pos + 64 {
+            let s = i - next_click_pos;
+            let v = if s % 2 == 0 { 30_000i16 } else { -30_000i16 };
+            if s + 1 == 64 {
+                next_click_pos += click_period;
+            }
+            v
+        } else {
+            0i16
+        };
+        let t = i as f32 / SR as f32;
+        let r = (2.0 * PI * 440.0 * t).sin() * scale;
+        pcm.push(l_burst);
+        pcm.push(r.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+    }
+
+    let mut enc = Mp3Encoder::new_joint_stereo_ms(BR, SR).expect("MS-stereo encoder build");
+    enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto accepted on MS-stereo (r163)");
+    enc.push_samples(&pcm).expect("push stereo pcm");
+    let mut bytes: Vec<u8> = Vec::new();
+    let _ = enc.finish(&mut bytes).expect("encoder finish");
+
+    let mut frames = 0usize;
+    let mut total_granules = 0usize;
+    let mut all_agreed = true;
+    let mut transition_granules = 0usize;
+    for frame in FrameWalker::new(&bytes) {
+        frames += 1;
+        let hdr = parse_header(&frame.data[..4]).expect("header parse");
+        assert_eq!(hdr.channel_count(), 2);
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
+        for gr in 0..si.granule_count as usize {
+            total_granules += 1;
+            let l = &si.granules[gr][0];
+            let r = &si.granules[gr][1];
+            if l.block_type != r.block_type
+                || l.window_switching_flag != r.window_switching_flag
+                || l.mixed_block_flag != r.mixed_block_flag
+            {
+                all_agreed = false;
+            }
+            if l.window_switching_flag && l.block_type != BlockType::Long {
+                transition_granules += 1;
+            }
+        }
+    }
+    assert!(frames > 0, "MS-stereo + auto emitted no frames");
+    assert!(total_granules > 0);
+    assert!(
+        all_agreed,
+        "MS-stereo + auto produced disagreeing per-channel side-info \
+         (cross-channel agreement broken)"
+    );
+    assert!(
+        transition_granules > 0,
+        "MS-stereo + auto: left-channel click train should have driven \
+         at least one §C.1.5.2 transition through the shared scheduler"
+    );
 }
 
 #[test]

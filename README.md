@@ -1605,6 +1605,71 @@ on every mixed granule and Mp3Demuxer round-trip acceptance). Tests:
 575 pass (was 554 at r160; +14 unit + 7 integration). No external
 implementation consulted.
 
+**Phase 2 step 33 (§2.4.3.4.9 cross-channel-MS block-type
+agreement)** closes the gap step 32 left open by widening the four
+block-type override toggles (`force_short_blocks_for_testing`,
+`force_mixed_blocks_for_testing`, `enable_auto_block_type`,
+`enable_auto_block_type_with_mixed`) onto MS-stereo joint modes
+(encoders built via `Mp3Encoder::new_joint_stereo_ms` /
+`Mp3Encoder::new_joint_stereo_auto`). The §2.4.3.4.9 agreement —
+both channels of an MS-stereo granule must share `block_type` /
+`window_switching_flag` / `mixed_block_flag` so that the
+§2.4.3.4.9.2 forward MS matrix `M = (L+R)/√2`, `S = (L-R)/√2`
+sees both halves in the same time-frequency tile — is now
+enforced **inside** the encode pre-pass rather than via an API
+reject. The four entry points return `Ok` for every channel
+layout the encoder supports.
+
+The force paths trivially agree: every (gr, ch) tile in
+`block_type_per_gc` is `[[BlockType::Short; 2]; GRANULES]` (or
+the mixed-tagged equivalent under `force_mixed_blocks`), so both
+channel slots carry the same block-type and the same
+`mixed_block_flag` by construction. The auto paths add a new
+`ms_agreement_active` branch in the `block_type_per_gc` pre-pass:
+each channel's PCM is still classified by its own attack detector
+and mixed classifier (per-channel ambient estimates so a quiet
+channel doesn't drag the loud one's threshold around), but the
+per-channel per-granule attack flags and mixed-classifier flags
+are folded via logical OR before stepping a single shared
+scheduler (we use `scheduler[0]`'s slot; the channel-1 scheduler
+is bypassed in this regime). The shared scheduler's per-granule
+`(BlockType, mixed_flag)` emission is then mirrored across both
+channel slots of `block_type_per_gc[gr]` and `mixed_per_gc[gr]`.
+
+The OR-fold is the "safe upper envelope" agreement rule: an
+attack on either L or R triggers the §C.1.5.2 transition for
+both. It accepts more short bursts than a hypothetical per-channel
+sequence would (each channel sees the other's transients) but
+never under-resolves a real transient on either side, and
+produces a self-consistent §C.1.5.2 sequence across one shared
+scheduler — no half-formed `Start-without-Short` chain the way
+two independently-stepped schedulers might if their flags
+happened to disagree at a transition boundary. Symmetric in L↔R
+by construction. Independent stereo (`ChannelMode::Stereo` /
+`ChannelMode::DualChannel` without joint coupling) keeps the
+r162 per-channel-scheduler behaviour: each channel runs its own
+detector + scheduler and picks its own §C.1.5.2 transition state.
+
+Validated by 8 new integration tests and 5 rewrites. The
+rewrites flip the r162 "MS-stereo + toggle → rejected" assertions
+to their "accepted" counterparts. The new tests add wire-level
+§2.4.3.4.9 agreement witnesses:
+`force_short_blocks_on_ms_stereo_writes_short_agreed_side_info`,
+`force_mixed_blocks_on_ms_stereo_writes_agreed_mixed_side_info`,
+and
+`auto_block_type_on_ms_stereo_agrees_per_granule_and_responds_to_either_channel`
+encode 250 ms / 1 s of stereo PCM through a MS-stereo encoder
+with the respective toggle on, then assert that every emitted
+granule's L and R side-info agrees on `window_switching_flag` /
+`block_type` / `mixed_block_flag`. The auto witness additionally
+puts a click train on the LEFT channel and a sustained sine on
+the RIGHT; the OR-fold means at least one §C.1.5.2 transition
+must fire (the right channel follows the left into Start /
+Short), which would NOT hold under the independent-stereo
+per-channel-scheduler rule. All emit valid `Mp3Demuxer`-acceptable
+bitstreams. Tests: 589 pass (was 586 at r162; +3 net). No
+external implementation consulted.
+
 **Phase 2 step 32 (§2.4.3.4.9 independent-stereo widening of the
 block-type override toggles)** narrows the long-standing
 "force-short / force-mixed / auto / auto-mixed are mono-only"
@@ -1664,10 +1729,10 @@ r161; +11 integration). No external implementation consulted.
 
 Remaining Phase 2 work: a real per-band psychoacoustic threshold (so
 the outer loop can spectrally redistribute bits without a hand-tuned
-constant), intensity-stereo encode (§2.4.3.4.9.3), §2.4.3.4.9
-cross-channel-MS block-type agreement (the gap the force-mode and
-auto toggles still reject MS-stereo joint modes on), LSF encode,
-and stereo / LSF decode through the trait wrapper.
+constant), intensity-stereo encode (§2.4.3.4.9.3), LSF / MPEG-2.5
+encode (blocked on the `MPEG-2.5-GAP.md` observer-trace items for
+scalefactor-band tables / Huffman mapping / frame-size validation at
+low rates), and stereo / LSF decode through the trait wrapper.
 
 ### Not yet implemented
 
@@ -1677,7 +1742,7 @@ scalefactor paths — are present; the wrapper is mono MPEG-1 only this
 round; the framing layer accepts MPEG-2.5 as of step 25 but the
 trait-wrapper audio-decode chain still rejects it pending the
 `MPEG-2.5-GAP.md` observer-trace items). The encoder is **Phase 1
-framing + Phase 2 steps 1–32 (forward MDCT primitive + analysis
+framing + Phase 2 steps 1–33 (forward MDCT primitive + analysis
 windowing + forward overlap split + polyphase analysis subband
 filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
 inner-loop `global_gain` search + exact §C.1.5.4.4.5/.8 Huffman bit
@@ -1728,15 +1793,16 @@ toggles so `force_short_blocks_for_testing`,
 `force_mixed_blocks_for_testing`, `enable_auto_block_type`, and
 `enable_auto_block_type_with_mixed` accept
 `ChannelMode::Stereo` / `ChannelMode::DualChannel` in addition to
-mono, gated by the new `Mp3Encoder::ms_joint_stereo_active`
-predicate so only MS-stereo joint modes still reject)** — it
+mono + §2.4.3.4.9 cross-channel-MS block-type agreement that
+widens the same four toggles onto MS-stereo joint modes, with the
+auto-path agreement enforced by OR-folding per-channel attack /
+mixed-classifier flags into a single shared `scheduler[0]` and
+mirroring its emission across both channel slots of
+`block_type_per_gc[gr]` / `mixed_per_gc[gr]`)** — it
 still lacks
 the psychoacoustic model (so the outer loop's `xmin(sb)` is a
 uniform constant rather than per-band masking-aware),
-intensity-stereo encode (§2.4.3.4.9.3), MS-stereo + short / mixed /
-auto-block-type support (the §2.4.3.4.9 cross-channel-MS agreement
-wiring the override toggles still reject `new_joint_stereo_ms` /
-`new_joint_stereo_auto` on), and
+intensity-stereo encode (§2.4.3.4.9.3), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's
 stream-level driver still rejects non-MPEG-1 streams; the
