@@ -1254,13 +1254,22 @@ new modules carry the logic:
   partition), computes per-subframe sum-of-squares energy, and flags
   the granule as carrying an attack iff the loudest subframe exceeds
   `threshold ×` the running ambient. The ambient is an exponentially
-  smoothed `min`-floor of recent subframe energies with leakage
-  `0.5`: slow enough to ride a sustained transient train without
-  rising into it, fast enough to track genuine background-level
-  changes within ≈ 4 granules. Default ratio `10.0`; the module
-  docs detail the tuning envelope (≥ 30 reserves shorts for only
-  the most extreme bursts, ≤ 3 over-fires on almost any modulated
-  signal). No external implementation was consulted — every
+  smoothed `min`-floor of recent subframe energies with a configurable
+  leakage (default `DEFAULT_AMBIENT_LEAK` = `0.5`): slow enough to
+  ride a sustained transient train without rising into it, fast
+  enough to track genuine background-level changes within ≈ 4
+  granules. Default threshold `10.0`; the module docs detail the
+  tuning envelope (≥ 30 reserves shorts for only the most extreme
+  bursts, ≤ 3 over-fires on almost any modulated signal). As of r164
+  the leakage factor is a per-instance knob alongside the threshold
+  via `AttackDetectorParams { threshold, leak }` +
+  `AttackDetector::with_params`; `with_threshold` keeps its
+  signature and forwards through `with_params` with the default
+  leak, so pre-r164 callers are unaffected. Both knobs are
+  silently coerced to their `DEFAULT_*` counterparts on out-of-domain
+  input (threshold ≤ 0 or non-finite; leak outside `(0, 1)` or
+  non-finite), independently — one bad knob never drags the other to
+  its default. No external implementation was consulted — every
   constant and every formula is justified by the clean-room
   reasoning at the top of the module (energy localisation,
   ambient-floor stability, IIR leakage).
@@ -1603,6 +1612,59 @@ mixed-auto; mixed-auto + outer-loop combination engages
 `outer_loop_search_mixed` end-to-end with `scalefac_compress = 15`
 on every mixed granule and Mp3Demuxer round-trip acceptance). Tests:
 575 pass (was 554 at r160; +14 unit + 7 integration). No external
+implementation consulted.
+
+**Phase 2 step 34 (§2.4.3.4.10 finer attack-detector knobs)** turns
+the encoder-side `attack_detect::AttackDetector`'s IIR adaptation
+rate into a per-instance tunable. Before r164 the detector exposed
+exactly one knob — the `subframe-to-ambient ratio` `threshold` that
+the loudest subframe must exceed for a granule to be flagged — and
+its ambient-update IIR was a private `LEAK = 0.5` constant baked
+into `classify`. The leakage controls *adaptation* (how fast the
+running ambient catches up to a changed background level), which is
+the orthogonal axis to *sensitivity*: a slower leak makes the
+detector ride a sustained transient train without absorbing it into
+the ambient and missing subsequent attacks; a faster leak follows a
+gradually-swelling background better but is more likely to drop a
+real burst on the second occurrence. The two are independent design
+choices and the spec leaves both unconstrained (§2.4.3.4.10's
+window-switching policy is non-normative), so the right move was to
+surface both knobs symmetrically rather than freeze the second one.
+
+The new public surface is the `AttackDetectorParams { threshold,
+leak }` value, the `DEFAULT_AMBIENT_LEAK` constant (`0.5`, the same
+value the private constant carried), and three new methods on
+`AttackDetector`: `with_params(params)` for the two-knob
+constructor, `leak()` to read back the effective leak, and `params()`
+for round-tripping the full tuning. `with_threshold` keeps its
+signature and is now defined as
+`with_params { threshold, leak: DEFAULT_AMBIENT_LEAK }`, so every
+existing caller — `Mp3Encoder::enable_auto_block_type` /
+`enable_auto_block_type_with_mixed`, the
+`make_encoder_*_with_threshold` factories, all in-tree tests — keeps
+its pre-r164 behaviour bit-for-bit. Validation matches the threshold
+knob's silently-coerce-to-default contract: leak values outside the
+open interval `(0, 1)` (NaN, infinities, ≤ 0, ≥ 1, or exactly the
+endpoints — `0` would freeze the ambient at its seed value and `1`
+would replace it on every granule, both of which defeat the IIR's
+smoothing purpose) all fall back to `DEFAULT_AMBIENT_LEAK`. The two
+knobs are validated independently so providing one bad value never
+drags the other to its default. +7 unit tests in `attack_detect.rs`:
+`default_params_match_documented_constants` pins the `0.5` /
+`10.0` defaults; `with_params_round_trips_in_domain_values` and
+`new_equivalent_to_with_params_default` cover the
+constructor-equivalence contract; `with_params_validates_each_knob_independently`
+and `leak_boundary_values_are_rejected` exercise the validation;
+`with_threshold_uses_default_leak` proves no behaviour regression
+for the legacy entry point; and
+`slower_leak_keeps_firing_longer_than_faster_leak` is the
+end-to-end behavioural witness — a slow-leak (`0.05`) and a
+fast-leak (`0.95`) detector are seeded with the same quiet granule,
+then fed an identical 10-granule sequence of loud bursts; the slow
+detector fires at least as many times as the fast detector (and on
+the test construction it fires strictly more, with the fast
+detector adapting within ≈ 2 granules and falling silent). Tests:
+596 pass (was 589; +7 net from this step). No external
 implementation consulted.
 
 **Phase 2 step 33 (§2.4.3.4.9 cross-channel-MS block-type

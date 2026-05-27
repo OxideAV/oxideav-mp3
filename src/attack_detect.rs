@@ -54,11 +54,17 @@
 //! 3. The granule is flagged as carrying an attack iff
 //!    `max_k r_k > threshold`.
 //! 4. The ambient estimate is updated with a single-pole IIR using a
-//!    fixed leakage `LEAK = 0.5` against `min_k E_k`: this keeps the
-//!    ambient slow to rise (so a quiet decay following an attack
-//!    doesn't drag the threshold up and miss the *next* attack) but
-//!    responsive enough on a steady-state signal to converge to the
-//!    correct floor within ≈ 4 granules.
+//!    leakage factor (default [`DEFAULT_AMBIENT_LEAK`] = `0.5`, knob
+//!    on [`AttackDetectorParams::leak`]) against `min_k E_k`: this
+//!    keeps the ambient slow to rise (so a quiet decay following an
+//!    attack doesn't drag the threshold up and miss the *next* attack)
+//!    but responsive enough on a steady-state signal to converge to
+//!    the correct floor within ≈ 4 granules at the default leak. r164
+//!    promoted this from a private constant into a per-instance knob
+//!    so callers can tune adaptation rate independently of the attack
+//!    threshold (e.g. a slower leak for material with a steady
+//!    background and rare transients, a faster leak for material with
+//!    a gradually-swelling background).
 //!
 //! # Threshold guidance
 //!
@@ -93,18 +99,89 @@ pub const SAMPLES_PER_SUBFRAME: usize = SAMPLES_PER_GRANULE / SUBFRAMES_PER_GRAN
 /// ratio for that case to be bounded, not infinite.
 pub const SILENCE_FLOOR: f64 = 1.0e-30;
 
-/// Exponential-leakage factor for the ambient-energy estimate. A
-/// value of `0.5` means the estimate moves halfway toward the new
+/// Default exponential-leakage factor for the ambient-energy estimate.
+/// A value of `0.5` means the estimate moves halfway toward the new
 /// floor sample per granule — slow enough to ride a sustained
 /// transient train without rising into it, but fast enough to track
 /// genuine background-level changes within a handful of granules.
-const LEAK: f64 = 0.5;
+///
+/// r164 promoted this from a private constant into the public default
+/// for the [`AttackDetectorParams::leak`] knob. Callers tuning the
+/// detector's adaptation rate can pass a different value to
+/// [`AttackDetector::with_params`]: smaller values (e.g. `0.1`) make
+/// the ambient slower to adapt — useful for material where the
+/// background is steady and transients arrive irregularly — and larger
+/// values (e.g. `0.9`) make it faster to follow a swelling background,
+/// at the cost of a stronger tendency to absorb sustained transient
+/// trains into the ambient (and thereby miss subsequent attacks of the
+/// same magnitude).
+pub const DEFAULT_AMBIENT_LEAK: f64 = 0.5;
 
 /// Default attack-detection threshold (subframe-to-ambient ratio that
 /// the loudest subframe must exceed for the granule to be flagged).
 /// Empirically a 10× ratio separates clear transients from
 /// steady-state modulation; see the module doc for tuning guidance.
 pub const DEFAULT_ATTACK_THRESHOLD: f64 = 10.0;
+
+/// Tunable parameters for the [`AttackDetector`] — the §2.4.3.4.10
+/// window-switching policy knobs that drive the encoder-side block-type
+/// scheduler. The two knobs trade off **sensitivity** (how loud a
+/// burst has to be, relative to the background, to be flagged) against
+/// **adaptation** (how quickly the running ambient catches up to a
+/// changing background).
+///
+/// Both fields are validated by [`AttackDetector::with_params`]:
+/// non-finite, non-positive, or out-of-domain values fall back to the
+/// corresponding `DEFAULT_*` constant, matching the
+/// [`AttackDetector::with_threshold`] coercion contract that already
+/// shipped in earlier rounds.
+///
+/// # Field semantics
+///
+/// * [`Self::threshold`] — the subframe-to-ambient energy ratio that
+///   the loudest subframe in a granule must exceed for the detector to
+///   report `true`. Larger = fewer short blocks (more conservative);
+///   smaller = more short blocks (more aggressive). Default
+///   [`DEFAULT_ATTACK_THRESHOLD`] (`10.0`).
+/// * [`Self::leak`] — the per-granule IIR leakage factor against the
+///   running ambient. Must lie strictly in `(0, 1)`: `0` would freeze
+///   the ambient forever at its seed value and `1` would replace it on
+///   every granule (defeating the purpose of running-min smoothing).
+///   The new ambient is computed as
+///   `ambient ← leak · min_k E_k + (1 − leak) · ambient`.
+///   Default [`DEFAULT_AMBIENT_LEAK`] (`0.5`).
+///
+/// No external reference implementation was consulted while choosing
+/// either knob's semantics. The ratio-of-energies threshold and the
+/// IIR-leakage adaptation are both consequences of the clean-room
+/// reasoning at the top of this module (energy localisation +
+/// adapt-to-floor).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttackDetectorParams {
+    /// Subframe-to-ambient ratio above which a granule is flagged.
+    /// See [`DEFAULT_ATTACK_THRESHOLD`].
+    pub threshold: f64,
+    /// Per-granule IIR leakage factor for the ambient estimate; must
+    /// be in `(0, 1)`. See [`DEFAULT_AMBIENT_LEAK`].
+    pub leak: f64,
+}
+
+impl AttackDetectorParams {
+    /// Construct a parameter pair using both DEFAULT_* values.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            threshold: DEFAULT_ATTACK_THRESHOLD,
+            leak: DEFAULT_AMBIENT_LEAK,
+        }
+    }
+}
+
+impl Default for AttackDetectorParams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Compute the sum-of-squared samples of a slice of PCM.
 ///
@@ -143,6 +220,15 @@ pub fn granule_subframe_energies(pcm: &[f32; SAMPLES_PER_GRANULE]) -> [f64; SUBF
 /// attack-threshold ratio. One detector per channel — the ambient
 /// floor is content-driven and the two channels of a stereo file can
 /// have very different floor levels.
+///
+/// Two knobs are exposed on construction (see
+/// [`AttackDetectorParams`]):
+///
+/// * `threshold` — the subframe-to-ambient ratio at which the granule
+///   is flagged. Default [`DEFAULT_ATTACK_THRESHOLD`] = `10.0`.
+/// * `leak` — the IIR adaptation rate of the ambient estimate. Default
+///   [`DEFAULT_AMBIENT_LEAK`] = `0.5`. (Promoted from a private
+///   constant to a per-instance knob in r164.)
 #[derive(Debug, Clone)]
 pub struct AttackDetector {
     /// Running ambient-energy estimate (the running `min`-floor of
@@ -152,32 +238,63 @@ pub struct AttackDetector {
     /// Attack threshold: the granule is flagged iff
     /// `max(E_k) / max(ambient, SILENCE_FLOOR) > threshold`.
     threshold: f64,
+    /// Per-granule IIR leakage against `min_k E_k`. The new ambient is
+    /// `leak · min_k E_k + (1 − leak) · ambient`. Must be in `(0, 1)`.
+    /// Validated by the constructors (`with_threshold`,
+    /// `with_params`); pathological caller values fall back to
+    /// [`DEFAULT_AMBIENT_LEAK`].
+    leak: f64,
 }
 
 impl AttackDetector {
-    /// Construct a detector with the [`DEFAULT_ATTACK_THRESHOLD`].
+    /// Construct a detector with [`AttackDetectorParams::default`].
     #[must_use]
     pub fn new() -> Self {
-        Self::with_threshold(DEFAULT_ATTACK_THRESHOLD)
+        Self::with_params(AttackDetectorParams::new())
     }
 
     /// Construct a detector with a caller-chosen attack-ratio
-    /// threshold (subframe-to-ambient ratio). Larger = more
-    /// conservative (fewer short blocks); smaller = more aggressive
-    /// (more short blocks). See the module docs for guidance.
+    /// threshold (subframe-to-ambient ratio) and the default leakage
+    /// factor. Larger threshold = more conservative (fewer short
+    /// blocks); smaller = more aggressive (more short blocks). See the
+    /// module docs for guidance. Equivalent to
+    /// `with_params(AttackDetectorParams { threshold, leak:
+    /// DEFAULT_AMBIENT_LEAK })`.
     #[must_use]
     pub fn with_threshold(threshold: f64) -> Self {
-        // Guard against pathological caller-supplied values: NaN, ≤0,
-        // or infinite thresholds would derail the ratio arithmetic.
-        // Coerce non-finite or non-positive values to the default.
-        let threshold = if threshold.is_finite() && threshold > 0.0 {
-            threshold
+        Self::with_params(AttackDetectorParams {
+            threshold,
+            leak: DEFAULT_AMBIENT_LEAK,
+        })
+    }
+
+    /// Construct a detector with both tuning knobs. Out-of-domain
+    /// values are silently coerced to their `DEFAULT_*` counterparts:
+    ///
+    /// * `params.threshold` ≤ 0 or non-finite → [`DEFAULT_ATTACK_THRESHOLD`].
+    /// * `params.leak` outside `(0, 1)` or non-finite → [`DEFAULT_AMBIENT_LEAK`].
+    ///
+    /// The two knobs are validated independently — supplying a bad
+    /// `threshold` does not force a fallback on `leak`, and vice
+    /// versa.
+    #[must_use]
+    pub fn with_params(params: AttackDetectorParams) -> Self {
+        let threshold = if params.threshold.is_finite() && params.threshold > 0.0 {
+            params.threshold
         } else {
             DEFAULT_ATTACK_THRESHOLD
+        };
+        // Strictly open interval: `0.0` would freeze the ambient,
+        // `1.0` would replace it on every granule.
+        let leak = if params.leak.is_finite() && params.leak > 0.0 && params.leak < 1.0 {
+            params.leak
+        } else {
+            DEFAULT_AMBIENT_LEAK
         };
         Self {
             ambient: 0.0,
             threshold,
+            leak,
         }
     }
 
@@ -185,6 +302,23 @@ impl AttackDetector {
     #[must_use]
     pub fn threshold(&self) -> f64 {
         self.threshold
+    }
+
+    /// Current ambient-estimate IIR leakage factor (`(0, 1)`).
+    #[must_use]
+    pub fn leak(&self) -> f64 {
+        self.leak
+    }
+
+    /// The effective tuning parameters this detector was constructed
+    /// with, after the [`Self::with_params`] coercion of out-of-domain
+    /// values. Useful for debugging / round-tripping config.
+    #[must_use]
+    pub fn params(&self) -> AttackDetectorParams {
+        AttackDetectorParams {
+            threshold: self.threshold,
+            leak: self.leak,
+        }
     }
 
     /// Current ambient-energy estimate. Mostly useful for testing and
@@ -238,7 +372,7 @@ impl AttackDetector {
         if self.ambient == 0.0 {
             self.ambient = e_min.max(SILENCE_FLOOR);
         } else {
-            self.ambient = LEAK * e_min + (1.0 - LEAK) * self.ambient;
+            self.ambient = self.leak * e_min + (1.0 - self.leak) * self.ambient;
         }
         flagged
     }
@@ -426,5 +560,203 @@ mod tests {
         assert!(det.ambient() > 0.0);
         det.reset();
         assert_eq!(det.ambient(), 0.0);
+    }
+
+    // r164 — finer §2.4.3.4.10 attack-detector knobs:
+    // `AttackDetectorParams` exposes the IIR leakage factor as a
+    // per-instance tunable alongside the existing threshold, with
+    // identical validation semantics (out-of-domain → DEFAULT_*).
+
+    /// `AttackDetectorParams::default` and `::new` agree, and surface
+    /// the DEFAULT_* constants verbatim. This pins the
+    /// backwards-compatible default behaviour: every existing caller
+    /// goes through `AttackDetector::new` → `with_params(default())`,
+    /// so the per-instance leak must equal the pre-r164 hardcoded
+    /// `0.5`.
+    #[test]
+    fn default_params_match_documented_constants() {
+        let p = AttackDetectorParams::default();
+        assert_eq!(p, AttackDetectorParams::new());
+        assert_eq!(p.threshold, DEFAULT_ATTACK_THRESHOLD);
+        assert_eq!(p.leak, DEFAULT_AMBIENT_LEAK);
+        assert_eq!(DEFAULT_AMBIENT_LEAK, 0.5);
+    }
+
+    /// `with_params` round-trips its in-domain inputs verbatim and
+    /// exposes them via `threshold()` / `leak()` / `params()`.
+    #[test]
+    fn with_params_round_trips_in_domain_values() {
+        let p = AttackDetectorParams {
+            threshold: 7.5,
+            leak: 0.25,
+        };
+        let det = AttackDetector::with_params(p);
+        assert_eq!(det.threshold(), 7.5);
+        assert_eq!(det.leak(), 0.25);
+        assert_eq!(det.params(), p);
+        // Ambient seed is always zero on construction; classify
+        // re-seeds from the first granule.
+        assert_eq!(det.ambient(), 0.0);
+    }
+
+    /// `with_params` clamps a bad `threshold` to
+    /// `DEFAULT_ATTACK_THRESHOLD` independently of `leak`, and
+    /// vice-versa — neither bad knob may force the other to its
+    /// default. The two coercions are independent by design so a
+    /// caller who provides one good knob keeps it.
+    #[test]
+    fn with_params_validates_each_knob_independently() {
+        // Good threshold, bad leak.
+        for bad_leak in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.1,
+            1.0,
+            1.5,
+        ] {
+            let det = AttackDetector::with_params(AttackDetectorParams {
+                threshold: 4.0,
+                leak: bad_leak,
+            });
+            assert_eq!(
+                det.threshold(),
+                4.0,
+                "good threshold dropped on bad leak={bad_leak}"
+            );
+            assert_eq!(
+                det.leak(),
+                DEFAULT_AMBIENT_LEAK,
+                "bad leak={bad_leak} not coerced"
+            );
+        }
+        // Bad threshold, good leak.
+        for bad_thr in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let det = AttackDetector::with_params(AttackDetectorParams {
+                threshold: bad_thr,
+                leak: 0.3,
+            });
+            assert_eq!(
+                det.threshold(),
+                DEFAULT_ATTACK_THRESHOLD,
+                "bad threshold={bad_thr} not coerced"
+            );
+            assert_eq!(
+                det.leak(),
+                0.3,
+                "good leak dropped on bad threshold={bad_thr}"
+            );
+        }
+    }
+
+    /// `with_threshold` is documented to be equivalent to
+    /// `with_params { threshold, leak: DEFAULT_AMBIENT_LEAK }`. The
+    /// existing pre-r164 callers go through `with_threshold`, so the
+    /// effective leak must match the legacy `0.5`.
+    #[test]
+    fn with_threshold_uses_default_leak() {
+        let det = AttackDetector::with_threshold(5.0);
+        assert_eq!(det.leak(), DEFAULT_AMBIENT_LEAK);
+        assert_eq!(det.threshold(), 5.0);
+    }
+
+    /// A smaller leak makes the ambient slower to adapt to a steady
+    /// loud signal — so a detector with `leak = 0.1` keeps flagging
+    /// longer than a `leak = 0.9` detector on the same repeated burst.
+    /// This validates that the knob is actually wired into
+    /// `classify`'s IIR update.
+    ///
+    /// Construction: warm up both detectors with a quiet granule so
+    /// the ambient seeds tiny, then feed an identical sequence of
+    /// loud bursts and count flag-fires. The slow-leak detector
+    /// **must** fire at least as many times as the fast-leak one
+    /// (typically strictly more), because its ambient takes longer to
+    /// catch up to the new background level.
+    #[test]
+    fn slower_leak_keeps_firing_longer_than_faster_leak() {
+        fn make(leak: f64) -> AttackDetector {
+            AttackDetector::with_params(AttackDetectorParams {
+                threshold: DEFAULT_ATTACK_THRESHOLD,
+                leak,
+            })
+        }
+        let mut slow = make(0.05); // very slow adaptation
+        let mut fast = make(0.95); // very fast adaptation
+
+        // Quiet seed granule (1e-4 magnitude).
+        let mut g_quiet = [0.0f32; SAMPLES_PER_GRANULE];
+        for (i, slot) in g_quiet.iter_mut().enumerate() {
+            *slot = if i % 7 == 0 { 1.0e-4 } else { -1.0e-4 };
+        }
+        let _ = slow.classify(&g_quiet);
+        let _ = fast.classify(&g_quiet);
+
+        // Loud burst (square wave at ±0.5) repeated for several
+        // granules. Both detectors should fire on the first burst;
+        // the slow-leak detector keeps firing longer because its
+        // ambient catches up to the new floor more slowly.
+        let mut g_loud = [0.0f32; SAMPLES_PER_GRANULE];
+        for (i, slot) in g_loud.iter_mut().enumerate() {
+            *slot = if i % 2 == 0 { 0.5 } else { -0.5 };
+        }
+        let mut slow_fires = 0;
+        let mut fast_fires = 0;
+        for _ in 0..10 {
+            if slow.classify(&g_loud) {
+                slow_fires += 1;
+            }
+            if fast.classify(&g_loud) {
+                fast_fires += 1;
+            }
+        }
+        // Both must fire at least once (the first burst). The slow
+        // detector must fire >= the fast detector — and on this
+        // construction we expect strictly more, with the fast one
+        // adapting within ~2 granules.
+        assert!(slow_fires >= 1, "slow detector never fired");
+        assert!(
+            slow_fires >= fast_fires,
+            "slow leak fired less than fast leak: slow={slow_fires} fast={fast_fires}"
+        );
+        // Fast leak adapts within a handful of granules and stops
+        // firing — sanity check on the fast-end of the knob.
+        assert!(
+            fast_fires <= 3,
+            "fast leak failed to adapt: fast_fires={fast_fires}"
+        );
+    }
+
+    /// Boundary check: a `leak` exactly at `0.0` or `1.0` is rejected
+    /// (closed-interval values would either freeze or replace the
+    /// ambient and defeat the IIR's purpose).
+    #[test]
+    fn leak_boundary_values_are_rejected() {
+        for boundary in [0.0, 1.0] {
+            let det = AttackDetector::with_params(AttackDetectorParams {
+                threshold: DEFAULT_ATTACK_THRESHOLD,
+                leak: boundary,
+            });
+            assert_eq!(
+                det.leak(),
+                DEFAULT_AMBIENT_LEAK,
+                "leak boundary {boundary} should fall back to default"
+            );
+        }
+    }
+
+    /// `AttackDetector::new` and `with_params(default())` produce
+    /// equivalent detectors — same threshold, same leak, same seed
+    /// ambient. This pins the no-args constructor as a transparent
+    /// alias for the default params, the only documented relationship
+    /// between the two constructors.
+    #[test]
+    fn new_equivalent_to_with_params_default() {
+        let a = AttackDetector::new();
+        let b = AttackDetector::with_params(AttackDetectorParams::default());
+        assert_eq!(a.threshold(), b.threshold());
+        assert_eq!(a.leak(), b.leak());
+        assert_eq!(a.ambient(), b.ambient());
+        assert_eq!(a.params(), b.params());
     }
 }

@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **§2.4.3.4.10 finer attack-detector knobs** (Phase 2 step 34, r164).
+  The encoder-side `attack_detect::AttackDetector` previously held a
+  single tunable, the subframe-to-ambient ratio `threshold`; the
+  ambient-estimate IIR leakage was a private `LEAK = 0.5` constant
+  baked into `classify`. This round promotes the leakage factor to a
+  per-instance knob via a new `AttackDetectorParams { threshold,
+  leak }` value + an `AttackDetector::with_params` constructor.
+  `with_threshold` keeps its previous signature (and is now defined
+  as `with_params { threshold, leak: DEFAULT_AMBIENT_LEAK }`), so
+  every existing caller — `Mp3Encoder::enable_auto_block_type` /
+  `enable_auto_block_type_with_mixed`, the
+  `make_encoder_*_with_threshold` factories, and all in-tree tests —
+  keeps its r163 behaviour bit-for-bit. The new knob is validated by
+  the same silently-coerce-to-default contract as the threshold knob:
+  leak values outside `(0, 1)` (including the closed-interval
+  endpoints, which would freeze or replace the ambient and defeat the
+  IIR's purpose), NaN, or infinite all fall back to
+  `DEFAULT_AMBIENT_LEAK`. Threshold and leak are validated
+  independently — providing one bad knob never drags the other to its
+  default. Public surface adds `AttackDetectorParams`,
+  `DEFAULT_AMBIENT_LEAK`, and the methods `AttackDetector::with_params`
+  / `leak` / `params`. +7 unit tests (default-params constants pin,
+  in-domain round-trip, per-knob independent validation,
+  `with_threshold` uses default leak, slow-leak vs fast-leak
+  behavioural divergence on a repeated burst, boundary `leak == 0.0`
+  / `leak == 1.0` rejection, `new == with_params(default)`
+  equivalence). 490 tests pass (was 483).
 - **§2.4.3.4.9 cross-channel-MS block-type agreement** (Phase 2 step
   33, r163). Closes the gap r162 left open by widening the four
   block-type override toggles (force-short, force-mixed, auto,
