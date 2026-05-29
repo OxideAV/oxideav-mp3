@@ -389,6 +389,7 @@ pub mod frame;
 pub mod huffman;
 pub mod imdct;
 pub mod inner_loop;
+pub mod lame_tag;
 pub mod main_data;
 pub mod mdct;
 pub mod mixed_classifier;
@@ -419,8 +420,8 @@ pub use codec_encoder::{
 };
 pub use crc::{crc16_bits, crc16_layer3, INITIAL_STATE as CRC_INITIAL_STATE};
 pub use demuxer::{
-    open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer, Mp3Tags, XingTag,
-    XingTagId, CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,
+    lame_magic_offset, open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer,
+    Mp3Tags, XingTag, XingTagId, CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,
 };
 pub use encoder::{
     encode_silent_frame, make_silent_header, silent_side_info, write_header, write_side_info,
@@ -440,6 +441,10 @@ pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
 pub use inner_loop::{
     coarse_bit_estimate, exact_bit_count, max_abs, search_bit_budget, search_magnitude_clamp,
     ExactBitCount, InnerLoopResult, BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
+};
+pub use lame_tag::{
+    parse_lame_tag, LameParseError, LameTag, DELAY_PADDING_OFFSET_FROM_LAME_MAGIC,
+    LAME_MAGIC_OFFSET_ALL_FLAGS, LAME_TAG_FIELDS_LEN, LAME_TAG_FULL_LEN,
 };
 pub use main_data::{
     assemble_main_data, schedule_reservoir, AssembledMainData, GranuleChannelData, ReservoirError,

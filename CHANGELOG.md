@@ -8,6 +8,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **LAME-extension gapless playback wiring** (r185). New
+  `lame_tag` module parses the LAME-tag extension that follows the
+  four Xing fields inside an MP3's leading information frame,
+  exposing all 17 LAME-defined fields including the
+  encoder-delay / zero-padding pair that drives gapless playback.
+  Provenance: `docs/audio/mp3/lame-xing-info-tag.md` — a clean-room
+  transcription of Gabriel Bouvigne's independently-published
+  *Mp3 Info Tag revision 1 Specifications* staged 2026-05-29 with
+  sha256 chain-of-custody. The byte-offset table is consumed via
+  magic-relative offsets (`LAME_MAGIC_OFFSET_ALL_FLAGS = 118`,
+  `DELAY_PADDING_OFFSET_FROM_LAME_MAGIC = 23` from the staged
+  doc's `$9A` / `$B1` absolutes); the gapless field is the 3-byte
+  run at `$B1–$B3` packed `[xxxxxxxx][xxxxyyyy][yyyyyyyy]` to two
+  12-bit unsigned values (each 0..=4095). `Mp3Demuxer` now wires
+  the parser into its `open()` path: when a Xing tag with all four
+  flag bits set is detected, the LAME magic offset is computed via
+  `lame_magic_offset(header_bytes, side_info_bytes, &xing)` and
+  fed to `parse_lame_tag`; the resulting `LameTag` is stored on
+  the demuxer and surfaced through new `.lame()` /
+  `.encoder_delay_samples()` / `.zero_padding_samples()` /
+  `.trimmed_duration_samples()` accessors. The trimmed-duration
+  accessor reports `gross_samples − encoder_delay − zero_padding`
+  for LAME-tagged streams and falls back to the gross duration
+  for non-LAME and zero-trim streams. Tests +18: 11 module-level
+  unit tests in `lame_tag::tests` (byte-pattern propagation of
+  the staged-doc §5 worked example
+  `[0x6C, 0x12, 0xD2] → delay=1729, padding=722`, exhaustive
+  12-bit boundary round-trip across `{0, 1, 2047, 2048, 4094,
+  4095}² = 36 (delay, padding) pairs`, all-field round-trip,
+  rejection of non-`"LAME"` magic and truncated payloads, MPEG-1
+  Layer-III / MPEG-2 LSF `samples_per_frame ∈ {1152, 576}`
+  trimmed-sample math, overflow refusal when
+  `delay + padding > frames × samples_per_frame`,
+  has-gapless-trim predicate), plus 7 demuxer-level integration
+  tests (`lame_magic_offset` doc-table matrix for all four
+  `(version, channels)` carrier-frame side-info layouts,
+  all-four-flag opening, doc worked-example end-to-end through
+  `Mp3Demuxer::open`, trimmed-duration math under non-zero
+  delay+padding, fallback equality with gross duration when no
+  LAME tag is present, fallback equality when LAME tag carries
+  zero delay+padding, non-`"LAME"` encoder string yields no LAME
+  tag while still keeping the Xing tag). Workspace policy noted:
+  parsing only attempted for the **all-four-Xing-flags** layout
+  the staged doc documents — other flag combinations return
+  `None` and the staged doc would need to be extended to cover
+  them. **Spec gap reported (not fished):** the staged doc's
+  `$9A–$A4 | 9 bytes` cell is internally inconsistent
+  (`$9A..=$A4` inclusive = 11 bytes); the parser trusts the
+  absolute-offset chain (`$A5, $A6, …, $BF`) over the
+  `9 bytes` annotation, leaving `$A3–$A4` as reserved padding.
+  Tag-CRC verification is deferred — the staged doc names
+  `CRCInitValue = 0x0000` but the polynomial is unspecified.
 - **`oxideav_core::Decoder` trait MPEG-2 LSF widening** (Phase 2
   step 37, r183). Extends `Mp3CoreDecoder` from MPEG-1-only to
   MPEG-1 **and** MPEG-2 LSF Layer III decode (mono and stereo,

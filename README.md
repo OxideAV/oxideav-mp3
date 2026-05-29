@@ -375,20 +375,62 @@ at the container level. `Mp3Demuxer::open` is the entry point:
   four optional fields (`frames`, `bytes`, 100-byte `toc`, `quality`)
   are decoded from a four-bit flag word; when the info frame is
   present it is consumed as a metadata carrier and packet emission
-  starts at the next audio frame. **The Xing / Info wire layout is
-  not yet staged in `docs/audio/mp3/`** — every numeric field
-  offset / width is verified byte-for-byte against the two on-disk
-  fixtures `docs/audio/mp3/fixtures/layer3-with-xing-vbri-tag/` and
-  `docs/audio/mp3/fixtures/layer3-with-id3v2-tag/` and their
-  companion `trace.txt`. A canonical layout doc (e.g. a Xing
-  programming guide) would close the residual provenance gap.
+  starts at the next audio frame. The Xing / Info wire layout is
+  now staged in `docs/audio/mp3/lame-xing-info-tag.md` (a clean-room
+  transcription of Gabriel Bouvigne's independently-published
+  *Mp3 Info Tag revision 1 Specifications* — independent format
+  documentation, not LAME source — staged 2026-05-29 with sha256
+  provenance). The previous "verified against the on-disk fixtures"
+  qualifier is preserved as cross-validation.
+- **LAME-extension gapless playback** (r185). The `lame_tag` module
+  parses the LAME extension that follows the four Xing fields at the
+  documented magic-relative offset (`$9A` from the Xing magic on the
+  staged doc's all-flags worked example, byte-aligned to the four
+  side-info layouts). The `LameTag` struct surfaces all 17
+  LAME-defined fields (encoder version, info-tag revision, VBR
+  method, lowpass, Replay-Gain peak / radio / audiophile, encoding
+  flags + ATH type, bitrate, **encoder delay**, **zero padding**,
+  misc, mp3-gain, preset + surround, music length, music CRC, tag
+  CRC). The gapless pair is the 3-byte run at magic-relative `$B1`
+  packed `[xxxxxxxx][xxxxyyyy][yyyyyyyy]` → 12-bit encoder delay +
+  12-bit zero padding (each 0..=4095). `Mp3Demuxer::open` calls the
+  parser only when all four Xing flag bits are set (the staged doc
+  covers no other layout) and the encoder string is `"LAME"`; for
+  other emitters (`"Lavc"`, `"Lavf"`, …) the parser refuses and
+  `lame()` returns `None`. The demuxer surfaces the trim through
+  `encoder_delay_samples()` / `zero_padding_samples()` and
+  `trimmed_duration_samples()` (= gross − delay − padding for
+  LAME-tagged streams, = gross duration otherwise). The on-wire
+  3-byte pack/unpack is exhaustively round-tripped across the
+  12-bit boundary corners (`0, 1, 2047, 2048, 4094, 4095` ×
+  `delay × padding`), the §5 worked-example byte pattern
+  `[0x6C, 0x12, 0xD2] → delay = 1729, padding = 722` propagates
+  byte-for-byte from raw bytes through `parse_lame_tag` and again
+  through the carrier-frame-driven `Mp3Demuxer::open` path, and a
+  zero-delay zero-padding LAME tag yields `trimmed = gross`
+  (no spurious trim) per the explicit
+  `has_gapless_trim` predicate.
+  **Tag-CRC verification** is deferred — the staged doc names
+  `CRCInitValue = 0x0000` but does not specify the polynomial; the
+  parser records the on-wire CRC for caller inspection without
+  validating it. **Spec gap:** the staged doc's `$9A–$A4 | 9 bytes`
+  cell is internally inconsistent (`$9A..=$A4` is 11 bytes
+  inclusive); the parser trusts the absolute-offset chain
+  (`$A5, $A6, …, $BF`) over the "9 bytes" annotation, leaving the
+  two bytes at `$A3–$A4` as reserved padding. Filling that
+  inconsistency in is a follow-up `docs/` patch.
 - **Duration estimation.** VBR streams with a Xing `frames` field
   report `frames × samples_per_frame / sample_rate`; CBR streams
   use `audio_bytes × 8 / bitrate × sample_rate`. The four-fixture
   reference (CBR-320, VBR-q5, ID3v2-tagged, Xing-tagged) all report
   ~835.9 ms vs ffprobe's 800.0 ms (`Δ = +4.5%`); the residual is the
-  LAME encoder-delay/padding that lives in the bytes after the
-  prompt-enumerated four Xing fields and is not consumed here.
+  LAME encoder-delay/padding overhead that **`trimmed_duration_samples()`
+  now removes for LAME-tagged streams** — for those streams the
+  trimmed value should converge on the reference duration once the
+  on-disk fixture's LAME tag carries non-zero delay/padding values
+  (none of the in-tree fixtures currently do; the existing
+  `Xing`-tagged fixture's `Lavc61.19` carrier is not LAME-emitted so
+  this code path is exercised via the synthetic unit tests).
 - **Packet emission.** Each call to `next_packet` reads one MPEG
   audio frame at the current cursor (resyncing on bad / overrun /
   sample-rate-mismatched headers), stamps it with a monotonic PTS in

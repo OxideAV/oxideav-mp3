@@ -61,6 +61,7 @@ use oxideav_core::{
 };
 
 use crate::frame::{parse_header, Layer, MpegVersion};
+use crate::lame_tag::{parse_lame_tag, LameTag};
 use crate::side_info::{
     SIDE_INFO_BYTES_LSF_MONO, SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO,
     SIDE_INFO_BYTES_STEREO,
@@ -259,6 +260,39 @@ pub fn parse_xing_info(frame_payload: &[u8], side_info_bytes: usize) -> Option<X
     })
 }
 
+/// Compute the byte offset of the LAME-extension magic inside an MP3
+/// carrier frame, given the [`XingTag`] that precedes it.
+///
+/// Per `docs/audio/mp3/lame-xing-info-tag.md`, on the worked
+/// MPEG-1-stereo example with **all four** Xing flags set the LAME
+/// magic sits at absolute `$9A` and the Xing magic at `$24` — i.e.
+/// 118 bytes after the Xing magic. The 118 figure breaks down as
+/// `4 (Xing magic) + 4 (flags) + 4 (frames) + 4 (bytes) + 100 (toc) +
+/// 4 (quality) − 2 (overlap between the trailing quality bytes and
+/// the leading encoder-version bytes)`. The returned offset is
+/// **frame-relative** — zero is the `0xFFE0...` sync byte at the
+/// start of the frame.
+///
+/// Returns `None` when fewer than all four Xing flag bits are set.
+/// The staged doc only documents the all-flags-set carrier-frame
+/// layout, and we refuse to guess where the LAME magic lands for the
+/// flag combinations the staged doc does not cover (DOCS-GAP — see
+/// the module-level comment).
+#[must_use]
+pub fn lame_magic_offset(
+    header_bytes: usize,
+    side_info_bytes: usize,
+    xing: &XingTag,
+) -> Option<usize> {
+    const ALL_FOUR: u32 = 0x0F;
+    if xing.flags & ALL_FOUR != ALL_FOUR {
+        return None;
+    }
+    // header + (CRC bytes — caller already accounted for them in
+    // header_bytes if needed) + side info + Xing-magic-relative 118.
+    Some(header_bytes + side_info_bytes + crate::lame_tag::LAME_MAGIC_OFFSET_ALL_FLAGS)
+}
+
 /// Return the Layer-III side-info length implied by an MPEG version
 /// and channel count, per the four `SIDE_INFO_BYTES_*` constants in
 /// [`crate::side_info`].
@@ -411,6 +445,13 @@ pub struct Mp3Demuxer {
     /// (or `None` for plain CBR streams). Drives VBR duration +
     /// TOC-based seeking.
     xing: Option<XingTag>,
+    /// Optional LAME-extension tag parsed from the carrier frame's
+    /// LAME magic (when present and all four Xing flag bits are set).
+    /// Drives **gapless playback** — the `encoder_delay` and
+    /// `zero_padding` fields tell the decoder how many priming samples
+    /// to trim off the front and how many zero-pad samples to trim
+    /// off the back.
+    lame: Option<LameTag>,
     /// Byte offset of the first MPEG audio frame (after ID3v2,
     /// before the first frame's syncword).
     first_frame_offset: u64,
@@ -446,6 +487,10 @@ pub struct Mp3Demuxer {
     /// [`Self::next_packet`], so duplicate calls all return `Eof`
     /// rather than re-probing the underlying reader.
     finished: bool,
+    /// Trimmed PCM sample count after applying the LAME encoder-delay
+    /// and zero-padding fields. Equal to `streams[0].duration` for
+    /// streams without a LAME tag; smaller when gapless trim applies.
+    trimmed_duration_samples: Option<i64>,
 }
 
 impl std::fmt::Debug for Mp3Demuxer {
@@ -454,6 +499,7 @@ impl std::fmt::Debug for Mp3Demuxer {
             .field("streams", &self.streams)
             .field("tags", &self.tags)
             .field("xing", &self.xing)
+            .field("lame", &self.lame)
             .field("first_frame_offset", &self.first_frame_offset)
             .field("first_audio_frame_offset", &self.first_audio_frame_offset)
             .field("total_len", &self.total_len)
@@ -464,6 +510,7 @@ impl std::fmt::Debug for Mp3Demuxer {
             .field("bitrate_bps", &self.bitrate_bps)
             .field("next_pts", &self.next_pts)
             .field("finished", &self.finished)
+            .field("trimmed_duration_samples", &self.trimmed_duration_samples)
             .finish()
     }
 }
@@ -541,6 +588,20 @@ impl Mp3Demuxer {
         let side_bytes = side_info_len(first_header.version, channels);
         let xing = parse_xing_info(&first_frame_buf, side_bytes);
 
+        // 5b. LAME-extension tag (gapless playback). Only attempted
+        //     when all four Xing flag bits are set, since that is the
+        //     only layout `docs/audio/mp3/lame-xing-info-tag.md`
+        //     documents. The encoder version, encoder-delay /
+        //     zero-padding pair, and the rest of the LAME-defined
+        //     fields are unpacked from the canonical
+        //     `header_bytes + side_info_bytes + 118` byte offset.
+        let lame = xing.as_ref().and_then(|xt| {
+            let crc_bytes = if first_header.crc_protected { 2 } else { 0 };
+            let header_bytes = 4 + crc_bytes;
+            let off = lame_magic_offset(header_bytes, side_bytes, xt)?;
+            parse_lame_tag(&first_frame_buf, off).ok()
+        });
+
         // 6. Decide where playable audio starts. A Xing/Info frame
         //    carries no PCM — its slot is reserved as a metadata
         //    carrier — so we skip past it for `next_packet`.
@@ -579,6 +640,21 @@ impl Mp3Demuxer {
             })
         };
 
+        // Gapless trim: when a LAME tag with non-zero
+        // encoder_delay or zero_padding is present, the playable PCM
+        // sample count is the gross duration minus the two trim
+        // values. Computed against the per-stream sample-rate-relative
+        // duration (which equals (frame_count × samples_per_frame)
+        // for the VBR case, and the bitrate-derived sample count for
+        // the CBR case).
+        let trimmed_duration_samples: Option<i64> = match (lame.as_ref(), duration_samples) {
+            (Some(tag), Some(gross)) if tag.has_gapless_trim() => {
+                let trim = (tag.encoder_delay as i64) + (tag.zero_padding as i64);
+                Some((gross - trim).max(0))
+            }
+            (_, dur) => dur,
+        };
+
         let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
         params.sample_rate = Some(sample_rate);
         params.channels = Some(channels as u16);
@@ -598,6 +674,7 @@ impl Mp3Demuxer {
             streams: vec![stream],
             tags,
             xing,
+            lame,
             first_frame_offset,
             first_audio_frame_offset,
             total_len,
@@ -608,6 +685,7 @@ impl Mp3Demuxer {
             bitrate_bps,
             next_pts: 0,
             finished: false,
+            trimmed_duration_samples,
         })
     }
 
@@ -621,6 +699,55 @@ impl Mp3Demuxer {
     #[must_use]
     pub fn xing(&self) -> Option<&XingTag> {
         self.xing.as_ref()
+    }
+
+    /// The LAME-extension tag parsed from the carrier frame, if one
+    /// was found.
+    ///
+    /// Carries the gapless-playback `encoder_delay` and `zero_padding`
+    /// pair (see [`crate::lame_tag::LameTag`]). Returns `None` when
+    /// the stream has no Xing/Info frame, when fewer than all four
+    /// Xing flag bits were set (the LAME-magic offset is undocumented
+    /// in the staged spec for those cases), or when the carrier
+    /// frame's encoder string was something other than `"LAME"` (e.g.
+    /// `"Lavc"`, `"Lavf"`).
+    #[must_use]
+    pub fn lame(&self) -> Option<&LameTag> {
+        self.lame.as_ref()
+    }
+
+    /// Encoder-delay PCM-sample count from the LAME extension, or
+    /// `None` when no LAME tag was found. This is the number of zero
+    /// samples the encoder added at the start of the stream to flush
+    /// the analysis filter bank; a gapless-aware decoder trims this
+    /// many samples (plus any decoder-intrinsic priming) off the
+    /// front of the decoded PCM.
+    #[must_use]
+    pub fn encoder_delay_samples(&self) -> Option<u32> {
+        self.lame.as_ref().map(|t| t.encoder_delay as u32)
+    }
+
+    /// Zero-padding PCM-sample count from the LAME extension, or
+    /// `None` when no LAME tag was found. This is the number of zero
+    /// samples the encoder appended to the last frame to fill the
+    /// granular boundary; a gapless-aware decoder drops this many
+    /// samples off the back of the decoded PCM.
+    #[must_use]
+    pub fn zero_padding_samples(&self) -> Option<u32> {
+        self.lame.as_ref().map(|t| t.zero_padding as u32)
+    }
+
+    /// Playable-PCM sample count after applying the LAME encoder-delay
+    /// and zero-padding trim, or the gross duration when no LAME tag
+    /// was found.
+    ///
+    /// Distinct from `streams()[0].duration` (which carries the
+    /// **gross** sample count including the encoder priming and the
+    /// trailing padding) — pipelines that need the on-disk-original
+    /// PCM length should consult this method.
+    #[must_use]
+    pub fn trimmed_duration_samples(&self) -> Option<i64> {
+        self.trimmed_duration_samples
     }
 
     /// Byte offset of the *first* MPEG audio frame in the file —
@@ -1190,5 +1317,238 @@ mod tests {
         assert!((actual - 5_760).abs() <= 1152);
         let pkt = d.next_packet().unwrap();
         assert_eq!(pkt.pts, Some(actual));
+    }
+
+    /// `lame_magic_offset` reflects the staged-doc all-flags layout
+    /// for the four `(version, channel_count)` carrier-frame cases.
+    #[test]
+    fn lame_magic_offset_matches_staged_doc_table() {
+        let mut xt = XingTag {
+            id: XingTagId::Xing,
+            flags: 0x0F,
+            frames: Some(0),
+            bytes: Some(0),
+            toc: Some([0u8; 100]),
+            quality: Some(0),
+        };
+        // MPEG-1 stereo: 4 header + 32 side-info + 118 = $9A absolute
+        // = 154 — matches the staged doc's worked example.
+        assert_eq!(
+            lame_magic_offset(4, SIDE_INFO_BYTES_STEREO, &xt),
+            Some(4 + 32 + 118)
+        );
+        // MPEG-1 mono: 4 header + 17 + 118.
+        assert_eq!(
+            lame_magic_offset(4, SIDE_INFO_BYTES_MONO, &xt),
+            Some(4 + 17 + 118)
+        );
+        // MPEG-2/2.5 stereo: 4 + 17 + 118.
+        assert_eq!(
+            lame_magic_offset(4, SIDE_INFO_BYTES_LSF_STEREO, &xt),
+            Some(4 + 17 + 118)
+        );
+        // MPEG-2/2.5 mono: 4 + 9 + 118.
+        assert_eq!(
+            lame_magic_offset(4, SIDE_INFO_BYTES_LSF_MONO, &xt),
+            Some(4 + 9 + 118)
+        );
+        // Fewer than all four flags → docs-gap, return None.
+        xt.flags = 0x07; // missing VBR_SCALE
+        assert_eq!(lame_magic_offset(4, SIDE_INFO_BYTES_STEREO, &xt), None);
+        xt.flags = 0x0E; // missing FRAMES
+        assert_eq!(lame_magic_offset(4, SIDE_INFO_BYTES_STEREO, &xt), None);
+    }
+
+    /// Build a synthetic carrier-frame buffer ("Xing" + all four
+    /// flags + LAME extension) inside an MPEG-1 stereo 128 kbps
+    /// 44.1 kHz frame, return the buffer + the parsed `Mp3Demuxer`.
+    /// The carrier is followed by `n_audio` zero-filled audio frames
+    /// so `Mp3Demuxer::open()` exits cleanly after the metadata
+    /// frame. Used by the gapless-trim tests below.
+    fn build_lame_carrier_stream(delay: u16, padding: u16, n_audio: usize) -> Vec<u8> {
+        // MPEG-1 stereo Layer III, 128 kbps, 44.1 kHz, no CRC.
+        let raw: u32 =
+            (0xFFF << 20) | (1 << 19) | (0b01 << 17) | (1 << 16) | (0b1001 << 12) | (0b00 << 10);
+        let hdr = raw.to_be_bytes();
+        let frame_len = 417usize;
+
+        // Carrier frame: Xing magic at 4+32=36; flags 0x0F at +40;
+        // frames=n_audio at +44; bytes=n_audio*frame_len at +48; toc at
+        // +52..152; quality=0 at +152..156. The LAME magic falls at
+        // +154 (4 + 32 + 118) and overlaps the last 2 bytes of the
+        // quality field — i.e. the high 2 bytes of "LAME" overwrite
+        // the last 2 zero bytes of quality. Total LAME extension run
+        // is 38 bytes ending at +154+38 = +192, comfortably inside
+        // the 417-byte frame slot.
+        let mut carrier = vec![0u8; frame_len];
+        carrier[..4].copy_from_slice(&hdr);
+        carrier[36..40].copy_from_slice(b"Xing");
+        carrier[40..44].copy_from_slice(&0x0000000Fu32.to_be_bytes());
+        carrier[44..48].copy_from_slice(&(n_audio as u32).to_be_bytes());
+        carrier[48..52].copy_from_slice(&((n_audio * frame_len) as u32).to_be_bytes());
+        for i in 0..100 {
+            carrier[52 + i] = ((i * 255) / 99) as u8;
+        }
+        carrier[152..156].copy_from_slice(&0u32.to_be_bytes()); // quality = 0
+                                                                // LAME extension @ +154 (overlaps last 2 zero bytes of quality).
+        let lame_off = 4 + SIDE_INFO_BYTES_STEREO + 118;
+        assert_eq!(lame_off, 154);
+        carrier[lame_off..lame_off + 9].copy_from_slice(b"LAME3.100");
+        // Skip the 2 unmoved bytes ($A3-$A4) — already zero.
+        // Revision/method at +11.
+        carrier[lame_off + 11] = 0x10;
+        // Lowpass at +12.
+        carrier[lame_off + 12] = 196;
+        // Peak amplitude (f32 1.0 = 0x3F80_0000) at +13..+17.
+        carrier[lame_off + 13..lame_off + 17].copy_from_slice(&0x3F80_0000u32.to_be_bytes());
+        // Radio + Audiophile RG.
+        carrier[lame_off + 17..lame_off + 19].copy_from_slice(&0u16.to_be_bytes());
+        carrier[lame_off + 19..lame_off + 21].copy_from_slice(&0u16.to_be_bytes());
+        // Flags/ATH + bitrate.
+        carrier[lame_off + 21] = 0;
+        carrier[lame_off + 22] = 128;
+        // Delay+padding 12+12-bit pack at +23..+26.
+        let b0 = (delay >> 4) as u8;
+        let b1 = (((delay & 0x0F) << 4) | ((padding >> 8) & 0x0F)) as u8;
+        let b2 = (padding & 0xFF) as u8;
+        carrier[lame_off + 23] = b0;
+        carrier[lame_off + 24] = b1;
+        carrier[lame_off + 25] = b2;
+        // Misc/mp3-gain/preset/music-length/music-CRC/tag-CRC all zero.
+
+        // n_audio plain frames (zero-filled bodies).
+        let mut audio_frame = vec![0u8; frame_len];
+        audio_frame[..4].copy_from_slice(&hdr);
+        let mut buf = carrier;
+        for _ in 0..n_audio {
+            buf.extend_from_slice(&audio_frame);
+        }
+        buf
+    }
+
+    #[test]
+    fn lame_tag_parsed_via_open_with_full_xing_flags() {
+        // Build a stream with the LAME tag carrying delay=1729,
+        // padding=722 — the §5 worked-example values from the staged
+        // doc. Confirm the demuxer surfaces them through `.lame()` /
+        // `.encoder_delay_samples()` / `.zero_padding_samples()`.
+        let buf = build_lame_carrier_stream(1729, 722, 4);
+        let d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).expect("open");
+        let lame = d.lame().expect("LAME tag present");
+        assert_eq!(lame.encoder_delay, 1729);
+        assert_eq!(lame.zero_padding, 722);
+        assert_eq!(&lame.encoder_version, b"LAME3.100");
+        assert_eq!(d.encoder_delay_samples(), Some(1729));
+        assert_eq!(d.zero_padding_samples(), Some(722));
+    }
+
+    #[test]
+    fn trimmed_duration_subtracts_gapless_field() {
+        // 4 audio frames × 1152 samples = 4608 gross.
+        // delay=1729 + padding=722 = 2451 trim.
+        // trimmed = 4608 - 2451 = 2157.
+        let buf = build_lame_carrier_stream(1729, 722, 4);
+        let d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).unwrap();
+        // Gross duration is still in streams[0].duration (the LAME tag
+        // does not change the on-wire MPEG frame count).
+        assert_eq!(d.streams()[0].duration, Some(4 * 1152));
+        // Trimmed duration honours the LAME-extension trim.
+        assert_eq!(d.trimmed_duration_samples(), Some(4 * 1152 - 1729 - 722));
+    }
+
+    #[test]
+    fn trimmed_duration_equals_gross_without_lame_tag() {
+        // Build the same synthetic CBR stream as
+        // `cbr_emits_n_packets_with_monotonic_pts` (no Xing or LAME).
+        let raw: u32 =
+            (0xFFF << 20) | (1 << 19) | (0b01 << 17) | (1 << 16) | (0b1001 << 12) | (0b00 << 10);
+        let hdr = raw.to_be_bytes();
+        let frame_len = 417usize;
+        let mut buf = Vec::new();
+        for _ in 0..6 {
+            buf.extend_from_slice(&hdr);
+            buf.extend(std::iter::repeat_n(0u8, frame_len - 4));
+        }
+        let d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).unwrap();
+        // No Xing tag → no LAME tag.
+        assert!(d.xing().is_none());
+        assert!(d.lame().is_none());
+        // Trimmed duration falls back to gross CBR duration.
+        let gross = d.streams()[0].duration;
+        assert_eq!(d.trimmed_duration_samples(), gross);
+    }
+
+    #[test]
+    fn trimmed_duration_equals_gross_for_zero_delay_padding() {
+        // LAME tag present but delay=0, padding=0 → no trim applies.
+        let buf = build_lame_carrier_stream(0, 0, 4);
+        let d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).unwrap();
+        let lame = d.lame().expect("LAME tag present");
+        assert!(!lame.has_gapless_trim());
+        let gross = d.streams()[0].duration;
+        assert_eq!(d.trimmed_duration_samples(), gross);
+    }
+
+    /// Doc worked-example byte pattern propagates byte-for-byte
+    /// through the demuxer. The §5 example fixes the exact 3 bytes
+    /// [0x6C, 0x12, 0xD2] in the delay+padding slot and asserts
+    /// delay=1729, padding=722.
+    #[test]
+    fn doc_worked_example_propagates_through_demuxer() {
+        let raw: u32 =
+            (0xFFF << 20) | (1 << 19) | (0b01 << 17) | (1 << 16) | (0b1001 << 12) | (0b00 << 10);
+        let hdr = raw.to_be_bytes();
+        let frame_len = 417usize;
+        let mut carrier = vec![0u8; frame_len];
+        carrier[..4].copy_from_slice(&hdr);
+        carrier[36..40].copy_from_slice(b"Xing");
+        carrier[40..44].copy_from_slice(&0x0000000Fu32.to_be_bytes());
+        carrier[44..48].copy_from_slice(&1u32.to_be_bytes());
+        carrier[48..52].copy_from_slice(&(frame_len as u32).to_be_bytes());
+        // TOC + zero quality kept zero; LAME magic at +154.
+        let lame_off = 154usize;
+        carrier[lame_off..lame_off + 4].copy_from_slice(b"LAME");
+        // §5 byte pattern at delay+padding offset +23.
+        carrier[lame_off + 23] = 0b0110_1100;
+        carrier[lame_off + 24] = 0b0001_0010;
+        carrier[lame_off + 25] = 0b1101_0010;
+        // Append a single audio frame so the demuxer terminates.
+        let mut audio_frame = vec![0u8; frame_len];
+        audio_frame[..4].copy_from_slice(&hdr);
+        let mut buf = carrier;
+        buf.extend_from_slice(&audio_frame);
+        let d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).unwrap();
+        let lame = d.lame().expect("LAME tag present");
+        assert_eq!(lame.encoder_delay, 1729);
+        assert_eq!(lame.zero_padding, 722);
+    }
+
+    /// A carrier frame whose encoder string is something other than
+    /// "LAME" (e.g. "Lavc" — common ffmpeg-side emitter) yields a
+    /// Xing tag but no LAME tag.
+    #[test]
+    fn non_lame_encoder_yields_no_lame_tag() {
+        let raw: u32 =
+            (0xFFF << 20) | (1 << 19) | (0b01 << 17) | (1 << 16) | (0b1001 << 12) | (0b00 << 10);
+        let hdr = raw.to_be_bytes();
+        let frame_len = 417usize;
+        let mut carrier = vec![0u8; frame_len];
+        carrier[..4].copy_from_slice(&hdr);
+        carrier[36..40].copy_from_slice(b"Xing");
+        carrier[40..44].copy_from_slice(&0x0000000Fu32.to_be_bytes());
+        carrier[44..48].copy_from_slice(&1u32.to_be_bytes());
+        carrier[48..52].copy_from_slice(&(frame_len as u32).to_be_bytes());
+        let lame_off = 154usize;
+        // Write "Lavc" instead of "LAME" — same offset.
+        carrier[lame_off..lame_off + 4].copy_from_slice(b"Lavc");
+        let mut audio_frame = vec![0u8; frame_len];
+        audio_frame[..4].copy_from_slice(&hdr);
+        let mut buf = carrier;
+        buf.extend_from_slice(&audio_frame);
+        let d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).unwrap();
+        assert!(d.xing().is_some(), "Xing tag still present");
+        assert!(d.lame().is_none(), "non-LAME encoder yields no LAME tag");
+        // Trimmed duration must still match gross (no LAME tag = no trim).
+        assert_eq!(d.trimmed_duration_samples(), d.streams()[0].duration);
     }
 }
