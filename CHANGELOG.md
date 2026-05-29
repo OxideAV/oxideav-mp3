@@ -8,6 +8,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`oxideav_core::Decoder` trait MPEG-2 LSF widening** (Phase 2
+  step 37, r183). Extends `Mp3CoreDecoder` from MPEG-1-only to
+  MPEG-1 **and** MPEG-2 LSF Layer III decode (mono and stereo,
+  independent / joint MS / joint MS+intensity all carried across).
+  The header-version guard in `decode_packet` now accepts
+  `MpegVersion::Mpeg1` and `MpegVersion::Mpeg2` and still rejects
+  `MpegVersion::Mpeg25` with an `Error::unsupported` whose message
+  cites the `docs/audio/mp3/MPEG-2.5-GAP.md` observer-trace gating
+  (scalefactor-band tables, low-rate frame-size validation,
+  Huffman table mapping at 8 / 11.025 / 12 kHz). The downstream
+  decode chain needed no change: `parse_side_info` /
+  `decode_scalefactors` / `requantize` / `process_stereo` were
+  already version-aware (the LSF single-granule
+  `granule_count == 1` layout, the 9-bit `scalefac_compress`
+  partitioning of ISO/IEC 13818-3 §2.4.3.4, and the LSF intensity-
+  position formula of `stereo::intensity_factors`), and the
+  per-channel `imdct_state` / `synth_state` arrays driven by
+  `si.granule_count` and `si.channels` consume one granule per
+  frame on LSF without further branching. Per-channel sample count
+  per emitted `AudioFrame` becomes 576 (LSF, one granule × 576
+  PCM samples) vs MPEG-1's 1152 (two granules). +2 new integration
+  tests in `tests/decoder_trait_lsf_roundtrip.rs` exercising the
+  staged `docs/audio/mp3/fixtures/layer3-mpeg2-22050-64kbps`
+  fixture (64 kbps / 22.05 kHz / stereo MPEG-2 LSF Layer III):
+  `trait_decode_lsf_stereo_fixture_matches_direct_chain_byte_exact`
+  pins the header version + sample-rate + channel count, walks
+  every wire frame through both the trait wrapper and the existing
+  direct-chain decode primitives, and asserts byte-exact per-channel
+  PCM equality; `registry_built_decoder_handles_lsf_stereo_packets`
+  drives the same fixture through the registry-installed factory.
+  Both tests skip cleanly under standalone-crate CI (workspace
+  `docs/` absent) per the `tests/docs_corpus.rs` pattern. +2 new
+  lib unit tests in `codec_decoder::tests`:
+  `send_packet_rejects_mpeg25_header_pending_observer_trace`
+  constructs a real Fraunhofer MPEG-2.5 header via the crate's own
+  `make_silent_header` + `write_header` (32 kbps / 11.025 kHz) and
+  pins the `Error::Unsupported` rejection with the
+  "MPEG-2.5 / observer-trace" message;
+  `send_packet_accepts_mpeg2_lsf_header_through_the_guard`
+  constructs an MPEG-2 LSF header (64 kbps / 22.05 kHz) and pins
+  that the r177-style `"MPEG-1 only"` rejection no longer fires
+  for LSF traffic. 611 tests pass total (+4 net from r177's
+  baseline). No external implementation consulted.
 - **`oxideav_core::Decoder` trait stereo widening** (Phase 2 step 36,
   r177). Extends `Mp3CoreDecoder` from mono-only to MPEG-1 Layer III
   mono **and** stereo (independent `ChannelMode::Stereo` /

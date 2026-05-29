@@ -15,9 +15,9 @@
 //!   side-info + main-data slot), matching what
 //!   [`crate::Mp3Demuxer::next_packet`] emits.
 //! * [`receive_frame`](Decoder::receive_frame) returns one
-//!   [`AudioFrame`] holding interleaved S16 PCM for that frame's two
-//!   granules (MPEG-1 Layer III mono = 1152 samples per frame per
-//!   channel).
+//!   [`AudioFrame`] holding planar S16 PCM for that frame's granules
+//!   (MPEG-1 = two granules × 576 samples = 1152 samples per channel,
+//!   MPEG-2 LSF = one granule × 576 samples = 576 samples per channel).
 //! * [`flush`](Decoder::flush) drains any buffered frame and signals
 //!   end-of-stream so subsequent `receive_frame` calls eventually
 //!   return [`Error::Eof`].
@@ -38,9 +38,9 @@
 //!
 //! ## Scope
 //!
-//! This module wires the MPEG-1 Layer III decode path — mono **and**
-//! stereo (independent, joint MS, joint MS+intensity) — through the
-//! framework trait.
+//! This module wires the Layer III decode path — MPEG-1 and MPEG-2 LSF,
+//! mono **and** stereo (independent, joint MS, joint MS+intensity) —
+//! through the framework trait.
 //!
 //! * **Mono and stereo.** `channels == 1` or `2`. For stereo frames the
 //!   per-channel state — `ImdctState` and `SynthState` — is carried
@@ -49,19 +49,29 @@
 //!   the established decode pipeline order. Mono behaviour is unchanged
 //!   from earlier rounds (only the channel-0 slot of the per-channel
 //!   state arrays is used).
-//! * **MPEG-1 only.** Sample rates 32 / 44.1 / 48 kHz. The MPEG-2 /
-//!   MPEG-2.5 LSF parsing path of [`parse_side_info`] /
-//!   [`decode_scalefactors`] is reachable but the synth chain has been
-//!   exercised end-to-end only against MPEG-1 fixtures so far; the LSF
-//!   trait wiring is a separate later round.
+//! * **MPEG-1 and MPEG-2 LSF.** Sample rates 32 / 44.1 / 48 kHz
+//!   (MPEG-1, ISO/IEC 11172-3 §2.4.2.3) and 16 / 22.05 / 24 kHz
+//!   (MPEG-2 lower-sampling-frequency, ISO/IEC 13818-3 §2.4.2.3).
+//!   On LSF the §2.4.1.7 side-info layout is the single-granule form
+//!   (`granule_count == 1`) and the §2.4.3.4 scalefactor decode uses
+//!   the 9-bit `scalefac_compress` partitioning; both are already
+//!   honoured by [`parse_side_info`] / [`decode_scalefactors`] and
+//!   downstream by [`requantize`] / [`crate::process_stereo`], so
+//!   widening the trait wrapper to LSF is just dropping the
+//!   MPEG-1-only header guard and letting `si.granule_count` /
+//!   `si.channels` drive the per-frame iteration count. MPEG-2.5 is
+//!   still rejected here: its observer-trace items in
+//!   `docs/audio/mp3/MPEG-2.5-GAP.md` block byte-exact decode at
+//!   8 / 11.025 / 12 kHz.
 //! * **Layer III only.** Layer I / Layer II frames are rejected at the
 //!   `send_packet` boundary.
 //!
 //! Output PCM follows the framework's `AudioFrame` convention: one
 //! `data[plane]` entry per channel (planar layout), with each plane
 //! holding little-endian `i16` samples. Mono output keeps the single
-//! plane; stereo output writes two planes (`data[0]` = L, `data[1]` = R)
-//! covering the same 1152 samples per granule pair.
+//! plane; stereo output writes two planes (`data[0]` = L, `data[1]` = R).
+//! Per-channel sample count per frame is 1152 on MPEG-1 (two granules)
+//! and 576 on MPEG-2 LSF (one granule).
 
 use std::collections::VecDeque;
 
@@ -82,11 +92,13 @@ use crate::side_info::parse_side_info;
 use crate::stream_encoder::SAMPLES_PER_FRAME_MPEG1;
 use crate::synth::{synth_granule, SynthState, PCM_PER_GRANULE};
 
-/// Build a boxed MPEG-1 Audio Layer III [`Decoder`] from `params`.
+/// Build a boxed MPEG-1 / MPEG-2 LSF Audio Layer III [`Decoder`] from
+/// `params`.
 ///
-/// `params.sample_rate` (32_000 / 44_100 / 48_000) and
-/// `params.channels` (1 or 2) configure the returned decoder's stream
-/// parameters; the actual per-frame sample rate and channel count are
+/// `params.sample_rate` (32_000 / 44_100 / 48_000 for MPEG-1, or
+/// 16_000 / 22_050 / 24_000 for MPEG-2 LSF) and `params.channels`
+/// (1 or 2) configure the returned decoder's stream parameters; the
+/// actual per-frame sample rate, channel count, and MPEG version are
 /// re-derived from each MP3 frame header on `send_packet`, so the
 /// values supplied here are a hint used only to construct the
 /// `output_params()` shape.
@@ -198,10 +210,19 @@ impl Mp3CoreDecoder {
                 hdr.layer
             )));
         }
-        if hdr.version != MpegVersion::Mpeg1 {
-            return Err(Error::unsupported(
-                "oxideav-mp3: decoder this round is MPEG-1 only",
-            ));
+        match hdr.version {
+            MpegVersion::Mpeg1 | MpegVersion::Mpeg2 => {}
+            MpegVersion::Mpeg25 => {
+                // MPEG-2.5 framing parses (§MPEG-2.5 step 25) but the
+                // full decode chain is gated on `MPEG-2.5-GAP.md`'s
+                // observer-trace items (scalefactor-band tables,
+                // Huffman table mapping, frame-size validation at
+                // 8 / 11.025 / 12 kHz). Reject here rather than
+                // produce non-spec PCM.
+                return Err(Error::unsupported(
+                    "oxideav-mp3: MPEG-2.5 trait decode pending observer-trace items",
+                ));
+            }
         }
         let nch = hdr.channel_count() as usize;
         if nch != 1 && nch != 2 {
@@ -398,8 +419,9 @@ impl Decoder for Mp3CoreDecoder {
     }
 }
 
-/// Install the MPEG-1 Audio Layer III decoder factory (alongside the
-/// existing encoder factory from r140) into `reg`.
+/// Install the MPEG-1 / MPEG-2 LSF Audio Layer III decoder factory
+/// (alongside the existing MPEG-1 encoder factory from r140) into
+/// `reg`.
 ///
 /// Claims the WAVE format tag `0x0055` (MPEG Layer III) and the
 /// Matroska codec id `A_MPEG/L3`. Both factories install on the same
@@ -706,5 +728,80 @@ mod tests {
             }
         }
         assert_eq!(a, b, "reset state did not produce a clean restart");
+    }
+
+    #[test]
+    fn send_packet_rejects_mpeg25_header_pending_observer_trace() {
+        // Build a real Fraunhofer MPEG-2.5 4-byte header via the
+        // crate's own header writer (32 kbps Layer III at 11.025 kHz,
+        // mono — round-trip-verified in `encoder` unit tests). Feed
+        // it to the trait decoder and confirm it is rejected with
+        // an `Error::Unsupported` rather than silently producing
+        // non-spec PCM. The MPEG-2.5 observer-trace items in
+        // `docs/audio/mp3/MPEG-2.5-GAP.md` (sample-rate-index
+        // dispatch in scalefactor-band tables, low-rate frame-size
+        // validation, Huffman table mapping) gate proper decode at
+        // 8 / 11.025 / 12 kHz; this guard keeps the gap honest.
+        use crate::encoder::{make_silent_header, write_header};
+        use crate::frame::ChannelMode;
+        let hdr = make_silent_header(32, 11_025, ChannelMode::SingleChannel)
+            .expect("mpeg-2.5 silent header build");
+        let hdr_bytes = write_header(&hdr);
+        let frame_len = hdr.frame_len().expect("mpeg-2.5 frame_len derivable");
+        // Pad to the header-implied frame_len so the rejection arm
+        // is reached before the truncation check (we want to assert
+        // the version guard fires, not the length guard).
+        let mut payload = hdr_bytes.to_vec();
+        payload.resize(frame_len, 0u8);
+        let tb = TimeBase::new(1, 11_025);
+        let pkt = Packet::new(0, tb, payload);
+        let mut dec = make_decoder(&build_decoder_params(11_025)).expect("make_decoder");
+        match dec.send_packet(&pkt) {
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("MPEG-2.5") || msg.contains("observer-trace"),
+                    "expected MPEG-2.5-pending error, got: {msg}"
+                );
+            }
+            Ok(()) => panic!("send_packet must reject MPEG-2.5 pending observer-trace items"),
+        }
+    }
+
+    #[test]
+    fn send_packet_accepts_mpeg2_lsf_header_through_the_guard() {
+        // Build a real MPEG-2 LSF 4-byte header (64 kbps Layer III at
+        // 22.05 kHz, mono). The packet's main-data slot is zeros so
+        // the decoder won't produce meaningful PCM, but the header
+        // version-field guard must let the packet through to the
+        // side-info / reservoir stage rather than rejecting at the
+        // `Mpeg1`-only branch the way r177's wrapper did. Either
+        // `Ok(())` (frame produced or buffered) or an error from a
+        // *later* stage (side-info parse / scalefactors / huffman)
+        // proves the guard widened; what we must NOT see is the
+        // r177-style "decoder this round is MPEG-1 only" rejection.
+        use crate::encoder::{make_silent_header, write_header};
+        use crate::frame::ChannelMode;
+        let hdr = make_silent_header(64, 22_050, ChannelMode::SingleChannel)
+            .expect("mpeg-2 lsf silent header build");
+        assert_eq!(hdr.version, MpegVersion::Mpeg2);
+        let hdr_bytes = write_header(&hdr);
+        let frame_len = hdr.frame_len().expect("lsf frame_len derivable");
+        let mut payload = hdr_bytes.to_vec();
+        payload.resize(frame_len, 0u8);
+        let tb = TimeBase::new(1, 22_050);
+        let pkt = Packet::new(0, tb, payload);
+        let mut dec = make_decoder(&build_decoder_params(22_050)).expect("make_decoder");
+        match dec.send_packet(&pkt) {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    !msg.contains("MPEG-1 only"),
+                    "MPEG-2 LSF header must not be rejected by the version guard \
+                     (got: {msg})"
+                );
+            }
+        }
     }
 }

@@ -814,6 +814,69 @@ match), and 250 ms of sine yields the expected count of
 is validated in r177 by `tests/decoder_trait_stereo_roundtrip.rs`
 (see "Phase 2 step 36" below).
 
+**Phase 2 step 37 (`oxideav_core::Decoder` trait MPEG-2 LSF
+widening)** extends `Mp3CoreDecoder` from MPEG-1-only to **MPEG-1
+and MPEG-2 LSF Layer III**, carrying the r177 stereo widening
+across both versions (mono and stereo, independent / joint MS /
+joint MS+intensity). The change is small in code and large in
+scope because the downstream primitives were already version-
+aware: `parse_side_info` already dispatches the §2.4.1.7 LSF
+9-byte-mono / 17-byte-stereo single-granule layout
+(`granule_count == 1`), `decode_scalefactors` already implements
+the §2.4.3.4 LSF 9-bit `scalefac_compress` partitioning with
+`slen1..4` and `nr_of_sfb1..4`, `requantize` already routes the
+22-band long / 13-band short table per `(sample_rate, version)`,
+and `stereo::process_stereo` already evaluates the LSF
+intensity-position formula and the LSF
+`int_scalefac_compress = scalefac_compress >> 1` right-channel
+derivation. The only change in the trait wrapper is the
+header-version guard: `MpegVersion::Mpeg1` and
+`MpegVersion::Mpeg2` are both accepted, `MpegVersion::Mpeg25`
+keeps its `Error::Unsupported` rejection with a message that
+cites the `docs/audio/mp3/MPEG-2.5-GAP.md` observer-trace items
+(scalefactor-band tables / Huffman table mapping / low-rate
+frame-size validation at 8 / 11.025 / 12 kHz) as the gating
+condition. The per-channel `imdct_state` / `synth_state` arrays
+and the per-granule loop over `si.granule_count` / `si.channels`
+need no further branching: an LSF frame iterates one granule
+instead of two and emits an `AudioFrame` carrying
+`PCM_PER_GRANULE = 576` samples per channel (vs MPEG-1's 1152).
+
+Validated by 2 new integration tests in
+`tests/decoder_trait_lsf_roundtrip.rs` against the staged
+`docs/audio/mp3/fixtures/layer3-mpeg2-22050-64kbps` fixture
+(64 kbps / 22.05 kHz / stereo MPEG-2 LSF Layer III, ID3v2-tagged):
+`trait_decode_lsf_stereo_fixture_matches_direct_chain_byte_exact`
+strips the ID3v2.4 frontmatter, pins the first audio frame's
+`(version, sample_rate, channel_count) == (Mpeg2, 22050, 2)`,
+walks every wire frame through both the trait wrapper and the
+existing direct-chain decode primitives (parse_header →
+parse_side_info → decode_scalefactors → decode_huffman →
+requantize → process_stereo → alias_reduce → imdct_granule →
+synth_granule), and asserts byte-exact per-channel `i16` PCM
+equality plus the `samples == PCM_PER_GRANULE` / planar
+`AudioFrame` invariants; `registry_built_decoder_handles_lsf_stereo_packets`
+drives the same fixture through the `oxideav_mp3::register`-
+installed factory and confirms byte-exact match. Both tests
+skip cleanly under standalone-crate CI (workspace `docs/`
+absent) per the established `tests/docs_corpus.rs` pattern.
+
+Two new lib unit tests in `codec_decoder::tests` pin the
+version-guard contract:
+`send_packet_rejects_mpeg25_header_pending_observer_trace`
+synthesises a real Fraunhofer MPEG-2.5 4-byte header via the
+crate's own `make_silent_header(32, 11_025, SingleChannel)` +
+`write_header` (round-trip-verified in the
+`encoder::tests::header_writer_is_parse_inverse_mpeg25` test)
+and asserts the wrapper rejects with an `Error::Unsupported`
+whose message names "MPEG-2.5" or "observer-trace";
+`send_packet_accepts_mpeg2_lsf_header_through_the_guard`
+synthesises a real MPEG-2 LSF header (64 kbps / 22.05 kHz /
+mono) and asserts the r177-style "MPEG-1 only" rejection no
+longer fires — proving the version guard widened correctly
+rather than relaxing into accept-all. Tests: 611 pass total
+(+4 net from r177). No external implementation consulted.
+
 **Phase 2 step 36 (`oxideav_core::Decoder` trait stereo widening)**
 extends `Mp3CoreDecoder` from mono-only to MPEG-1 Layer III mono
 **and** stereo (independent `ChannelMode::Stereo` /
@@ -1947,14 +2010,14 @@ low rates), and stereo / LSF decode through the trait wrapper.
 
 ### Not yet implemented
 
-MPEG-2 LSF / MPEG-2.5 decode through the `Decoder` trait wrapper
-(stereo MPEG-1 lands in r177 step 36 — see above; the underlying LSF
-side-info / scalefactor / requantize paths are present but the
-trait wrapper's header guard rejects non-MPEG-1 streams pending
-end-to-end LSF synth-chain fixtures, and the framing layer accepts
-MPEG-2.5 as of step 25 but the trait-wrapper audio-decode chain
-still rejects it pending the `MPEG-2.5-GAP.md` observer-trace
-items). The encoder is **Phase 1
+MPEG-2.5 decode through the `Decoder` trait wrapper (MPEG-1 lands
+in r141, MPEG-1 stereo in r177 step 36, and MPEG-2 LSF mono +
+stereo in r183 step 37 — see above; the trait wrapper's header
+guard now accepts `MpegVersion::Mpeg1` and `MpegVersion::Mpeg2`
+and rejects `MpegVersion::Mpeg25` only, pending the
+`MPEG-2.5-GAP.md` observer-trace items — scalefactor-band tables /
+Huffman table mapping / low-rate frame-size validation at
+8 / 11.025 / 12 kHz). The encoder is **Phase 1
 framing + Phase 2 steps 1–33 (forward MDCT primitive + analysis
 windowing + forward overlap split + polyphase analysis subband
 filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4
