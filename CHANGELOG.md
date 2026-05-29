@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`oxideav_core::Decoder` trait stereo widening** (Phase 2 step 36,
+  r177). Extends `Mp3CoreDecoder` from mono-only to MPEG-1 Layer III
+  mono **and** stereo (independent `ChannelMode::Stereo` /
+  `ChannelMode::DualChannel`, joint MS, joint MS+intensity). The
+  per-channel decode state — `ImdctState` for the §2.4.3.4.10.4
+  IMDCT overlap memory and `SynthState` for the §2.4.3.2 polyphase
+  synthesis shift register — is carried in two-element arrays
+  inside the wrapper. Each `send_packet` runs a two-pass per-granule
+  decode: pass 1 walks every channel through `decode_huffman` +
+  `requantize` and collects the dequantized `xr[576]` lines; on
+  `JointStereo` granules the existing `process_stereo` primitive
+  rewrites the L/R pair in place per `mode_extension` (MS matrix
+  and / or intensity decode per §2.4.3.4.9.1–.9.3); pass 2 runs
+  the per-channel `alias_reduce` → `imdct_granule` →
+  `synth_granule` tail and writes each channel's PCM into its own
+  plane of the emitted `AudioFrame`. The output `AudioFrame`
+  switches from interleaved (`data[0]` is the only plane) to
+  planar (`data[0]` = L, `data[1]` = R for stereo; single plane
+  for mono) per the framework's convention. `make_decoder` accepts
+  `channels = 1` or `channels = 2` and rejects every other value
+  with `Error::invalid`; the registry factory installed by
+  `crate::register` carries the same widening. MPEG-1 only / Layer
+  III only / non-free-format guards at `send_packet` are
+  unchanged. Existing mono behaviour is preserved bit-for-bit (the
+  r141 byte-exact assertion still passes against the
+  per-channel-state wrapper using only its `[0]` slot). +4 new
+  integration tests in `tests/decoder_trait_stereo_roundtrip.rs`
+  (independent-stereo byte-exact match, joint-MS byte-exact match
+  with mono-on-L panning to prove the inverse rotation runs inside
+  the wrapper, planar `AudioFrame` invariants, and registry-built
+  decoder end-to-end) plus 1 net new unit test on `make_decoder`'s
+  channel-count validation. 619 tests pass total (was 615; +4
+  integration). No external implementation consulted.
 - **`DEFAULT_AMBIENT_LEAK` empirical-corpus calibration** (Phase 2
   step 35, r165). Replaces the hand-wave justification for the
   r164-promoted `DEFAULT_AMBIENT_LEAK = 0.5` constant with a

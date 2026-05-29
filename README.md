@@ -792,23 +792,88 @@ The `codec_decoder` module ships the **symmetric** decoder-side
 trait wiring. `Mp3CoreDecoder` implements `oxideav_core::Decoder`:
 `send_packet` parses one inbound MP3 frame (header + optional CRC +
 side-info + main-data slot), runs the per-granule
-`decode_huffman` → `requantize` → `alias_reduce` → `imdct_granule` →
-`synth_granule` chain, and queues an `AudioFrame` of interleaved S16
-PCM (1152 samples/channel for MPEG-1 Layer III). Per-stream state —
-the §2.4.2.7 bit reservoir, the §2.4.3.4.10.4 IMDCT overlap memory,
-and the §2.4.3.2 polyphase synthesis filterbank shift register — is
-carried across packets; `reset()` wipes all three for post-seek
-recovery. `codec_decoder::make_decoder` is the direct-API factory
-matching `oxideav-core`'s `DecoderFactory` signature.
-`crate::register` now installs the container demuxer **and** both
-codec factories on a single `CodecInfo` (codec id `"mp3"`, WAVE tag
-`0x0055`, Matroska `A_MPEG/L3`). Validated by
-`tests/decoder_trait_roundtrip.rs`: a 500 ms sine encoded → sliced
-into per-frame packets → driven through the trait Decoder produces
-i16 PCM **byte-exact identical** to the direct-chain output on the
-same input bytes (sample-for-sample match), and 250 ms of sine yields
-the expected count of `AudioFrame`s with 1152 samples/channel and
-monotonic PTS.
+`decode_huffman` → `requantize` → `process_stereo` (joint granules
+only) → `alias_reduce` → `imdct_granule` → `synth_granule` chain,
+and queues an `AudioFrame` of planar S16 PCM (1152 samples/channel
+for MPEG-1 Layer III; one plane per channel — `data[0]` = L,
+`data[1]` = R for stereo, single plane for mono). Per-stream state —
+the §2.4.2.7 bit reservoir and the **per-channel** §2.4.3.4.10.4
+IMDCT overlap memory + §2.4.3.2 polyphase synthesis filterbank
+shift register pair — is carried across packets; `reset()` wipes
+all of it for post-seek recovery. `codec_decoder::make_decoder` is
+the direct-API factory matching `oxideav-core`'s `DecoderFactory`
+signature. `crate::register` now installs the container demuxer
+**and** both codec factories on a single `CodecInfo` (codec id
+`"mp3"`, WAVE tag `0x0055`, Matroska `A_MPEG/L3`). Mono was
+validated in r141 by `tests/decoder_trait_roundtrip.rs`: a 500 ms
+sine encoded → sliced into per-frame packets → driven through the
+trait Decoder produces i16 PCM **byte-exact identical** to the
+direct-chain output on the same input bytes (sample-for-sample
+match), and 250 ms of sine yields the expected count of
+`AudioFrame`s with 1152 samples/channel and monotonic PTS. Stereo
+is validated in r177 by `tests/decoder_trait_stereo_roundtrip.rs`
+(see "Phase 2 step 36" below).
+
+**Phase 2 step 36 (`oxideav_core::Decoder` trait stereo widening)**
+extends `Mp3CoreDecoder` from mono-only to MPEG-1 Layer III mono
+**and** stereo (independent `ChannelMode::Stereo` /
+`ChannelMode::DualChannel`, joint MS, joint MS+intensity). The
+per-channel decode state — `ImdctState` for the §2.4.3.4.10.4
+overlap memory and `SynthState` for the §2.4.3.2 polyphase
+synthesis filterbank shift register — is carried in two-element
+arrays inside the wrapper, with index `[0]` always live and
+index `[1]` exercised on stereo packets. Each `send_packet` runs
+a two-pass per-granule decode: first pass walks every channel
+through `decode_huffman` + `requantize` and collects the
+dequantized `xr[576]` lines; on `JointStereo` granules the
+crate's existing `process_stereo` primitive then rewrites the
+L/R pair in place per `mode_extension` (MS matrix and / or
+intensity decode per §2.4.3.4.9.1–.9.3) using the right
+channel's scalefactors and granule-channel side info for the
+intensity bound; the second pass runs the per-channel
+`alias_reduce` → `imdct_granule` → `synth_granule` tail and
+writes each channel's PCM into its own plane of the emitted
+`AudioFrame`. The output `AudioFrame` switches from a single
+interleaved `data[0]` byte run to planar layout —
+`data[0]` = L, `data[1]` = R for stereo, single plane for mono —
+matching the framework's convention. `make_decoder` accepts
+`channels = 1` or `channels = 2` and rejects every other value
+with `Error::invalid`; the registry factory installed by
+`crate::register` carries the same widening. The MPEG-1 only /
+Layer III only checks at `send_packet` are unchanged. Validated
+by 4 new integration tests in
+`tests/decoder_trait_stereo_roundtrip.rs`:
+`trait_decode_independent_stereo_matches_direct_chain_byte_exact`
+encodes a 250 ms 440 Hz / 880 Hz LR-distinct sine pair through
+`Mp3Encoder::new(192, 44_100, ChannelMode::Stereo)` and confirms
+the trait wrapper produces **sample-for-sample-identical** L and
+R PCM compared to a per-channel-state direct decode chain
+(`process_stereo` is a pass-through on `mode_extension == '00'`,
+exercising the per-channel state arrays);
+`trait_decode_joint_ms_stereo_matches_direct_chain_byte_exact`
+encodes a mono-on-L panned 440 Hz tone (`R = 0`) through
+`Mp3Encoder::new_joint_stereo_ms` so the MS rotation moves real
+energy onto the side channel, asserts the first frame's header
+carries `JointStereo` + `mode_extension.ms_stereo == true`, and
+confirms the trait wrapper still recovers the same L / R PCM
+byte-exactly — proving the §2.4.3.4.9.2 inverse runs correctly
+inside the wrapper rather than the pass-through path;
+`trait_decode_stereo_emits_planar_audioframes_with_correct_sample_count`
+pins the planar `AudioFrame` invariants (two `data[]` planes of
+equal length, `samples == 1152` per MPEG-1 Layer III frame,
+2 bytes per S16 sample on each plane); and
+`registry_built_decoder_handles_stereo_packets` confirms the
+factory installed by `crate::register` carries the widening
+end-to-end. Existing mono behaviour is preserved bit-for-bit
+(same byte-exact `trait_decode_matches_direct_chain_byte_exact`
+assertion as r141, now passing against the per-channel-state
+wrapper using only its `[0]` slot). Tests across the crate stay
+green at 619 total (497 lib + 122 integration). Remaining work
+flagged here: MPEG-2 LSF / MPEG-2.5 decode through the trait
+wrapper (the framing layer, side-info parser, and scalefactor
+decoder all accept LSF / MPEG-2.5 streams; the trait wrapper's
+header guard rejects them pending end-to-end LSF synth-chain
+fixtures and the `MPEG-2.5-GAP.md` observer-trace items).
 
 The `xing_info` module ships **Phase 2 step 13** — the encode-side
 inverse of the demuxer's existing `parse_xing_info`. `XingTagSpec`
@@ -1882,12 +1947,14 @@ low rates), and stereo / LSF decode through the trait wrapper.
 
 ### Not yet implemented
 
-Stereo / MPEG-2 LSF decode through the `Decoder` trait wrapper (the
-underlying primitives — `process_stereo` and the LSF side-info /
-scalefactor paths — are present; the wrapper is mono MPEG-1 only this
-round; the framing layer accepts MPEG-2.5 as of step 25 but the
-trait-wrapper audio-decode chain still rejects it pending the
-`MPEG-2.5-GAP.md` observer-trace items). The encoder is **Phase 1
+MPEG-2 LSF / MPEG-2.5 decode through the `Decoder` trait wrapper
+(stereo MPEG-1 lands in r177 step 36 — see above; the underlying LSF
+side-info / scalefactor / requantize paths are present but the
+trait wrapper's header guard rejects non-MPEG-1 streams pending
+end-to-end LSF synth-chain fixtures, and the framing layer accepts
+MPEG-2.5 as of step 25 but the trait-wrapper audio-decode chain
+still rejects it pending the `MPEG-2.5-GAP.md` observer-trace
+items). The encoder is **Phase 1
 framing + Phase 2 steps 1–33 (forward MDCT primitive + analysis
 windowing + forward overlap split + polyphase analysis subband
 filterbank + §2.4.3.4.7 quantization primitive + §C.1.5.4.4

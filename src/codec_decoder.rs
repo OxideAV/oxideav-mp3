@@ -38,13 +38,17 @@
 //!
 //! ## Scope
 //!
-//! This round wires the mono MPEG-1 Layer III decode path through the
-//! framework trait, matching the encoder scope of r140:
+//! This module wires the MPEG-1 Layer III decode path — mono **and**
+//! stereo (independent, joint MS, joint MS+intensity) — through the
+//! framework trait.
 //!
-//! * **Mono only.** `channels == 1`. Stereo decode through the trait is
-//!   a follow-up: the underlying [`process_stereo`](crate::process_stereo)
-//!   primitive exists, but driving two channels through one synth state
-//!   per channel and interleaving the result is out of scope here.
+//! * **Mono and stereo.** `channels == 1` or `2`. For stereo frames the
+//!   per-channel state — `ImdctState` and `SynthState` — is carried
+//!   in a two-element array, and the §2.4.3.4.9 stereo processing stage
+//!   (`process_stereo`) runs between requantize and alias reduction per
+//!   the established decode pipeline order. Mono behaviour is unchanged
+//!   from earlier rounds (only the channel-0 slot of the per-channel
+//!   state arrays is used).
 //! * **MPEG-1 only.** Sample rates 32 / 44.1 / 48 kHz. The MPEG-2 /
 //!   MPEG-2.5 LSF parsing path of [`parse_side_info`] /
 //!   [`decode_scalefactors`] is reachable but the synth chain has been
@@ -52,6 +56,12 @@
 //!   trait wiring is a separate later round.
 //! * **Layer III only.** Layer I / Layer II frames are rejected at the
 //!   `send_packet` boundary.
+//!
+//! Output PCM follows the framework's `AudioFrame` convention: one
+//! `data[plane]` entry per channel (planar layout), with each plane
+//! holding little-endian `i16` samples. Mono output keeps the single
+//! plane; stereo output writes two planes (`data[0]` = L, `data[1]` = R)
+//! covering the same 1152 samples per granule pair.
 
 use std::collections::VecDeque;
 
@@ -72,10 +82,10 @@ use crate::side_info::parse_side_info;
 use crate::stream_encoder::SAMPLES_PER_FRAME_MPEG1;
 use crate::synth::{synth_granule, SynthState, PCM_PER_GRANULE};
 
-/// Build a boxed MPEG-1 Audio Layer III mono [`Decoder`] from `params`.
+/// Build a boxed MPEG-1 Audio Layer III [`Decoder`] from `params`.
 ///
-/// `params.sample_rate` (32_000 / 44_100 / 48_000) and `params.channels`
-/// (must be 1 for this round) configure the returned decoder's stream
+/// `params.sample_rate` (32_000 / 44_100 / 48_000) and
+/// `params.channels` (1 or 2) configure the returned decoder's stream
 /// parameters; the actual per-frame sample rate and channel count are
 /// re-derived from each MP3 frame header on `send_packet`, so the
 /// values supplied here are a hint used only to construct the
@@ -83,23 +93,23 @@ use crate::synth::{synth_granule, SynthState, PCM_PER_GRANULE};
 ///
 /// # Errors
 ///
-/// Returns [`Error::invalid`] when `channels` is supplied and not 1 —
-/// stereo decode through this trait wrapper is a follow-up.
-/// `sample_rate` is optional (defaults to 44_100 when absent): the
-/// real value is re-read from every frame header anyway.
+/// Returns [`Error::invalid`] when `channels` is supplied and not 1 or
+/// 2. MPEG-1 Layer III carries at most two channels per §2.4.2.1, so
+/// `channels >= 3` is unrepresentable on the wire and is rejected at
+/// build time. `sample_rate` is optional (defaults to 44_100 when
+/// absent): the real value is re-read from every frame header anyway.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    if let Some(ch) = params.channels {
-        if ch != 1 {
-            return Err(Error::invalid(format!(
-                "oxideav-mp3: decoder supports mono only (channels={ch})"
-            )));
-        }
+    let channels = params.channels.unwrap_or(1);
+    if channels != 1 && channels != 2 {
+        return Err(Error::invalid(format!(
+            "oxideav-mp3: decoder supports 1 or 2 channels (channels={channels})"
+        )));
     }
     let sample_rate = params.sample_rate.unwrap_or(44_100);
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     out_params.sample_rate = Some(sample_rate);
-    out_params.channels = Some(1);
+    out_params.channels = Some(channels);
     out_params.sample_format = Some(SampleFormat::S16);
     out_params.tag = Some(CodecTag::wave_format(WAVE_FORMAT_MP3));
 
@@ -133,8 +143,12 @@ pub struct Mp3CoreDecoder {
     codec_id: CodecId,
     output: CodecParameters,
     reservoir: Reservoir,
-    imdct_state: ImdctState,
-    synth_state: SynthState,
+    /// Per-channel IMDCT overlap memory. Index `[0]` is always used;
+    /// `[1]` is touched only when a stereo header parses on a packet.
+    imdct_state: [ImdctState; 2],
+    /// Per-channel polyphase synthesis shift register. Same indexing
+    /// convention as `imdct_state`.
+    synth_state: [SynthState; 2],
     pending_frames: VecDeque<AudioFrame>,
     /// Set once [`Decoder::flush`] has been called; `receive_frame`
     /// returns [`Error::Eof`] after `pending_frames` is empty.
@@ -157,8 +171,8 @@ impl Mp3CoreDecoder {
             codec_id,
             output,
             reservoir: Reservoir::new(),
-            imdct_state: ImdctState::new(),
-            synth_state: SynthState::new(),
+            imdct_state: [ImdctState::new(), ImdctState::new()],
+            synth_state: [SynthState::new(), SynthState::new()],
             pending_frames: VecDeque::new(),
             eof: false,
         }
@@ -189,10 +203,10 @@ impl Mp3CoreDecoder {
                 "oxideav-mp3: decoder this round is MPEG-1 only",
             ));
         }
-        if hdr.channel_count() != 1 {
+        let nch = hdr.channel_count() as usize;
+        if nch != 1 && nch != 2 {
             return Err(Error::unsupported(format!(
-                "oxideav-mp3: decoder this round is mono only (header channels={})",
-                hdr.channel_count()
+                "oxideav-mp3: unsupported channel count {nch} (expected 1 or 2)"
             )));
         }
         let frame_len = hdr.frame_len().ok_or_else(|| {
@@ -237,15 +251,23 @@ impl Mp3CoreDecoder {
         let fsf = decode_scalefactors(&hdr, &si, &run)
             .map_err(|e| Error::other(format!("oxideav-mp3: scalefactors: {e:?}")))?;
 
-        let mut interleaved_pcm: Vec<i16> =
-            Vec::with_capacity(SAMPLES_PER_FRAME_MPEG1 * usize::from(si.channels));
+        let nch_si = si.channels as usize;
+        // Per-channel planar PCM buffer, one Vec<i16> per channel.
+        let mut pcm_planes: Vec<Vec<i16>> = (0..nch_si)
+            .map(|_| Vec::with_capacity(SAMPLES_PER_FRAME_MPEG1))
+            .collect();
         let mut bit_cursor = 0usize;
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
+            // Per-granule first pass: decode huffman + requantize for
+            // every channel; collect the dequantized `xr` lines so a
+            // stereo granule can run §2.4.3.4.9 joint-stereo processing
+            // (MS / intensity) on the (L, R) pair before alias
+            // reduction. Mono granules fall through with no stereo
+            // step.
+            let mut xr_per_ch: Vec<[f32; 576]> = (0..nch_si).map(|_| [0.0; 576]).collect();
+            for (ch, xr_slot) in xr_per_ch.iter_mut().enumerate() {
                 let gc = &si.granules[gr][ch];
                 let mut r = MainDataReader::new(&run);
-                // Position the bit-reader at this granule-channel's
-                // part-3 start (sum of preceding part2_3_length values).
                 let mut left = bit_cursor;
                 while left >= 32 {
                     let _ = r.read(32);
@@ -258,30 +280,64 @@ impl Mp3CoreDecoder {
                 let is = decode_huffman(&mut r, gc, part3_bits, hdr.sample_rate_hz, hdr.version)
                     .map_err(|e| Error::other(format!("oxideav-mp3: huffman: {e:?}")))?;
                 let sf = &fsf.granules[gr][ch];
-                let xr = requantize(&is, gc, sf, hdr.sample_rate_hz, hdr.version);
-                let xar = alias_reduce(&xr, gc);
-                let subband_time = imdct_granule(&xar, gc, &mut self.imdct_state);
-                let pcm_f32 = synth_granule(&subband_time, &mut self.synth_state);
+                *xr_slot = requantize(&is, gc, sf, hdr.sample_rate_hz, hdr.version);
+                bit_cursor += gc.part2_3_length as usize;
+            }
+
+            // §2.4.3.4.9 stereo processing — runs on stereo joint
+            // granules only; independent-channel and mono granules pass
+            // through with no change. `process_stereo` rewrites L / R in
+            // place per the header's `mode_extension` bits using the
+            // right channel's scalefactors / granule-channel side info
+            // for the intensity bound.
+            if nch_si == 2 && hdr.mode == crate::frame::ChannelMode::JointStereo {
+                let (left_xr, right_xr) = xr_per_ch.split_at_mut(1);
+                let left_arr: &mut [f32; 576] = &mut left_xr[0];
+                let right_arr: &mut [f32; 576] = &mut right_xr[0];
+                let right_sf = &fsf.granules[gr][1];
+                let right_gc = &si.granules[gr][1];
+                crate::stereo::process_stereo(
+                    left_arr,
+                    right_arr,
+                    right_sf,
+                    right_gc,
+                    hdr.mode_extension,
+                    hdr.sample_rate_hz,
+                    hdr.version,
+                );
+            }
+
+            // Per-channel alias reduction + IMDCT + synthesis.
+            for (ch, xr_ch) in xr_per_ch.iter().enumerate() {
+                let gc = &si.granules[gr][ch];
+                let xar = alias_reduce(xr_ch, gc);
+                let subband_time = imdct_granule(&xar, gc, &mut self.imdct_state[ch]);
+                let pcm_f32 = synth_granule(&subband_time, &mut self.synth_state[ch]);
                 for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
                     let v = p * f32::from(i16::MAX);
-                    interleaved_pcm.push(v.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                    pcm_planes[ch].push(v.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
                 }
-                bit_cursor += gc.part2_3_length as usize;
             }
         }
 
         // Per-channel sample count this frame: MPEG-1 Layer III = 1152
-        // (two granules × 576 PCM samples each). For mono this is the
-        // total sample count of the interleaved buffer.
+        // (two granules × 576 PCM samples each).
         let samples_per_ch = (si.granule_count as usize) * PCM_PER_GRANULE;
-        let mut bytes_le: Vec<u8> = Vec::with_capacity(interleaved_pcm.len() * 2);
-        for s in &interleaved_pcm {
-            bytes_le.extend_from_slice(&s.to_le_bytes());
-        }
+        // Pack each plane to little-endian i16 bytes.
+        let data: Vec<Vec<u8>> = pcm_planes
+            .iter()
+            .map(|plane| {
+                let mut bytes_le: Vec<u8> = Vec::with_capacity(plane.len() * 2);
+                for s in plane {
+                    bytes_le.extend_from_slice(&s.to_le_bytes());
+                }
+                bytes_le
+            })
+            .collect();
         let frame = AudioFrame {
             samples: samples_per_ch as u32,
             pts: packet.pts,
-            data: vec![bytes_le],
+            data,
         };
         Ok(Some(frame))
     }
@@ -334,8 +390,8 @@ impl Decoder for Mp3CoreDecoder {
 
     fn reset(&mut self) -> Result<()> {
         self.reservoir = Reservoir::new();
-        self.imdct_state = ImdctState::new();
-        self.synth_state = SynthState::new();
+        self.imdct_state = [ImdctState::new(), ImdctState::new()];
+        self.synth_state = [SynthState::new(), SynthState::new()];
         self.pending_frames.clear();
         self.eof = false;
         Ok(())
@@ -479,9 +535,22 @@ mod tests {
     }
 
     #[test]
-    fn make_decoder_rejects_stereo() {
+    fn make_decoder_accepts_mono_and_stereo() {
+        let mut mono = CodecParameters::audio(CodecId::new("mp3"));
+        mono.channels = Some(1);
+        assert!(make_decoder(&mono).is_ok());
+        let mut stereo = CodecParameters::audio(CodecId::new("mp3"));
+        stereo.channels = Some(2);
+        let dec = make_decoder(&stereo).expect("stereo decoder builds");
+        assert_eq!(dec.codec_id().as_str(), "mp3");
+    }
+
+    #[test]
+    fn make_decoder_rejects_unsupported_channel_count() {
         let mut p = CodecParameters::audio(CodecId::new("mp3"));
-        p.channels = Some(2);
+        p.channels = Some(3);
+        assert!(make_decoder(&p).is_err());
+        p.channels = Some(0);
         assert!(make_decoder(&p).is_err());
     }
 
