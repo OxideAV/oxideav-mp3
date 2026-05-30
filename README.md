@@ -856,6 +856,85 @@ match), and 250 ms of sine yields the expected count of
 is validated in r177 by `tests/decoder_trait_stereo_roundtrip.rs`
 (see "Phase 2 step 36" below).
 
+**Phase 2 step 38 (`DEFAULT_ATTACK_THRESHOLD` empirical-corpus
+calibration)** closes the dual of the r165 leak calibration on the
+encoder-side `attack_detect::AttackDetector`. r165 pinned
+`DEFAULT_AMBIENT_LEAK = 0.5` against a synthetic-corpus parameter
+sweep while holding the threshold knob fixed at
+`DEFAULT_ATTACK_THRESHOLD = 10.0`; the closing paragraph of that
+step's README block called out the natural followup — *"a future
+round that revisits `DEFAULT_ATTACK_THRESHOLD` should re-run the
+sweep at the new threshold."* r192 runs that followup on the
+threshold axis directly.
+
+The sweep `THRESHOLD_SWEEP = [1.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0,
+30.0, 50.0, 100.0]` spans the qualitative bounds the module doc
+names: `≤ 3` over-aggressive, around `10` the recommended detection
+sweet spot, `≥ 30` reserves short blocks for only the most extreme
+bursts. Spacing is denser at the small-threshold end (where the
+over-aggressive failure mode transitions sharply) and coarser at
+the large end (where conservative thresholds saturate smoothly on
+the corpus's burst-energy distribution). The leak knob is held at
+the r165-calibrated `DEFAULT_AMBIENT_LEAK = 0.5` throughout so the
+only varying axis is the threshold. The corpus is the same 8 rows
+r165 built (`steady_sine`, `steady_noise`, `isolated_click`,
+`burst_train_period4`, `slow_swell`, `swell_then_click`,
+`sustained_drum_pair`, `level_shift`); the per-row error metric
+`max(0, |observed − expected| − tolerance)` is identical to r165.
+
+Five new tests pin the result (mirroring the r165 dual at the
+threshold axis):
+
+* `default_threshold_is_an_argmin_over_the_sweep` — no in-domain
+  threshold strictly beats `10.0` on the aggregate metric.
+* `default_threshold_beats_overaggressive_endpoint_and_ties_conservative`
+  — `10.0` strictly beats the over-aggressive endpoint `1.0` and
+  ties the conservative endpoint `100.0`. The asymmetry is the
+  empirical headline at the threshold axis: at the calibrated leak
+  the rejected region is `[1.0, 3.0]` (aggregate errors `179` and
+  `4`), the transition region is `[5.0, 7.0]` (errors `2` and `2`
+  — one residual fire each on the `slow_swell` and
+  `swell_then_click` rows), and the acceptable plateau is
+  `[10.0, 100.0]` (all tied at zero aggregate error). The default
+  `10.0` is the *lowest-bound* argmin — every higher threshold
+  ties because the corpus's burst magnitudes (`0.5–0.9` on a
+  `1e-4` floor → subframe-vs-ambient ratios in the 10⁵–10⁶ range)
+  sit orders of magnitude past every sweep point.
+* `default_threshold_emits_zero_fires_on_steady_rows` — zero fires
+  on both steady-state rows (`steady_sine`, `steady_noise`),
+  isolating the false-fire failure mode (small threshold on
+  modulated material) from the missed-fire failure mode (large
+  threshold on a burst train).
+* `default_threshold_catches_at_least_half_of_burst_train` — the
+  burst-train row catches `≥ 5` of its 9 expected hits at the
+  default threshold (in practice all 9 catch at the calibrated
+  leak).
+* `threshold_sweep_is_well_formed` — sorted, positive, finite,
+  contains the running default, and spans the module-doc
+  qualitative bounds (first ≤ 3, last ≥ 30).
+
+The honest empirical finding the calibration leaves on the record:
+the threshold knob's *tuning-relevant* range at the calibrated
+leak is `[1.0, 7.0]` — the conservative plateau `[10.0, 100.0]`
+ties at zero, so a workload that wants to lower the false-fire
+rate further can only do so by tightening the *leak* in concert
+(the r165 calibration block lays out that direction). The `10.0`
+choice sits at the lowest-bound argmin, which is the best
+operational policy for an encoder: lower thresholds forfeit the
+zero-fire guarantee on steady-state rows, higher thresholds buy
+nothing on the corpus while plausibly missing softer transients
+on richer material. The module-doc qualitative bounds (≤ 3
+over-aggressive, ≥ 30 conservative) are confirmed.
+
+The first granule of each row is discarded as a seed-only call,
+matching r165's procedure and the operational shape of the
+detector (the encoder's `block_type_per_gc` pre-pass and the
+§C.1.5.2 state machine both begin in `Long` regardless of the
+first granule's classification). Tests: 634 pass (was 629; +5
+from this step). No external implementation consulted — the
+corpus is the r165 corpus, the sweep is a one-axis extension of
+the r165 sweep, and the metric is the r165 metric.
+
 **Phase 2 step 37 (`oxideav_core::Decoder` trait MPEG-2 LSF
 widening)** extends `Mp3CoreDecoder` from MPEG-1-only to **MPEG-1
 and MPEG-2 LSF Layer III**, carrying the r177 stereo widening

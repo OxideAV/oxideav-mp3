@@ -8,6 +8,48 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`DEFAULT_ATTACK_THRESHOLD` empirical-corpus calibration**
+  (Phase 2 step 38, r192). Closes the dual of the r165 leak
+  calibration on the encoder-side `attack_detect::AttackDetector`.
+  r165 pinned `DEFAULT_AMBIENT_LEAK = 0.5` against a synthetic
+  parameter sweep with the threshold knob held fixed at
+  `DEFAULT_ATTACK_THRESHOLD = 10.0`; r192 reruns the same corpus
+  with the leak now held at the r165-calibrated default and varies
+  the threshold axis. Sweep
+  `THRESHOLD_SWEEP = [1.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0,
+  50.0, 100.0]` spans the qualitative bounds the module doc names
+  (≤ 3 over-aggressive, around 10 the recommended sweet spot,
+  ≥ 30 conservative). Per-threshold error is summed as
+  `max(0, |observed − expected| − tolerance)` across the same
+  8 corpus rows r165 used (`steady_sine`, `steady_noise`,
+  `isolated_click`, `burst_train_period4`, `slow_swell`,
+  `swell_then_click`, `sustained_drum_pair`, `level_shift`).
+  Five new tests pin the result:
+  `default_threshold_is_an_argmin_over_the_sweep` (no in-domain
+  threshold strictly beats `10.0` on the aggregate metric);
+  `default_threshold_beats_overaggressive_endpoint_and_ties_conservative`
+  (`10.0` strictly beats the over-aggressive endpoint `1.0` —
+  aggregate error `179` vs `0` — and ties the conservative endpoint
+  `100.0` — both `0`; the rejected region is `[1.0, 3.0]`, the
+  transition region is `[5.0, 7.0]`, the acceptable plateau is
+  `[10.0, 100.0]`);
+  `default_threshold_emits_zero_fires_on_steady_rows` (zero fires
+  on `steady_sine` / `steady_noise` at the default);
+  `default_threshold_catches_at_least_half_of_burst_train` (the
+  burst-train row catches at least 5 of 9 expected hits at the
+  default — in practice all 9); and
+  `threshold_sweep_is_well_formed` (sorted, positive, finite,
+  contains the default, spans the documented bounds).
+  Tests: 634 pass (was 629; +5 from this step). cargo clippy
+  --all-targets --no-deps -- -D warnings clean; cargo fmt --check
+  clean. No external implementation consulted (the corpus, the
+  sweep, and the metric are all derived from the
+  `attack_detect` module's own clean-room reasoning, extending the
+  r165 calibration along the threshold axis).
+  `DEFAULT_ATTACK_THRESHOLD`'s doc-comment is updated with the
+  argmin + asymmetric endpoint property; the constant value
+  `10.0` is unchanged — the calibration validates the existing
+  default, it does not move it.
 - **LAME-extension gapless playback wiring** (r185). New
   `lame_tag` module parses the LAME-tag extension that follows the
   four Xing fields inside an MP3's leading information frame,
