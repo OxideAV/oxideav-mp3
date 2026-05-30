@@ -6,6 +6,70 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-mp3/releases/tag/v0.1.2) - 2026-05-30
+
+### Other
+
+- DEFAULT_ATTACK_THRESHOLD empirical-corpus calibration (Phase 2 step 38)
+- §B1 encoder-delay + zero-padding gapless wiring (r185)
+- oxideav_core::Decoder trait MPEG-2 LSF widening (Phase 2 step 37)
+- oxideav_core::Decoder trait stereo widening (Phase 2 step 36)
+- DEFAULT_AMBIENT_LEAK empirical-corpus calibration (Phase 2 step 35)
+- §2.4.3.4.10 finer attack-detector knobs (Phase 2 step 34)
+- §2.4.3.4.9 cross-channel-MS block-type agreement (Phase 2 step 33)
+- §2.4.3.4.9 independent-stereo widening of the block-type override toggles (Phase 2 step 32)
+- §2.4.3.4.10.3 auto block-type mixed-block promotion (Phase 2 step 31)
+- §C.1.5.4.3 long-family transition-skeleton wiring (Phase 2 step 30)
+- §C.1.5.4.3 mixed-block analogue `outer_loop_search_mixed` (Phase 2 step 29)
+- §C.1.5.4.3 auto block-type × outer-loop integration (Phase 2 step 28)
+- §C.1.5.4.3 short-block analogue `outer_loop_search_short` (Phase 2 step 27)
+- auto block-type: signal-driven attack detection + §C.1.5.2 state machine (Phase 2 step 26)
+- §MPEG-2.5 frame-parser support (Phase 2 step 25)
+- §C.1.5.4.4.8 linbits-reach filter (Phase 2 step 24, #1106)
+- §2.4.2.7 forward mixed-block MDCT encode path (Phase 2 step 23)
+- §2.4.3.4.10.2 forward short-block MDCT path (Phase 2 step 22)
+- joint-stereo auto MS/LR trait factory (Phase 2 step 21)
+- joint-stereo auto MS/LR per-frame picker (Phase 2 step 20)
+- §C.1.5.4.3.4 preemphasis decision (Phase 2 step 19)
+- §C.1.5.4.3 scalefac_scale 0→1 escalation (Phase 2 step 18)
+- joint-stereo MS encode (Phase 2 step 17)
+- scrub pre-existing LAME decorative-attribution prose
+- Phase 2 step 16 — independent-stereo (ChannelMode::Stereo / DualChannel) encode
+- Phase 2 step 15 — opt-in §2.4.3.1 CRC-16 frame protection
+- Phase 2 step 14 — true-VBR per-frame bitrate + Xing TOC auto-fill
+- Phase 2 step 13 — Xing/Info VBR information-frame emission
+- oxideav_core::Decoder trait wiring + dual-API factory
+- Phase 2 step 12 — wire Mp3Encoder into oxideav_core::Encoder trait
+- §C.1.5.4.3 outer (distortion-control) loop — Phase 2 step 11
+- Phase 2 step 10 — stream-level PCM → MP3 driver
+- Phase 2 step 9 — §2.4.2.7 cross-frame bit-reservoir scheduler (main_data_begin > 0)
+- §2.4.1.7 main_data() assembler + main_data_begin=0 (Phase 2 step 8)
+- §2.4.1.7 huffmancodebits() bit emission (Phase 2 step 7)
+- docs — exact count is non-monotone, search uses qquant+1 scan
+- exact §C.1.5.4.4.5/.8 Huffman bit count (Phase 2 step 6)
+- §C.1.5.4.4 inner-loop global_gain search (Phase 2 step 5)
+- §2.4.3.4.7 quantization primitive (Phase 2 step 4)
+- scrub external-name disclaimer (clean-room hygiene)
+- §C.1.3 / Figure C.4 polyphase analysis subband filterbank — encoder Phase 2 step 3
+- §2.4.3.4.10.3/4 analysis windowing + forward overlap split — encoder Phase 2 step 2
+- §2.4.3.4.10.2 forward MDCT — encoder Phase 2 step 1
+- §2.4.1.3/§2.4.1.7 Layer III encoder Phase 1 (framing + silent frame)
+- standalone-CI: don't assert fixture presence in docs_corpus
+- oxideav_core::Demuxer impl with ID3v2 / ID3v1 / Xing-Info / seek
+- §2.4.3.2 / Figure A.2 polyphase synthesis subband filterbank
+- §2.4.3.4.10 IMDCT + windowing + overlap-add + frequency inversion
+- complete Table 3-B.7 codebooks + §2.4.3.4.10.1 alias reduction
+- clean-room §2.4.3.4.9 stereo processing (MS + intensity)
+- add §2.4.3.4.8 short-block reorder stage
+- §2.4.3.4.7 main-data requantization stage
+- Layer III Huffman decode stage (clean-room, tables 0..=13)
+- Layer III scalefactor decode stage (clean-room)
+- add MPEG-2 / MPEG-2.5 LSF single-granule variant
+- clean-room MPEG-1 Layer III side-information parser
+- clean-room MPEG audio framing layer (header + frame-walk)
+- drop fuzz workflow (no fuzz targets in scaffold)
+- orphan rebuild — clean-room reset 2026-05-24
+
 ### Added
 
 - **`DEFAULT_ATTACK_THRESHOLD` empirical-corpus calibration**
