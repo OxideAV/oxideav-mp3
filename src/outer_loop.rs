@@ -350,6 +350,57 @@ pub fn outer_loop_search_long(
     uniform_threshold: f64,
     max_iter: u32,
 ) -> OuterLoopResult {
+    // Scalar shim — broadcast the uniform scalar into a per-band vector
+    // and dispatch to the per-band primitive. Bit-exactly equivalent to
+    // the pre-r194 inline body (the only code path that reads
+    // `xmin_per_band[sfb]` always returns the same value, so every
+    // `> uniform_threshold` comparison resolves identically).
+    let xmin_per_band = [uniform_threshold; LONG_SFB];
+    outer_loop_search_long_per_band(
+        xr,
+        gc_template,
+        sample_rate_hz,
+        version,
+        per_gc_bit_budget,
+        &xmin_per_band,
+        max_iter,
+    )
+}
+
+/// Per-band-threshold variant of [`outer_loop_search_long`] —
+/// r194 (Phase 2 step 39).
+///
+/// Identical to [`outer_loop_search_long`] except that the per-band
+/// distortion threshold is supplied as a `[f64; LONG_SFB]` vector
+/// `xmin_per_band[sfb]` instead of a single scalar. Each
+/// §C.1.5.4.3.5 amplification + §C.1.5.4.3.6 termination test reads
+/// the per-band entry, enabling a spectrally-aware
+/// [`crate::psy::XminThresholds`] threshold (e.g. the textually-
+/// transcribed Annex D threshold in quiet) to redistribute the bit
+/// budget across the spectrum.
+///
+/// **Backward compat:** [`outer_loop_search_long`] is a thin shim over
+/// this primitive that broadcasts the scalar into a uniform per-band
+/// vector, so existing callers keep their behaviour unchanged.
+///
+/// The carrier semantics are identical: `gc_template` MUST satisfy the
+/// same long-family acceptance ([`BlockType::Long`] with
+/// `window_switching_flag = false`, or [`BlockType::Start`] /
+/// [`BlockType::End`] with `window_switching_flag = true`),
+/// `gc_template.scalefac_compress` MUST be
+/// [`OUTER_LOOP_SCALEFAC_COMPRESS`], and the returned
+/// [`OuterLoopResult`] carries the same scalefactor / global-gain /
+/// preflag / scalefac_scale state.
+#[must_use]
+pub fn outer_loop_search_long_per_band(
+    xr: &[f32; NUM_LINES],
+    gc_template: &GranuleChannel,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    per_gc_bit_budget: u64,
+    xmin_per_band: &[f64; LONG_SFB],
+    max_iter: u32,
+) -> OuterLoopResult {
     // Long-family acceptance: Long with window_switching off, or
     // Start / End with window_switching on. Pure-Short / mixed-Short
     // have their own primitives ([`outer_loop_search_short`] /
@@ -435,11 +486,11 @@ pub fn outer_loop_search_long(
             version,
         );
 
-        // Identify bands over threshold.
+        // Identify bands over their per-band threshold.
         let mut any_over = false;
         let mut would_exceed_cap = false;
         for (sfb, &d) in xfsf.iter().enumerate() {
-            if d > uniform_threshold {
+            if d > xmin_per_band[sfb] {
                 any_over = true;
                 let next = u16::from(sf.long[sfb]) + 1;
                 if next > u16::from(scalefac_long_upper_limit(sfb)) {
@@ -471,7 +522,12 @@ pub fn outer_loop_search_long(
         //     inner-loop call against a different sf).
         if !preflag_decided {
             preflag_decided = true;
-            let upper_four_all_over = xfsf[17..=20].iter().all(|&d| d > uniform_threshold);
+            // The §C.1.5.4.3.4 preemphasis heuristic compares each of the
+            // upper-4 long bands' distortion to its OWN per-band
+            // threshold, so a spectrally-shaped `xmin_per_band` with a
+            // higher threshold on (say) sfb 20 than sfb 17 still does
+            // the right thing.
+            let upper_four_all_over = (17..=20).all(|sfb| xfsf[sfb] > xmin_per_band[sfb]);
             if upper_four_all_over {
                 sf.preflag = true;
                 iterations += 1;
@@ -538,9 +594,10 @@ pub fn outer_loop_search_long(
         last_good_scale = scalefac_scale;
         last_good_inner = inner;
 
-        // §C.1.5.4.3.5: amplify the offending bands by one step each.
+        // §C.1.5.4.3.5: amplify the offending bands by one step each
+        // (compared against the per-band threshold).
         for (sfb, &d) in xfsf.iter().enumerate() {
-            if d > uniform_threshold {
+            if d > xmin_per_band[sfb] {
                 let cap = scalefac_long_upper_limit(sfb);
                 if sf.long[sfb] < cap {
                     sf.long[sfb] = sf.long[sfb].saturating_add(1);

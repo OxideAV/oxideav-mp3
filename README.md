@@ -2122,12 +2122,64 @@ granules in channel 0 but Long-only in channel 1); and 3 in
 `enable_auto_block_type_with_mixed`). Tests: 586 pass (was 575 at
 r161; +11 integration). No external implementation consulted.
 
-Remaining Phase 2 work: a real per-band psychoacoustic threshold (so
-the outer loop can spectrally redistribute bits without a hand-tuned
-constant), intensity-stereo encode (§2.4.3.4.9.3), LSF / MPEG-2.5
-encode (blocked on the `MPEG-2.5-GAP.md` observer-trace items for
-scalefactor-band tables / Huffman mapping / frame-size validation at
-low rates), and stereo / LSF decode through the trait wrapper.
+**Phase 2 step 39 (r194)** — per-band psychoacoustic-threshold
+scaffold (Annex D threshold-in-quiet long-block path). The new
+`psy` module exposes `XminThresholds` — a typed per-band threshold
+vector (`[f64; LONG_SFB]` long, plus short / mixed cells for the
+follow-up rounds) and two constructors: `XminThresholds::uniform`
+(byte-equivalent shim for the pre-r194 scalar threshold path) and
+`XminThresholds::threshold_in_quiet_long`, which derives a per-band
+`xmin[sfb]` from the Annex D Table D.1 *threshold in quiet* curve.
+The curve is sampled via monotone piecewise-linear interpolation
+through **only the textually-transcribed anchors** in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` — i = 1
+(62.5 Hz / 33.44 dB), i = 2…5 (the first five rows), i = 51
+(prose-anchored minimum near 3.375 kHz / −4.97 dB), and i = 108
+(15 kHz / 51.04 dB). The PNG-only inner rows of D.1a–f are
+**deliberately not OCR'd** this round (DOCS-GAP); the
+under-sampled curve is the conservative direction (under-estimated
+`xmin` → more aggressive amplification → more bits on that band →
+strictly higher quality). The §D.1 Step 3 bitrate-dependent offset
+is applied verbatim: −12 dB for ≥ 96 kbit/s, 0 dB below.
+
+The outer-loop `outer_loop_search_long` was refactored: the
+existing `(uniform_threshold: f64, …)` API becomes a thin shim over
+a new `outer_loop_search_long_per_band(…, xmin_per_band: &[f64; 21],
+…)` primitive that reads the per-band entry in every §C.1.5.4.3.5
+amplification + §C.1.5.4.3.6 termination test (and in the
+§C.1.5.4.3.4 preemphasis decision). The per-band primitive is a
+strict generalisation: broadcasting the scalar into a uniform
+vector recovers byte-for-byte the scalar path. The stream encoder
+exposes `Mp3Encoder::set_per_band_xmin` to install the per-band
+vector; the long-block outer-loop dispatch routes to the per-band
+primitive when set. The short / mixed branches still consume the
+scalar threshold this round (their per-band variants land in a
+follow-up; the `XminThresholds` struct exposes the short /
+mixed-short cells today so the API doesn't churn).
+
+Validated by 6 new integration tests in
+`per_band_xmin_roundtrip.rs`: byte-equivalence between the per-band
+uniform shim and the scalar path (regression anchor for the
+refactor), threshold-in-quiet long-block self-decode at finite
+PSNR > 20 dB on a 6-tone multi-tone fixture (measured 69.94 dB),
+divergence between the per-band LTq path and the uniform path at
+the same scalar threshold (witnesses the LTq vector actually
+propagating into the §C.1.5.4.3 decision), API rejection of
+`set_per_band_xmin` without the outer loop enabled, silence
+round-trip, and single-tone 440 Hz self-decode at 65.77 dB. The
+`psy` module adds 9 unit tests. Tests: 649 pass (was 633 baseline;
++10 unit, +6 integration). No external implementation consulted.
+
+Remaining Phase 2 work: the full Annex D Model 1 / Model 2
+psychoacoustic model (1024-sample FFT + tonality classifier +
+masking-function convolution — the threshold-in-quiet curve landed
+in r194 is the *lower bound* of any signal-dependent psychoacoustic
+threshold), short / mixed per-band threshold plumbing (the outer
+loop's `*_short` / `*_mixed` per-band variants), intensity-stereo
+encode (§2.4.3.4.9.3), LSF / MPEG-2.5 encode (blocked on the
+`MPEG-2.5-GAP.md` observer-trace items for scalefactor-band tables /
+Huffman mapping / frame-size validation at low rates), and
+stereo / LSF decode through the trait wrapper.
 
 ### Not yet implemented
 
@@ -2195,10 +2247,24 @@ widens the same four toggles onto MS-stereo joint modes, with the
 auto-path agreement enforced by OR-folding per-channel attack /
 mixed-classifier flags into a single shared `scheduler[0]` and
 mirroring its emission across both channel slots of
-`block_type_per_gc[gr]` / `mixed_per_gc[gr]`)** — it
-still lacks
-the psychoacoustic model (so the outer loop's `xmin(sb)` is a
-uniform constant rather than per-band masking-aware),
+`block_type_per_gc[gr]` / `mixed_per_gc[gr]` + Annex D
+threshold-in-quiet **per-band threshold scaffold** —
+`crate::psy::XminThresholds` + `outer_loop_search_long_per_band`
+primitive + `Mp3Encoder::set_per_band_xmin` opt-in so the
+long-block outer loop reads `xmin[sfb]` from the Annex D
+Table D.1 *threshold in quiet* curve (sampled via monotone
+piecewise-linear interpolation through the textually-transcribed
+anchors at 62.5 Hz / 33.44 dB, the i=2..5 rows, the i=51 prose
+minimum near 3.375 kHz / −4.97 dB, and 15 kHz / 51.04 dB — the
+PNG-only inner rows of D.1a–f are deliberately not OCR'd this
+round) with the §D.1 Step 3 `−12 dB` offset at ≥ 96 kbit/s. The
+short / mixed branches still consume the scalar threshold;
+their per-band variants are the next follow-up)** — it still
+lacks
+the full Annex D Model 1 / Model 2 psychoacoustic model
+(1024-sample FFT + tonality classifier + masking-function
+convolution — the r194 threshold-in-quiet curve is the *lower
+bound* of any signal-dependent psychoacoustic threshold),
 intensity-stereo encode (§2.4.3.4.9.3), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's

@@ -159,6 +159,12 @@ pub enum StreamEncodeError {
         /// Slot capacity at the configured `max_index`.
         max_slot_bytes: usize,
     },
+    /// Caller invoked [`Mp3Encoder::set_per_band_xmin`] on an encoder
+    /// that does not have the §C.1.5.4.3 outer (distortion-control)
+    /// loop enabled. The per-band threshold vector is only consumed by
+    /// the outer-loop path — install the outer loop first via
+    /// [`Mp3Encoder::new_with_outer_loop`].
+    PerBandXminWithoutOuterLoop,
 }
 
 impl core::fmt::Display for StreamEncodeError {
@@ -184,6 +190,9 @@ impl core::fmt::Display for StreamEncodeError {
             } => write!(
                 f,
                 "VBR: frame {frame_index} main_data {main_data_len} B does not fit max-index slot {max_slot_bytes} B"
+            ),
+            StreamEncodeError::PerBandXminWithoutOuterLoop => f.write_str(
+                "set_per_band_xmin requires the outer loop to be enabled first (use Mp3Encoder::new_with_outer_loop)",
             ),
         }
     }
@@ -241,6 +250,25 @@ pub struct Mp3Encoder {
     /// the uniform `xmin[sb]` threshold applied to every long-block
     /// scalefactor band.
     outer_loop_threshold: Option<f64>,
+
+    /// When `Some`, the long-block outer-loop branch consumes the
+    /// per-band threshold vector `xmin[sb]` from this
+    /// [`crate::psy::XminThresholds`] instead of the uniform scalar
+    /// stashed in [`Self::outer_loop_threshold`]. The short / mixed
+    /// branches in this round still consume the uniform scalar (their
+    /// `*_per_band` outer-loop variants land in a follow-up — see
+    /// [`crate::psy`]'s scope note).
+    ///
+    /// **Activation rules** — the per-band path requires the outer
+    /// loop to be enabled in the first place (i.e.
+    /// [`Self::outer_loop_threshold`] is also `Some`). Setting
+    /// `per_band_xmin` without first calling
+    /// [`Self::new_with_outer_loop`] is rejected at API time.
+    ///
+    /// Set by [`Self::set_per_band_xmin`] (the only public path that
+    /// installs an [`crate::psy::XminThresholds`]). Default `None`
+    /// preserves the pre-r194 uniform-threshold behaviour byte-for-byte.
+    per_band_xmin: Option<crate::psy::XminThresholds>,
 
     /// When `Some`, [`Mp3Encoder::finish`] prepends a Xing / Info VBR
     /// information frame ([`crate::xing_info::build_info_frame`]) to
@@ -621,6 +649,7 @@ impl Mp3Encoder {
             pending_pcm,
             frames: Vec::new(),
             outer_loop_threshold: None,
+            per_band_xmin: None,
             xing_template: None,
             vbr: None,
             crc_enabled: false,
@@ -1290,6 +1319,56 @@ impl Mp3Encoder {
         let mut enc = Self::new(bitrate_kbps, sample_rate_hz, mode)?;
         enc.outer_loop_threshold = Some(uniform_threshold);
         Ok(enc)
+    }
+
+    /// Install a per-band threshold vector
+    /// ([`crate::psy::XminThresholds`]) the long-block outer-loop
+    /// branch will consume INSTEAD of the uniform scalar threshold the
+    /// encoder was constructed with. The short / mixed branches in this
+    /// round still consume the uniform scalar; their per-band variants
+    /// land in a follow-up.
+    ///
+    /// This is the entry point for spectrally-shaped psychoacoustic
+    /// thresholds — e.g. the Annex D threshold-in-quiet derived by
+    /// [`crate::psy::XminThresholds::threshold_in_quiet_long`]. The
+    /// encoder's `xfsf(sb)` over-threshold test for each long-band
+    /// scalefactor band switches from `xfsf(sb) > uniform_threshold` to
+    /// `xfsf(sb) > xmin.long[sfb]`, so a band with a low per-band
+    /// threshold (e.g. the 3.4 kHz region near the LTq minimum) is
+    /// amplified more aggressively than a band with a high per-band
+    /// threshold (e.g. the bass or treble extremes).
+    ///
+    /// **Bit-exact compat:** installing
+    /// [`crate::psy::XminThresholds::uniform`] with the same value the
+    /// encoder was constructed with is functionally a no-op — the
+    /// long-block outer-loop branch produces bit-identical output to
+    /// the uniform-scalar path (the `*_per_band` primitive is a strict
+    /// generalisation; uniform fill broadcasts the scalar over all 21
+    /// bands and every comparison resolves identically). This is the
+    /// regression-test anchor for the per-band integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamEncodeError::PerBandXminWithoutOuterLoop`] if the
+    /// encoder was constructed via [`Mp3Encoder::new`] (no outer loop) —
+    /// install the outer loop first via
+    /// [`Mp3Encoder::new_with_outer_loop`].
+    pub fn set_per_band_xmin(
+        &mut self,
+        xmin: crate::psy::XminThresholds,
+    ) -> Result<(), StreamEncodeError> {
+        if self.outer_loop_threshold.is_none() {
+            return Err(StreamEncodeError::PerBandXminWithoutOuterLoop);
+        }
+        self.per_band_xmin = Some(xmin);
+        Ok(())
+    }
+
+    /// `true` when [`Self::set_per_band_xmin`] has installed a per-band
+    /// threshold vector — used by integration tests / observability.
+    #[must_use]
+    pub fn per_band_xmin_enabled(&self) -> bool {
+        self.per_band_xmin.is_some()
     }
 
     /// Push PCM samples (`i16`). For mono encoders the input is a
@@ -2281,15 +2360,38 @@ impl Mp3Encoder {
                                 // — see its doc on long-family
                                 // acceptance).
                                 BlockType::Long => {
-                                    let res = outer_loop_search_long(
-                                        &xr_pre,
-                                        &gc_for_ol,
-                                        self.sample_rate_hz,
-                                        self.version,
-                                        inner_budget_for_outer,
-                                        thr,
-                                        DEFAULT_OUTER_LOOP_MAX_ITER,
-                                    );
+                                    // r194 step 39: when a per-band
+                                    // threshold vector is installed,
+                                    // dispatch onto the
+                                    // `*_per_band` long primitive that
+                                    // reads `xmin.long[sfb]` instead of
+                                    // the uniform scalar. The per-band
+                                    // primitive is a strict
+                                    // generalisation — installing
+                                    // `XminThresholds::uniform(thr)`
+                                    // recovers byte-for-byte the
+                                    // scalar-path output.
+                                    let res = if let Some(xmin) = &self.per_band_xmin {
+                                        crate::outer_loop::outer_loop_search_long_per_band(
+                                            &xr_pre,
+                                            &gc_for_ol,
+                                            self.sample_rate_hz,
+                                            self.version,
+                                            inner_budget_for_outer,
+                                            &xmin.long,
+                                            DEFAULT_OUTER_LOOP_MAX_ITER,
+                                        )
+                                    } else {
+                                        outer_loop_search_long(
+                                            &xr_pre,
+                                            &gc_for_ol,
+                                            self.sample_rate_hz,
+                                            self.version,
+                                            inner_budget_for_outer,
+                                            thr,
+                                            DEFAULT_OUTER_LOOP_MAX_ITER,
+                                        )
+                                    };
                                     // The outer loop reports:
                                     //   * `scalefac_scale` — §C.1.5.4.3
                                     //     dynamic-range escalation
@@ -2386,15 +2488,31 @@ impl Mp3Encoder {
                                 // Long so the same primitive serves
                                 // all three.
                                 BlockType::Start | BlockType::End => {
-                                    let res = outer_loop_search_long(
-                                        &xr_pre,
-                                        &gc_for_ol,
-                                        self.sample_rate_hz,
-                                        self.version,
-                                        inner_budget_for_outer,
-                                        thr,
-                                        DEFAULT_OUTER_LOOP_MAX_ITER,
-                                    );
+                                    // Same long-family primitive as the
+                                    // `BlockType::Long` arm — see the
+                                    // r194 per-band dispatch comment
+                                    // above.
+                                    let res = if let Some(xmin) = &self.per_band_xmin {
+                                        crate::outer_loop::outer_loop_search_long_per_band(
+                                            &xr_pre,
+                                            &gc_for_ol,
+                                            self.sample_rate_hz,
+                                            self.version,
+                                            inner_budget_for_outer,
+                                            &xmin.long,
+                                            DEFAULT_OUTER_LOOP_MAX_ITER,
+                                        )
+                                    } else {
+                                        outer_loop_search_long(
+                                            &xr_pre,
+                                            &gc_for_ol,
+                                            self.sample_rate_hz,
+                                            self.version,
+                                            inner_budget_for_outer,
+                                            thr,
+                                            DEFAULT_OUTER_LOOP_MAX_ITER,
+                                        )
+                                    };
                                     (
                                         res.scalefactors,
                                         res.global_gain,

@@ -394,6 +394,7 @@ pub mod main_data;
 pub mod mdct;
 pub mod mixed_classifier;
 pub mod outer_loop;
+pub mod psy;
 pub mod quantize;
 pub mod reorder;
 pub mod requantize;
@@ -459,12 +460,14 @@ pub use mixed_classifier::{
 };
 pub use outer_loop::{
     band_distortion_long, band_distortion_mixed_long, band_distortion_mixed_short,
-    band_distortion_short, outer_loop_search_long, outer_loop_search_mixed,
-    outer_loop_search_short, scalefac_long_upper_limit, scalefac_short_upper_limit,
-    OuterLoopMixedResult, OuterLoopResult, OuterLoopShortResult, OuterLoopStats,
-    MIXED_FIRST_SHORT_SFB, MIXED_LAST_LONG_SFB, MIXED_SCALEFAC_L_MAX, OUTER_LOOP_SCALEFAC_COMPRESS,
-    SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW, SCALEFAC_S_MAX_HIGH, SCALEFAC_S_MAX_LOW,
+    band_distortion_short, outer_loop_search_long, outer_loop_search_long_per_band,
+    outer_loop_search_mixed, outer_loop_search_short, scalefac_long_upper_limit,
+    scalefac_short_upper_limit, OuterLoopMixedResult, OuterLoopResult, OuterLoopShortResult,
+    OuterLoopStats, MIXED_FIRST_SHORT_SFB, MIXED_LAST_LONG_SFB, MIXED_SCALEFAC_L_MAX,
+    OUTER_LOOP_SCALEFAC_COMPRESS, SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW, SCALEFAC_S_MAX_HIGH,
+    SCALEFAC_S_MAX_LOW,
 };
+pub use psy::{XminThresholds, DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE};
 pub use quantize::quantize;
 pub use reorder::reorder;
 pub use requantize::{requantize, scalefac_multiplier, PRETAB};
