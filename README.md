@@ -2257,14 +2257,35 @@ piecewise-linear interpolation through the textually-transcribed
 anchors at 62.5 Hz / 33.44 dB, the i=2..5 rows, the i=51 prose
 minimum near 3.375 kHz / −4.97 dB, and 15 kHz / 51.04 dB — the
 PNG-only inner rows of D.1a–f are deliberately not OCR'd this
-round) with the §D.1 Step 3 `−12 dB` offset at ≥ 96 kbit/s. The
-short / mixed branches still consume the scalar threshold;
-their per-band variants are the next follow-up)** — it still
+round) with the §D.1 Step 3 `−12 dB` offset at ≥ 96 kbit/s +
+r197 §C.1.5.4.3 pure-short outer-loop per-cell threshold —
+`outer_loop_search_short_per_band` primitive accepts a
+`[[f64; SHORT_WINDOWS]; SHORT_SFB]` per-cell `xmin` matrix that
+every §C.1.5.4.3.5 amplification + §C.1.5.4.3.6 termination cell
+test reads, with `outer_loop_search_short` refactored to a thin
+scalar shim that broadcasts the uniform threshold into a uniform
+matrix (byte-for-byte equivalent to the pre-r197 inline body),
+plus a new `XminThresholds::threshold_in_quiet(SR, version,
+br_per_ch)` constructor that fills BOTH the `long[sfb]` cells
+(identical derivation to the r194 `threshold_in_quiet_long`) AND
+the `short[sfb][win]` cells (each short SFB's centre frequency
+read from the same Annex D anchors, broadcast across the three
+windows of the band — Annex D Table D.1 is a function of
+frequency only) and the §D.1 Step 3 offset applied to both
+shapes, wired through the `stream_encoder` dispatch so
+`BlockType::Short if !mixed_block_flag` granules route onto the
+new per-band primitive whenever `set_per_band_xmin` has installed
+a matrix — it still
 lacks
 the full Annex D Model 1 / Model 2 psychoacoustic model
 (1024-sample FFT + tonality classifier + masking-function
-convolution — the r194 threshold-in-quiet curve is the *lower
-bound* of any signal-dependent psychoacoustic threshold),
+convolution — the r194 / r197 threshold-in-quiet curve is the
+*lower bound* of any signal-dependent psychoacoustic threshold),
+mixed-block per-band threshold (the `mixed_long` /
+`mixed_short` cells of `XminThresholds` are populated by
+`threshold_in_quiet` but the `outer_loop_search_mixed` primitive
+still consumes the scalar threshold — the per-band mixed variant
+is the next follow-up),
 intensity-stereo encode (§2.4.3.4.9.3), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's

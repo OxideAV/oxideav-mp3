@@ -483,3 +483,175 @@ fn per_band_sine_self_decode_psnr_above_floor() {
     eprintln!("per-band LTq sine self-decode PSNR = {p:.2} dB");
     assert!(p > 20.0, "per-band LTq sine PSNR too low: {p} dB");
 }
+
+// =========================================================================
+// r197 step 40 — per-band short-block tests
+// =========================================================================
+
+/// **Backward-compat anchor (short-block)** — installing
+/// `XminThresholds::uniform(thr)` while every granule is force-shorted
+/// must produce a bit-identical byte stream to the scalar uniform path.
+/// Witnesses the r197 `outer_loop_search_short` scalar shim is
+/// bit-for-bit equivalent to the per-band primitive under a uniform
+/// matrix.
+#[test]
+fn per_band_short_uniform_is_bit_identical_to_scalar_uniform() {
+    let pcm = multi_tone_pcm(
+        PCM_LEN_SAMPLES,
+        &[110.0, 440.0, 880.0, 1760.0, 3520.0, 7040.0],
+        0.12,
+    );
+    let thr = 5.0e-8;
+
+    let bytes_scalar = encode(
+        || {
+            let mut enc = Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, thr)
+                .expect("encoder build");
+            enc.force_short_blocks_for_testing(true)
+                .expect("enable force-short");
+            enc
+        },
+        &pcm,
+    );
+
+    let bytes_per_band = encode(
+        || {
+            let mut enc = Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, thr)
+                .expect("encoder build");
+            enc.force_short_blocks_for_testing(true)
+                .expect("enable force-short");
+            enc.set_per_band_xmin(XminThresholds::uniform(thr))
+                .expect("install uniform per-band");
+            assert!(enc.per_band_xmin_enabled());
+            enc
+        },
+        &pcm,
+    );
+
+    assert_eq!(
+        bytes_scalar.len(),
+        bytes_per_band.len(),
+        "short-block per-band uniform produced different stream length than scalar uniform",
+    );
+    assert_eq!(
+        bytes_scalar, bytes_per_band,
+        "short-block per-band uniform fill must be bit-identical to scalar uniform threshold path",
+    );
+}
+
+/// **Threshold-in-quiet short-block round-trips to non-silent finite PCM**
+/// — a force-shorted granule under the per-band LTq matrix decodes
+/// through the crate's own decode chain to finite, non-silent PCM.
+/// Witnesses the new `XminThresholds::threshold_in_quiet` constructor's
+/// short cells propagate into the encoder's pure-short outer loop and
+/// produce a parseable byte stream. (Force-short on a steady multi-tone
+/// fixture inherently has lower PSNR than the long-block path —
+/// short-block windows are designed for transients, not sustained
+/// tones; mirrors `force_short_stream_decodes_to_finite_non_silent_pcm`
+/// in `short_block_encoder_roundtrip.rs`.)
+#[test]
+fn per_band_threshold_in_quiet_short_self_decode_is_finite_non_silent() {
+    let pcm = multi_tone_pcm(
+        PCM_LEN_SAMPLES,
+        &[110.0, 440.0, 880.0, 1760.0, 3520.0, 7040.0],
+        0.12,
+    );
+
+    let bytes = encode(
+        || {
+            let mut enc = Mp3Encoder::new_with_outer_loop(
+                BR,
+                SR,
+                ChannelMode::SingleChannel,
+                oxideav_mp3::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD,
+            )
+            .expect("encoder build");
+            enc.force_short_blocks_for_testing(true)
+                .expect("enable force-short");
+            enc.set_per_band_xmin(XminThresholds::threshold_in_quiet(
+                SR,
+                MpegVersion::Mpeg1,
+                BR,
+            ))
+            .expect("install ltq per-band");
+            enc
+        },
+        &pcm,
+    );
+    assert!(
+        bytes.len() > 1000,
+        "encoded stream too small: {}",
+        bytes.len()
+    );
+    let recon = decode_mp3_mono(&bytes);
+    assert!(!recon.is_empty(), "decoded PCM was empty");
+    let energy: f64 = recon
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        / recon.len() as f64;
+    assert!(
+        energy.is_finite() && energy > 0.0,
+        "decoded PCM had zero or non-finite energy ({energy})",
+    );
+    let p = aligned_psnr(&pcm, &recon);
+    eprintln!(
+        "per-band short-block LTq self-decode PSNR = {p:.2} dB (finite, non-silent — \
+         short-block paths inherently lose more on sustained tones than long blocks)",
+    );
+    assert!(p.is_finite() && p > 0.0, "PSNR was non-finite or negative");
+}
+
+/// **Per-band short threshold changes byte stream vs uniform** — at the
+/// same scalar threshold + same fixture under force-short, installing
+/// the LTq matrix produces a different byte stream than the uniform
+/// path. Witnesses that the per-cell threshold propagates into the
+/// pure-short outer-loop decision.
+#[test]
+fn per_band_short_threshold_changes_byte_stream_vs_uniform() {
+    let pcm = multi_tone_pcm(
+        PCM_LEN_SAMPLES,
+        &[110.0, 440.0, 880.0, 1760.0, 3520.0, 7040.0],
+        0.12,
+    );
+    // Tight scalar threshold — same value as the long-block divergence
+    // test; ensures the uniform path actually fires the amp step.
+    let scalar_thr = 5.0e-8;
+
+    let bytes_uniform = encode(
+        || {
+            let mut enc =
+                Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, scalar_thr)
+                    .expect("encoder build");
+            enc.force_short_blocks_for_testing(true)
+                .expect("enable force-short");
+            enc
+        },
+        &pcm,
+    );
+
+    let bytes_per_band = encode(
+        || {
+            let mut enc =
+                Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, scalar_thr)
+                    .expect("encoder build");
+            enc.force_short_blocks_for_testing(true)
+                .expect("enable force-short");
+            enc.set_per_band_xmin(XminThresholds::threshold_in_quiet(
+                SR,
+                MpegVersion::Mpeg1,
+                BR,
+            ))
+            .expect("install ltq per-band");
+            enc
+        },
+        &pcm,
+    );
+
+    assert_ne!(
+        bytes_uniform, bytes_per_band,
+        "short-block per-band LTq path produced the SAME bytes as uniform path on a \
+         spectrally-rich fixture under a tight scalar threshold — the per-cell threshold \
+         isn't propagating into the pure-short outer-loop decision",
+    );
+}

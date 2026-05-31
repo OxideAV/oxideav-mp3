@@ -114,7 +114,7 @@
 //!   them.
 
 use crate::frame::MpegVersion;
-use crate::requantize::long_band_starts;
+use crate::requantize::{long_band_starts, short_band_starts};
 use crate::scalefactors::{LONG_SFB, SHORT_SFB, SHORT_WINDOWS};
 use crate::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD;
 
@@ -226,6 +226,122 @@ impl XminThresholds {
             short: [[short_uniform_fallback; SHORT_WINDOWS]; SHORT_SFB],
             mixed_long: [short_uniform_fallback; LONG_SFB],
             mixed_short: [[short_uniform_fallback; SHORT_WINDOWS]; SHORT_SFB],
+        }
+    }
+
+    /// Construct a pure-short-block per-cell threshold matrix from the
+    /// Annex D Table D.1 **threshold-in-quiet** anchors, plus a long-band
+    /// vector for any caller that mixes long and short granules through
+    /// the same encoder (the long path is identical to
+    /// [`Self::threshold_in_quiet_long`]). The §D.1 Step 3 offset
+    /// (`−12 dB` for `bitrate_kbps_per_channel >= 96`, `0 dB` otherwise)
+    /// applies to both shapes — same bitrate-dependent transparency
+    /// reference for both block types.
+    ///
+    /// Short-band centre-frequency mapping: a pure-short granule splits
+    /// the 576-line spectrum into 3 windows × 192 per-window lines.
+    /// Per-window line `k` represents the bin at `f = k · Fs / 384` Hz
+    /// (the per-window short MDCT is 192-sample / 384-point window;
+    /// Nyquist `Fs/2` sits at per-window line `k = 96`, i.e. half the
+    /// per-window line count). Each short scalefactor band `sfb` covers
+    /// per-window lines `[starts[sfb], starts[sfb+1])`; the band's
+    /// centre frequency is the geometric mean of the lowest and highest
+    /// per-window line in the band, converted through that `Fs/384`
+    /// per-line factor. All three windows of the band share the same
+    /// per-cell threshold — the threshold-in-quiet is a *frequency*
+    /// property, not a temporal one (Annex D Table D.1 is sampled
+    /// against `f` only). The temporal structure of the short window
+    /// (which window peaks where) is exactly what `subblock_gain` and
+    /// the per-window MDCT already capture; the threshold-in-quiet
+    /// per-cell value should mirror the long-block bowl shape and apply
+    /// uniformly across the three windows of each band.
+    ///
+    /// The mixed-block long region (`mixed_long[0..=7]`) and mixed-block
+    /// short region (`mixed_short[3..=11][..]`) are populated from the
+    /// same anchors using the appropriate frequency mapping for each
+    /// sub-region. The mixed-block long region uses the same long-band
+    /// centre-frequency formula as `Self::threshold_in_quiet_long` over
+    /// the first 8 long bands (the only ones a mixed block carries
+    /// long-coded — see [`crate::outer_loop::MIXED_LAST_LONG_SFB`]); the
+    /// mixed-block short region uses the same per-window short-band
+    /// formula as the pure-short path over `sfb ∈ [3, 12)` (mixed blocks
+    /// absorb short `sfb 0..=2` into the long-window portion).
+    #[must_use]
+    pub fn threshold_in_quiet(
+        sample_rate_hz: u32,
+        version: MpegVersion,
+        bitrate_kbps_per_channel: u32,
+    ) -> Self {
+        // §D.1 Step 3 verbatim offset.
+        let offset_db = if bitrate_kbps_per_channel >= 96 {
+            -12.0_f64
+        } else {
+            0.0_f64
+        };
+
+        // Long bands — same derivation as `threshold_in_quiet_long`.
+        let long_starts = long_band_starts(sample_rate_hz, version);
+        let mut long = [0.0_f64; LONG_SFB];
+        let long_line_to_hz = f64::from(sample_rate_hz) / 1152.0;
+        for sfb in 0..LONG_SFB {
+            let lo_line = long_starts[sfb] as f64;
+            let hi_line = long_starts[sfb + 1] as f64 - 1.0;
+            let lo_safe = if lo_line < 0.5 { 0.5 } else { lo_line };
+            let centre_line = (lo_safe * hi_line.max(0.5)).sqrt();
+            let centre_hz = centre_line * long_line_to_hz;
+            let ltq_db = ltq_db_at_hz(centre_hz) + offset_db;
+            long[sfb] = db_to_xfsf_energy(ltq_db);
+        }
+
+        // Pure-short bands — per-window line `k` → `f = k · Fs / 384` Hz.
+        // All three windows of each band share the same per-cell xmin
+        // (Annex D Table D.1 is purely a function of frequency; the
+        // temporal placement of the three windows is captured by the
+        // §2.4.3.4.7.1 `subblock_gain[w]` reconstruction term, not by
+        // `LTq(f)`).
+        let short_starts = short_band_starts(sample_rate_hz, version);
+        let short_line_to_hz = f64::from(sample_rate_hz) / 384.0;
+        let mut short = [[0.0_f64; SHORT_WINDOWS]; SHORT_SFB];
+        for sfb in 0..SHORT_SFB {
+            let lo_line = short_starts[sfb] as f64;
+            let hi_line = short_starts[sfb + 1] as f64 - 1.0;
+            let lo_safe = if lo_line < 0.5 { 0.5 } else { lo_line };
+            let centre_line = (lo_safe * hi_line.max(0.5)).sqrt();
+            let centre_hz = centre_line * short_line_to_hz;
+            let ltq_db = ltq_db_at_hz(centre_hz) + offset_db;
+            let xmin = db_to_xfsf_energy(ltq_db);
+            for cell in short[sfb].iter_mut() {
+                *cell = xmin;
+            }
+        }
+
+        // Mixed-block long region: same long-band derivation, but only
+        // the first 8 long bands are carried by a mixed granule. Entries
+        // 8..21 are populated with the same long-block values (so any
+        // out-of-range read returns a sensible value rather than zero —
+        // not consumed by the mixed primitive, but kept consistent for
+        // simple inspection).
+        let mut mixed_long = long;
+        for entry in mixed_long.iter_mut().take(8) {
+            // Already filled from the `long` clone — no-op; kept as a
+            // comment anchor that the first 8 entries are the
+            // mixed-block long-region thresholds the outer loop will
+            // read once the per-band mixed primitive lands.
+            let _ = entry;
+        }
+
+        // Mixed-block short region: same per-window short-band
+        // derivation, restricted to `sfb ∈ [3, 12)`. Entries `[0, 3)`
+        // are populated with the same per-band values (so out-of-range
+        // reads return a sensible value rather than zero); the mixed
+        // primitive will only read `[3, 12)`.
+        let mixed_short = short;
+
+        Self {
+            long,
+            short,
+            mixed_long,
+            mixed_short,
         }
     }
 }
@@ -483,6 +599,113 @@ mod tests {
         for row in &x.mixed_short {
             for &v in row {
                 assert_eq!(v, DEFAULT_OUTER_LOOP_THRESHOLD);
+            }
+        }
+    }
+
+    // =====================================================================
+    // `threshold_in_quiet` (r197 — short / mixed cells now derived) tests
+    // =====================================================================
+
+    #[test]
+    fn threshold_in_quiet_long_cells_match_threshold_in_quiet_long() {
+        // The long cells produced by `threshold_in_quiet` must match
+        // those produced by `threshold_in_quiet_long` at the same
+        // bitrate (the long-band derivation is identical; the only
+        // difference is that `threshold_in_quiet` also derives the short
+        // / mixed cells).
+        let both = XminThresholds::threshold_in_quiet(44_100, MpegVersion::Mpeg1, 128);
+        let long_only = XminThresholds::threshold_in_quiet_long(
+            44_100,
+            MpegVersion::Mpeg1,
+            128,
+            DEFAULT_OUTER_LOOP_THRESHOLD,
+        );
+        for sfb in 0..LONG_SFB {
+            assert!(
+                (both.long[sfb] - long_only.long[sfb]).abs() < 1.0e-9,
+                "sfb {sfb}: both.long={} long_only.long={}",
+                both.long[sfb],
+                long_only.long[sfb],
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_in_quiet_short_cells_share_per_band_value_across_windows() {
+        // The threshold-in-quiet is purely a function of frequency
+        // (Annex D Table D.1), so the three windows of each short SFB
+        // must carry the same per-cell xmin.
+        let x = XminThresholds::threshold_in_quiet(44_100, MpegVersion::Mpeg1, 128);
+        for sfb in 0..SHORT_SFB {
+            let w0 = x.short[sfb][0];
+            for win in 1..SHORT_WINDOWS {
+                assert!(
+                    (x.short[sfb][win] - w0).abs() < 1.0e-12,
+                    "sfb {sfb}: window {win} ({}) differs from window 0 ({w0})",
+                    x.short[sfb][win],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn threshold_in_quiet_short_high_bitrate_applies_offset() {
+        let high = XminThresholds::threshold_in_quiet(44_100, MpegVersion::Mpeg1, 128);
+        let low = XminThresholds::threshold_in_quiet(44_100, MpegVersion::Mpeg1, 64);
+        // Same monotone offset as the long path: `−12 dB` ⇒ each high
+        // entry is `10^(−12/10)` times the low entry (factor ~0.0631).
+        for sfb in 0..SHORT_SFB {
+            let ratio = low.short[sfb][0] / high.short[sfb][0];
+            assert!(
+                (ratio - 10.0_f64.powf(12.0 / 10.0)).abs() < 1.0e-6,
+                "sfb {sfb}: ratio {ratio} should be 10^1.2",
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_in_quiet_short_band_shape_is_bowl() {
+        // Same bowl as the long path: a minimum in the mid-spectrum,
+        // higher thresholds at the low- and high-band ends. The short-
+        // band centre-frequency mapping uses `Fs/384` per per-window
+        // line — band 11 at 44.1 kHz covers per-window lines [106, 136),
+        // centre ≈ 13.4 kHz, well into the rising treble edge of LTq.
+        let x = XminThresholds::threshold_in_quiet(44_100, MpegVersion::Mpeg1, 128);
+        let bass = x.short[0][0];
+        let treble = x.short[SHORT_SFB - 1][0];
+        let (min_sfb, &min_v) = x
+            .short
+            .iter()
+            .enumerate()
+            .map(|(sfb, row)| (sfb, &row[0]))
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        assert!(
+            bass > min_v,
+            "bass sfb 0 ({bass}) should be > minimum sfb {min_sfb} ({min_v})",
+        );
+        assert!(
+            treble > min_v,
+            "treble sfb 11 ({treble}) should be > minimum sfb {min_sfb} ({min_v})",
+        );
+        assert!((1..SHORT_SFB - 1).contains(&min_sfb));
+    }
+
+    #[test]
+    fn threshold_in_quiet_mixed_short_matches_short() {
+        // Mixed-short carries the same per-band values as pure-short
+        // (same frequency mapping; mixed blocks just don't read sfb
+        // 0..=2). Convenient invariant for callers that swap a
+        // pure-short granule for a mixed granule without re-computing
+        // the matrix.
+        let x = XminThresholds::threshold_in_quiet(44_100, MpegVersion::Mpeg1, 128);
+        for sfb in 0..SHORT_SFB {
+            for win in 0..SHORT_WINDOWS {
+                assert!(
+                    (x.mixed_short[sfb][win] - x.short[sfb][win]).abs() < 1.0e-12,
+                    "mixed_short[{sfb}][{win}] != short[{sfb}][{win}]",
+                );
             }
         }
     }

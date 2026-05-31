@@ -909,6 +909,13 @@ pub struct OuterLoopShortResult {
 /// `uniform_threshold` is `xmin(sb)` applied uniformly across every cell
 /// (psychoacoustic model deferred — same convention as the long-block
 /// loop). `max_iter` caps the outer loop at a finite count.
+///
+/// **Backward compat shim:** this is now a thin wrapper that broadcasts
+/// `uniform_threshold` into a `[[f64; SHORT_WINDOWS]; SHORT_SFB]` per-cell
+/// vector and dispatches to [`outer_loop_search_short_per_band`]. Every
+/// `> xmin_per_cell[sfb][win]` comparison resolves identically to the
+/// pre-r197 scalar `> uniform_threshold` body when every cell carries the
+/// same value — bit-for-bit equivalent.
 #[must_use]
 pub fn outer_loop_search_short(
     xr: &[f32; NUM_LINES],
@@ -917,6 +924,52 @@ pub fn outer_loop_search_short(
     version: MpegVersion,
     per_gc_bit_budget: u64,
     uniform_threshold: f64,
+    max_iter: u32,
+) -> OuterLoopShortResult {
+    let xmin_per_cell = [[uniform_threshold; SHORT_WINDOWS]; SHORT_SFB];
+    outer_loop_search_short_per_band(
+        xr,
+        gc_template,
+        sample_rate_hz,
+        version,
+        per_gc_bit_budget,
+        &xmin_per_cell,
+        max_iter,
+    )
+}
+
+/// Per-cell-threshold variant of [`outer_loop_search_short`] — r197
+/// (Phase 2 step 40).
+///
+/// Identical to [`outer_loop_search_short`] except that the per-cell
+/// distortion threshold is supplied as a `[[f64; SHORT_WINDOWS]; SHORT_SFB]`
+/// matrix `xmin_per_cell[sfb][window]` instead of a single scalar. Each
+/// §C.1.5.4.3.5 amplification + §C.1.5.4.3.6 termination test reads the
+/// per-cell entry, enabling a spectrally-aware
+/// [`crate::psy::XminThresholds`] threshold (e.g. the textually-
+/// transcribed Annex D threshold in quiet, sampled at each short band's
+/// centre frequency and broadcast across the three windows of the band)
+/// to redistribute the bit budget across the spectrum.
+///
+/// **Backward compat:** [`outer_loop_search_short`] is a thin shim over
+/// this primitive that broadcasts the scalar into a uniform per-cell
+/// matrix, so existing callers keep their behaviour unchanged.
+///
+/// The carrier semantics are identical: `gc_template` MUST satisfy the
+/// same pure-short acceptance ([`BlockType::Short`] with
+/// `window_switching_flag = true` and `mixed_block_flag = false`),
+/// `gc_template.scalefac_compress` MUST be
+/// [`OUTER_LOOP_SCALEFAC_COMPRESS`], and the returned
+/// [`OuterLoopShortResult`] carries the same scalefactor / global-gain /
+/// subblock-gain / scalefac_scale state.
+#[must_use]
+pub fn outer_loop_search_short_per_band(
+    xr: &[f32; NUM_LINES],
+    gc_template: &GranuleChannel,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    per_gc_bit_budget: u64,
+    xmin_per_cell: &[[f64; SHORT_WINDOWS]; SHORT_SFB],
     max_iter: u32,
 ) -> OuterLoopShortResult {
     debug_assert!(gc_template.window_switching_flag);
@@ -1012,13 +1065,17 @@ pub fn outer_loop_search_short(
             }
         }
 
-        // Identify cells over threshold (§C.1.5.4.3.3 per-cell xfsf).
+        // Identify cells over their per-cell threshold (§C.1.5.4.3.3
+        // per-cell xfsf). The per-cell threshold reduces to the scalar
+        // uniform threshold of the pre-r197 path when
+        // [`outer_loop_search_short`] broadcasts a single value into every
+        // matrix entry.
         let mut any_over = false;
         let mut would_exceed_cap = false;
         for (sfb, xfsf_row) in xfsf.iter().enumerate() {
             let cap = scalefac_short_upper_limit(sfb);
             for (win, &d) in xfsf_row.iter().enumerate() {
-                if d > uniform_threshold {
+                if d > xmin_per_cell[sfb][win] {
                     any_over = true;
                     let next = u16::from(sf.short[sfb][win]) + 1;
                     if next > u16::from(cap) {
@@ -1069,11 +1126,12 @@ pub fn outer_loop_search_short(
         last_good_sg = subblock_gain;
         last_good_inner = inner;
 
-        // §C.1.5.4.3.5 amplification, per-cell.
+        // §C.1.5.4.3.5 amplification, per-cell (compared against the
+        // per-cell threshold).
         for (sfb, xfsf_row) in xfsf.iter().enumerate() {
             let cap = scalefac_short_upper_limit(sfb);
             for (win, &d) in xfsf_row.iter().enumerate() {
-                if d > uniform_threshold && sf.short[sfb][win] < cap {
+                if d > xmin_per_cell[sfb][win] && sf.short[sfb][win] < cap {
                     sf.short[sfb][win] = sf.short[sfb][win].saturating_add(1);
                     if !amplified[sfb][win] {
                         amplified[sfb][win] = true;
@@ -2448,6 +2506,182 @@ mod tests {
                 );
             }
         }
+    }
+
+    // =====================================================================
+    // Pure-short per-band outer loop tests (Phase 2 step 40 — r197)
+    // =====================================================================
+
+    #[test]
+    fn short_per_band_uniform_matches_scalar_bit_for_bit() {
+        // The shim contract: feeding `xmin_per_cell = [[thr; 3]; 12]` into
+        // the per-band primitive must produce byte-identical output to
+        // feeding `thr` into the scalar primitive. This is the r197
+        // refactor regression anchor — without it, the per-band path
+        // would not be a strict generalisation of the scalar path.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.013).sin() * 65.0;
+        }
+        let gc = short_template();
+        let thr = 1.0e-3;
+
+        let scalar = outer_loop_search_short(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, thr, 64);
+        let per_band_uniform = [[thr; SHORT_WINDOWS]; SHORT_SFB];
+        let perband = outer_loop_search_short_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &per_band_uniform,
+            64,
+        );
+
+        assert_eq!(scalar.scalefactors.short, perband.scalefactors.short);
+        assert_eq!(scalar.global_gain, perband.global_gain);
+        assert_eq!(scalar.subblock_gain, perband.subblock_gain);
+        assert_eq!(scalar.scalefac_scale, perband.scalefac_scale);
+        assert_eq!(scalar.is, perband.is);
+        assert_eq!(scalar.stats.iterations, perband.stats.iterations);
+        assert_eq!(scalar.stats.bands_amplified, perband.stats.bands_amplified,);
+        assert_eq!(scalar.stats.converged, perband.stats.converged);
+    }
+
+    #[test]
+    fn short_per_band_tighter_one_cell_amplifies_only_that_cell() {
+        // Cells `(sfb, win) != (1, 1)` see a huge threshold (no
+        // amplification); cell `(1, 1)` sees a tiny threshold. The loop
+        // must amplify ONLY that one cell. Witnesses that the per-cell
+        // threshold steers amplification on a per-cell basis (not a
+        // global "everything over scalar" mask).
+        //
+        // Fixture: plant energy in (sfb 1, win 1) at 44.1 kHz. From the
+        // existing `outer_loop_short_amplifies_only_offending_cells`
+        // test scaffolding: SHORT_STARTS_44 places sfb 1 at per-window
+        // lines [4, 8) (width 4); window 1's interleaved range starts
+        // at 3*4 + 1*4 = 16.
+        let mut xr = [0.0f32; NUM_LINES];
+        for k in 0..4 {
+            xr[16 + k] = 400.0 + (k as f32) * 7.0;
+        }
+        let gc = short_template();
+        let mut xmin = [[1.0e30; SHORT_WINDOWS]; SHORT_SFB];
+        xmin[1][1] = 0.0; // every cell with any baseline distortion exceeds this
+        let res =
+            outer_loop_search_short_per_band(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, &xmin, 64);
+        // The targeted cell (sfb 1, win 1) must have been amplified.
+        // Final-state check: only cell (1, 1) ends up non-zero. (Note:
+        // `stats.bands_amplified` is a CUMULATIVE counter — on a
+        // `scalefac_scale` escalation event the in-progress
+        // scalefactors are halved and the `amplified` tracker reset,
+        // so a single targeted cell can contribute >1 to that counter
+        // across the escalation boundary; we check the final state
+        // matrix instead, which is the user-observable result.)
+        assert!(
+            res.scalefactors.short[1][1] > 0,
+            "targeted cell (sfb=1, win=1) was NOT amplified (sf={})",
+            res.scalefactors.short[1][1],
+        );
+        for (sfb, row) in res.scalefactors.short.iter().enumerate() {
+            for (win, &sf_val) in row.iter().enumerate() {
+                if (sfb, win) == (1, 1) {
+                    continue;
+                }
+                assert_eq!(
+                    sf_val, 0,
+                    "non-target cell (sfb={sfb}, win={win}) was amplified to {sf_val}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_per_band_huge_threshold_matrix_terminates_iter1() {
+        // Every cell sees a huge threshold ⇒ no cell exceeds it; the
+        // per-band primitive converges on iteration 1, matching the
+        // scalar primitive's behaviour at `uniform_threshold = 1.0e30`.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let gc = short_template();
+        let xmin = [[1.0e30; SHORT_WINDOWS]; SHORT_SFB];
+        let res =
+            outer_loop_search_short_per_band(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, &xmin, 64);
+        assert!(res.stats.converged);
+        assert_eq!(res.stats.iterations, 1);
+        assert_eq!(res.stats.bands_amplified, 0);
+        assert_eq!(res.subblock_gain, [0, 0, 0]);
+        assert!(!res.scalefac_scale);
+    }
+
+    #[test]
+    fn short_per_band_per_cell_thresholds_diverge_from_uniform() {
+        // Set a non-uniform matrix where the low-sfb cells carry a
+        // tighter threshold than the high-sfb cells. Witnesses that the
+        // per-band primitive routes more amplification to low-sfb cells
+        // than the uniform path would.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let gc = short_template();
+        // Per-band: sfb 0..3 → 0.0 (loosest amplification trigger),
+        // sfb 3..12 → 1.0e30 (never amplifies).
+        let mut xmin_skewed = [[1.0e30; SHORT_WINDOWS]; SHORT_SFB];
+        for row in xmin_skewed.iter_mut().take(3) {
+            for cell in row.iter_mut() {
+                *cell = 0.0;
+            }
+        }
+        let skewed = outer_loop_search_short_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &xmin_skewed,
+            64,
+        );
+        // Uniform: every cell at the same loose threshold ⇒ nothing
+        // amplifies.
+        let xmin_uniform = [[1.0e30; SHORT_WINDOWS]; SHORT_SFB];
+        let uniform = outer_loop_search_short_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &xmin_uniform,
+            64,
+        );
+        // Skewed must amplify; uniform must not.
+        assert!(skewed.stats.bands_amplified > 0);
+        assert_eq!(uniform.stats.bands_amplified, 0);
+        // And the amplification must land in the targeted band range.
+        let mut low_amp = 0u32;
+        let mut high_amp = 0u32;
+        for sfb in 0..SHORT_SFB {
+            for win in 0..SHORT_WINDOWS {
+                let v = skewed.scalefactors.short[sfb][win];
+                if v > 0 {
+                    if sfb < 3 {
+                        low_amp += 1;
+                    } else {
+                        high_amp += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            low_amp > 0,
+            "expected at least one low-sfb (0..3) cell to be amplified, got low_amp={low_amp}",
+        );
+        assert_eq!(
+            high_amp, 0,
+            "expected no high-sfb (3..12) cell to be amplified, got high_amp={high_amp}",
+        );
     }
 
     // =====================================================================

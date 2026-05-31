@@ -2428,15 +2428,39 @@ impl Mp3Encoder {
                                     // layout for pure-short reads
                                     // `sf.short[sfb][win]` for sfb 0..12
                                     // (see `write_mpeg1_granule_channel`).
-                                    let res = outer_loop_search_short(
-                                        &xr_pre,
-                                        &gc_for_ol,
-                                        self.sample_rate_hz,
-                                        self.version,
-                                        inner_budget_for_outer,
-                                        thr,
-                                        DEFAULT_OUTER_LOOP_MAX_ITER,
-                                    );
+                                    //
+                                    // r197 step 40: when a per-band
+                                    // threshold matrix is installed,
+                                    // dispatch onto the
+                                    // `*_per_band` short primitive that
+                                    // reads `xmin.short[sfb][win]` instead
+                                    // of the uniform scalar. The per-band
+                                    // primitive is a strict generalisation
+                                    // — installing
+                                    // `XminThresholds::uniform(thr)`
+                                    // recovers byte-for-byte the
+                                    // scalar-path output.
+                                    let res = if let Some(xmin) = &self.per_band_xmin {
+                                        crate::outer_loop::outer_loop_search_short_per_band(
+                                            &xr_pre,
+                                            &gc_for_ol,
+                                            self.sample_rate_hz,
+                                            self.version,
+                                            inner_budget_for_outer,
+                                            &xmin.short,
+                                            DEFAULT_OUTER_LOOP_MAX_ITER,
+                                        )
+                                    } else {
+                                        outer_loop_search_short(
+                                            &xr_pre,
+                                            &gc_for_ol,
+                                            self.sample_rate_hz,
+                                            self.version,
+                                            inner_budget_for_outer,
+                                            thr,
+                                            DEFAULT_OUTER_LOOP_MAX_ITER,
+                                        )
+                                    };
                                     (
                                         res.scalefactors,
                                         res.global_gain,

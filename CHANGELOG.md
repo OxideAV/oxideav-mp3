@@ -11,6 +11,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - psy: per-band threshold-vector scaffold (Annex D threshold-in-quiet
   long-block path) + `outer_loop_search_long_per_band` primitive +
   `Mp3Encoder::set_per_band_xmin` (Phase 2 step 39 / r194)
+- psy: per-cell threshold-in-quiet pure-short path +
+  `outer_loop_search_short_per_band` primitive +
+  `XminThresholds::threshold_in_quiet` constructor (long + short cells
+  populated from the same Annex D anchors) + stream-encoder dispatch on
+  `BlockType::Short if !mixed_block_flag` (Phase 2 step 40 / r197)
 
 ## [0.1.2](https://github.com/OxideAV/oxideav-mp3/releases/tag/v0.1.2) - 2026-05-30
 
