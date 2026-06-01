@@ -99,6 +99,48 @@ pub fn make_encoder_with_outer_loop(
     make_encoder_inner(params, Some(uniform_threshold))
 }
 
+/// Build a boxed MPEG-1 Audio Layer III mono / independent-stereo CBR
+/// [`Encoder`] with the §C.1.5.4.3 outer (distortion-control) loop
+/// enabled and the per-band Annex D **threshold-in-quiet** vector
+/// ([`crate::psy::XminThresholds::threshold_in_quiet`]) pre-installed
+/// as the per-band `xmin(sb)` for every block-type branch (long /
+/// pure-short / mixed). Trait-API one-shot bundle of
+/// [`Mp3Encoder::new_with_outer_loop`] +
+/// [`Mp3Encoder::set_per_band_xmin`] (equivalent to
+/// [`Mp3Encoder::new_with_threshold_in_quiet`]).
+///
+/// The per-band path is a strict generalisation of the uniform-scalar
+/// path: a band whose distortion stays below its `xmin` is left at the
+/// current quantization, while a band whose distortion exceeds the
+/// per-band threshold is amplified by the outer loop. With the
+/// threshold-in-quiet shape this spends bits where the ear actually
+/// needs them — mid-spectrum bands near the 3.4 kHz LTq minimum carry
+/// a stricter `xmin` than the bass / treble extremes — and the §D.1
+/// Step 3 `−12 dB` offset at `bitrate_kbps_per_channel >= 96` lowers
+/// the whole curve another factor of `10^(−12/10)` to recover the
+/// reference's transparency target. The per-channel bitrate
+/// (`bit_rate / channels`) is what the offset switches on; the
+/// `bit_rate` field is in bits/s, so 192_000 bit/s stereo → 96 kbit/s
+/// per channel, exactly the cutover point.
+///
+/// Equivalent direct-API recipe:
+///
+/// ```ignore
+/// use oxideav_mp3::Mp3Encoder;
+/// let enc = Mp3Encoder::new_with_threshold_in_quiet(
+///     128, 44_100, ChannelMode::SingleChannel,
+/// )?;
+/// ```
+///
+/// # Errors
+///
+/// Same as [`make_encoder_with_outer_loop`] — bad sample-rate /
+/// bit-rate / channel-count combination, or a non-MPEG-1 sample rate
+/// (LSF remains deferred).
+pub fn make_encoder_with_threshold_in_quiet(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_inner_threshold_in_quiet(params)
+}
+
 /// Build a boxed MPEG-1 Audio Layer III stereo CBR [`Encoder`] in
 /// **joint-stereo MS** mode (ISO/IEC 11172-3:1993 §2.4.3.4.9.2).
 ///
@@ -261,6 +303,54 @@ fn make_encoder_inner(
         None => Mp3Encoder::new(bitrate_kbps, sample_rate, mode),
     }
     .map_err(|e| Error::other(format!("oxideav-mp3: encoder build: {e}")))?;
+
+    let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+    out_params.sample_rate = Some(sample_rate);
+    out_params.channels = Some(channels);
+    out_params.sample_format = Some(SampleFormat::S16);
+    out_params.bit_rate = Some(u64::from(bitrate_kbps) * 1000);
+    out_params.tag = Some(CodecTag::wave_format(WAVE_FORMAT_MP3));
+
+    Ok(Box::new(Mp3CoreEncoder::new(
+        CodecId::new(CODEC_ID_STR),
+        inner,
+        out_params,
+        sample_rate,
+        channels as usize,
+    )))
+}
+
+/// Sibling of [`make_encoder_inner`] that constructs the underlying
+/// [`Mp3Encoder`] via [`Mp3Encoder::new_with_threshold_in_quiet`]
+/// (outer loop on, per-band Annex D threshold-in-quiet vector
+/// pre-installed). Validation rules — sample-rate present, channels in
+/// `{1, 2}`, bit-rate in range — are identical to
+/// [`make_encoder_inner`]; only the underlying constructor differs.
+fn make_encoder_inner_threshold_in_quiet(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| Error::invalid("oxideav-mp3: sample_rate required"))?;
+    let channels = params
+        .channels
+        .ok_or_else(|| Error::invalid("oxideav-mp3: channels required"))?;
+    let mode = match channels {
+        1 => ChannelMode::SingleChannel,
+        2 => ChannelMode::Stereo,
+        _ => {
+            return Err(Error::invalid(format!(
+                "oxideav-mp3: encoder supports 1 or 2 channels (channels={channels})"
+            )));
+        }
+    };
+    let bitrate_bps = params.bit_rate.unwrap_or(128_000);
+    if bitrate_bps == 0 || bitrate_bps > 1_000_000 {
+        return Err(Error::invalid(format!(
+            "oxideav-mp3: bit_rate {bitrate_bps} out of range"
+        )));
+    }
+    let bitrate_kbps = (bitrate_bps / 1000) as u32;
+    let inner = Mp3Encoder::new_with_threshold_in_quiet(bitrate_kbps, sample_rate, mode)
+        .map_err(|e| Error::other(format!("oxideav-mp3: encoder build: {e}")))?;
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     out_params.sample_rate = Some(sample_rate);
@@ -767,6 +857,105 @@ mod tests {
         let enc =
             make_encoder_with_outer_loop(&p, DEFAULT_OUTER_LOOP_THRESHOLD).expect("outer-loop");
         assert_eq!(enc.codec_id().as_str(), "mp3");
+    }
+
+    #[test]
+    fn make_encoder_with_threshold_in_quiet_constructs_and_reports_params() {
+        // Mono — straight-line construction through the factory must
+        // report the same `output_params` as the uniform-scalar
+        // outer-loop factory at the same `bit_rate`.
+        let p = build_params(44_100, 128_000);
+        let enc = make_encoder_with_threshold_in_quiet(&p).expect("ltq factory mono");
+        assert_eq!(enc.codec_id().as_str(), "mp3");
+        assert_eq!(enc.output_params().sample_rate, Some(44_100));
+        assert_eq!(enc.output_params().channels, Some(1));
+        assert_eq!(enc.output_params().bit_rate, Some(128_000));
+    }
+
+    #[test]
+    fn make_encoder_with_threshold_in_quiet_accepts_stereo() {
+        // Stereo at 192 kbit/s — per-channel bitrate 96 kbit/s, exactly
+        // the §D.1 Step 3 trigger. The factory must accept it and
+        // report `channels = 2`.
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(2);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(192_000);
+        let enc = make_encoder_with_threshold_in_quiet(&p).expect("ltq factory stereo");
+        assert_eq!(enc.output_params().channels, Some(2));
+        assert_eq!(enc.output_params().bit_rate, Some(192_000));
+    }
+
+    #[test]
+    fn make_encoder_with_threshold_in_quiet_rejects_more_than_two_channels() {
+        // Same channel-count guard as `make_encoder` — multi-channel /
+        // joint-stereo are out of scope for the threshold-in-quiet
+        // factory.
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(3);
+        assert!(make_encoder_with_threshold_in_quiet(&p).is_err());
+    }
+
+    #[test]
+    fn make_encoder_with_threshold_in_quiet_requires_sample_rate() {
+        // Missing `sample_rate` is rejected just like `make_encoder`.
+        let bare = CodecParameters::audio(CodecId::new("mp3"));
+        assert!(make_encoder_with_threshold_in_quiet(&bare).is_err());
+    }
+
+    #[test]
+    fn make_encoder_with_threshold_in_quiet_emits_self_decoding_stream() {
+        // End-to-end sanity: the factory builds an encoder whose flushed
+        // byte stream parses cleanly as a sequence of MPEG-1 Layer III
+        // frames with the §2.4.2.3 sync word. Confirms the per-band
+        // outer-loop dispatch wires through the trait wrapper without
+        // changing the wire shape.
+        use crate::frame::{parse_header, FrameWalker};
+
+        let p = build_params(44_100, 128_000);
+        let mut enc = make_encoder_with_threshold_in_quiet(&p).expect("ltq factory");
+        // 4 frames of 440 Hz mono sine (1152 samples / frame).
+        let pcm_bytes = sine_s16(SAMPLES_PER_FRAME_MPEG1 * 4, 440.0, 44_100.0, 0.3);
+        let frame = AudioFrame {
+            samples: (SAMPLES_PER_FRAME_MPEG1 * 4) as u32,
+            pts: None,
+            data: vec![pcm_bytes],
+        };
+        enc.send_frame(&Frame::Audio(frame)).expect("send");
+        enc.flush().expect("flush");
+
+        let mut packets: Vec<Packet> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(pkt) => packets.push(pkt),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        assert!(
+            packets.len() >= 4,
+            "expected ≥ 4 frames, got {}",
+            packets.len()
+        );
+        // Reconstruct the wire stream and confirm every frame walks
+        // cleanly: 12-bit sync, parse_header accepts the 4 header bytes.
+        let mut wire = Vec::new();
+        for pkt in &packets {
+            wire.extend_from_slice(&pkt.data);
+        }
+        let frames: Vec<_> = FrameWalker::new(&wire).collect();
+        assert!(
+            frames.len() >= 4,
+            "walker found {} frames, expected ≥ 4",
+            frames.len(),
+        );
+        for f in &frames {
+            let hdr_bytes: [u8; 4] = f.data[..4].try_into().expect("header bytes");
+            let hdr = parse_header(&hdr_bytes).expect("header parses");
+            assert_eq!(hdr.sample_rate_hz, 44_100);
+        }
     }
 
     #[test]

@@ -286,6 +286,7 @@
 //! [`Mp3Encoder`] factory remains the historical streaming entry
 //! point, and [`codec_encoder::make_encoder`] /
 //! [`codec_encoder::make_encoder_with_outer_loop`] /
+//! [`codec_encoder::make_encoder_with_threshold_in_quiet`] /
 //! [`codec_encoder::make_encoder_joint_stereo_ms`] /
 //! [`codec_encoder::make_encoder_joint_stereo_auto`] /
 //! [`codec_encoder::make_encoder_joint_stereo_auto_with_threshold`]
@@ -417,7 +418,8 @@ pub use block_type_sm::BlockTypeStateMachine;
 pub use codec_decoder::{make_decoder, register_codecs, Mp3CoreDecoder};
 pub use codec_encoder::{
     make_encoder, make_encoder_joint_stereo_auto, make_encoder_joint_stereo_auto_with_threshold,
-    make_encoder_joint_stereo_ms, make_encoder_with_outer_loop, Mp3CoreEncoder,
+    make_encoder_joint_stereo_ms, make_encoder_with_outer_loop,
+    make_encoder_with_threshold_in_quiet, Mp3CoreEncoder,
 };
 pub use crc::{crc16_bits, crc16_layer3, INITIAL_STATE as CRC_INITIAL_STATE};
 pub use demuxer::{

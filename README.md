@@ -2220,6 +2220,46 @@ a long-region skew diverges from the long-region uniform path. Tests:
 671 pass (was 662 baseline; +6 unit, +3 integration). No external
 implementation consulted.
 
+**Phase 2 step 42 (r207)** — trait-API one-shot threshold-in-quiet
+factory. The r194 / r197 / r204 per-band scaffolds required callers
+to build the encoder via `Mp3Encoder::new_with_outer_loop(…,
+DEFAULT_OUTER_LOOP_THRESHOLD)` and **then** install the per-band
+vector via `Mp3Encoder::set_per_band_xmin(XminThresholds::threshold_in_quiet(SR,
+version, bitrate_kbps_per_channel))`. r207 collapses that recipe to a
+single constructor `Mp3Encoder::new_with_threshold_in_quiet(bitrate_kbps,
+sample_rate_hz, mode)` (direct API) plus a matching trait-API factory
+`codec_encoder::make_encoder_with_threshold_in_quiet(&params)`. Both
+derive the per-channel bitrate (`bitrate_kbps / nch`, with `nch = 1`
+for `SingleChannel` and `nch = 2` for `Stereo` / `DualChannel`) and
+pass it to `XminThresholds::threshold_in_quiet` so the §D.1 Step 3
+`−12 dB` offset switches on exactly when
+`bitrate_kbps_per_channel >= 96` — 128 kbit/s mono (per-ch 128, ≥ 96)
+triggers, 64 kbit/s mono (per-ch 64, < 96) does not, 192 kbit/s
+stereo (per-ch 96) is exactly the cutover. The carried uniform-scalar
+slot is `DEFAULT_OUTER_LOOP_THRESHOLD` so a follow-up
+`set_per_band_xmin` re-override sees the same convergence dynamics
+as `new_with_outer_loop` at the default threshold.
+
+Validated by 9 new lib unit tests: 4 in `stream_encoder::tests`
+(`new_with_threshold_in_quiet_enables_outer_loop_and_per_band` pins
+both knobs armed; `…_carries_long_band_bowl_shape` extracts the
+installed `XminThresholds` and confirms the bass/treble extremes sit
+above the mid-spectrum minimum, witnessing the
+threshold-in-quiet derivation actually fired; `…_applies_step3_offset_per_channel_bitrate`
+pins the 10^1.2 ratio between high-br and low-br mono at the same
+sample rate; `…_stereo_uses_per_channel_bitrate_for_step3` pins the
+same ratio between 192-kbit/s stereo and 128-kbit/s stereo, proving
+the offset reads the per-channel bitrate, not the aggregate), plus
+5 in `codec_encoder::tests`
+(`make_encoder_with_threshold_in_quiet_constructs_and_reports_params`,
+`…_accepts_stereo`, `…_rejects_more_than_two_channels`,
+`…_requires_sample_rate`, and an end-to-end
+`…_emits_self_decoding_stream` that drives 4 frames of 440 Hz mono
+sine through `send_frame` + `flush` + `receive_packet` and confirms
+the assembled byte stream walks cleanly via `FrameWalker` +
+`parse_header` at the configured 44.1 kHz). Tests: 556 lib (was 547
+baseline; +9 unit). No external implementation consulted.
+
 Remaining Phase 2 work: the full Annex D Model 1 / Model 2
 psychoacoustic model (1024-sample FFT + tonality classifier +
 masking-function convolution — the threshold-in-quiet curve landed

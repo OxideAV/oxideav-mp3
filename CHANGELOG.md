@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: trait-API one-shot threshold-in-quiet factory —
+  `Mp3Encoder::new_with_threshold_in_quiet` + the matching
+  `codec_encoder::make_encoder_with_threshold_in_quiet` bundle
+  `new_with_outer_loop(DEFAULT_OUTER_LOOP_THRESHOLD)` +
+  `set_per_band_xmin(XminThresholds::threshold_in_quiet(SR, version,
+  bitrate_kbps_per_channel))` into one call. Per-channel bitrate
+  (`bitrate_kbps / nch`) drives the §D.1 Step 3 `−12 dB` offset
+  switch — 192 kbit/s stereo (96 kbit/s per channel) is exactly the
+  cutover, 128 kbit/s mono (128 ≥ 96) triggers, 128 kbit/s stereo
+  (64 < 96) does not (Phase 2 step 42 / r207)
 - psy: per-band threshold-vector scaffold (Annex D threshold-in-quiet
   long-block path) + `outer_loop_search_long_per_band` primitive +
   `Mp3Encoder::set_per_band_xmin` (Phase 2 step 39 / r194)

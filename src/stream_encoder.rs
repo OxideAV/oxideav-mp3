@@ -1321,6 +1321,68 @@ impl Mp3Encoder {
         Ok(enc)
     }
 
+    /// Build an encoder identical to [`Mp3Encoder::new_with_outer_loop`]
+    /// with the per-band Annex D **threshold-in-quiet** vector
+    /// ([`crate::psy::XminThresholds::threshold_in_quiet`]) pre-installed
+    /// as the §C.1.5.4.3 outer-loop threshold for every block-type
+    /// branch (long / pure-short / mixed). One-shot bundle of
+    /// [`Mp3Encoder::new_with_outer_loop`] +
+    /// [`Mp3Encoder::set_per_band_xmin`] for the
+    /// most common psychoacoustic-thresholding recipe: the long-block
+    /// outer loop reads `xmin.long[sfb]`, the pure-short loop reads
+    /// `xmin.short[sfb][win]`, and the mixed-block loop reads
+    /// `xmin.mixed_long[sfb]` / `xmin.mixed_short[sfb][win]`, each band
+    /// / cell sampled from the §"Table D.1a" anchors (see
+    /// [`crate::psy`] module docstring) with the §D.1 Step 3
+    /// `−12 dB` offset applied when
+    /// `bitrate_kbps_per_channel >= 96` (i.e.
+    /// `bitrate_kbps / nch >= 96`).
+    ///
+    /// The uniform-scalar outer-loop slot itself is set to
+    /// [`DEFAULT_OUTER_LOOP_THRESHOLD`] so any future caller that
+    /// re-overrides the per-band vector via
+    /// [`Mp3Encoder::set_per_band_xmin`] with a different
+    /// [`crate::psy::XminThresholds`] (or installs
+    /// [`crate::psy::XminThresholds::uniform`] to revert to uniform)
+    /// observes the same convergence dynamics as
+    /// [`Mp3Encoder::new_with_outer_loop`] at that threshold.
+    ///
+    /// `bitrate_kbps_per_channel` is `bitrate_kbps / nch` where `nch`
+    /// is the channel count implied by `mode` (1 for
+    /// [`ChannelMode::SingleChannel`], 2 for the others). The §D.1
+    /// Step 3 offset is keyed on the per-channel bitrate because the
+    /// transparency reference is per-channel — at 192 kbit/s stereo
+    /// each channel carries 96 kbit/s, exactly the cutover point.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Mp3Encoder::new_with_outer_loop`].
+    pub fn new_with_threshold_in_quiet(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+        mode: ChannelMode,
+    ) -> Result<Self, StreamEncodeError> {
+        let mut enc = Self::new_with_outer_loop(
+            bitrate_kbps,
+            sample_rate_hz,
+            mode,
+            DEFAULT_OUTER_LOOP_THRESHOLD,
+        )?;
+        // `nch` is established by `new()`; divide by it to get the
+        // §D.1 Step 3 per-channel reference (192 kbit/s stereo →
+        // 96 kbit/s per channel, the cutover).
+        let nch = enc.nch as u32;
+        let bitrate_per_channel = bitrate_kbps / nch.max(1);
+        let xmin = crate::psy::XminThresholds::threshold_in_quiet(
+            sample_rate_hz,
+            enc.version,
+            bitrate_per_channel,
+        );
+        // Cannot fail: outer-loop threshold was just set above.
+        enc.set_per_band_xmin(xmin)?;
+        Ok(enc)
+    }
+
     /// Install a per-band threshold vector
     /// ([`crate::psy::XminThresholds`]) the long-block outer-loop
     /// branch will consume INSTEAD of the uniform scalar threshold the
@@ -4026,6 +4088,124 @@ mod tests {
                 !hdr.mode_extension.ms_stereo,
                 "threshold=0 must reject MS on frame at offset {} (any side energy disqualifies)",
                 f.offset
+            );
+        }
+    }
+
+    // =====================================================================
+    // `new_with_threshold_in_quiet` — outer-loop + Annex D LTq vector
+    // bundled construction. Verifies the one-shot constructor sets the
+    // same state the two-step `new_with_outer_loop` + `set_per_band_xmin`
+    // recipe produces.
+    // =====================================================================
+
+    #[test]
+    fn new_with_threshold_in_quiet_enables_outer_loop_and_per_band() {
+        // Mono — straight-line case. The constructor must arm both the
+        // outer loop AND the per-band vector; either left disarmed is a
+        // regression.
+        let enc = Mp3Encoder::new_with_threshold_in_quiet(128, 44_100, ChannelMode::SingleChannel)
+            .expect("mono ctor");
+        assert!(
+            enc.outer_loop_threshold.is_some(),
+            "new_with_threshold_in_quiet must arm the outer loop",
+        );
+        assert!(
+            enc.per_band_xmin_enabled(),
+            "new_with_threshold_in_quiet must arm the per-band vector",
+        );
+        // The carried uniform scalar is the documented
+        // DEFAULT_OUTER_LOOP_THRESHOLD so subsequent re-overrides of
+        // the per-band vector see the same uniform fallback.
+        assert_eq!(enc.outer_loop_threshold, Some(DEFAULT_OUTER_LOOP_THRESHOLD));
+    }
+
+    #[test]
+    fn new_with_threshold_in_quiet_carries_long_band_bowl_shape() {
+        // Pull the installed per-band vector back out and check the
+        // long-block bowl shape Annex D Table D.1 prescribes — the
+        // mid-spectrum minimum must sit strictly below the bass /
+        // treble extremes. This proves the constructor wired the
+        // `threshold_in_quiet` derivation (and not the uniform fill).
+        let enc = Mp3Encoder::new_with_threshold_in_quiet(128, 44_100, ChannelMode::SingleChannel)
+            .expect("mono ctor");
+        let xmin = enc
+            .per_band_xmin
+            .as_ref()
+            .expect("per-band vector installed");
+        // Bass (sfb 0) > minimum, treble (sfb 20) > minimum, with the
+        // minimum sitting in the mid-spectrum (not at either edge).
+        let (min_sfb, &min_v) = xmin
+            .long
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        assert!(
+            xmin.long[0] > min_v,
+            "bass sfb 0 ({}) must be > minimum sfb {min_sfb} ({min_v})",
+            xmin.long[0],
+        );
+        let last = xmin.long.len() - 1;
+        assert!(
+            xmin.long[last] > min_v,
+            "treble sfb {last} ({}) must be > minimum sfb {min_sfb} ({min_v})",
+            xmin.long[last],
+        );
+        assert!(
+            (1..last).contains(&min_sfb),
+            "min sfb {min_sfb} must sit in the mid-spectrum (not at either edge)",
+        );
+    }
+
+    #[test]
+    fn new_with_threshold_in_quiet_applies_step3_offset_per_channel_bitrate() {
+        // The §D.1 Step 3 `−12 dB` offset switches on
+        // `bitrate_kbps_per_channel >= 96`. Mono at 128 kbit/s (per-ch
+        // 128 ≥ 96) triggers; mono at 64 kbit/s (per-ch 64 < 96) does
+        // not. The per-band entries at the trigger bitrate must be
+        // strictly lower (= more aggressive amplification target).
+        let high = Mp3Encoder::new_with_threshold_in_quiet(128, 44_100, ChannelMode::SingleChannel)
+            .expect("high-br mono");
+        let low = Mp3Encoder::new_with_threshold_in_quiet(64, 44_100, ChannelMode::SingleChannel)
+            .expect("low-br mono");
+        let xh = high.per_band_xmin.as_ref().expect("hi xmin");
+        let xl = low.per_band_xmin.as_ref().expect("lo xmin");
+        for sfb in 0..xh.long.len() {
+            assert!(
+                xh.long[sfb] < xl.long[sfb],
+                "sfb {sfb}: high-br {} must be < low-br {} (Step 3 offset)",
+                xh.long[sfb],
+                xl.long[sfb],
+            );
+            let ratio = xl.long[sfb] / xh.long[sfb];
+            // 10^(12/10) ≈ 15.85.
+            assert!(
+                (ratio - 10.0_f64.powf(12.0 / 10.0)).abs() < 1.0e-6,
+                "sfb {sfb}: ratio {ratio} must equal 10^1.2",
+            );
+        }
+    }
+
+    #[test]
+    fn new_with_threshold_in_quiet_stereo_uses_per_channel_bitrate_for_step3() {
+        // Stereo at 192 kbit/s has 96 kbit/s per channel — exactly the
+        // §D.1 Step 3 trigger. Stereo at 128 kbit/s has 64 kbit/s per
+        // channel — below the trigger. The constructor must compute
+        // the offset on the per-channel bitrate, NOT the aggregate.
+        let trigger = Mp3Encoder::new_with_threshold_in_quiet(192, 44_100, ChannelMode::Stereo)
+            .expect("stereo 192");
+        let below = Mp3Encoder::new_with_threshold_in_quiet(128, 44_100, ChannelMode::Stereo)
+            .expect("stereo 128");
+        let xt = trigger.per_band_xmin.as_ref().unwrap();
+        let xb = below.per_band_xmin.as_ref().unwrap();
+        // Identical 10^1.2 ratio between trigger (offset applied) and
+        // below (offset zero) at every long band.
+        for sfb in 0..xt.long.len() {
+            let ratio = xb.long[sfb] / xt.long[sfb];
+            assert!(
+                (ratio - 10.0_f64.powf(12.0 / 10.0)).abs() < 1.0e-6,
+                "stereo sfb {sfb}: ratio {ratio} must equal 10^1.2 (per-channel offset)",
             );
         }
     }
