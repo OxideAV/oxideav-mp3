@@ -2170,13 +2170,62 @@ round-trip, and single-tone 440 Hz self-decode at 65.77 dB. The
 `psy` module adds 9 unit tests. Tests: 649 pass (was 633 baseline;
 +10 unit, +6 integration). No external implementation consulted.
 
+**Phase 2 step 41 (r204)** — per-band psychoacoustic-threshold
+plumbing for the **mixed-block** path. Closes the dispatcher gap
+left by r194 (long path) and r197 (pure-short path): the
+`outer_loop_search_mixed_per_band` primitive now accepts a
+`xmin_long: &[f64; LONG_SFB]` long-region per-band vector (entries
+`[0, MIXED_LAST_LONG_SFB]` = `0..=7` are read; the rest are
+ignored) AND a `xmin_short: &[[f64; SHORT_WINDOWS]; SHORT_SFB]`
+short-region per-cell matrix (entries
+`[MIXED_FIRST_SHORT_SFB, SHORT_SFB)` = `[3, 12)` are read; the rest
+are ignored). Every §C.1.5.4.3.5 amplification + §C.1.5.4.3.6
+termination cell test reads the appropriate vector / matrix entry.
+
+The pre-r204 `outer_loop_search_mixed(_, _, _, _, _, thr, _)` is
+refactored to a thin scalar shim that broadcasts the uniform
+threshold into a uniform `[thr; LONG_SFB]` long-region vector AND a
+uniform `[[thr; SHORT_WINDOWS]; SHORT_SFB]` short-region matrix,
+then dispatches into the new per-band primitive — byte-for-byte
+equivalent to the pre-r204 inline body (regression-anchored by
+`mixed_per_band_uniform_matches_scalar_bit_for_bit`).
+
+The `stream_encoder` dispatch is wired so the
+`BlockType::Short if mixed_block_flag` arm routes onto the new
+per-band primitive whenever `set_per_band_xmin` has installed a
+matrix, consuming `XminThresholds::mixed_long` for the long region
+and `XminThresholds::mixed_short` for the short region. Without
+`set_per_band_xmin` the dispatch falls back to the scalar shim, so
+existing callers see no change. `XminThresholds::threshold_in_quiet`
+(landed in r197) already populates both `mixed_long` and
+`mixed_short` from the same Annex D anchors — `mixed_long[0..=7]`
+shares the long-band derivation with `long[0..=7]`, and
+`mixed_short[3..=11][..]` shares the per-window short-band derivation
+with `short[3..=11][..]` — so installing the LTq vector is enough to
+exercise the new path end-to-end.
+
+Validated by 3 new integration tests in
+`per_band_xmin_roundtrip.rs`: byte-equivalence between the per-band
+uniform shim and the scalar path on a force-mixed encoder (regression
+anchor for the refactor); threshold-in-quiet mixed-block self-decode
+to finite, non-silent PCM through the crate's own decode chain;
+divergence between the per-band LTq path and the uniform path at the
+same scalar threshold on a force-mixed encoder (witnesses both the
+`mixed_long` vector and the `mixed_short` matrix actually propagating
+into the §C.1.5.4.3 decision). The `outer_loop` module adds 6 unit
+tests: shim equivalence, huge-threshold iter-1 termination, a tighter
+long band amplifies only that long band, a tighter short cell
+amplifies only that short cell, out-of-range entries are ignored, and
+a long-region skew diverges from the long-region uniform path. Tests:
+671 pass (was 662 baseline; +6 unit, +3 integration). No external
+implementation consulted.
+
 Remaining Phase 2 work: the full Annex D Model 1 / Model 2
 psychoacoustic model (1024-sample FFT + tonality classifier +
 masking-function convolution — the threshold-in-quiet curve landed
-in r194 is the *lower bound* of any signal-dependent psychoacoustic
-threshold), short / mixed per-band threshold plumbing (the outer
-loop's `*_short` / `*_mixed` per-band variants), intensity-stereo
-encode (§2.4.3.4.9.3), LSF / MPEG-2.5 encode (blocked on the
+in r194 / r197 / r204 is the *lower bound* of any signal-dependent
+psychoacoustic threshold), intensity-stereo encode (§2.4.3.4.9.3),
+LSF / MPEG-2.5 encode (blocked on the
 `MPEG-2.5-GAP.md` observer-trace items for scalefactor-band tables /
 Huffman mapping / frame-size validation at low rates), and
 stereo / LSF decode through the trait wrapper.
@@ -2275,17 +2324,29 @@ frequency only) and the §D.1 Step 3 offset applied to both
 shapes, wired through the `stream_encoder` dispatch so
 `BlockType::Short if !mixed_block_flag` granules route onto the
 new per-band primitive whenever `set_per_band_xmin` has installed
-a matrix — it still
+a matrix + r204 §C.1.5.4.3 mixed-block outer-loop per-band
+threshold — `outer_loop_search_mixed_per_band` primitive accepts a
+`xmin_long: &[f64; LONG_SFB]` long-region per-band vector (sfb
+0..=7 are read) AND a
+`xmin_short: &[[f64; SHORT_WINDOWS]; SHORT_SFB]` short-region
+per-cell matrix (sfb 3..=11 cells are read) that every §C.1.5.4.3.5
+amplification + §C.1.5.4.3.6 termination cell test reads, with
+`outer_loop_search_mixed` refactored to a thin scalar shim that
+broadcasts the uniform threshold into uniform long + short
+vectors (byte-for-byte equivalent to the pre-r204 inline body);
+the stream-encoder dispatch routes `BlockType::Short if
+mixed_block_flag` granules onto the new per-band primitive,
+consuming `XminThresholds::mixed_long` for the long region and
+`XminThresholds::mixed_short` for the short region whenever
+`set_per_band_xmin` has installed an `XminThresholds` (already
+populated by the r197 `XminThresholds::threshold_in_quiet`
+constructor from the same Annex D anchors) — it still
 lacks
 the full Annex D Model 1 / Model 2 psychoacoustic model
 (1024-sample FFT + tonality classifier + masking-function
-convolution — the r194 / r197 threshold-in-quiet curve is the
-*lower bound* of any signal-dependent psychoacoustic threshold),
-mixed-block per-band threshold (the `mixed_long` /
-`mixed_short` cells of `XminThresholds` are populated by
-`threshold_in_quiet` but the `outer_loop_search_mixed` primitive
-still consumes the scalar threshold — the per-band mixed variant
-is the next follow-up),
+convolution — the r194 / r197 / r204 threshold-in-quiet curve is
+the *lower bound* of any signal-dependent psychoacoustic
+threshold),
 intensity-stereo encode (§2.4.3.4.9.3), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's

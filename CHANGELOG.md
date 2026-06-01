@@ -16,6 +16,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `XminThresholds::threshold_in_quiet` constructor (long + short cells
   populated from the same Annex D anchors) + stream-encoder dispatch on
   `BlockType::Short if !mixed_block_flag` (Phase 2 step 40 / r197)
+- psy: per-band threshold-in-quiet mixed-block path +
+  `outer_loop_search_mixed_per_band` primitive (long-region per-band
+  `xmin_long[0..=7]` + short-region per-cell
+  `xmin_short[3..=11][..]`) + stream-encoder dispatch on
+  `BlockType::Short if mixed_block_flag` consuming
+  `XminThresholds::mixed_long` / `XminThresholds::mixed_short`
+  (Phase 2 step 41 / r204)
 
 ## [0.1.2](https://github.com/OxideAV/oxideav-mp3/releases/tag/v0.1.2) - 2026-05-30
 

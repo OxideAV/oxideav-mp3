@@ -655,3 +655,177 @@ fn per_band_short_threshold_changes_byte_stream_vs_uniform() {
          isn't propagating into the pure-short outer-loop decision",
     );
 }
+
+// =========================================================================
+// r204 step 41 — per-band mixed-block tests
+// =========================================================================
+
+/// **Backward-compat anchor (mixed-block)** — installing
+/// `XminThresholds::uniform(thr)` while every granule is force-mixed
+/// must produce a bit-identical byte stream to the scalar uniform path.
+/// Witnesses that the r204 `outer_loop_search_mixed` scalar shim is
+/// bit-for-bit equivalent to the per-band primitive under uniform
+/// `xmin_long` + uniform `xmin_short` vectors.
+#[test]
+fn per_band_mixed_uniform_is_bit_identical_to_scalar_uniform() {
+    let pcm = multi_tone_pcm(
+        PCM_LEN_SAMPLES,
+        &[110.0, 440.0, 880.0, 1760.0, 3520.0, 7040.0],
+        0.12,
+    );
+    let thr = 5.0e-8;
+
+    let bytes_scalar = encode(
+        || {
+            let mut enc = Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, thr)
+                .expect("encoder build");
+            enc.force_mixed_blocks_for_testing(true)
+                .expect("enable force-mixed");
+            enc
+        },
+        &pcm,
+    );
+
+    let bytes_per_band = encode(
+        || {
+            let mut enc = Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, thr)
+                .expect("encoder build");
+            enc.force_mixed_blocks_for_testing(true)
+                .expect("enable force-mixed");
+            enc.set_per_band_xmin(XminThresholds::uniform(thr))
+                .expect("install uniform per-band");
+            assert!(enc.per_band_xmin_enabled());
+            enc
+        },
+        &pcm,
+    );
+
+    assert_eq!(
+        bytes_scalar.len(),
+        bytes_per_band.len(),
+        "mixed-block per-band uniform produced different stream length than scalar uniform",
+    );
+    assert_eq!(
+        bytes_scalar, bytes_per_band,
+        "mixed-block per-band uniform fill must be bit-identical to scalar uniform threshold path",
+    );
+}
+
+/// **Threshold-in-quiet mixed-block round-trips to non-silent finite PCM**
+/// — a force-mixed granule under the per-band LTq vectors decodes
+/// through the crate's own decode chain to finite, non-silent PCM.
+/// Witnesses that the `XminThresholds::threshold_in_quiet` `mixed_long`
+/// and `mixed_short` cells propagate into the encoder's mixed-block outer
+/// loop and produce a parseable byte stream. (Force-mixed on a steady
+/// multi-tone fixture inherently has lower PSNR than the long-block
+/// path — the mixed-block short region's three-window split is designed
+/// for transient onsets within a granule, not sustained tones.)
+#[test]
+fn per_band_threshold_in_quiet_mixed_self_decode_is_finite_non_silent() {
+    let pcm = multi_tone_pcm(
+        PCM_LEN_SAMPLES,
+        &[110.0, 440.0, 880.0, 1760.0, 3520.0, 7040.0],
+        0.12,
+    );
+
+    let bytes = encode(
+        || {
+            let mut enc = Mp3Encoder::new_with_outer_loop(
+                BR,
+                SR,
+                ChannelMode::SingleChannel,
+                oxideav_mp3::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD,
+            )
+            .expect("encoder build");
+            enc.force_mixed_blocks_for_testing(true)
+                .expect("enable force-mixed");
+            enc.set_per_band_xmin(XminThresholds::threshold_in_quiet(
+                SR,
+                MpegVersion::Mpeg1,
+                BR,
+            ))
+            .expect("install ltq per-band");
+            enc
+        },
+        &pcm,
+    );
+    assert!(
+        bytes.len() > 1000,
+        "encoded stream too small: {}",
+        bytes.len()
+    );
+    let recon = decode_mp3_mono(&bytes);
+    assert!(!recon.is_empty(), "decoded PCM was empty");
+    let energy: f64 = recon
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        / recon.len() as f64;
+    assert!(
+        energy.is_finite() && energy > 0.0,
+        "decoded PCM had zero or non-finite energy ({energy})",
+    );
+    let p = aligned_psnr(&pcm, &recon);
+    eprintln!(
+        "per-band mixed-block LTq self-decode PSNR = {p:.2} dB (finite, non-silent — \
+         mixed-block short region inherently loses more on sustained tones than long blocks)",
+    );
+    assert!(p.is_finite(), "PSNR was non-finite");
+}
+
+/// **Per-band mixed threshold changes byte stream vs uniform** — at the
+/// same scalar threshold + same fixture under force-mixed, installing
+/// the LTq vectors produces a different byte stream than the uniform
+/// path. Witnesses that the per-band threshold propagates into the
+/// mixed-block outer-loop decision through both the long-region vector
+/// (`mixed_long[0..=7]`) and the short-region matrix
+/// (`mixed_short[3..=11][..]`).
+#[test]
+fn per_band_mixed_threshold_changes_byte_stream_vs_uniform() {
+    let pcm = multi_tone_pcm(
+        PCM_LEN_SAMPLES,
+        &[110.0, 440.0, 880.0, 1760.0, 3520.0, 7040.0],
+        0.12,
+    );
+    // Tight scalar threshold — same value as the long-block + short-block
+    // divergence tests; ensures the uniform path actually fires the amp
+    // step.
+    let scalar_thr = 5.0e-8;
+
+    let bytes_uniform = encode(
+        || {
+            let mut enc =
+                Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, scalar_thr)
+                    .expect("encoder build");
+            enc.force_mixed_blocks_for_testing(true)
+                .expect("enable force-mixed");
+            enc
+        },
+        &pcm,
+    );
+
+    let bytes_per_band = encode(
+        || {
+            let mut enc =
+                Mp3Encoder::new_with_outer_loop(BR, SR, ChannelMode::SingleChannel, scalar_thr)
+                    .expect("encoder build");
+            enc.force_mixed_blocks_for_testing(true)
+                .expect("enable force-mixed");
+            enc.set_per_band_xmin(XminThresholds::threshold_in_quiet(
+                SR,
+                MpegVersion::Mpeg1,
+                BR,
+            ))
+            .expect("install ltq per-band");
+            enc
+        },
+        &pcm,
+    );
+
+    assert_ne!(
+        bytes_uniform, bytes_per_band,
+        "mixed-block per-band LTq path produced the SAME bytes as uniform path on a \
+         spectrally-rich fixture under a tight scalar threshold — the per-band threshold \
+         isn't propagating into the mixed-block outer-loop decision",
+    );
+}

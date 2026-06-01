@@ -136,16 +136,18 @@ pub struct XminThresholds {
     /// Consumed by [`crate::outer_loop::outer_loop_search_long_per_band`].
     pub long: [f64; LONG_SFB],
     /// Pure-short-block per-cell threshold, `xmin[sfb][window]` for
-    /// `sfb ∈ 0..12`, `window ∈ 0..3`. Consumed by the pure-short
-    /// per-band variant; scaffold for the follow-up round.
+    /// `sfb ∈ 0..12`, `window ∈ 0..3`. Consumed by
+    /// [`crate::outer_loop::outer_loop_search_short_per_band`].
     pub short: [[f64; SHORT_WINDOWS]; SHORT_SFB],
     /// Mixed-block long-region per-band threshold (long-window portion
-    /// only — `xmin[sfb]` for `sfb ∈ 0..8`). Scaffold for the follow-up
-    /// round; first 8 entries are read.
+    /// only — `xmin[sfb]` for `sfb ∈ 0..8`). Consumed by
+    /// [`crate::outer_loop::outer_loop_search_mixed_per_band`]; first 8
+    /// entries are read.
     pub mixed_long: [f64; LONG_SFB],
     /// Mixed-block short-region per-cell threshold (short-window
-    /// portion — `xmin[sfb][window]` for `sfb ∈ 3..12`). Scaffold for
-    /// the follow-up round; entries `[3..12]` are read.
+    /// portion — `xmin[sfb][window]` for `sfb ∈ 3..12`). Consumed by
+    /// [`crate::outer_loop::outer_loop_search_mixed_per_band`]; entries
+    /// `[3..12]` are read.
     pub mixed_short: [[f64; SHORT_WINDOWS]; SHORT_SFB],
 }
 

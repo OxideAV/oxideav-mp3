@@ -2485,15 +2485,43 @@ impl Mp3Encoder {
                                     // `sf.long[0..8]` at slen1 then
                                     // `sf.short[3..12][..]` (see
                                     // `write_mpeg1_granule_channel`).
-                                    let res = outer_loop_search_mixed(
-                                        &xr_pre,
-                                        &gc_for_ol,
-                                        self.sample_rate_hz,
-                                        self.version,
-                                        inner_budget_for_outer,
-                                        thr,
-                                        DEFAULT_OUTER_LOOP_MAX_ITER,
-                                    );
+                                    //
+                                    // r204 step 41: when a per-band
+                                    // threshold matrix is installed,
+                                    // dispatch onto the
+                                    // `*_per_band` mixed primitive that
+                                    // reads `xmin.mixed_long[sfb]` for
+                                    // the long region (sfb 0..=7) and
+                                    // `xmin.mixed_short[sfb][win]` for
+                                    // the short region (sfb 3..=11)
+                                    // instead of the uniform scalar.
+                                    // The per-band primitive is a strict
+                                    // generalisation — installing
+                                    // `XminThresholds::uniform(thr)`
+                                    // recovers byte-for-byte the
+                                    // scalar-path output.
+                                    let res = if let Some(xmin) = &self.per_band_xmin {
+                                        crate::outer_loop::outer_loop_search_mixed_per_band(
+                                            &xr_pre,
+                                            &gc_for_ol,
+                                            self.sample_rate_hz,
+                                            self.version,
+                                            inner_budget_for_outer,
+                                            &xmin.mixed_long,
+                                            &xmin.mixed_short,
+                                            DEFAULT_OUTER_LOOP_MAX_ITER,
+                                        )
+                                    } else {
+                                        outer_loop_search_mixed(
+                                            &xr_pre,
+                                            &gc_for_ol,
+                                            self.sample_rate_hz,
+                                            self.version,
+                                            inner_budget_for_outer,
+                                            thr,
+                                            DEFAULT_OUTER_LOOP_MAX_ITER,
+                                        )
+                                    };
                                     (
                                         res.scalefactors,
                                         res.global_gain,

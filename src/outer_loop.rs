@@ -1427,6 +1427,14 @@ pub struct OuterLoopMixedResult {
 /// (long-region band as a single cell; short-region cells as
 /// per-(sfb, window) tuples) — the psychoacoustic model is deferred.
 /// `max_iter` caps the outer loop at a finite count.
+///
+/// **Backward compat shim:** this is now a thin wrapper that broadcasts
+/// `uniform_threshold` into a `[f64; LONG_SFB]` long-region vector AND a
+/// `[[f64; SHORT_WINDOWS]; SHORT_SFB]` short-region matrix, then
+/// dispatches to [`outer_loop_search_mixed_per_band`]. Every
+/// `> xmin_long[sfb]` / `> xmin_short[sfb][win]` comparison resolves
+/// identically to the pre-r204 scalar `> uniform_threshold` body when
+/// every cell carries the same value — bit-for-bit equivalent.
 #[must_use]
 pub fn outer_loop_search_mixed(
     xr: &[f32; NUM_LINES],
@@ -1435,6 +1443,67 @@ pub fn outer_loop_search_mixed(
     version: MpegVersion,
     per_gc_bit_budget: u64,
     uniform_threshold: f64,
+    max_iter: u32,
+) -> OuterLoopMixedResult {
+    let xmin_long = [uniform_threshold; LONG_SFB];
+    let xmin_short = [[uniform_threshold; SHORT_WINDOWS]; SHORT_SFB];
+    outer_loop_search_mixed_per_band(
+        xr,
+        gc_template,
+        sample_rate_hz,
+        version,
+        per_gc_bit_budget,
+        &xmin_long,
+        &xmin_short,
+        max_iter,
+    )
+}
+
+/// Per-band variant of [`outer_loop_search_mixed`] — r204
+/// (Phase 2 step 41).
+///
+/// Identical to [`outer_loop_search_mixed`] except that the per-cell
+/// distortion threshold is supplied as TWO inputs:
+///
+/// * `xmin_long: &[f64; LONG_SFB]` — the long-region per-band threshold.
+///   Only entries `[0, MIXED_LAST_LONG_SFB]` (= `0..=7`) are read; the
+///   rest are ignored. Matches the shape consumed by
+///   [`outer_loop_search_long_per_band`].
+/// * `xmin_short: &[[f64; SHORT_WINDOWS]; SHORT_SFB]` — the short-region
+///   per-cell threshold matrix. Only entries
+///   `[MIXED_FIRST_SHORT_SFB, SHORT_SFB)` (= `[3, 12)`) are read; the
+///   rest are ignored. Matches the shape consumed by
+///   [`outer_loop_search_short_per_band`].
+///
+/// Each §C.1.5.4.3.5 amplification + §C.1.5.4.3.6 termination test reads
+/// the per-cell entry from the appropriate vector. This enables a
+/// spectrally-aware [`crate::psy::XminThresholds`] threshold (e.g. the
+/// textually-transcribed Annex D threshold in quiet, sampled at each
+/// long band's centre frequency on the long region and at each short
+/// band's centre frequency on the short region) to redistribute the bit
+/// budget across the spectrum of a mixed-block granule.
+///
+/// **Backward compat:** [`outer_loop_search_mixed`] is a thin shim over
+/// this primitive that broadcasts the scalar into uniform vectors, so
+/// existing callers keep their behaviour unchanged.
+///
+/// The carrier semantics are identical: `gc_template` MUST satisfy the
+/// same mixed acceptance ([`BlockType::Short`] with
+/// `window_switching_flag = true` and `mixed_block_flag = true`),
+/// `gc_template.scalefac_compress` MUST be
+/// [`OUTER_LOOP_SCALEFAC_COMPRESS`], and the returned
+/// [`OuterLoopMixedResult`] carries the same scalefactor / global-gain /
+/// subblock-gain / scalefac_scale state.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn outer_loop_search_mixed_per_band(
+    xr: &[f32; NUM_LINES],
+    gc_template: &GranuleChannel,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    per_gc_bit_budget: u64,
+    xmin_long: &[f64; LONG_SFB],
+    xmin_short: &[[f64; SHORT_WINDOWS]; SHORT_SFB],
     max_iter: u32,
 ) -> OuterLoopMixedResult {
     debug_assert!(gc_template.window_switching_flag);
@@ -1541,12 +1610,19 @@ pub fn outer_loop_search_mixed(
             }
         }
 
-        // Identify cells over threshold + cap-would-exceed candidates.
+        // Identify cells over their per-region threshold + cap-would-
+        // exceed candidates. The long-region scan reads `xmin_long[sfb]`
+        // for `sfb ∈ [0, MIXED_LAST_LONG_SFB]`; the short-region scan
+        // reads `xmin_short[sfb][win]` for
+        // `sfb ∈ [MIXED_FIRST_SHORT_SFB, SHORT_SFB)`. Both reduce to the
+        // scalar uniform threshold of the pre-r204 path when
+        // [`outer_loop_search_mixed`] broadcasts a single value into
+        // every long-region band and every short-region cell.
         let mut any_over = false;
         let mut would_exceed_cap = false;
         // Long-region scan.
         for (sfb, &d) in xfsf_l.iter().enumerate().take(MIXED_LAST_LONG_SFB + 1) {
-            if d > uniform_threshold {
+            if d > xmin_long[sfb] {
                 any_over = true;
                 let next = u16::from(sf.long[sfb]) + 1;
                 if next > u16::from(MIXED_SCALEFAC_L_MAX) {
@@ -1563,7 +1639,7 @@ pub fn outer_loop_search_mixed(
         {
             let cap = scalefac_short_upper_limit(sfb);
             for (win, &d) in xfsf_row.iter().enumerate() {
-                if d > uniform_threshold {
+                if d > xmin_short[sfb][win] {
                     any_over = true;
                     let next = u16::from(sf.short[sfb][win]) + 1;
                     if next > u16::from(cap) {
@@ -1623,9 +1699,10 @@ pub fn outer_loop_search_mixed(
         last_good_sg = subblock_gain;
         last_good_inner = inner;
 
-        // §C.1.5.4.3.5 amplification — long region, sfb 0..=7.
+        // §C.1.5.4.3.5 amplification — long region, sfb 0..=7. Read
+        // `xmin_long[sfb]` per band.
         for (sfb, &d) in xfsf_l.iter().enumerate().take(MIXED_LAST_LONG_SFB + 1) {
-            if d > uniform_threshold && sf.long[sfb] < MIXED_SCALEFAC_L_MAX {
+            if d > xmin_long[sfb] && sf.long[sfb] < MIXED_SCALEFAC_L_MAX {
                 sf.long[sfb] = sf.long[sfb].saturating_add(1);
                 if !amplified_long[sfb] {
                     amplified_long[sfb] = true;
@@ -1633,7 +1710,8 @@ pub fn outer_loop_search_mixed(
                 }
             }
         }
-        // §C.1.5.4.3.5 amplification — short region, sfb 3..=11.
+        // §C.1.5.4.3.5 amplification — short region, sfb 3..=11. Read
+        // `xmin_short[sfb][win]` per cell.
         for (sfb, xfsf_row) in xfsf_s
             .iter()
             .enumerate()
@@ -1642,7 +1720,7 @@ pub fn outer_loop_search_mixed(
         {
             let cap = scalefac_short_upper_limit(sfb);
             for (win, &d) in xfsf_row.iter().enumerate() {
-                if d > uniform_threshold && sf.short[sfb][win] < cap {
+                if d > xmin_short[sfb][win] && sf.short[sfb][win] < cap {
                     sf.short[sfb][win] = sf.short[sfb][win].saturating_add(1);
                     if !amplified_short[sfb][win] {
                         amplified_short[sfb][win] = true;
@@ -3117,6 +3195,342 @@ mod tests {
                     v <= cap,
                     "short sfb={sfb} win={win} sf={v} exceeds cap {cap}",
                 );
+            }
+        }
+    }
+
+    // =====================================================================
+    // Mixed-block per-band outer loop tests (Phase 2 step 41 — r204)
+    // =====================================================================
+
+    #[test]
+    fn mixed_per_band_uniform_matches_scalar_bit_for_bit() {
+        // The shim contract: feeding uniform `xmin_long = [thr; LONG_SFB]`
+        // AND `xmin_short = [[thr; SHORT_WINDOWS]; SHORT_SFB]` into the
+        // per-band primitive must produce byte-identical output to feeding
+        // `thr` into the scalar primitive. This is the r204 refactor
+        // regression anchor — without it, the per-band path would not be
+        // a strict generalisation of the scalar path.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.013).sin() * 65.0;
+        }
+        let gc = mixed_template();
+        let thr = 1.0e-3;
+
+        let scalar = outer_loop_search_mixed(&xr, &gc, 44_100, MpegVersion::Mpeg1, 2000, thr, 64);
+        let xmin_long_uniform = [thr; LONG_SFB];
+        let xmin_short_uniform = [[thr; SHORT_WINDOWS]; SHORT_SFB];
+        let perband = outer_loop_search_mixed_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &xmin_long_uniform,
+            &xmin_short_uniform,
+            64,
+        );
+
+        assert_eq!(scalar.scalefactors.long, perband.scalefactors.long);
+        assert_eq!(scalar.scalefactors.short, perband.scalefactors.short);
+        assert_eq!(scalar.global_gain, perband.global_gain);
+        assert_eq!(scalar.subblock_gain, perband.subblock_gain);
+        assert_eq!(scalar.scalefac_scale, perband.scalefac_scale);
+        assert_eq!(scalar.is, perband.is);
+        assert_eq!(scalar.stats.iterations, perband.stats.iterations);
+        assert_eq!(scalar.stats.bands_amplified, perband.stats.bands_amplified);
+        assert_eq!(scalar.stats.converged, perband.stats.converged);
+    }
+
+    #[test]
+    fn mixed_per_band_huge_threshold_matrix_terminates_iter1() {
+        // Every cell sees a huge threshold ⇒ no cell exceeds it; the
+        // per-band primitive converges on iteration 1, matching the
+        // scalar primitive's behaviour at `uniform_threshold = 1.0e30`.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let gc = mixed_template();
+        let xmin_long = [1.0e30; LONG_SFB];
+        let xmin_short = [[1.0e30; SHORT_WINDOWS]; SHORT_SFB];
+        let res = outer_loop_search_mixed_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &xmin_long,
+            &xmin_short,
+            64,
+        );
+        assert!(res.stats.converged);
+        assert_eq!(res.stats.iterations, 1);
+        assert_eq!(res.stats.bands_amplified, 0);
+        assert_eq!(res.subblock_gain, [0, 0, 0]);
+        assert!(!res.scalefac_scale);
+        // Both regions stay zero.
+        for &v in res.scalefactors.long.iter() {
+            assert_eq!(v, 0);
+        }
+        for row in res.scalefactors.short.iter() {
+            for &v in row.iter() {
+                assert_eq!(v, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_per_band_tighter_long_band_amplifies_only_long_region() {
+        // `xmin_long[sfb=1]` is set to 0.0 (any baseline distortion
+        // exceeds it); every other long band + every short cell sees a
+        // huge threshold. The loop must amplify ONLY long sfb=1.
+        // Witnesses that the per-band long vector steers amplification
+        // on a per-band basis (not a global mask).
+        //
+        // Fixture: long sfb 1 covers lines [4, 8) at 44.1 kHz; place
+        // energy there.
+        let mut xr = [0.0f32; NUM_LINES];
+        for k in 0..4 {
+            xr[4 + k] = 400.0 + (k as f32) * 7.0;
+        }
+        let gc = mixed_template();
+        let mut xmin_long = [1.0e30; LONG_SFB];
+        xmin_long[1] = 0.0;
+        let xmin_short = [[1.0e30; SHORT_WINDOWS]; SHORT_SFB];
+        let res = outer_loop_search_mixed_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &xmin_long,
+            &xmin_short,
+            64,
+        );
+        // The targeted long band must have been amplified.
+        assert!(
+            res.scalefactors.long[1] > 0,
+            "targeted long sfb=1 was NOT amplified (sf={})",
+            res.scalefactors.long[1],
+        );
+        // No other long band in the mixed range should be amplified.
+        for (sfb, &v) in res
+            .scalefactors
+            .long
+            .iter()
+            .enumerate()
+            .take(MIXED_LAST_LONG_SFB + 1)
+        {
+            if sfb == 1 {
+                continue;
+            }
+            assert_eq!(v, 0, "non-target long sfb={sfb} was amplified to {v}",);
+        }
+        // No short cell should be amplified.
+        for (sfb, row) in res
+            .scalefactors
+            .short
+            .iter()
+            .enumerate()
+            .take(SHORT_SFB)
+            .skip(MIXED_FIRST_SHORT_SFB)
+        {
+            for (win, &v) in row.iter().enumerate() {
+                assert_eq!(
+                    v, 0,
+                    "non-target short cell (sfb={sfb}, win={win}) was amplified to {v}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_per_band_tighter_short_cell_amplifies_only_that_cell() {
+        // `xmin_short[sfb=4][win=1]` is set to 0.0; everywhere else is
+        // huge. The loop must amplify ONLY that short cell. Witnesses
+        // that the per-band short matrix steers amplification on a
+        // per-cell basis on the mixed primitive's short region.
+        //
+        // Fixture: mirrors the existing
+        // `outer_loop_mixed_amplifies_short_region_when_only_short_cell_loaded`
+        // anchor — at 44.1 kHz SHORT_STARTS_44 places sfb 4 at
+        // per-window lines [16, 22); window 1 interleaved range starts
+        // at base = 3*16 + 1*6 = 54.
+        let mut xr = [0.0f32; NUM_LINES];
+        for k in 0..6 {
+            xr[54 + k] = 80.0 + (k as f32) * 3.5;
+        }
+        let gc = mixed_template();
+        let xmin_long = [1.0e30; LONG_SFB];
+        let mut xmin_short = [[1.0e30; SHORT_WINDOWS]; SHORT_SFB];
+        xmin_short[4][1] = 0.0;
+        let res = outer_loop_search_mixed_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &xmin_long,
+            &xmin_short,
+            64,
+        );
+        // The targeted cell must have been amplified.
+        assert!(
+            res.scalefactors.short[4][1] > 0,
+            "targeted short cell (sfb=4, win=1) was NOT amplified (sf={})",
+            res.scalefactors.short[4][1],
+        );
+        // No long band should be amplified.
+        for (sfb, &v) in res
+            .scalefactors
+            .long
+            .iter()
+            .enumerate()
+            .take(MIXED_LAST_LONG_SFB + 1)
+        {
+            assert_eq!(v, 0, "non-target long sfb={sfb} was amplified to {v}",);
+        }
+        // No other short cell should be amplified.
+        for (sfb, row) in res
+            .scalefactors
+            .short
+            .iter()
+            .enumerate()
+            .take(SHORT_SFB)
+            .skip(MIXED_FIRST_SHORT_SFB)
+        {
+            for (win, &v) in row.iter().enumerate() {
+                if (sfb, win) == (4, 1) {
+                    continue;
+                }
+                assert_eq!(
+                    v, 0,
+                    "non-target short cell (sfb={sfb}, win={win}) was amplified to {v}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_per_band_ignores_out_of_range_entries() {
+        // `xmin_long[8..21]` and `xmin_short[0..3][..]` are outside the
+        // mixed-layout's read range. Set them to a poisonous value
+        // (0.0 — would amplify every cell if read). The primitive must
+        // ignore them: with the in-range entries huge, the loop must
+        // converge at iteration 1 with zero amplification.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let gc = mixed_template();
+        let mut xmin_long = [1.0e30; LONG_SFB];
+        for v in xmin_long.iter_mut().skip(MIXED_LAST_LONG_SFB + 1) {
+            *v = 0.0; // poison out-of-range entries
+        }
+        let mut xmin_short = [[1.0e30; SHORT_WINDOWS]; SHORT_SFB];
+        for row in xmin_short.iter_mut().take(MIXED_FIRST_SHORT_SFB) {
+            for cell in row.iter_mut() {
+                *cell = 0.0; // poison out-of-range entries
+            }
+        }
+        let res = outer_loop_search_mixed_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &xmin_long,
+            &xmin_short,
+            64,
+        );
+        assert!(
+            res.stats.converged,
+            "primitive read out-of-range xmin entries (stats={:?})",
+            res.stats,
+        );
+        assert_eq!(res.stats.iterations, 1);
+        assert_eq!(res.stats.bands_amplified, 0);
+    }
+
+    #[test]
+    fn mixed_per_band_skewed_long_region_diverges_from_uniform() {
+        // Skewed: long sfb 0..=3 see tight threshold; short region +
+        // long sfb 4..=7 see huge threshold. Uniform: everything sees
+        // the same huge threshold. The skewed path must amplify some
+        // long cells; the uniform path must not. Witnesses per-band
+        // steering through the long-region vector.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.011).sin() * 80.0;
+        }
+        let gc = mixed_template();
+
+        let mut xmin_long_skewed = [1.0e30; LONG_SFB];
+        for v in xmin_long_skewed.iter_mut().take(4) {
+            *v = 0.0;
+        }
+        let xmin_short_huge = [[1.0e30; SHORT_WINDOWS]; SHORT_SFB];
+        let skewed = outer_loop_search_mixed_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &xmin_long_skewed,
+            &xmin_short_huge,
+            64,
+        );
+
+        let xmin_long_uniform = [1.0e30; LONG_SFB];
+        let uniform = outer_loop_search_mixed_per_band(
+            &xr,
+            &gc,
+            44_100,
+            MpegVersion::Mpeg1,
+            2000,
+            &xmin_long_uniform,
+            &xmin_short_huge,
+            64,
+        );
+
+        assert!(
+            skewed.stats.bands_amplified > 0,
+            "skewed path failed to amplify (bands_amp={})",
+            skewed.stats.bands_amplified,
+        );
+        assert_eq!(
+            uniform.stats.bands_amplified, 0,
+            "uniform path amplified despite huge threshold (bands_amp={})",
+            uniform.stats.bands_amplified,
+        );
+        // Amplification must land in the targeted long band range.
+        let mut low_long_amp = 0u32;
+        let mut high_long_amp = 0u32;
+        for sfb in 0..=MIXED_LAST_LONG_SFB {
+            let v = skewed.scalefactors.long[sfb];
+            if v > 0 {
+                if sfb < 4 {
+                    low_long_amp += 1;
+                } else {
+                    high_long_amp += 1;
+                }
+            }
+        }
+        assert!(
+            low_long_amp > 0,
+            "expected at least one targeted long band (sfb 0..4) to be amplified, \
+             got low_long_amp={low_long_amp}",
+        );
+        assert_eq!(
+            high_long_amp, 0,
+            "expected no long band (sfb 4..=7) to be amplified, got high_long_amp={high_long_amp}",
+        );
+        // No short cell should be amplified (their thresholds are huge).
+        for row in skewed.scalefactors.short.iter().skip(MIXED_FIRST_SHORT_SFB) {
+            for &v in row.iter() {
+                assert_eq!(v, 0, "unexpected short-cell amplification: sf={v}");
             }
         }
     }
