@@ -280,7 +280,46 @@ impl XminThresholds {
         } else {
             0.0_f64
         };
+        Self::threshold_in_quiet_with_offset_db(sample_rate_hz, version, offset_db)
+    }
 
+    /// As [`Self::threshold_in_quiet`], but the caller supplies the dB
+    /// **offset** that would normally be derived from
+    /// `bitrate_kbps_per_channel` per ISO/IEC 11172-3:1993 §D.1 Step 3.
+    ///
+    /// The spec's Step 3 procedure mandates exactly two offsets — `−12
+    /// dB` for `bitrate_kbps_per_channel >= 96`, `0 dB` otherwise — and
+    /// every caller producing a *spec-conformant* outer-loop threshold
+    /// must continue to use [`Self::threshold_in_quiet`]. This
+    /// `_with_offset_db` variant exists for callers that need to
+    /// **tune** the transparency target (e.g. quality-knob front-ends,
+    /// regression-test sweeps over the offset, VBR encoders that pick a
+    /// running offset from a recent-bitrate accumulator). The dB scalar
+    /// is applied **uniformly across every band, long / short / mixed
+    /// alike**, on top of the per-frequency `LTq` shape — i.e. the
+    /// curve's bowl is preserved and the whole curve is translated up
+    /// or down by `offset_db` dB.
+    ///
+    /// Conventions for the caller:
+    ///
+    /// * `offset_db = -12.0` is the spec-default high-bitrate path
+    ///   (matches `threshold_in_quiet(_, _, 96)` to within FP).
+    /// * `offset_db = 0.0` is the spec-default low-bitrate path
+    ///   (matches `threshold_in_quiet(_, _, 64)` to within FP).
+    /// * `offset_db < -12.0` tightens the threshold (more bits per
+    ///   band, higher SNR vs LTq).
+    /// * `offset_db > 0.0` loosens it (fewer bits, lower SNR vs LTq).
+    /// * No FP-domain clamping is applied — extreme values (`±200 dB`)
+    ///   will produce arithmetic over/underflows in `db_to_xfsf_energy`
+    ///   that are the caller's responsibility to avoid; the encoder
+    ///   itself doesn't read the absolute magnitude, only the per-band
+    ///   ordering.
+    #[must_use]
+    pub fn threshold_in_quiet_with_offset_db(
+        sample_rate_hz: u32,
+        version: MpegVersion,
+        offset_db: f64,
+    ) -> Self {
         // Long bands — same derivation as `threshold_in_quiet_long`.
         let long_starts = long_band_starts(sample_rate_hz, version);
         let mut long = [0.0_f64; LONG_SFB];
@@ -710,5 +749,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    // =====================================================================
+    // `threshold_in_quiet_with_offset_db` — caller-supplied §D.1 Step 3
+    // offset (r213).
+    // =====================================================================
+
+    #[test]
+    fn threshold_in_quiet_with_offset_db_recovers_spec_high_bitrate_path() {
+        // `offset_db = -12.0` (the spec's `bitrate_kbps_per_channel >= 96`
+        // path) must reproduce the same vector as
+        // `threshold_in_quiet(_, _, 128)` to within FP tolerance, for all
+        // cells (long / short / mixed).
+        let custom =
+            XminThresholds::threshold_in_quiet_with_offset_db(44_100, MpegVersion::Mpeg1, -12.0);
+        let spec = XminThresholds::threshold_in_quiet(44_100, MpegVersion::Mpeg1, 128);
+        for sfb in 0..LONG_SFB {
+            assert!(
+                (custom.long[sfb] - spec.long[sfb]).abs() < 1.0e-9,
+                "long sfb {sfb}: custom {} vs spec {}",
+                custom.long[sfb],
+                spec.long[sfb],
+            );
+            assert!((custom.mixed_long[sfb] - spec.mixed_long[sfb]).abs() < 1.0e-9);
+        }
+        for sfb in 0..SHORT_SFB {
+            for win in 0..SHORT_WINDOWS {
+                assert!(
+                    (custom.short[sfb][win] - spec.short[sfb][win]).abs() < 1.0e-9,
+                    "short [{sfb}][{win}]: custom {} vs spec {}",
+                    custom.short[sfb][win],
+                    spec.short[sfb][win],
+                );
+                assert!((custom.mixed_short[sfb][win] - spec.mixed_short[sfb][win]).abs() < 1.0e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn threshold_in_quiet_with_offset_db_recovers_spec_low_bitrate_path() {
+        // `offset_db = 0.0` (the spec's `bitrate_kbps_per_channel < 96`
+        // path) must reproduce the same vector as
+        // `threshold_in_quiet(_, _, 64)`.
+        let custom =
+            XminThresholds::threshold_in_quiet_with_offset_db(44_100, MpegVersion::Mpeg1, 0.0);
+        let spec = XminThresholds::threshold_in_quiet(44_100, MpegVersion::Mpeg1, 64);
+        for sfb in 0..LONG_SFB {
+            assert!(
+                (custom.long[sfb] - spec.long[sfb]).abs() < 1.0e-9,
+                "long sfb {sfb}: custom {} vs spec {}",
+                custom.long[sfb],
+                spec.long[sfb],
+            );
+        }
+        for sfb in 0..SHORT_SFB {
+            for win in 0..SHORT_WINDOWS {
+                assert!(
+                    (custom.short[sfb][win] - spec.short[sfb][win]).abs() < 1.0e-9,
+                    "short [{sfb}][{win}]: custom {} vs spec {}",
+                    custom.short[sfb][win],
+                    spec.short[sfb][win],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn threshold_in_quiet_with_offset_db_tightens_below_spec_minus12() {
+        // An offset stricter than `−12 dB` translates the bowl down
+        // (linear ratio `10^(offset/10)`): every cell of the
+        // `offset = −24 dB` vector is exactly `10^(−12/10)` times the
+        // corresponding cell of the `offset = −12 dB` vector — same
+        // bowl shape, shifted floor.
+        let spec =
+            XminThresholds::threshold_in_quiet_with_offset_db(44_100, MpegVersion::Mpeg1, -12.0);
+        let tighter =
+            XminThresholds::threshold_in_quiet_with_offset_db(44_100, MpegVersion::Mpeg1, -24.0);
+        let expected_ratio = 10.0_f64.powf(-12.0 / 10.0);
+        for sfb in 0..LONG_SFB {
+            let ratio = tighter.long[sfb] / spec.long[sfb];
+            assert!(
+                (ratio - expected_ratio).abs() < 1.0e-9,
+                "long sfb {sfb}: ratio {ratio} should be {expected_ratio}",
+            );
+        }
+        for sfb in 0..SHORT_SFB {
+            let ratio = tighter.short[sfb][0] / spec.short[sfb][0];
+            assert!(
+                (ratio - expected_ratio).abs() < 1.0e-9,
+                "short sfb {sfb}: ratio {ratio} should be {expected_ratio}",
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_in_quiet_with_offset_db_loosens_above_zero() {
+        // Mirror of the previous test: an offset above `0 dB` translates
+        // the bowl up by the same linear ratio.
+        let spec =
+            XminThresholds::threshold_in_quiet_with_offset_db(44_100, MpegVersion::Mpeg1, 0.0);
+        let looser =
+            XminThresholds::threshold_in_quiet_with_offset_db(44_100, MpegVersion::Mpeg1, 6.0);
+        let expected_ratio = 10.0_f64.powf(6.0 / 10.0);
+        for sfb in 0..LONG_SFB {
+            let ratio = looser.long[sfb] / spec.long[sfb];
+            assert!(
+                (ratio - expected_ratio).abs() < 1.0e-6,
+                "long sfb {sfb}: ratio {ratio} should be {expected_ratio}",
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_in_quiet_with_offset_db_preserves_bowl_shape() {
+        // The bowl-vs-bass-vs-treble invariants of the spec-default
+        // `threshold_in_quiet` must survive an arbitrary offset (the
+        // offset is a uniform dB translation; the per-frequency
+        // ordering is unchanged).
+        let x =
+            XminThresholds::threshold_in_quiet_with_offset_db(44_100, MpegVersion::Mpeg1, -30.0);
+        let bass = x.long[0];
+        let treble = x.long[LONG_SFB - 1];
+        let (min_sfb, &min_v) = x
+            .long
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        assert!(
+            bass > min_v,
+            "bass sfb 0 ({bass}) should be > minimum sfb {min_sfb} ({min_v})",
+        );
+        assert!(
+            treble > min_v,
+            "treble sfb 20 ({treble}) should be > minimum sfb {min_sfb} ({min_v})",
+        );
+        assert!((1..LONG_SFB - 1).contains(&min_sfb));
     }
 }

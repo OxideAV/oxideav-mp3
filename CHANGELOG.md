@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: caller-supplied §D.1 Step 3 dB offset path —
+  `XminThresholds::threshold_in_quiet_with_offset_db(sample_rate_hz,
+  version, offset_db)` accepts an arbitrary dB scalar in place of the
+  spec's two-branch `−12 dB` / `0 dB` switch on
+  `bitrate_kbps_per_channel >= 96`. The bowl-vs-bass-vs-treble per-band
+  shape is preserved; the whole curve is translated up or down by
+  `offset_db` dB. `Mp3Encoder::new_with_threshold_in_quiet_offset` +
+  `codec_encoder::make_encoder_with_threshold_in_quiet_offset` thread
+  the offset through the direct- and trait-API factories. Spec-default
+  values are byte-identical to `threshold_in_quiet`:
+  `offset_db = -12.0` matches the `>=96 kbit/s/ch` branch, `0.0`
+  matches the `<96 kbit/s/ch` branch (Phase 2 step 43 / r213)
 - psy: trait-API one-shot threshold-in-quiet factory —
   `Mp3Encoder::new_with_threshold_in_quiet` + the matching
   `codec_encoder::make_encoder_with_threshold_in_quiet` bundle

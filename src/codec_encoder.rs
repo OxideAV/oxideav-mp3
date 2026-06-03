@@ -138,7 +138,38 @@ pub fn make_encoder_with_outer_loop(
 /// bit-rate / channel-count combination, or a non-MPEG-1 sample rate
 /// (LSF remains deferred).
 pub fn make_encoder_with_threshold_in_quiet(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    make_encoder_inner_threshold_in_quiet(params)
+    make_encoder_inner_threshold_in_quiet(params, None)
+}
+
+/// Build a boxed MPEG-1 Audio Layer III mono / independent-stereo CBR
+/// [`Encoder`] with the §C.1.5.4.3 outer-loop **plus** the per-band
+/// Annex D threshold-in-quiet vector, using a **caller-supplied** §D.1
+/// Step 3 dB offset instead of the spec-default per-channel-bitrate
+/// branching. Trait-API one-shot bundle of
+/// [`Mp3Encoder::new_with_threshold_in_quiet_offset`].
+///
+/// The spec's §D.1 Step 3 mandates exactly two offsets — `−12 dB` when
+/// `bitrate_kbps_per_channel >= 96` and `0 dB` otherwise — and every
+/// spec-conformant transparency target maps to one of those two
+/// values. Callers wanting the spec default should continue to use
+/// [`make_encoder_with_threshold_in_quiet`]; this `_offset` variant is
+/// for front-ends that expose a continuous transparency / quality
+/// slider, for VBR encoders that compute a running offset from a
+/// recent-bitrate accumulator, and for test sweeps over the offset.
+///
+/// `offset_db` is applied uniformly across every long, pure-short, and
+/// mixed cell on top of the per-frequency `LTq` shape — the bowl is
+/// preserved and the whole curve is translated up or down by
+/// `offset_db` dB.
+///
+/// # Errors
+///
+/// Same as [`make_encoder_with_threshold_in_quiet`].
+pub fn make_encoder_with_threshold_in_quiet_offset(
+    params: &CodecParameters,
+    offset_db: f64,
+) -> Result<Box<dyn Encoder>> {
+    make_encoder_inner_threshold_in_quiet(params, Some(offset_db))
 }
 
 /// Build a boxed MPEG-1 Audio Layer III stereo CBR [`Encoder`] in
@@ -326,7 +357,10 @@ fn make_encoder_inner(
 /// pre-installed). Validation rules — sample-rate present, channels in
 /// `{1, 2}`, bit-rate in range — are identical to
 /// [`make_encoder_inner`]; only the underlying constructor differs.
-fn make_encoder_inner_threshold_in_quiet(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+fn make_encoder_inner_threshold_in_quiet(
+    params: &CodecParameters,
+    offset_db: Option<f64>,
+) -> Result<Box<dyn Encoder>> {
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| Error::invalid("oxideav-mp3: sample_rate required"))?;
@@ -349,8 +383,13 @@ fn make_encoder_inner_threshold_in_quiet(params: &CodecParameters) -> Result<Box
         )));
     }
     let bitrate_kbps = (bitrate_bps / 1000) as u32;
-    let inner = Mp3Encoder::new_with_threshold_in_quiet(bitrate_kbps, sample_rate, mode)
-        .map_err(|e| Error::other(format!("oxideav-mp3: encoder build: {e}")))?;
+    let inner = match offset_db {
+        Some(off) => {
+            Mp3Encoder::new_with_threshold_in_quiet_offset(bitrate_kbps, sample_rate, mode, off)
+        }
+        None => Mp3Encoder::new_with_threshold_in_quiet(bitrate_kbps, sample_rate, mode),
+    }
+    .map_err(|e| Error::other(format!("oxideav-mp3: encoder build: {e}")))?;
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     out_params.sample_rate = Some(sample_rate);
@@ -956,6 +995,79 @@ mod tests {
             let hdr = parse_header(&hdr_bytes).expect("header parses");
             assert_eq!(hdr.sample_rate_hz, 44_100);
         }
+    }
+
+    #[test]
+    fn make_encoder_with_threshold_in_quiet_offset_constructs_and_reports_params() {
+        // Caller-supplied offset path mirrors the spec-default path's
+        // construction surface: same `output_params`, same `codec_id`,
+        // just the threshold-vector dB translation differs.
+        let p = build_params(44_100, 128_000);
+        let enc =
+            make_encoder_with_threshold_in_quiet_offset(&p, -6.0).expect("ltq offset factory");
+        assert_eq!(enc.codec_id().as_str(), "mp3");
+        assert_eq!(enc.output_params().sample_rate, Some(44_100));
+        assert_eq!(enc.output_params().channels, Some(1));
+        assert_eq!(enc.output_params().bit_rate, Some(128_000));
+    }
+
+    #[test]
+    fn make_encoder_with_threshold_in_quiet_offset_emits_self_decoding_stream() {
+        // End-to-end sanity for the custom-offset variant: encoded
+        // stream parses cleanly as MPEG-1 Layer III frames at the
+        // requested sample rate.
+        use crate::frame::{parse_header, FrameWalker};
+
+        let p = build_params(44_100, 128_000);
+        let mut enc =
+            make_encoder_with_threshold_in_quiet_offset(&p, -18.0).expect("ltq offset factory");
+        let pcm_bytes = sine_s16(SAMPLES_PER_FRAME_MPEG1 * 4, 440.0, 44_100.0, 0.3);
+        let frame = AudioFrame {
+            samples: (SAMPLES_PER_FRAME_MPEG1 * 4) as u32,
+            pts: None,
+            data: vec![pcm_bytes],
+        };
+        enc.send_frame(&Frame::Audio(frame)).expect("send");
+        enc.flush().expect("flush");
+
+        let mut packets: Vec<Packet> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(pkt) => packets.push(pkt),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        assert!(
+            packets.len() >= 4,
+            "expected ≥ 4 frames, got {}",
+            packets.len(),
+        );
+        let mut wire = Vec::new();
+        for pkt in &packets {
+            wire.extend_from_slice(&pkt.data);
+        }
+        let frames: Vec<_> = FrameWalker::new(&wire).collect();
+        assert!(frames.len() >= 4, "walker found {}", frames.len());
+        for f in &frames {
+            let hdr_bytes: [u8; 4] = f.data[..4].try_into().expect("header bytes");
+            let hdr = parse_header(&hdr_bytes).expect("header parses");
+            assert_eq!(hdr.sample_rate_hz, 44_100);
+        }
+    }
+
+    #[test]
+    fn make_encoder_with_threshold_in_quiet_offset_rejects_more_than_two_channels() {
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(3);
+        assert!(make_encoder_with_threshold_in_quiet_offset(&p, -12.0).is_err());
+    }
+
+    #[test]
+    fn make_encoder_with_threshold_in_quiet_offset_requires_sample_rate() {
+        let bare = CodecParameters::audio(CodecId::new("mp3"));
+        assert!(make_encoder_with_threshold_in_quiet_offset(&bare, -12.0).is_err());
     }
 
     #[test]

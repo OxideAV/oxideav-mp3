@@ -1383,6 +1383,50 @@ impl Mp3Encoder {
         Ok(enc)
     }
 
+    /// Build an encoder identical to [`Mp3Encoder::new_with_threshold_in_quiet`]
+    /// except the caller supplies the §D.1 Step 3 dB **offset** directly
+    /// instead of letting it be derived from the per-channel bitrate.
+    ///
+    /// The spec's §D.1 Step 3 mandates exactly two offsets: `−12 dB`
+    /// when `bitrate_kbps_per_channel >= 96` and `0 dB` otherwise.
+    /// Every spec-conformant transparency target falls into one of those
+    /// two values, and callers wanting the spec default should use
+    /// [`Mp3Encoder::new_with_threshold_in_quiet`]. This `_offset`
+    /// variant exists for quality-knob front-ends (a continuous
+    /// transparency slider), VBR encoders that pick a running offset
+    /// from a recent-bitrate accumulator, and regression-test sweeps
+    /// over the offset.
+    ///
+    /// `offset_db` is applied uniformly across every band — long,
+    /// pure-short, and mixed — on top of the per-frequency `LTq` shape
+    /// (the bowl is preserved, the curve is translated up or down by
+    /// `offset_db` dB).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Mp3Encoder::new_with_outer_loop`].
+    pub fn new_with_threshold_in_quiet_offset(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+        mode: ChannelMode,
+        offset_db: f64,
+    ) -> Result<Self, StreamEncodeError> {
+        let mut enc = Self::new_with_outer_loop(
+            bitrate_kbps,
+            sample_rate_hz,
+            mode,
+            DEFAULT_OUTER_LOOP_THRESHOLD,
+        )?;
+        let xmin = crate::psy::XminThresholds::threshold_in_quiet_with_offset_db(
+            sample_rate_hz,
+            enc.version,
+            offset_db,
+        );
+        // Cannot fail: outer-loop threshold was just set above.
+        enc.set_per_band_xmin(xmin)?;
+        Ok(enc)
+    }
+
     /// Install a per-band threshold vector
     /// ([`crate::psy::XminThresholds`]) the long-block outer-loop
     /// branch will consume INSTEAD of the uniform scalar threshold the
@@ -4206,6 +4250,113 @@ mod tests {
             assert!(
                 (ratio - 10.0_f64.powf(12.0 / 10.0)).abs() < 1.0e-6,
                 "stereo sfb {sfb}: ratio {ratio} must equal 10^1.2 (per-channel offset)",
+            );
+        }
+    }
+
+    // =====================================================================
+    // `new_with_threshold_in_quiet_offset` — caller-supplied §D.1 Step 3
+    // offset (r213).
+    // =====================================================================
+
+    #[test]
+    fn new_with_threshold_in_quiet_offset_arms_outer_loop_and_per_band() {
+        let enc = Mp3Encoder::new_with_threshold_in_quiet_offset(
+            128,
+            44_100,
+            ChannelMode::SingleChannel,
+            -6.0,
+        )
+        .expect("ltq offset mono");
+        assert!(
+            enc.outer_loop_threshold.is_some(),
+            "outer-loop must be armed",
+        );
+        assert!(
+            enc.per_band_xmin_enabled(),
+            "per-band vector must be installed",
+        );
+    }
+
+    #[test]
+    fn new_with_threshold_in_quiet_offset_minus12_matches_spec_high_bitrate_path() {
+        // `offset_db = -12.0` reproduces the §D.1 Step 3 high-bitrate
+        // path — equivalent (to FP tolerance) to the per-channel
+        // `bitrate_kbps_per_channel >= 96` branch of
+        // `new_with_threshold_in_quiet`.
+        let custom = Mp3Encoder::new_with_threshold_in_quiet_offset(
+            128,
+            44_100,
+            ChannelMode::SingleChannel,
+            -12.0,
+        )
+        .expect("custom");
+        let spec = Mp3Encoder::new_with_threshold_in_quiet(128, 44_100, ChannelMode::SingleChannel)
+            .expect("spec");
+        let xc = custom.per_band_xmin.as_ref().unwrap();
+        let xs = spec.per_band_xmin.as_ref().unwrap();
+        for sfb in 0..xc.long.len() {
+            assert!(
+                (xc.long[sfb] - xs.long[sfb]).abs() < 1.0e-9,
+                "long sfb {sfb}: custom {} vs spec {}",
+                xc.long[sfb],
+                xs.long[sfb],
+            );
+        }
+    }
+
+    #[test]
+    fn new_with_threshold_in_quiet_offset_zero_matches_spec_low_bitrate_path() {
+        let custom = Mp3Encoder::new_with_threshold_in_quiet_offset(
+            128,
+            44_100,
+            ChannelMode::SingleChannel,
+            0.0,
+        )
+        .expect("custom");
+        // Spec low-bitrate path: per-channel bitrate < 96.
+        let spec = Mp3Encoder::new_with_threshold_in_quiet(64, 44_100, ChannelMode::SingleChannel)
+            .expect("spec");
+        let xc = custom.per_band_xmin.as_ref().unwrap();
+        let xs = spec.per_band_xmin.as_ref().unwrap();
+        for sfb in 0..xc.long.len() {
+            assert!(
+                (xc.long[sfb] - xs.long[sfb]).abs() < 1.0e-9,
+                "long sfb {sfb}: custom {} vs spec {}",
+                xc.long[sfb],
+                xs.long[sfb],
+            );
+        }
+    }
+
+    #[test]
+    fn new_with_threshold_in_quiet_offset_monotone_in_offset_db() {
+        // A lower (more negative) offset_db must produce strictly
+        // smaller per-band xmin values (more aggressive amplification
+        // target) at every long band — the offset is a uniform dB
+        // translation of the bowl.
+        let strict = Mp3Encoder::new_with_threshold_in_quiet_offset(
+            128,
+            44_100,
+            ChannelMode::SingleChannel,
+            -24.0,
+        )
+        .expect("strict");
+        let loose = Mp3Encoder::new_with_threshold_in_quiet_offset(
+            128,
+            44_100,
+            ChannelMode::SingleChannel,
+            0.0,
+        )
+        .expect("loose");
+        let xs = strict.per_band_xmin.as_ref().unwrap();
+        let xl = loose.per_band_xmin.as_ref().unwrap();
+        for sfb in 0..xs.long.len() {
+            assert!(
+                xs.long[sfb] < xl.long[sfb],
+                "sfb {sfb}: strict {} should be < loose {}",
+                xs.long[sfb],
+                xl.long[sfb],
             );
         }
     }

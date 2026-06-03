@@ -2260,6 +2260,47 @@ the assembled byte stream walks cleanly via `FrameWalker` +
 `parse_header` at the configured 44.1 kHz). Tests: 556 lib (was 547
 baseline; +9 unit). No external implementation consulted.
 
+**Phase 2 step 43 (r213)** — caller-supplied §D.1 Step 3 dB offset
+path. The Phase 2 step 42 factory `new_with_threshold_in_quiet` (and
+its trait companion) derives the spec's two-branch offset (`−12 dB`
+when `bitrate_kbps_per_channel >= 96`, `0 dB` otherwise) from the
+per-channel bitrate. r213 surfaces the dB knob directly via
+`XminThresholds::threshold_in_quiet_with_offset_db(sample_rate_hz,
+version, offset_db)` + `Mp3Encoder::new_with_threshold_in_quiet_offset(bitrate_kbps,
+sample_rate_hz, mode, offset_db)` + the trait factory
+`codec_encoder::make_encoder_with_threshold_in_quiet_offset(&params,
+offset_db)`. The caller can now sweep the offset continuously (e.g.
+exposing a transparency / quality slider, or letting a VBR front-end
+pick a running offset from a recent-bitrate accumulator) instead of
+being limited to the two spec values. The bowl-vs-bass-vs-treble
+per-band ordering is preserved — `offset_db` is a uniform dB
+translation of the whole curve. Spec defaults remain bit-compatible:
+`offset_db = -12.0` reproduces the high-bitrate path of
+`new_with_threshold_in_quiet(128, 44_100, mono)` to within FP, and
+`offset_db = 0.0` reproduces the low-bitrate path of
+`new_with_threshold_in_quiet(64, 44_100, mono)`.
+
+Validated by 13 new lib unit tests: 5 in `psy::tests`
+(`threshold_in_quiet_with_offset_db_recovers_spec_high_bitrate_path` +
+`…_recovers_spec_low_bitrate_path` pin FP-tolerance equivalence with
+the two spec branches across long, short, mixed, mixed-short cells;
+`…_tightens_below_spec_minus12` + `…_loosens_above_zero` pin the
+`10^(Δdb/10)` linear-ratio invariant for translation; `…_preserves_bowl_shape`
+confirms the bass/treble extremes still sit above the mid-spectrum
+minimum at `offset_db = -30 dB`), 4 in `stream_encoder::tests`
+(`new_with_threshold_in_quiet_offset_arms_outer_loop_and_per_band` pins
+both knobs armed; `…_minus12_matches_spec_high_bitrate_path` +
+`…_zero_matches_spec_low_bitrate_path` pin per-band equivalence with
+the spec-default constructor at the two anchor offsets;
+`…_monotone_in_offset_db` pins the strict ordering between
+`-24 dB` and `0 dB`), plus 4 in `codec_encoder::tests`
+(`make_encoder_with_threshold_in_quiet_offset_constructs_and_reports_params`,
+`…_emits_self_decoding_stream` end-to-ending 4 frames of 440 Hz mono
+sine at `offset_db = -18 dB` through `send_frame` + `flush` +
+`FrameWalker`, plus the `…_rejects_more_than_two_channels` /
+`…_requires_sample_rate` validation guards). Tests: 569 lib (was 556
+baseline; +13 unit). No external implementation consulted.
+
 Remaining Phase 2 work: the full Annex D Model 1 / Model 2
 psychoacoustic model (1024-sample FFT + tonality classifier +
 masking-function convolution — the threshold-in-quiet curve landed
