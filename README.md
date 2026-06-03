@@ -2301,15 +2301,92 @@ sine at `offset_db = -18 dB` through `send_frame` + `flush` +
 `…_requires_sample_rate` validation guards). Tests: 569 lib (was 556
 baseline; +13 unit). No external implementation consulted.
 
-Remaining Phase 2 work: the full Annex D Model 1 / Model 2
-psychoacoustic model (1024-sample FFT + tonality classifier +
-masking-function convolution — the threshold-in-quiet curve landed
-in r194 / r197 / r204 is the *lower bound* of any signal-dependent
-psychoacoustic threshold), intensity-stereo encode (§2.4.3.4.9.3),
-LSF / MPEG-2.5 encode (blocked on the
-`MPEG-2.5-GAP.md` observer-trace items for scalefactor-band tables /
-Huffman mapping / frame-size validation at low rates), and
-stereo / LSF decode through the trait wrapper.
+**Phase 2 step 44 (r219)** — Annex D Model 1 §D.1 Step 6
+masking-function `vf` + masking-index `av_tm` / `av_nm` + Step 7
+global-threshold summation primitives. The prior threshold-in-quiet
+work (r194 / r197 / r204 / r207 / r213) gave the outer loop a
+per-band lower bound on its `xmin` vector — the signal-independent
+floor of any psychoacoustic threshold. r219 lands the masker-driven
+upper structure of Model 1 itself as a set of pure, future-callable
+primitives:
+
+* `masking_index_tonal(z_j)` reproduces the verbatim §D.1 Step 6
+  formula `av_tm = -1.525 - 0.275 * z(j) - 4.5` dB.
+* `masking_index_non_tonal(z_j)` reproduces `av_nm = -1.525 - 0.175
+  * z(j) - 0.5` dB.
+* `masking_function_vf(dz, X)` returns the verbatim 4-branch
+  piecewise `vf` for `dz ∈ [-3, 8)`:
+  * Branch 1, `-3 ≤ dz < -1`: `vf = 17·(dz+1) - (0.4·X + 6)` dB.
+  * Branch 2, `-1 ≤ dz < 0`: `vf = (0.4·X + 6)·dz` dB.
+  * Branch 3, `0 ≤ dz < 1`: `vf = -17·dz` dB.
+  * Branch 4, `1 ≤ dz < 8`: `vf = -(dz-1)·(17 - 0.15·X) - 17` dB.
+  * Outside the window: `None` (masker ignored — `LT = -∞ dB`).
+* `individual_masking_threshold_db(masker, z_i)` composes a
+  single masker's `LT = X + av + vf` at any target Bark line
+  `z(i)`, returning `None` when the line falls outside the
+  masker's `[z_j - 3, z_j + 8)` reach.
+* `global_masking_threshold_db(maskers, z_i, ltq_db)` carries out
+  the §D.1 Step 7 power sum `LTg(i) = 10·log10( 10^(LTq/10) + Σ_j
+  10^(LT_j/10) )` across every in-range masker plus the
+  threshold-in-quiet anchor, returning the global masking
+  threshold in dB at `z(i)`.
+
+The Bark coordinates the primitive operates on (`z_bark` on each
+`Masker { kind, z_bark, spl_db }`) are *abstract* — the caller is
+free to derive them from any subband / FFT-bin Bark mapping. The
+spec's recommended Bark mapping table comes from the PNG-only Annex
+D Table D.2 set; this round deliberately does not consume those
+tables. Steps 1–5 of Model 1 (1024-sample FFT, SPL conversion,
+tonality classifier, decimation / reorganisation, masker selection)
+similarly remain blocked on the PNG-only Tables D.1 / D.2 / D.3 /
+D.4 DOCS-GAP and are not landed this round; r219 supplies the
+masker → masking-threshold half of the model that the future Steps
+1–5 will eventually drive.
+
+Validated by 18 new lib unit tests in `psy::tests`:
+`masking_index_tonal_recovers_spec_formula` +
+`masking_index_non_tonal_recovers_spec_formula` reproduce the two
+verbatim equations at five Bark positions each;
+`masking_index_tonal_below_non_tonal_at_same_z` pins the
+`av_tm < av_nm` ordering across the band; six
+`masking_function_vf_*` tests cover the four piecewise branches
+with hand-computed numeric anchors (`vf(-3, 60) = -64`,
+`vf(-2, 80) = -55`, `vf(-1, 60) = -30`, `vf(-0.5, 60) = -15`,
+`vf(0.5, 60) = -8.5`, `vf(1, 60) = -17`, `vf(2, 60) = -25`,
+`vf(5, 80) = -37`) plus continuity at `dz = 0` and `None`
+out-of-range guards on both sides of `[-3, 8)`;
+`individual_masking_threshold_db_tonal_at_self_is_spl_plus_av` +
+`…_non_tonal_at_self_is_spl_plus_av` pin the `LT = SPL + av` at
+`z(i) = z(j)` identity for both classifications;
+`…_returns_none_outside_window` pins the masker reach;
+`…_tonal_below_non_tonal_at_same_z` confirms the tonal LT sits
+below the non-tonal LT at matched parameters across five `z(i)`
+samples inside the window. Five `global_masking_threshold_db_*`
+tests cover Step 7 reductions: no maskers → LTg = LTq; distant
+masker (outside `[-3, 8)` Bark) → LTg = LTq; strong nearby
+masker → LTg dominates LTq within < 1 dB of the masker's
+own LT; LTg(both) > LTg(either) for two maskers (monotone
+power addition); exact `+10·log10(2) ≈ +3.0103 dB` for two
+equal-power co-located maskers. Tests: 587 lib (was 569
+baseline; +18 unit). No external implementation consulted; only
+the textually-transcribed `av` / `vf` / `LTg` equations from
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
+read.
+
+Remaining Phase 2 work: Model 1 Steps 1–5 (1024-sample FFT +
+SPL conversion + tonality classifier + decimation + masker
+selection — these consume the PNG-only Annex D Tables D.1 / D.2
+that this crate's docs collaborator has staged as PNG renders
+only; OCR to text is the DOCS-GAP) plus the Bark / Hz / line
+mapping needed to feed the §D.1 Step 6 / Step 7 primitives that
+landed this round, the full Annex D Model 2 (calculation
+partition table D.3 — also PNG-only — plus the Model 2
+spreading-function `tmpy` line that is typeset as image in the
+PDF and is not text-extractable), intensity-stereo encode
+(§2.4.3.4.9.3), LSF / MPEG-2.5 encode (blocked on the
+`MPEG-2.5-GAP.md` observer-trace items for scalefactor-band
+tables / Huffman mapping / frame-size validation at low rates),
+and stereo / LSF decode through the trait wrapper.
 
 ### Not yet implemented
 
@@ -2421,13 +2498,28 @@ consuming `XminThresholds::mixed_long` for the long region and
 `XminThresholds::mixed_short` for the short region whenever
 `set_per_band_xmin` has installed an `XminThresholds` (already
 populated by the r197 `XminThresholds::threshold_in_quiet`
-constructor from the same Annex D anchors) — it still
+constructor from the same Annex D anchors) + r219 Annex D
+Model 1 §D.1 Step 6 masking-function `vf` + masking-index
+`av_tm` / `av_nm` + Step 7 global-threshold summation
+primitives (`masking_function_vf`, `masking_index_tonal`,
+`masking_index_non_tonal`, `individual_masking_threshold_db`,
+`global_masking_threshold_db`) accepting a slice of
+`Masker { kind, z_bark, spl_db }` and a `LTq(i)` scalar
+threshold-in-quiet anchor, reproducing the verbatim spec
+equations including the half-open `[-3, 8)` masker window —
+it still
 lacks
-the full Annex D Model 1 / Model 2 psychoacoustic model
-(1024-sample FFT + tonality classifier + masking-function
-convolution — the r194 / r197 / r204 threshold-in-quiet curve is
-the *lower bound* of any signal-dependent psychoacoustic
-threshold),
+Model 1 Steps 1–5 (1024-sample FFT + SPL conversion + tonality
+classifier + decimation + masker selection — the r194 / r197 /
+r204 threshold-in-quiet curve is the *lower bound* and r219's
+masker primitives are the *upper structure* of any
+signal-dependent psychoacoustic threshold, but the masker
+selection itself reads the PNG-only Annex D Table D.2 critical-
+band-boundary set and is blocked on the OCR DOCS-GAP), the full
+Annex D Model 2 psychoacoustic model (calculation-partition
+table D.3 — also PNG-only — plus the Model 2 spreading-function
+`tmpy` line that is typeset as image in the PDF and is not
+text-extractable),
 intensity-stereo encode (§2.4.3.4.9.3), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's

@@ -8,6 +8,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 6 masking-function `vf` +
+  masking-index `av_tm` / `av_nm` + Step 7 global-threshold
+  summation primitives. `masking_index_tonal(z_j)` /
+  `masking_index_non_tonal(z_j)` reproduce the verbatim spec
+  formulas (`-1.525 - 0.275 * z(j) - 4.5` and
+  `-1.525 - 0.175 * z(j) - 0.5` dB respectively).
+  `masking_function_vf(dz, X)` returns the 4-branch piecewise
+  `vf` for `dz ∈ [-3, 8)`, `None` outside (the spec's "masker
+  ignored" range). `individual_masking_threshold_db(masker, z_i)`
+  composes `LT = X + av + vf` for a single `Masker { kind, z_bark,
+  spl_db }`. `global_masking_threshold_db(maskers, z_i, ltq_db)`
+  carries out the Step 7 `LTg(i) = 10 * log10(10^(LTq/10) + Σ
+  10^(LT/10))` energy sum across all in-range maskers. These are
+  pure primitives that consume the (masker SPL, masker Bark
+  position) tuples Steps 1-5 of Model 1 will eventually produce —
+  Steps 1-5 themselves (1024-sample FFT, SPL conversion, tonality
+  classifier, decimation, masker selection) remain blocked on
+  the PNG-only Annex D Tables D.1 / D.2 / D.3 / D.4 DOCS-GAP and
+  are not landed this round. Validated by 18 new lib unit tests
+  in `psy::tests` covering: exact reproduction of the masking-index
+  spec formulas at five Bark positions each; tonal `av_tm <` non-tonal
+  `av_nm` invariant; `vf` four-branch numeric reproduction with
+  hand-computed values for each branch (`vf(-3, 60) = -64`,
+  `vf(-1, 60) = -30`, `vf(0.5, 60) = -8.5`, `vf(2, 60) = -25`, etc.);
+  `vf` continuity across `dz = 0`; `vf` `None`-out-of-range guards
+  at `dz < -3` and `dz >= 8`; individual-threshold formula
+  composition at `z(i) = z(j)` (`LT = SPL + av`); tonal LT below
+  non-tonal LT at matched parameters; global-threshold reductions
+  (no maskers → LTq, distant masker → LTq, strong local masker
+  dominates), monotone power addition across one vs two maskers,
+  and exact `+10*log10(2) ≈ +3.0103 dB` for two equal-power
+  co-located maskers (Phase 2 step 44 / r219)
 - psy: caller-supplied §D.1 Step 3 dB offset path —
   `XminThresholds::threshold_in_quiet_with_offset_db(sample_rate_hz,
   version, offset_db)` accepts an arbitrary dB scalar in place of the
