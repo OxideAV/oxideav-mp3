@@ -2536,7 +2536,53 @@ line, mid-band ranges, top-band edge inclusion, out-of-range
 None), the D.2e illegibility cell read-back, and the
 cross-Layer sanity check that D.2d's first band edge sits
 below D.2a's first band edge (Layer II's longer window resolves
-a lower starting band edge) — it still
+a lower starting band edge) + r229 Annex D Model 1 §D.1 Step 4
+masker placement helper + Step 7 nearby-masker Bark-window
+range pre-filter. `masker_at_band(boundaries, band_no, kind,
+spl_db)` composes Step 45's `CRITICAL_BANDS_D2*` slices and
+Step 44's `Masker` carrier: the masker is placed at the
+band's verbatim top `z_bark` coordinate per the §D.1 Step 4
+rule (the band's top Bark coordinate is the spec's masker
+representative position), and the caller-supplied SPL (the
+value Steps 1-3 will produce from the FFT spectrum) is wrapped
+into the typed `Masker { kind, z_bark, spl_db }` carrier
+already consumed by `individual_masking_threshold_db` and
+`global_masking_threshold_db`. The §D.1 Step 7 nearby-masker
+window predicate `masker_in_step7_window_of_line(masker,
+z_i_bark)` exposes the spec's "for a given i the range of j
+may be reduced to maskers within −8…+3 Bark of i" optimisation
+as a single inlined Bark-distance test: a caller computing a
+sparse per-line `LTg(i)` map can pre-shrink its masker slice
+once per line via `filter()` and skip the
+`individual_masking_threshold_db` call (and its branch on the
+`vf` piecewise function) for every out-of-range masker. The
+two bounds are exposed as named `pub const`s
+(`STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE = -8.0` open low,
+`STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE = 3.0` closed high) and
+the predicate is the open-low, closed-high intersection of
+the spec text with the §D.1 Step 6 `vf` `[-3, 8)` half-open
+`dz` window — the set of maskers it lets through is exactly
+the set for which `individual_masking_threshold_db` returns
+`Some`. 12 new unit tests cover: band-0 first-row anchor
+(D.2a `z = 0.617`, SPL passthrough) and last-row anchor
+(D.2a band 23 `z = 23.923`) for placement; out-of-range band
+index returns `None`; cross-table dispatch (D.2d band 0 sits
+below D.2a band 0 — Layer II longer window); a self-placement
+composition smoke test (place at band 5, evaluate LT at the
+masker's own `z` → `SPL + av_tm`); a loud-local-masker
+composition smoke test (place at D.2c band 10 with 80 dB SPL
+→ `LTg` >> `LTq`); the §D.1 Step 7 window constants reproduce
+the spec text (`-8` open, `+3` closed); in-range edge cases
+(centred, 2 Bark above, 5 Bark below); high-edge inclusivity
+at `dz_from_line = +3` exactly + exclusion at `+3.0001`;
+low-edge exclusivity at `dz_from_line = -8` exactly +
+inclusion just above; a 0.25-Bark masker-position sweep
+verifying the predicate matches `individual_masking_threshold_db`'s
+`Some` set on every sample; a functional invariant
+(`filter()`-then-`global_masking_threshold_db` produces the
+same `LTg(i)` as feeding the full slice — the pre-filter is
+mechanically equivalent to dropping `vf = None` contributions
+from the energy sum) — it still
 lacks
 Model 1 Steps 1–3 + 5 (1024-sample FFT + SPL conversion +
 tonality classifier + decimation: Steps 4's table is now

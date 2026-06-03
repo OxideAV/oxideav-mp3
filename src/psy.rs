@@ -1103,6 +1103,118 @@ pub fn band_of_fft_line(boundaries: &[CriticalBandBoundary], fft_line_index: u16
     None
 }
 
+// =====================================================================
+// Annex D Model 1 — Step 4 masker placement + Step 7 nearby-masker
+// Bark-window filter (Phase 2 step 46 / r229).
+//
+// Step 45 (r224) landed the Tables D.2a-f critical-band-boundary
+// constants + the `band_of_fft_line` locator that maps an FFT-line
+// index to its critical-band index `no`. Step 44 (r219) landed the
+// `Masker` data carrier consumed by Steps 6 + 7. The compositional
+// gap between those two primitives is "given a critical-band index
+// and an SPL in dB, produce a `Masker` placed at the band's `z_bark`
+// coordinate." That placement is the verbatim §D.1 Step 4 rule (the
+// masker's Bark coordinate is the band's top `z_bark` per Tables
+// D.2; the masker's SPL is the band's representative SPL produced
+// by Steps 1-3, which remain blocked on the PNG-only Tables D.1 /
+// D.3 / D.4 — this round delivers the placement, not the SPL).
+//
+// Step 7 separately allows a "for a given i the range of j may be
+// reduced to maskers within −8…+3 Bark of i" pre-filter. Today's
+// `global_masking_threshold_db` already drops out-of-range maskers
+// via the `vf` `[-3, 8)` window inside
+// `individual_masking_threshold_db`; the spec optimisation is a
+// caller-side pre-pass that skips even the `vf` evaluation. We
+// expose it as a generic iterator-style predicate
+// (`masker_in_step7_window_of_line`) so a caller building a sparse
+// per-line `LTg(i)` map can pre-shrink its masker slice once per
+// line without re-implementing the Bark arithmetic.
+// =====================================================================
+
+/// Place a Model 1 masker at the §D.1 Step 4 critical-band boundary
+/// coordinate. Returns a [`Masker`] whose `z_bark` equals
+/// `boundaries[band_no as usize].z_bark` (the band's top Bark
+/// coordinate per the spec's Tables D.2) and whose `spl_db` is the
+/// caller-supplied per-band representative SPL (the value Step 4
+/// produces from the Step 1-3 SPL spectrum — `X_tm[z(j)]` for tonal
+/// maskers, the energy-sum `X_nm[z(j)]` for non-tonal maskers).
+///
+/// Returns `None` if `band_no` is out of range for `boundaries`.
+///
+/// This is a thin composition primitive: it bundles "read the band's
+/// Bark coordinate from the Tables D.2 slice you already have" plus
+/// "wrap the SPL into a typed [`Masker`]" into one inlined call so
+/// the caller (a future Steps 1-5 driver, blocked on Tables D.1 /
+/// D.3 / D.4 PNG-only transcription) never has to know about the
+/// `CriticalBandBoundary.z_bark` field directly. The placement rule
+/// is verbatim spec: the masker sits at the band's top Bark
+/// coordinate.
+#[inline]
+#[must_use]
+pub fn masker_at_band(
+    boundaries: &[CriticalBandBoundary],
+    band_no: u16,
+    kind: MaskerKind,
+    spl_db: f64,
+) -> Option<Masker> {
+    let row = boundaries.get(band_no as usize)?;
+    Some(Masker {
+        kind,
+        z_bark: row.z_bark,
+        spl_db,
+    })
+}
+
+/// Lower bound of the §D.1 Step 7 "nearby-masker" Bark window for a
+/// target line at `z(i)`. The spec text reads:
+///
+/// > For a given i the range of j may be reduced to maskers within
+/// > −8…+3 Bark of i.
+///
+/// Equivalently: a masker at `z(j)` is "near" line `i` iff
+/// `z(j) ∈ (z(i) - 8, z(i) + 3]`. This constant is the open-bottom
+/// `-8` (the lowest `z(j) - z(i)` displacement, exclusive — a masker
+/// 8 Bark below the line is the edge of the §D.1 Step 6 `vf`
+/// piecewise function's `dz < 8` upper branch, which is right-open).
+pub const STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE: f64 = -8.0;
+
+/// Upper bound (inclusive) of the §D.1 Step 7 "nearby-masker" Bark
+/// window for a target line at `z(i)`: a masker at `z(j)` is "near"
+/// line `i` iff `z(j) ∈ (z(i) - 8, z(i) + 3]`. The `+3` is the
+/// highest `z(j) - z(i)` displacement (inclusive — the spec's
+/// `vf` lower branch is left-closed at `dz = -3`, so a masker
+/// exactly 3 Bark above the line is still in range).
+pub const STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE: f64 = 3.0;
+
+/// Predicate for the §D.1 Step 7 "nearby-masker" optimisation:
+/// returns `true` iff the masker at `z(j) = masker.z_bark` is inside
+/// the spec's `(z(i) - 8, z(i) + 3]` Bark window of the target line
+/// at `z_i_bark`.
+///
+/// Equivalent to "the masker would contribute a finite `vf` term to
+/// the global masking threshold at this line" — the §D.1 Step 6 `vf`
+/// is defined for `dz = z(i) - z(j) ∈ [-3, 8)`, which is exactly
+/// `z(j) ∈ (z(i) - 8, z(i) + 3]`. A caller can use this predicate
+/// to pre-shrink the masker slice fed to
+/// [`global_masking_threshold_db`] once per line, avoiding the
+/// `individual_masking_threshold_db` call (and its branch on `vf`)
+/// for every out-of-range masker.
+///
+/// The two bounds are sourced from the spec text "maskers within
+/// −8…+3 Bark of i" (the cited range in §D.1 Step 7) intersected
+/// with the §D.1 Step 6 `vf` piecewise function's half-open
+/// `[-3, 8)` `dz` window. Pairing the two yields the open-low,
+/// closed-high form encoded above; this exactly matches the set of
+/// maskers for which `individual_masking_threshold_db` returns
+/// `Some`.
+#[inline]
+#[must_use]
+pub fn masker_in_step7_window_of_line(masker: &Masker, z_i_bark: f64) -> bool {
+    let dz_from_line = masker.z_bark - z_i_bark;
+    dz_from_line > STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE
+        && dz_from_line <= STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2132,5 +2244,255 @@ mod tests {
         assert_eq!(CRITICAL_BANDS_D2D.len(), 24 + 1);
         assert_eq!(CRITICAL_BANDS_D2E.len(), 26 + 1);
         assert_eq!(CRITICAL_BANDS_D2F.len(), 26 + 1);
+    }
+
+    // ---- Phase 2 step 46 / r229 — §D.1 Step 4 placement + Step 7
+    //      Bark-window range pre-filter primitives.
+
+    #[test]
+    fn masker_at_band_uses_band_top_z_bark_for_first_band() {
+        // D.2a band 0 has z_bark = 0,617 per the docs file (row 1 of
+        // the §D.1 Step 4 table for Layer I, 32 kHz). A tonal masker
+        // placed at band 0 with SPL = 60 dB sits at z = 0.617 and
+        // carries the caller-supplied SPL verbatim.
+        let m = masker_at_band(&CRITICAL_BANDS_D2A, 0, MaskerKind::Tonal, 60.0)
+            .expect("band 0 is in range");
+        assert_eq!(m.kind, MaskerKind::Tonal);
+        assert!((m.z_bark - 0.617).abs() < 1.0e-9);
+        assert!((m.spl_db - 60.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn masker_at_band_uses_band_top_z_bark_for_last_band() {
+        // D.2a band 23 has z_bark = 23,923 per the docs file (last row
+        // of the §D.1 Step 4 table for Layer I, 32 kHz; the top
+        // critical-band boundary inside the 32 kHz audio band, at FFT
+        // line 108 / 15 000 Hz). A non-tonal masker placed at band
+        // 23 with SPL = 45 dB sits at z = 23.923.
+        let m = masker_at_band(&CRITICAL_BANDS_D2A, 23, MaskerKind::NonTonal, 45.0)
+            .expect("band 23 is in range");
+        assert_eq!(m.kind, MaskerKind::NonTonal);
+        assert!((m.z_bark - 23.923).abs() < 1.0e-9);
+        assert!((m.spl_db - 45.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn masker_at_band_out_of_range_returns_none() {
+        // D.2a has 24 bands (no 0..23). Band 24 is out of range.
+        assert!(masker_at_band(&CRITICAL_BANDS_D2A, 24, MaskerKind::Tonal, 60.0).is_none());
+        // And an obviously-too-large index also returns None.
+        assert!(masker_at_band(&CRITICAL_BANDS_D2A, 999, MaskerKind::NonTonal, 30.0).is_none());
+    }
+
+    #[test]
+    fn masker_at_band_dispatches_per_table() {
+        // The same band index draws from different tables based on
+        // (Layer, Fs). Band 0 of D.2d (Layer II, 32 kHz) sits below
+        // band 0 of D.2a (Layer I, 32 kHz): Layer II's longer FFT
+        // resolves a lower band edge. Placement reads the matching
+        // table's z_bark verbatim.
+        let l1 = masker_at_band(&CRITICAL_BANDS_D2A, 0, MaskerKind::Tonal, 60.0).unwrap();
+        let l2 = masker_at_band(&CRITICAL_BANDS_D2D, 0, MaskerKind::Tonal, 60.0).unwrap();
+        assert!(l2.z_bark < l1.z_bark);
+    }
+
+    #[test]
+    fn masker_at_band_then_individual_threshold_reproduces_self_spl_plus_av() {
+        // Composition smoke test: place a tonal masker at D.2a band 5
+        // with SPL = 70 dB, then evaluate the individual masking
+        // threshold at the masker's own z_bark. The result must equal
+        // SPL + av_tm(z) per the §D.1 Step 6 spec equation
+        // (vf(0, X) = 0).
+        let m = masker_at_band(&CRITICAL_BANDS_D2A, 5, MaskerKind::Tonal, 70.0).unwrap();
+        let lt = individual_masking_threshold_db(&m, m.z_bark).unwrap();
+        let av = masking_index_tonal(m.z_bark);
+        assert!((lt - (70.0 + av)).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn masker_at_band_then_global_threshold_at_band_top_exceeds_ltq() {
+        // A loud local masker placed at a band's top z_bark should
+        // dominate the global threshold sum at that line: the result
+        // is strictly above the threshold-in-quiet floor.
+        let m = masker_at_band(&CRITICAL_BANDS_D2C, 10, MaskerKind::NonTonal, 80.0).unwrap();
+        let ltq_db = -4.97;
+        let ltg = global_masking_threshold_db(&[m], m.z_bark, ltq_db);
+        assert!(
+            ltg > ltq_db + 30.0,
+            "LTg = {ltg} should be >> LTq = {ltq_db}"
+        );
+    }
+
+    #[test]
+    fn step7_window_constants_match_spec_text() {
+        // Verbatim spec text: "for a given i the range of j may be
+        // reduced to maskers within −8…+3 Bark of i". The constants
+        // expose those two numbers as `dz = z(j) - z(i)` bounds: the
+        // low end is open at -8 (the vf branch is right-open at
+        // dz < 8 → z(j) > z(i) - 8), the high end is closed at +3
+        // (the vf branch is left-closed at dz >= -3 → z(j) <=
+        // z(i) + 3).
+        assert!((STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE - (-8.0)).abs() < 1.0e-12);
+        assert!((STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE - 3.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn step7_window_includes_in_range_masker() {
+        // Masker at z_j = 5 Bark, target line at z_i = 5 Bark
+        // (dz_from_line = 0): in range.
+        let m = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 60.0,
+        };
+        assert!(masker_in_step7_window_of_line(&m, 5.0));
+        // Masker 2 Bark above the line (dz_from_line = +2): in
+        // range.
+        assert!(masker_in_step7_window_of_line(&m, 3.0));
+        // Masker 5 Bark below the line (dz_from_line = -5): in
+        // range.
+        assert!(masker_in_step7_window_of_line(&m, 10.0));
+    }
+
+    #[test]
+    fn step7_window_high_edge_inclusive() {
+        // Masker exactly 3 Bark above the target line
+        // (dz_from_line = +3): inclusive — the §D.1 Step 6 `vf` lower
+        // branch is left-closed at dz = -3, so this masker still
+        // contributes (vf returns Some).
+        let m = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 8.0,
+            spl_db: 60.0,
+        };
+        assert!(masker_in_step7_window_of_line(&m, 5.0));
+        // Confirm `vf` agrees: the corresponding dz = -3 returns
+        // Some (the `vf` predicate returns Some on the closed left
+        // edge).
+        let dz = 5.0_f64 - 8.0;
+        assert_eq!(dz, -3.0);
+        assert!(masking_function_vf(dz, 60.0).is_some());
+    }
+
+    #[test]
+    fn step7_window_high_edge_just_above_excluded() {
+        // Masker `dz_from_line = +3.0001`: out of range.
+        let m = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 8.0001,
+            spl_db: 60.0,
+        };
+        assert!(!masker_in_step7_window_of_line(&m, 5.0));
+    }
+
+    #[test]
+    fn step7_window_low_edge_exclusive() {
+        // Masker exactly 8 Bark below the target line
+        // (dz_from_line = -8): exclusive — the §D.1 Step 6 `vf`
+        // upper branch is right-open at dz < 8, so this masker is
+        // ignored.
+        let m = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 60.0,
+        };
+        // dz_from_line = 5 - 13 = -8 → exclusive.
+        assert!(!masker_in_step7_window_of_line(&m, 13.0));
+        // Confirm vf agrees: dz = +8 (z(i) - z(j) = 13 - 5 = 8)
+        // returns None.
+        let dz = 13.0_f64 - 5.0;
+        assert_eq!(dz, 8.0);
+        assert!(masking_function_vf(dz, 60.0).is_none());
+    }
+
+    #[test]
+    fn step7_window_low_edge_just_above_included() {
+        // Masker `dz_from_line = -7.999`: in range. The masker sits
+        // 7.999 Bark below the line, just inside the open low edge.
+        let m = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 60.0,
+        };
+        assert!(masker_in_step7_window_of_line(&m, 12.999));
+    }
+
+    #[test]
+    fn step7_window_matches_individual_threshold_some_set() {
+        // Spec invariant — the §D.1 Step 7 nearby-masker window
+        // exactly equals the set of maskers for which
+        // `individual_masking_threshold_db` returns `Some`.
+        // Spot-check: iterate a 0.25-Bark sweep of masker positions
+        // around a fixed target line and verify the predicate
+        // agrees with the `vf` `Some/None` outcome.
+        let z_i = 10.0;
+        let mut sweep_z = -2.0;
+        while sweep_z < 20.0 {
+            let m = Masker {
+                kind: MaskerKind::NonTonal,
+                z_bark: sweep_z,
+                spl_db: 50.0,
+            };
+            let predicate = masker_in_step7_window_of_line(&m, z_i);
+            let lt = individual_masking_threshold_db(&m, z_i);
+            assert_eq!(
+                predicate,
+                lt.is_some(),
+                "predicate disagrees at sweep_z = {sweep_z}: pred = {predicate}, lt = {lt:?}",
+            );
+            sweep_z += 0.25;
+        }
+    }
+
+    #[test]
+    fn step7_window_pre_filter_preserves_global_threshold_value() {
+        // Functional invariant — pre-filtering the masker slice with
+        // the §D.1 Step 7 window predicate produces the same
+        // `LTg(i)` value as feeding the full slice to
+        // `global_masking_threshold_db`. (The optimisation is
+        // strictly mechanical: filtered-out maskers would have
+        // contributed `vf = None` anyway, dropping them from the
+        // energy sum.)
+        let z_i = 8.0;
+        let ltq_db = -3.0;
+        let maskers = [
+            // In-range tonal masker.
+            Masker {
+                kind: MaskerKind::Tonal,
+                z_bark: 7.5,
+                spl_db: 65.0,
+            },
+            // In-range non-tonal masker.
+            Masker {
+                kind: MaskerKind::NonTonal,
+                z_bark: 9.5,
+                spl_db: 55.0,
+            },
+            // Out-of-range masker far below the line.
+            Masker {
+                kind: MaskerKind::Tonal,
+                z_bark: -5.0,
+                spl_db: 90.0,
+            },
+            // Out-of-range masker far above the line.
+            Masker {
+                kind: MaskerKind::NonTonal,
+                z_bark: 20.0,
+                spl_db: 90.0,
+            },
+        ];
+        let full = global_masking_threshold_db(&maskers, z_i, ltq_db);
+        let filtered: Vec<Masker> = maskers
+            .iter()
+            .copied()
+            .filter(|m| masker_in_step7_window_of_line(m, z_i))
+            .collect();
+        // Two maskers survive the pre-filter.
+        assert_eq!(filtered.len(), 2);
+        let after = global_masking_threshold_db(&filtered, z_i, ltq_db);
+        assert!(
+            (full - after).abs() < 1.0e-12,
+            "pre-filter changed LTg: full = {full}, after = {after}",
+        );
     }
 }

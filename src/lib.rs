@@ -471,7 +471,11 @@ pub use outer_loop::{
     MIXED_FIRST_SHORT_SFB, MIXED_LAST_LONG_SFB, MIXED_SCALEFAC_L_MAX, OUTER_LOOP_SCALEFAC_COMPRESS,
     SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW, SCALEFAC_S_MAX_HIGH, SCALEFAC_S_MAX_LOW,
 };
-pub use psy::{XminThresholds, DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE};
+pub use psy::{
+    masker_at_band, masker_in_step7_window_of_line, XminThresholds,
+    DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE, STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE,
+    STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE,
+};
 pub use quantize::quantize;
 pub use reorder::reorder;
 pub use requantize::{requantize, scalefac_multiplier, PRETAB};
