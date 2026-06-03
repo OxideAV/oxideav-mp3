@@ -708,6 +708,401 @@ pub fn global_masking_threshold_db(maskers: &[Masker], z_i_bark: f64, ltq_db: f6
     10.0 * energy_sum.log10()
 }
 
+// =====================================================================
+// Annex D Model 1 — Table D.2a–f critical-band boundaries
+// (Phase 2 step 45 / r224).
+//
+// Spec context (clause D.1, ISO/IEC 11172-3:1993, informative annex):
+//
+//   "Step 4: finding tonal/non-tonal components" partitions the FFT
+//   spectrum into critical bands defined by Tables D.2a-f. Each row
+//   gives a critical-band boundary as (band number, top FFT-line
+//   index into Table D.1, top frequency in Hz, top Bark coordinate).
+//   A band `k` spans the FFT lines from the previous band's top
+//   index + 1 through the current row's `index_fcb` inclusive. The
+//   bottom of band 0 is implicitly FFT line 1.
+//
+// Six tables cover the (Layer, Fs) Cartesian product:
+//   D.2a — Layer I, Fs = 32 kHz, 24 bands (no 0..23)
+//   D.2b — Layer I, Fs = 44.1 kHz, 25 bands (no 0..24)
+//   D.2c — Layer I, Fs = 48 kHz, 26 bands (no 0..25)
+//   D.2d — Layer II, Fs = 32 kHz, 25 bands (no 0..24)
+//   D.2e — Layer II, Fs = 44.1 kHz, 27 bands (no 0..26)
+//   D.2f — Layer II, Fs = 48 kHz, 27 bands (no 0..26)
+//
+// Verbatim transcription from
+// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` §"Table
+// D.2a-f - Critical band boundaries" (lines 125..314). The docs
+// file marks band 17 of D.2e Bark coordinate as `16,11[illegible]`
+// (clipped final digit in the PDF render); this module preserves
+// that uncertainty by recording the legible prefix as `16.11` and
+// documenting the illegibility through the
+// `D2E_BAND_17_BARK_IS_ILLEGIBLE` constant (the doc's prose
+// estimate of `16,116` is explicitly NOT adopted as fact — the
+// implementation reads the legible-only value).
+//
+// Decimal-comma convention: the spec uses European decimal notation
+// (`0,617` = 0.617; `15 000,000` Hz = 15000.0 Hz). Constants below
+// are reproduced with the period equivalents and the thin-space
+// thousands separator stripped, consistent with idiomatic Rust f64
+// literals; no value has been rounded or altered from the spec.
+//
+// This module surfaces the tables as `&[CriticalBandBoundary]` slices
+// dispatched by [`critical_band_boundaries`] on (`Layer`, `Fs`); the
+// future Model 1 §D.1 Step 4 (masker selection) will iterate the
+// returned slice and place each tonal/non-tonal masker at the band's
+// `z_bark` coordinate before feeding it to the already-landed
+// `Masker` carrier consumed by [`global_masking_threshold_db`].
+// =====================================================================
+
+/// A single row of Annex D Table D.2 (critical-band boundary). The
+/// row's fields are the top end of the band: the highest FFT-line
+/// index in the band (`index_fcb`, 1-based into Table D.1), the top
+/// frequency `frequency_hz` (Hz, the frequency corresponding to that
+/// FFT line per Table D.1), and the top Bark coordinate `z_bark` (the
+/// critical-band rate `z` corresponding to that frequency per
+/// Table D.1).
+///
+/// A band `k` spans the FFT lines from `boundaries[k - 1].index_fcb + 1`
+/// (or `1` for `k = 0`) through `boundaries[k].index_fcb` inclusive,
+/// covering the closed Bark interval
+/// `[boundaries[k - 1].z_bark, boundaries[k].z_bark]` (the spec
+/// boundaries are right-closed in Bark).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CriticalBandBoundary {
+    /// Critical-band index (`no` column in the spec table), zero-based
+    /// per the spec's `no 0..` numbering.
+    pub no: u16,
+    /// Top FFT-line index in this critical band (the spec's "index of
+    /// F&CB" column — i.e. an index into the matching Table D.1
+    /// frequency / critical-band table for this `(Layer, Fs)`).
+    pub index_fcb: u16,
+    /// Top frequency of this critical band, in Hz (the frequency
+    /// corresponding to `index_fcb` per Table D.1).
+    pub frequency_hz: f64,
+    /// Top critical-band rate of this band, in Bark units `z` (the
+    /// Bark coordinate corresponding to `frequency_hz` per Table D.1).
+    pub z_bark: f64,
+}
+
+impl CriticalBandBoundary {
+    /// Construct a boundary row at compile time.
+    #[inline]
+    #[must_use]
+    pub const fn new(no: u16, index_fcb: u16, frequency_hz: f64, z_bark: f64) -> Self {
+        Self {
+            no,
+            index_fcb,
+            frequency_hz,
+            z_bark,
+        }
+    }
+}
+
+/// Documented illegibility marker: D.2e band 17's Bark coordinate
+/// prints as `16,11` with a clipped final digit in the staged PDF
+/// render. This module records the legible prefix `16.11` (a strict
+/// under-estimate within ±0.01 Bark of the true value, and not the
+/// docs file's prose `16,116` estimate, which is explicitly NOT
+/// adopted as a verbatim source value).
+///
+/// Marker set to `true` only for the affected (Layer II, 44.1 kHz)
+/// row 17 cell; consumers that need to widen the under-estimate by
+/// the `~0.006 Bark` typesetting tolerance can read this marker.
+pub const D2E_BAND_17_BARK_IS_ILLEGIBLE: bool = true;
+
+/// Table D.2a — Layer I, Fs = 32 kHz (24 bands, `no` 0..=23).
+///
+/// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.2a - Layer I, Fs = 32 kHz (24 bands, no 0..23)".
+pub const CRITICAL_BANDS_D2A: [CriticalBandBoundary; 24] = [
+    CriticalBandBoundary::new(0, 1, 62.500, 0.617),
+    CriticalBandBoundary::new(1, 3, 187.500, 1.842),
+    CriticalBandBoundary::new(2, 5, 312.500, 3.037),
+    CriticalBandBoundary::new(3, 7, 437.500, 4.185),
+    CriticalBandBoundary::new(4, 9, 562.500, 5.272),
+    CriticalBandBoundary::new(5, 11, 687.500, 6.289),
+    CriticalBandBoundary::new(6, 13, 812.500, 7.233),
+    CriticalBandBoundary::new(7, 15, 937.500, 8.103),
+    CriticalBandBoundary::new(8, 18, 1125.000, 9.275),
+    CriticalBandBoundary::new(9, 21, 1312.500, 10.301),
+    CriticalBandBoundary::new(10, 24, 1500.000, 11.199),
+    CriticalBandBoundary::new(11, 27, 1687.500, 11.988),
+    CriticalBandBoundary::new(12, 32, 2000.000, 13.104),
+    CriticalBandBoundary::new(13, 37, 2312.500, 14.027),
+    CriticalBandBoundary::new(14, 44, 2750.000, 15.087),
+    CriticalBandBoundary::new(15, 50, 3250.000, 16.069),
+    CriticalBandBoundary::new(16, 55, 3875.000, 17.078),
+    CriticalBandBoundary::new(17, 61, 4625.000, 18.089),
+    CriticalBandBoundary::new(18, 68, 5500.000, 19.095),
+    CriticalBandBoundary::new(19, 74, 6500.000, 20.079),
+    CriticalBandBoundary::new(20, 79, 7750.000, 21.098),
+    CriticalBandBoundary::new(21, 85, 9250.000, 22.046),
+    CriticalBandBoundary::new(22, 94, 11500.000, 23.030),
+    CriticalBandBoundary::new(23, 108, 15000.000, 23.923),
+];
+
+/// Table D.2b — Layer I, Fs = 44.1 kHz (25 bands, `no` 0..=24).
+///
+/// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.2b - Layer I, Fs = 44,1 kHz (25 bands, no 0..24)".
+pub const CRITICAL_BANDS_D2B: [CriticalBandBoundary; 25] = [
+    CriticalBandBoundary::new(0, 1, 86.133, 0.850),
+    CriticalBandBoundary::new(1, 2, 172.266, 1.694),
+    CriticalBandBoundary::new(2, 3, 258.398, 2.525),
+    CriticalBandBoundary::new(3, 5, 430.664, 4.124),
+    CriticalBandBoundary::new(4, 6, 516.797, 4.882),
+    CriticalBandBoundary::new(5, 8, 689.063, 6.301),
+    CriticalBandBoundary::new(6, 9, 775.195, 6.959),
+    CriticalBandBoundary::new(7, 11, 947.461, 8.169),
+    CriticalBandBoundary::new(8, 13, 1119.727, 9.244),
+    CriticalBandBoundary::new(9, 15, 1291.992, 10.195),
+    CriticalBandBoundary::new(10, 17, 1464.258, 11.037),
+    CriticalBandBoundary::new(11, 20, 1722.656, 12.125),
+    CriticalBandBoundary::new(12, 23, 1981.055, 13.042),
+    CriticalBandBoundary::new(13, 27, 2325.586, 14.062),
+    CriticalBandBoundary::new(14, 32, 2756.250, 15.100),
+    CriticalBandBoundary::new(15, 37, 3186.914, 15.955),
+    CriticalBandBoundary::new(16, 45, 3875.977, 17.079),
+    CriticalBandBoundary::new(17, 50, 4478.906, 17.904),
+    CriticalBandBoundary::new(18, 55, 5340.234, 18.922),
+    CriticalBandBoundary::new(19, 61, 6373.828, 19.963),
+    CriticalBandBoundary::new(20, 68, 7579.688, 20.971),
+    CriticalBandBoundary::new(21, 75, 9302.344, 22.074),
+    CriticalBandBoundary::new(22, 81, 11369.531, 22.984),
+    CriticalBandBoundary::new(23, 93, 15503.906, 24.013),
+    CriticalBandBoundary::new(24, 106, 19982.813, 24.573),
+];
+
+/// Table D.2c — Layer I, Fs = 48 kHz (26 bands, `no` 0..=25).
+///
+/// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.2c - Layer I, Fs = 48 kHz (26 bands, no 0..25)".
+pub const CRITICAL_BANDS_D2C: [CriticalBandBoundary; 26] = [
+    CriticalBandBoundary::new(0, 1, 93.750, 0.925),
+    CriticalBandBoundary::new(1, 2, 187.500, 1.842),
+    CriticalBandBoundary::new(2, 3, 281.250, 2.742),
+    CriticalBandBoundary::new(3, 4, 375.000, 3.618),
+    CriticalBandBoundary::new(4, 5, 468.750, 4.463),
+    CriticalBandBoundary::new(5, 6, 562.500, 5.272),
+    CriticalBandBoundary::new(6, 7, 656.250, 6.041),
+    CriticalBandBoundary::new(7, 9, 843.750, 7.457),
+    CriticalBandBoundary::new(8, 10, 937.500, 8.103),
+    CriticalBandBoundary::new(9, 12, 1125.000, 9.275),
+    CriticalBandBoundary::new(10, 14, 1312.500, 10.301),
+    CriticalBandBoundary::new(11, 16, 1500.000, 11.199),
+    CriticalBandBoundary::new(12, 19, 1781.250, 12.347),
+    CriticalBandBoundary::new(13, 21, 1968.750, 13.002),
+    CriticalBandBoundary::new(14, 25, 2343.750, 14.111),
+    CriticalBandBoundary::new(15, 29, 2718.750, 15.018),
+    CriticalBandBoundary::new(16, 35, 3281.250, 16.124),
+    CriticalBandBoundary::new(17, 41, 3843.750, 17.032),
+    CriticalBandBoundary::new(18, 49, 4687.500, 18.166),
+    CriticalBandBoundary::new(19, 53, 5437.500, 19.028),
+    CriticalBandBoundary::new(20, 58, 6375.000, 19.964),
+    CriticalBandBoundary::new(21, 65, 7687.500, 21.052),
+    CriticalBandBoundary::new(22, 73, 9375.000, 22.113),
+    CriticalBandBoundary::new(23, 79, 11625.000, 23.072),
+    CriticalBandBoundary::new(24, 89, 15375.000, 23.991),
+    CriticalBandBoundary::new(25, 102, 20250.000, 24.597),
+];
+
+/// Table D.2d — Layer II, Fs = 32 kHz (25 bands, `no` 0..=24).
+///
+/// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.2d - Layer II, Fs = 32 kHz (25 bands, no 0..24)".
+pub const CRITICAL_BANDS_D2D: [CriticalBandBoundary; 25] = [
+    CriticalBandBoundary::new(0, 1, 31.250, 0.309),
+    CriticalBandBoundary::new(1, 3, 93.750, 0.925),
+    CriticalBandBoundary::new(2, 6, 187.500, 1.842),
+    CriticalBandBoundary::new(3, 10, 312.500, 3.037),
+    CriticalBandBoundary::new(4, 13, 406.250, 3.903),
+    CriticalBandBoundary::new(5, 17, 531.250, 5.006),
+    CriticalBandBoundary::new(6, 21, 656.250, 6.041),
+    CriticalBandBoundary::new(7, 25, 781.250, 7.004),
+    CriticalBandBoundary::new(8, 30, 937.500, 8.103),
+    CriticalBandBoundary::new(9, 35, 1093.750, 9.090),
+    CriticalBandBoundary::new(10, 41, 1281.250, 10.139),
+    CriticalBandBoundary::new(11, 47, 1468.750, 11.058),
+    CriticalBandBoundary::new(12, 51, 1687.500, 11.988),
+    CriticalBandBoundary::new(13, 56, 2000.000, 13.104),
+    CriticalBandBoundary::new(14, 61, 2312.500, 14.027),
+    CriticalBandBoundary::new(15, 68, 2750.000, 15.087),
+    CriticalBandBoundary::new(16, 74, 3250.000, 16.069),
+    CriticalBandBoundary::new(17, 79, 3875.000, 17.078),
+    CriticalBandBoundary::new(18, 85, 4625.000, 18.089),
+    CriticalBandBoundary::new(19, 92, 5500.000, 19.095),
+    CriticalBandBoundary::new(20, 98, 6500.000, 20.079),
+    CriticalBandBoundary::new(21, 103, 7750.000, 21.098),
+    CriticalBandBoundary::new(22, 109, 9250.000, 22.046),
+    CriticalBandBoundary::new(23, 118, 11500.000, 23.030),
+    CriticalBandBoundary::new(24, 132, 15000.000, 23.923),
+];
+
+/// Table D.2e — Layer II, Fs = 44.1 kHz (27 bands, `no` 0..=26).
+///
+/// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.2e - Layer II, Fs = 44,1 kHz (27 bands, no 0..26)".
+///
+/// **Illegible cell:** row 17, `z_bark`. The PDF render clips the
+/// final digit, printing `16,11` with a fragment of a fourth digit.
+/// The docs file marks it `[illegible]`. This array records the
+/// legible-only value `16.11`; the docs file's prose estimate
+/// (`16,116`) is explicitly NOT adopted. See
+/// [`D2E_BAND_17_BARK_IS_ILLEGIBLE`].
+pub const CRITICAL_BANDS_D2E: [CriticalBandBoundary; 27] = [
+    CriticalBandBoundary::new(0, 1, 43.066, 0.425),
+    CriticalBandBoundary::new(1, 2, 86.133, 0.850),
+    CriticalBandBoundary::new(2, 3, 129.199, 1.273),
+    CriticalBandBoundary::new(3, 5, 215.332, 2.112),
+    CriticalBandBoundary::new(4, 7, 301.465, 2.934),
+    CriticalBandBoundary::new(5, 10, 430.664, 4.124),
+    CriticalBandBoundary::new(6, 13, 559.863, 5.249),
+    CriticalBandBoundary::new(7, 16, 689.063, 6.301),
+    CriticalBandBoundary::new(8, 19, 818.262, 7.274),
+    CriticalBandBoundary::new(9, 22, 947.461, 8.169),
+    CriticalBandBoundary::new(10, 26, 1119.727, 9.244),
+    CriticalBandBoundary::new(11, 30, 1291.992, 10.195),
+    CriticalBandBoundary::new(12, 35, 1507.324, 11.232),
+    CriticalBandBoundary::new(13, 40, 1722.656, 12.125),
+    CriticalBandBoundary::new(14, 46, 1981.055, 13.042),
+    CriticalBandBoundary::new(15, 51, 2325.586, 14.062),
+    CriticalBandBoundary::new(16, 56, 2756.250, 15.100),
+    // Row 17: docs marks `z_bark` as `16,11[illegible]`. Legible-
+    // only value transcribed; see `D2E_BAND_17_BARK_IS_ILLEGIBLE`.
+    CriticalBandBoundary::new(17, 62, 3273.047, 16.11),
+    CriticalBandBoundary::new(18, 69, 3875.977, 17.079),
+    CriticalBandBoundary::new(19, 74, 4478.906, 17.904),
+    CriticalBandBoundary::new(20, 79, 5340.234, 18.922),
+    CriticalBandBoundary::new(21, 85, 6373.828, 19.963),
+    CriticalBandBoundary::new(22, 92, 7579.688, 20.971),
+    CriticalBandBoundary::new(23, 99, 9302.344, 22.074),
+    CriticalBandBoundary::new(24, 105, 11369.531, 22.984),
+    CriticalBandBoundary::new(25, 117, 15503.906, 24.013),
+    CriticalBandBoundary::new(26, 130, 19982.813, 24.573),
+];
+
+/// Table D.2f — Layer II, Fs = 48 kHz (27 bands, `no` 0..=26).
+///
+/// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.2f - Layer II, Fs = 48 kHz (27 bands, no 0..26)".
+pub const CRITICAL_BANDS_D2F: [CriticalBandBoundary; 27] = [
+    CriticalBandBoundary::new(0, 1, 46.875, 0.463),
+    CriticalBandBoundary::new(1, 2, 93.750, 0.925),
+    CriticalBandBoundary::new(2, 3, 140.625, 1.385),
+    CriticalBandBoundary::new(3, 5, 234.375, 2.295),
+    CriticalBandBoundary::new(4, 7, 328.125, 3.184),
+    CriticalBandBoundary::new(5, 9, 421.875, 4.045),
+    CriticalBandBoundary::new(6, 12, 562.500, 5.272),
+    CriticalBandBoundary::new(7, 14, 656.250, 6.041),
+    CriticalBandBoundary::new(8, 17, 796.875, 7.119),
+    CriticalBandBoundary::new(9, 20, 937.500, 8.103),
+    CriticalBandBoundary::new(10, 24, 1125.000, 9.275),
+    CriticalBandBoundary::new(11, 27, 1265.625, 10.057),
+    CriticalBandBoundary::new(12, 32, 1500.000, 11.199),
+    CriticalBandBoundary::new(13, 37, 1734.375, 12.170),
+    CriticalBandBoundary::new(14, 42, 1968.750, 13.002),
+    CriticalBandBoundary::new(15, 49, 2343.750, 14.111),
+    CriticalBandBoundary::new(16, 53, 2718.750, 15.018),
+    CriticalBandBoundary::new(17, 59, 3281.250, 16.124),
+    CriticalBandBoundary::new(18, 65, 3843.750, 17.032),
+    CriticalBandBoundary::new(19, 73, 4687.500, 18.166),
+    CriticalBandBoundary::new(20, 77, 5437.500, 19.028),
+    CriticalBandBoundary::new(21, 82, 6375.000, 19.964),
+    CriticalBandBoundary::new(22, 89, 7687.500, 21.052),
+    CriticalBandBoundary::new(23, 97, 9375.000, 22.113),
+    CriticalBandBoundary::new(24, 103, 11625.000, 23.072),
+    CriticalBandBoundary::new(25, 113, 15375.000, 23.991),
+    CriticalBandBoundary::new(26, 126, 20250.000, 24.597),
+];
+
+/// One of the three Annex D sampling frequencies the critical-band
+/// tables are defined for (`32`, `44.1`, `48` kHz). The Annex D
+/// dispatch key is the (Layer, Fs) pair; this enum collapses the
+/// three integer rates onto a typed key so callers cannot accidentally
+/// request a non-existent table for, e.g., 16 kHz (the LSF rates of
+/// MPEG-2 lower-sampling-frequency are out of scope — Annex D is
+/// MPEG-1 only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnnexDSamplingRate {
+    /// 32 kHz.
+    Hz32000,
+    /// 44.1 kHz.
+    Hz44100,
+    /// 48 kHz.
+    Hz48000,
+}
+
+impl AnnexDSamplingRate {
+    /// Construct from a raw Hz value, returning `None` for any rate
+    /// outside the Annex D set (`32000`, `44100`, `48000`).
+    #[inline]
+    #[must_use]
+    pub const fn from_hz(hz: u32) -> Option<Self> {
+        match hz {
+            32_000 => Some(Self::Hz32000),
+            44_100 => Some(Self::Hz44100),
+            48_000 => Some(Self::Hz48000),
+            _ => None,
+        }
+    }
+
+    /// Sampling rate in Hz.
+    #[inline]
+    #[must_use]
+    pub const fn as_hz(self) -> u32 {
+        match self {
+            Self::Hz32000 => 32_000,
+            Self::Hz44100 => 44_100,
+            Self::Hz48000 => 48_000,
+        }
+    }
+}
+
+/// Return the verbatim Annex D Table D.2 critical-band-boundary slice
+/// for `(layer, fs)`. Returns `None` for Layer III (Annex D is
+/// defined only for Layer I and Layer II — Layer III's psychoacoustic
+/// model selection is described in clause C.1.5.3.2.1 which re-uses
+/// the Layer I/II tables with a Layer-III-specific spreading-function
+/// override, so a Layer III caller should pass the matching Layer
+/// (`LayerI` or `LayerII`) explicitly per the Annex D scope).
+#[inline]
+#[must_use]
+pub fn critical_band_boundaries(
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+) -> Option<&'static [CriticalBandBoundary]> {
+    use crate::frame::Layer;
+    match (layer, fs) {
+        (Layer::LayerI, AnnexDSamplingRate::Hz32000) => Some(&CRITICAL_BANDS_D2A),
+        (Layer::LayerI, AnnexDSamplingRate::Hz44100) => Some(&CRITICAL_BANDS_D2B),
+        (Layer::LayerI, AnnexDSamplingRate::Hz48000) => Some(&CRITICAL_BANDS_D2C),
+        (Layer::LayerII, AnnexDSamplingRate::Hz32000) => Some(&CRITICAL_BANDS_D2D),
+        (Layer::LayerII, AnnexDSamplingRate::Hz44100) => Some(&CRITICAL_BANDS_D2E),
+        (Layer::LayerII, AnnexDSamplingRate::Hz48000) => Some(&CRITICAL_BANDS_D2F),
+        (Layer::LayerIII, _) => None,
+    }
+}
+
+/// Map an FFT-line index `i` (1-based, into the matching Table D.1
+/// frequency / critical-band table) to the critical-band index `no`
+/// it falls into. Returns `None` only if `i` is `0` (the spec's
+/// indices are 1-based) or exceeds the largest band's `index_fcb`
+/// (an FFT line above the audio band of the table).
+#[inline]
+#[must_use]
+pub fn band_of_fft_line(boundaries: &[CriticalBandBoundary], fft_line_index: u16) -> Option<u16> {
+    if fft_line_index == 0 {
+        return None;
+    }
+    for b in boundaries {
+        if fft_line_index <= b.index_fcb {
+            return Some(b.no);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1431,5 +1826,311 @@ mod tests {
             "double {double} - single {single} = {} dB, expected +3.0103",
             double - single,
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Annex D Table D.2a–f critical-band-boundary tests (Phase 2 step 45).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn d2a_has_24_bands_numbered_0_through_23() {
+        assert_eq!(CRITICAL_BANDS_D2A.len(), 24);
+        for (k, b) in CRITICAL_BANDS_D2A.iter().enumerate() {
+            assert_eq!(b.no as usize, k, "D.2a row {k} has wrong `no`");
+        }
+    }
+
+    #[test]
+    fn d2b_has_25_bands_numbered_0_through_24() {
+        assert_eq!(CRITICAL_BANDS_D2B.len(), 25);
+        for (k, b) in CRITICAL_BANDS_D2B.iter().enumerate() {
+            assert_eq!(b.no as usize, k, "D.2b row {k} has wrong `no`");
+        }
+    }
+
+    #[test]
+    fn d2c_has_26_bands_numbered_0_through_25() {
+        assert_eq!(CRITICAL_BANDS_D2C.len(), 26);
+        for (k, b) in CRITICAL_BANDS_D2C.iter().enumerate() {
+            assert_eq!(b.no as usize, k, "D.2c row {k} has wrong `no`");
+        }
+    }
+
+    #[test]
+    fn d2d_has_25_bands_numbered_0_through_24() {
+        assert_eq!(CRITICAL_BANDS_D2D.len(), 25);
+        for (k, b) in CRITICAL_BANDS_D2D.iter().enumerate() {
+            assert_eq!(b.no as usize, k, "D.2d row {k} has wrong `no`");
+        }
+    }
+
+    #[test]
+    fn d2e_has_27_bands_numbered_0_through_26() {
+        assert_eq!(CRITICAL_BANDS_D2E.len(), 27);
+        for (k, b) in CRITICAL_BANDS_D2E.iter().enumerate() {
+            assert_eq!(b.no as usize, k, "D.2e row {k} has wrong `no`");
+        }
+    }
+
+    #[test]
+    fn d2f_has_27_bands_numbered_0_through_26() {
+        assert_eq!(CRITICAL_BANDS_D2F.len(), 27);
+        for (k, b) in CRITICAL_BANDS_D2F.iter().enumerate() {
+            assert_eq!(b.no as usize, k, "D.2f row {k} has wrong `no`");
+        }
+    }
+
+    #[test]
+    fn d2a_first_row_matches_docs_anchor() {
+        // Spec anchor (D.2a row 0): no = 0, index = 1, freq = 62.500,
+        // z = 0.617.
+        let row = CRITICAL_BANDS_D2A[0];
+        assert_eq!(row.no, 0);
+        assert_eq!(row.index_fcb, 1);
+        assert!((row.frequency_hz - 62.500).abs() < 1.0e-9);
+        assert!((row.z_bark - 0.617).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn d2a_last_row_matches_docs_anchor() {
+        // Spec anchor (D.2a row 23): no = 23, index = 108, freq =
+        // 15000.0, z = 23.923.
+        let row = *CRITICAL_BANDS_D2A.last().unwrap();
+        assert_eq!(row.no, 23);
+        assert_eq!(row.index_fcb, 108);
+        assert!((row.frequency_hz - 15000.000).abs() < 1.0e-9);
+        assert!((row.z_bark - 23.923).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn d2c_first_and_last_rows_match_docs_anchors() {
+        // Layer I, 48 kHz: 26 bands, first at (1, 93.750, 0.925),
+        // last at (102, 20250.000, 24.597).
+        let first = CRITICAL_BANDS_D2C[0];
+        assert_eq!((first.no, first.index_fcb), (0, 1));
+        assert!((first.frequency_hz - 93.750).abs() < 1.0e-9);
+        assert!((first.z_bark - 0.925).abs() < 1.0e-9);
+        let last = *CRITICAL_BANDS_D2C.last().unwrap();
+        assert_eq!((last.no, last.index_fcb), (25, 102));
+        assert!((last.frequency_hz - 20250.000).abs() < 1.0e-9);
+        assert!((last.z_bark - 24.597).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn d2e_illegible_band_17_preserves_legible_prefix() {
+        // Docs marks D.2e row 17 z_bark as `16,11[illegible]`. The
+        // legible prefix `16.11` MUST be preserved verbatim; the
+        // prose-estimate `16.116` MUST NOT be silently adopted.
+        let row = CRITICAL_BANDS_D2E[17];
+        assert_eq!(row.no, 17);
+        assert_eq!(row.index_fcb, 62);
+        assert!((row.frequency_hz - 3273.047).abs() < 1.0e-9);
+        // Two-decimal exact: 16.11, not 16.116.
+        assert!(
+            (row.z_bark - 16.11).abs() < 1.0e-9,
+            "D.2e row 17 z_bark = {} (must be the legible prefix 16.11, not the prose estimate 16.116)",
+            row.z_bark,
+        );
+        // And the documented-illegibility marker must agree.
+        const { assert!(D2E_BAND_17_BARK_IS_ILLEGIBLE) }
+    }
+
+    #[test]
+    fn all_tables_monotone_in_frequency_and_bark() {
+        // Critical-band boundaries are top-of-band ascending; the
+        // spec's tables are monotone in (index_fcb, frequency_hz,
+        // z_bark) jointly.
+        for (label, table) in [
+            ("D.2a", &CRITICAL_BANDS_D2A[..]),
+            ("D.2b", &CRITICAL_BANDS_D2B[..]),
+            ("D.2c", &CRITICAL_BANDS_D2C[..]),
+            ("D.2d", &CRITICAL_BANDS_D2D[..]),
+            ("D.2e", &CRITICAL_BANDS_D2E[..]),
+            ("D.2f", &CRITICAL_BANDS_D2F[..]),
+        ] {
+            for w in table.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                assert!(
+                    a.index_fcb < b.index_fcb,
+                    "{label}: index_fcb not strictly ascending at bands {} -> {}",
+                    a.no,
+                    b.no,
+                );
+                assert!(
+                    a.frequency_hz < b.frequency_hz,
+                    "{label}: frequency_hz not strictly ascending at bands {} -> {}",
+                    a.no,
+                    b.no,
+                );
+                assert!(
+                    a.z_bark < b.z_bark,
+                    "{label}: z_bark not strictly ascending at bands {} -> {}",
+                    a.no,
+                    b.no,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn annex_d_sampling_rate_round_trips() {
+        for &hz in &[32_000u32, 44_100, 48_000] {
+            let fs = AnnexDSamplingRate::from_hz(hz).unwrap();
+            assert_eq!(fs.as_hz(), hz);
+        }
+        assert!(AnnexDSamplingRate::from_hz(16_000).is_none());
+        assert!(AnnexDSamplingRate::from_hz(22_050).is_none());
+        assert!(AnnexDSamplingRate::from_hz(24_000).is_none());
+    }
+
+    #[test]
+    fn critical_band_boundaries_dispatches_correct_table() {
+        use crate::frame::Layer;
+        // Six valid combinations dispatch to the six tables.
+        let cases = [
+            (
+                Layer::LayerI,
+                AnnexDSamplingRate::Hz32000,
+                &CRITICAL_BANDS_D2A[..],
+            ),
+            (
+                Layer::LayerI,
+                AnnexDSamplingRate::Hz44100,
+                &CRITICAL_BANDS_D2B[..],
+            ),
+            (
+                Layer::LayerI,
+                AnnexDSamplingRate::Hz48000,
+                &CRITICAL_BANDS_D2C[..],
+            ),
+            (
+                Layer::LayerII,
+                AnnexDSamplingRate::Hz32000,
+                &CRITICAL_BANDS_D2D[..],
+            ),
+            (
+                Layer::LayerII,
+                AnnexDSamplingRate::Hz44100,
+                &CRITICAL_BANDS_D2E[..],
+            ),
+            (
+                Layer::LayerII,
+                AnnexDSamplingRate::Hz48000,
+                &CRITICAL_BANDS_D2F[..],
+            ),
+        ];
+        for (layer, fs, expected) in cases {
+            let got = critical_band_boundaries(layer, fs).unwrap();
+            // Compare by len and first/last for a cheap structural check.
+            assert_eq!(got.len(), expected.len());
+            assert_eq!(got.first(), expected.first());
+            assert_eq!(got.last(), expected.last());
+        }
+        // Layer III: returns None for every Fs.
+        for fs in [
+            AnnexDSamplingRate::Hz32000,
+            AnnexDSamplingRate::Hz44100,
+            AnnexDSamplingRate::Hz48000,
+        ] {
+            assert!(critical_band_boundaries(Layer::LayerIII, fs).is_none());
+        }
+    }
+
+    #[test]
+    fn band_of_fft_line_locates_each_band_correctly() {
+        // Verify the band-locator against D.2a, where the first band
+        // covers line 1, the second covers lines 2..=3, the third
+        // covers lines 4..=5, and so on.
+        let t = &CRITICAL_BANDS_D2A;
+        // 0 is not a valid 1-based index.
+        assert_eq!(band_of_fft_line(t, 0), None);
+        // Line 1 -> band 0.
+        assert_eq!(band_of_fft_line(t, 1), Some(0));
+        // Lines 2, 3 -> band 1 (covers 2..=3).
+        assert_eq!(band_of_fft_line(t, 2), Some(1));
+        assert_eq!(band_of_fft_line(t, 3), Some(1));
+        // Lines 4, 5 -> band 2 (covers 4..=5).
+        assert_eq!(band_of_fft_line(t, 4), Some(2));
+        assert_eq!(band_of_fft_line(t, 5), Some(2));
+        // Line 108 (top of last band) -> band 23.
+        assert_eq!(band_of_fft_line(t, 108), Some(23));
+        // Line 109 (above the audio band) -> None.
+        assert_eq!(band_of_fft_line(t, 109), None);
+        // Line 999 (way out of range) -> None.
+        assert_eq!(band_of_fft_line(t, 999), None);
+    }
+
+    #[test]
+    fn band_of_fft_line_locates_each_d2e_band_correctly() {
+        // D.2e bands cover lines 1, 2, 3, 4..=5, 6..=7, 8..=10,
+        // 11..=13, 14..=16, ..., 118..=130. Spot-check a few.
+        let t = &CRITICAL_BANDS_D2E;
+        assert_eq!(band_of_fft_line(t, 1), Some(0));
+        assert_eq!(band_of_fft_line(t, 2), Some(1));
+        assert_eq!(band_of_fft_line(t, 3), Some(2));
+        assert_eq!(band_of_fft_line(t, 4), Some(3));
+        assert_eq!(band_of_fft_line(t, 5), Some(3));
+        assert_eq!(band_of_fft_line(t, 6), Some(4));
+        assert_eq!(band_of_fft_line(t, 7), Some(4));
+        // Top of last band (no = 26): index 130.
+        assert_eq!(band_of_fft_line(t, 130), Some(26));
+        assert_eq!(band_of_fft_line(t, 131), None);
+    }
+
+    #[test]
+    fn d2e_band_17_z_bark_is_under_estimate_within_typeset_tolerance() {
+        // The legible prefix `16.11` is a strict under-estimate of
+        // the true Bark value (the clipped fourth digit cannot drop
+        // it below `16.11` because all four digits are visible up to
+        // the second-decimal place). The surrounding bands sit at
+        // `15.100` (band 16) and `17.079` (band 18); a monotone
+        // interpolation must place band 17 inside `(15.100, 17.079)`.
+        let b16 = CRITICAL_BANDS_D2E[16];
+        let b17 = CRITICAL_BANDS_D2E[17];
+        let b18 = CRITICAL_BANDS_D2E[18];
+        assert!(
+            b16.z_bark < b17.z_bark && b17.z_bark < b18.z_bark,
+            "D.2e band 17 z_bark {} must lie strictly between band 16 {} and band 18 {}",
+            b17.z_bark,
+            b16.z_bark,
+            b18.z_bark,
+        );
+        // And within `0.01` Bark of the documented prefix.
+        assert!((b17.z_bark - 16.11).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn d2d_first_row_extends_below_d2a_first_row() {
+        // Layer II Fs = 32 kHz starts the first critical band at
+        // 31.25 Hz (z = 0.309) — the Layer II FFT window is twice as
+        // long, so it can resolve a band below Layer I's first band
+        // edge of 62.5 Hz. Cross-table sanity check.
+        let l1 = CRITICAL_BANDS_D2A[0];
+        let l2 = CRITICAL_BANDS_D2D[0];
+        assert!(
+            l2.frequency_hz < l1.frequency_hz,
+            "D.2d first band freq {} should be < D.2a first band freq {}",
+            l2.frequency_hz,
+            l1.frequency_hz,
+        );
+    }
+
+    #[test]
+    fn d2_band_counts_match_docs_step_4_summary() {
+        // From the docs file (clause D.1 prose, "Annex D contents map"):
+        //   Layer I  : 23 / 24 / 25  @ 32 / 44.1 / 48 kHz
+        //   Layer II : 24 / 26 / 26  @ 32 / 44.1 / 48 kHz
+        //
+        // The table headers carry the *cell-count* (24/25/26 etc.,
+        // numbered no 0..N-1). The docs' "23/24/25" prose counts the
+        // band-edge intervals between rows, which is one less than
+        // the row count: 24 rows -> 23 intervals. Cross-check that
+        // the row count = prose-count + 1 holds for each table.
+        assert_eq!(CRITICAL_BANDS_D2A.len(), 23 + 1);
+        assert_eq!(CRITICAL_BANDS_D2B.len(), 24 + 1);
+        assert_eq!(CRITICAL_BANDS_D2C.len(), 25 + 1);
+        assert_eq!(CRITICAL_BANDS_D2D.len(), 24 + 1);
+        assert_eq!(CRITICAL_BANDS_D2E.len(), 26 + 1);
+        assert_eq!(CRITICAL_BANDS_D2F.len(), 26 + 1);
     }
 }

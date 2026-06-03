@@ -8,6 +8,61 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 4 critical-band-boundary
+  **Tables D.2a–f** transcribed verbatim from the docs file
+  `mp3-annex-d-psychoacoustic-extracts.md`. New
+  `CriticalBandBoundary { no, index_fcb, frequency_hz, z_bark }`
+  carrier and six `pub const` arrays `CRITICAL_BANDS_D2A`
+  through `CRITICAL_BANDS_D2F` for the (Layer I/II × 32/44.1/48
+  kHz) Cartesian product (24 / 25 / 26 / 25 / 27 / 27 rows
+  respectively, all using zero-based `no` numbering per the
+  spec table). New typed sampling-rate key
+  `AnnexDSamplingRate { Hz32000, Hz44100, Hz48000 }` with
+  `from_hz` / `as_hz` accessors. `critical_band_boundaries(layer,
+  fs)` dispatches `(Layer, AnnexDSamplingRate)` to the matching
+  table, returning `None` for `Layer::LayerIII` (Annex D is
+  normative only for Layer I and Layer II — Layer III's
+  spreading-function override in C.1.5.3.2.1 reuses these
+  tables explicitly via the matching Layer-I or Layer-II key).
+  `band_of_fft_line(boundaries, fft_line_index)` is the
+  §D.1 Step 4 masker-placement primitive: it maps a 1-based
+  FFT-line index into Table D.1's frequency table to the
+  critical-band index `no` it falls into, returning `None` for
+  `0` (invalid 1-based index) and for any index above the
+  top band's `index_fcb` (out of the audio band of the table).
+  The staged docs file marks D.2e row 17's `z_bark` cell as
+  `16,11[illegible]` (clipped final digit in the PDF render);
+  the constant `D2E_BAND_17_BARK_IS_ILLEGIBLE` records that
+  uncertainty, and the table cell preserves the legible-only
+  prefix `16.11` — the docs file's prose estimate `16.116` is
+  explicitly NOT adopted as a verbatim source value (a
+  three-decimal value would mis-represent the spec render's
+  legible precision). 13 new unit tests in `psy::tests`
+  cover: per-table band-count + monotone `no` contiguity
+  (`no == k` for every row index `k`); first-row and last-row
+  cell-by-cell anchor reproduction against the docs file (D.2a
+  rows 0 + 23, D.2c rows 0 + 25); strict monotone ascent in
+  (`index_fcb`, `frequency_hz`, `z_bark`) across every adjacent
+  pair of all six tables; `AnnexDSamplingRate::from_hz`
+  round-trip on `{32_000, 44_100, 48_000}` Hz plus rejection of
+  three LSF rates (`16_000, 22_050, 24_000`);
+  `critical_band_boundaries` six-way valid dispatch + Layer III
+  `None`; the `band_of_fft_line` locator on D.2a (zero rejection,
+  bottom-band single-line edge, two mid-band ranges, top-band
+  edge inclusion at line 108, out-of-range `None` at lines 109
+  + 999) and on D.2e (early bands 0..4); the D.2e illegible-cell
+  read-back preserves `16.11` exactly and excludes the prose
+  estimate; the cross-table sanity check that D.2d's first band
+  edge sits below D.2a's first band edge (Layer II's longer FFT
+  window resolves a lower starting band edge); and a
+  cross-check that each table's row count equals the prose
+  step-4-summary count + 1 (24 cells for "23 bands", etc.).
+  These tables are the §D.1 Step 4 masker-placement substrate
+  the future Model 1 Step 4 (tonal-vs-non-tonal classifier)
+  will iterate over; the placeholder/scaffold path of r194 /
+  r197 / r204's threshold-in-quiet `XminThresholds` remains
+  unchanged. (Phase 2 step 45)
+
 - psy: Annex D Model 1 §D.1 Step 6 masking-function `vf` +
   masking-index `av_tm` / `av_nm` + Step 7 global-threshold
   summation primitives. `masking_index_tonal(z_j)` /

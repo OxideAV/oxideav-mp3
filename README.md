@@ -2506,18 +2506,45 @@ primitives (`masking_function_vf`, `masking_index_tonal`,
 `global_masking_threshold_db`) accepting a slice of
 `Masker { kind, z_bark, spl_db }` and a `LTq(i)` scalar
 threshold-in-quiet anchor, reproducing the verbatim spec
-equations including the half-open `[-3, 8)` masker window —
-it still
+equations including the half-open `[-3, 8)` masker window +
+r224 Annex D Model 1 §D.1 Step 4 critical-band-boundary
+**Tables D.2a–f** transcribed verbatim from the staged
+text-extracted docs file (no PNG OCR involved — the six tables
+were textually transcribed in `mp3-annex-d-psychoacoustic-extracts.md`
+as of docs commit `dc78918`): `CriticalBandBoundary { no,
+index_fcb, frequency_hz, z_bark }` rows for the six
+(Layer I/II × 32/44.1/48 kHz) combinations, dispatched by
+`critical_band_boundaries(layer, fs)` on the new typed key
+`AnnexDSamplingRate { Hz32000, Hz44100, Hz48000 }` (Layer III
+returns `None` per Annex D's normative Layer-I/II scope; the
+spec's clause C.1.5.3.2.1 Layer-III spreading-function override
+reuses the Layer-I/II tables, so a Layer III caller passes the
+Layer parameter explicitly), with an FFT-line-to-band locator
+`band_of_fft_line(boundaries, fft_line_index)` for §D.1 Step 4
+masker placement, the `D2E_BAND_17_BARK_IS_ILLEGIBLE` marker
+preserving the staged-doc-noted clipped `z_bark` digit in
+D.2e row 17 as the legible-prefix `16.11` (the doc's prose
+estimate `16.116` is explicitly NOT adopted as a verbatim source
+value), and 13 unit tests covering: per-table band-count + `no`
+contiguity (24/25/26/25/27/27 rows = prose count + 1),
+first/last-row anchor cross-checks against the docs file,
+strict (`index_fcb`, `frequency_hz`, `z_bark`) monotonicity,
+`AnnexDSamplingRate::from_hz` round-trip + non-Annex-D-rate
+rejection, the six-way (Layer, Fs) dispatch table, the
+band-of-FFT-line locator (zero-rejection, bottom-band single
+line, mid-band ranges, top-band edge inclusion, out-of-range
+None), the D.2e illegibility cell read-back, and the
+cross-Layer sanity check that D.2d's first band edge sits
+below D.2a's first band edge (Layer II's longer window resolves
+a lower starting band edge) — it still
 lacks
-Model 1 Steps 1–5 (1024-sample FFT + SPL conversion + tonality
-classifier + decimation + masker selection — the r194 / r197 /
-r204 threshold-in-quiet curve is the *lower bound* and r219's
-masker primitives are the *upper structure* of any
-signal-dependent psychoacoustic threshold, but the masker
-selection itself reads the PNG-only Annex D Table D.2 critical-
-band-boundary set and is blocked on the OCR DOCS-GAP), the full
+Model 1 Steps 1–3 + 5 (1024-sample FFT + SPL conversion +
+tonality classifier + decimation: Steps 4's table is now
+landed but the surrounding Steps still need the FFT primitive
++ a tonality classifier; that's a `core`-level numerical
+primitive that is independent of the Annex D tables), the full
 Annex D Model 2 psychoacoustic model (calculation-partition
-table D.3 — also PNG-only — plus the Model 2 spreading-function
+table D.3 — PNG-only — plus the Model 2 spreading-function
 `tmpy` line that is typeset as image in the PDF and is not
 text-extractable),
 intensity-stereo encode (§2.4.3.4.9.3), and
