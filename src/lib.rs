@@ -472,8 +472,9 @@ pub use outer_loop::{
     SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW, SCALEFAC_S_MAX_HIGH, SCALEFAC_S_MAX_LOW,
 };
 pub use psy::{
-    masker_at_band, masker_in_step7_window_of_line, XminThresholds,
-    DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE, STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE,
+    decimate_tonal_within_half_bark, masker_above_threshold_in_quiet, masker_at_band,
+    masker_in_step7_window_of_line, XminThresholds, DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE,
+    STEP5_TONAL_DECIMATION_WINDOW_BARK, STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE,
     STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE,
 };
 pub use quantize::quantize;

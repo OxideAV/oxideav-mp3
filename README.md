@@ -2582,13 +2582,51 @@ verifying the predicate matches `individual_masking_threshold_db`'s
 (`filter()`-then-`global_masking_threshold_db` produces the
 same `LTg(i)` as feeding the full slice — the pre-filter is
 mechanically equivalent to dropping `vf = None` contributions
-from the energy sum) — it still
+from the energy sum) + r232 Annex D Model 1 §D.1 Step 5
+decimation primitives bridging Step 4 placement (r229) and
+Step 6 individual-masking-threshold calculation (r219).
+`masker_above_threshold_in_quiet(masker, ltq_db)` is the
+verbatim Step 5(a) threshold-in-quiet screening predicate
+(`X_tm(k) >= LTq(k)` / `X_nm(k) >= LTq(k)`, identical
+comparison for tonal and non-tonal maskers) and
+`decimate_tonal_within_half_bark(maskers)` is the Step 5(b)
+tonal-cluster decimation sieve: a sliding window of width
+`STEP5_TONAL_DECIMATION_WINDOW_BARK = 0.5` Bark (named
+`pub const`, verbatim spec text "a sliding window in the
+critical band domain is used with a width of 0,5 Bark")
+collapses every cluster of two-or-more tonal maskers within
+**strictly less than** 0.5 Bark of each other to the
+loudest member of the cluster (input-order stable on tied
+SPLs — first-encountered wins). Non-tonal maskers pass
+through unchanged because §D.1 Step 4(c) already yields at
+most one non-tonal masker per critical band, and the
+output preserves the caller's original slice order (the
+non-tonal subset is interleaved back at its original
+positions). 17 new unit tests cover: Step 5(a) above-LTq
+keep / below-LTq drop / at-LTq inclusive boundary on both
+tonal and non-tonal maskers; the
+`STEP5_TONAL_DECIMATION_WINDOW_BARK` constant reads back
+0.5; Step 5(b) edge cases (empty input, singleton
+passthrough, pair within window keeps loudest, pair at
+exactly 0.5 Bark both survive per the spec's strict
+"less than" wording, pair outside window both survive,
+non-tonal cluster pass-through unchanged, three-member
+tonal cluster collapses to single loudest, two separated
+clusters collapse independently, ties resolve to
+first-encountered for output stability, unsorted input
+still clusters correctly, mixed tonal / non-tonal
+preserves non-tonal in place); a compositional invariant
+(Step 5(a) then Step 5(b) reproduces the spec's full
+Step 5 sieve); and an end-to-end smoke that pipes
+Step 5(a) + 5(b) into Step 7
+`global_masking_threshold_db` and confirms the result
+matches direct evaluation on the decimated slice — it still
 lacks
-Model 1 Steps 1–3 + 5 (1024-sample FFT + SPL conversion +
-tonality classifier + decimation: Steps 4's table is now
-landed but the surrounding Steps still need the FFT primitive
-+ a tonality classifier; that's a `core`-level numerical
-primitive that is independent of the Annex D tables), the full
+Model 1 Steps 1–3 (1024-sample FFT + SPL conversion +
+tonality classifier — surrounding Steps still need the FFT
+primitive + a tonality classifier; that's a `core`-level
+numerical primitive that is independent of the Annex D
+tables), the full
 Annex D Model 2 psychoacoustic model (calculation-partition
 table D.3 — PNG-only — plus the Model 2 spreading-function
 `tmpy` line that is typeset as image in the PDF and is not

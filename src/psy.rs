@@ -1215,6 +1215,182 @@ pub fn masker_in_step7_window_of_line(masker: &Masker, z_i_bark: f64) -> bool {
         && dz_from_line <= STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE
 }
 
+// =====================================================================
+// Annex D Model 1 — §D.1 Step 5 decimation primitives (Phase 2 step 47).
+//
+// Step 5 of Model 1 is "decimation of tonal and non-tonal masking
+// components" — a two-part sieve that runs between Step 4's masker
+// placement (already wired in r229) and Step 6's individual
+// masking-threshold calculation (already wired in r219). The spec text
+// (PDF page 118 / printed 112, clause D.1 "Step 5") defines two
+// sub-procedures:
+//
+//   (a) Threshold-in-quiet screening — a masker is kept only if its
+//       SPL is at or above the threshold-in-quiet LTq at the masker's
+//       own frequency. The spec equations are
+//
+//           X_tm(k) >= LTq(k)         keep tonal masker
+//           X_nm(k) >= LTq(k)         keep non-tonal masker
+//
+//       (verbatim from the spec text). Both masker classes use the
+//       same comparison rule.
+//
+//   (b) Tonal cluster decimation — tonal maskers within a 0.5-Bark
+//       sliding window collapse to the loudest member of the cluster
+//       (verbatim spec text: "Decimation of two or more tonal
+//       components within a distance of less than 0,5 Bark: Keep the
+//       component with the highest power, and remove the smaller
+//       component(s) from the list of tonal components. For this
+//       operation, a sliding window in the critical band domain is
+//       used with a width of 0,5 Bark"). The spec applies this only
+//       to tonal maskers — non-tonal maskers are already at most one
+//       per critical band by Step 4(c) and are passed through
+//       unchanged.
+//
+// Both primitives operate on the typed `&[Masker]` slice produced by
+// `masker_at_band` (r229). The LTq value for Step 5(a) is supplied
+// by the caller in dB — typically sourced from `ltq_db_at_hz` after
+// converting the masker's `z_bark` to its corresponding frequency
+// via the Tables D.1 (Frequency / Bark / LTq) mapping the caller
+// holds. The 0.5-Bark window constant for Step 5(b) is exposed as a
+// named `pub const` (`STEP5_TONAL_DECIMATION_WINDOW_BARK`) for direct
+// citation back to the spec text.
+//
+// The two primitives compose left-to-right (a → b) into a single
+// Step 5 sieve; callers that already pre-filter their masker slice
+// (e.g. by feeding only above-LTq lines from the Step 4 tonal /
+// non-tonal selection) may skip (a) and run (b) directly on the
+// tonal slice. Both primitives preserve the caller's masker order
+// for in-cluster ties (the first-encountered loudest masker wins),
+// which keeps the output stable across repeated calls on the same
+// input.
+// =====================================================================
+
+/// Spec width of the §D.1 Step 5(b) tonal-decimation sliding window,
+/// in Bark units (verbatim spec text: "a sliding window in the
+/// critical band domain is used with a width of 0,5 Bark").
+///
+/// Two tonal maskers separated by **strictly less than** this width
+/// are in the same cluster and collapse to the loudest member; the
+/// spec phrasing is "less than 0,5 Bark", which this constant
+/// captures as the strict upper bound.
+pub const STEP5_TONAL_DECIMATION_WINDOW_BARK: f64 = 0.5;
+
+/// §D.1 Step 5(a) threshold-in-quiet screening predicate. Returns
+/// `true` iff the masker survives the spec's screening rule
+///
+/// ```text
+/// X_tm(k) >= LTq(k)        tonal masker kept
+/// X_nm(k) >= LTq(k)        non-tonal masker kept
+/// ```
+///
+/// `ltq_db` is the threshold-in-quiet **at the masker's own
+/// frequency** in dB — sourced by the caller from `ltq_db_at_hz`
+/// after converting `masker.z_bark` to a Hertz value via the
+/// caller's Tables D.1 (Frequency / Bark / LTq) mapping. The
+/// comparison is identical for tonal and non-tonal maskers; the
+/// kind tag is preserved on the surviving maskers because Step 6
+/// dispatches the masking-index `av` per kind.
+#[inline]
+#[must_use]
+pub fn masker_above_threshold_in_quiet(masker: &Masker, ltq_db: f64) -> bool {
+    masker.spl_db >= ltq_db
+}
+
+/// §D.1 Step 5(b) tonal-cluster decimation. Returns a new `Vec`
+/// containing every input masker with **tonal** maskers in any
+/// strictly-less-than-`0.5`-Bark cluster collapsed to the loudest
+/// member of the cluster. Non-tonal maskers pass through unchanged
+/// (the spec applies this sub-step only to tonal maskers — Step 4(c)
+/// already produces at most one non-tonal masker per critical band).
+///
+/// The output preserves the caller's input order: surviving maskers
+/// appear in their original positions in the slice. Tied SPLs in a
+/// cluster resolve to the first-encountered masker (input-order
+/// stable), so repeated calls on the same input produce identical
+/// output.
+///
+/// Algorithm: a sliding window over the **tonal** subset sorted by
+/// `z_bark` accumulates a cluster while consecutive tonal maskers
+/// are within `STEP5_TONAL_DECIMATION_WINDOW_BARK` of each other;
+/// when the window closes, the cluster's loudest member is kept and
+/// the rest are dropped. The non-tonal subset is interleaved back
+/// into the output in original-slice order.
+///
+/// The spec text reads "less than 0,5 Bark", which this
+/// implementation encodes as a strict `<` comparison on the Bark
+/// difference between consecutive sorted tonal maskers. A pair of
+/// tonal maskers separated by exactly `0.5` Bark is therefore
+/// **not** in the same cluster and both survive.
+#[must_use]
+pub fn decimate_tonal_within_half_bark(maskers: &[Masker]) -> Vec<Masker> {
+    // Fast path: nothing to do for the empty / singleton input.
+    if maskers.len() < 2 {
+        return maskers.to_vec();
+    }
+    // Collect the tonal subset with its original-slice positions so
+    // the output ordering survives the sort-and-cluster pass.
+    let mut tonal_indices: Vec<usize> = maskers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| match m.kind {
+            MaskerKind::Tonal => Some(i),
+            MaskerKind::NonTonal => None,
+        })
+        .collect();
+    // Sort tonal indices by z_bark ascending. Ties on z_bark fall
+    // back to input order via the original-index secondary key to
+    // keep cluster membership deterministic on coincident maskers.
+    tonal_indices.sort_by(|&a, &b| {
+        maskers[a]
+            .z_bark
+            .partial_cmp(&maskers[b].z_bark)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    // Walk the sorted tonal list, accumulating clusters whose
+    // consecutive Bark gap is strictly below the window width.
+    // For each cluster, mark all but the loudest member as dropped.
+    let mut dropped = vec![false; maskers.len()];
+    let mut cluster_start = 0usize; // index into tonal_indices
+    while cluster_start < tonal_indices.len() {
+        let mut cluster_end = cluster_start + 1; // exclusive
+        while cluster_end < tonal_indices.len() {
+            let prev = maskers[tonal_indices[cluster_end - 1]].z_bark;
+            let cur = maskers[tonal_indices[cluster_end]].z_bark;
+            if cur - prev < STEP5_TONAL_DECIMATION_WINDOW_BARK {
+                cluster_end += 1;
+            } else {
+                break;
+            }
+        }
+        // Cluster spans `tonal_indices[cluster_start..cluster_end]`.
+        // Keep the loudest member; first-encountered wins on ties so
+        // the output is input-order stable.
+        let mut keep_pos = cluster_start;
+        let mut keep_spl = maskers[tonal_indices[cluster_start]].spl_db;
+        for cur in (cluster_start + 1)..cluster_end {
+            let spl = maskers[tonal_indices[cur]].spl_db;
+            if spl > keep_spl {
+                keep_spl = spl;
+                keep_pos = cur;
+            }
+        }
+        for cur in cluster_start..cluster_end {
+            if cur != keep_pos {
+                dropped[tonal_indices[cur]] = true;
+            }
+        }
+        cluster_start = cluster_end;
+    }
+    // Emit the surviving maskers in original-slice order.
+    maskers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| if dropped[i] { None } else { Some(*m) })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2494,5 +2670,403 @@ mod tests {
             (full - after).abs() < 1.0e-12,
             "pre-filter changed LTg: full = {full}, after = {after}",
         );
+    }
+
+    // ---- Phase 2 step 47 — §D.1 Step 5 decimation primitives.
+
+    #[test]
+    fn step5a_keeps_masker_above_ltq() {
+        // Masker SPL strictly above LTq → kept (tonal).
+        let m_tonal = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        assert!(masker_above_threshold_in_quiet(&m_tonal, 20.0));
+        // Same for a non-tonal masker — the spec rule is identical
+        // for both classes.
+        let m_nt = Masker {
+            kind: MaskerKind::NonTonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        assert!(masker_above_threshold_in_quiet(&m_nt, 20.0));
+    }
+
+    #[test]
+    fn step5a_drops_masker_below_ltq() {
+        // Masker SPL strictly below LTq → dropped.
+        let m_tonal = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 10.0,
+        };
+        assert!(!masker_above_threshold_in_quiet(&m_tonal, 20.0));
+        let m_nt = Masker {
+            kind: MaskerKind::NonTonal,
+            z_bark: 5.0,
+            spl_db: -5.0,
+        };
+        assert!(!masker_above_threshold_in_quiet(&m_nt, 0.0));
+    }
+
+    #[test]
+    fn step5a_keeps_masker_at_ltq_inclusive() {
+        // The spec uses `>=`, so a masker exactly at LTq survives.
+        let m = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 20.0,
+        };
+        assert!(masker_above_threshold_in_quiet(&m, 20.0));
+    }
+
+    #[test]
+    fn step5b_window_constant_is_half_bark() {
+        // Verbatim spec text: "a sliding window in the critical band
+        // domain is used with a width of 0,5 Bark".
+        assert!((STEP5_TONAL_DECIMATION_WINDOW_BARK - 0.5).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn step5b_empty_input_returns_empty() {
+        let out = decimate_tonal_within_half_bark(&[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn step5b_singleton_passes_through() {
+        let m = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 60.0,
+        };
+        let out = decimate_tonal_within_half_bark(&[m]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], m);
+    }
+
+    #[test]
+    fn step5b_pair_within_window_keeps_loudest() {
+        // Two tonal maskers 0.3 Bark apart — strictly inside the
+        // 0.5-Bark window. The louder one survives.
+        let quiet = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        let loud = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.3,
+            spl_db: 70.0,
+        };
+        let out = decimate_tonal_within_half_bark(&[quiet, loud]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], loud);
+    }
+
+    #[test]
+    fn step5b_pair_at_exact_half_bark_both_survive() {
+        // The spec text reads "less than 0,5 Bark", so exactly
+        // 0.5 Bark apart is OUTSIDE the cluster — both survive.
+        let a = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        let b = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.5,
+            spl_db: 70.0,
+        };
+        let out = decimate_tonal_within_half_bark(&[a, b]);
+        assert_eq!(out.len(), 2);
+        // Output preserves input order.
+        assert_eq!(out[0], a);
+        assert_eq!(out[1], b);
+    }
+
+    #[test]
+    fn step5b_pair_outside_window_both_survive() {
+        // Two tonal maskers 1.0 Bark apart — well outside the window.
+        let a = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 60.0,
+        };
+        let b = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 6.0,
+            spl_db: 50.0,
+        };
+        let out = decimate_tonal_within_half_bark(&[a, b]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn step5b_non_tonal_passes_through_unchanged() {
+        // Non-tonal maskers are not subject to Step 5(b) at all — even
+        // a tight 0.1-Bark non-tonal cluster survives intact (the spec
+        // applies decimation only to tonal maskers because Step 4(c)
+        // already produces at most one non-tonal masker per critical
+        // band).
+        let a = Masker {
+            kind: MaskerKind::NonTonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        let b = Masker {
+            kind: MaskerKind::NonTonal,
+            z_bark: 5.1,
+            spl_db: 70.0,
+        };
+        let out = decimate_tonal_within_half_bark(&[a, b]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], a);
+        assert_eq!(out[1], b);
+    }
+
+    #[test]
+    fn step5b_cluster_of_three_keeps_only_loudest() {
+        // Three tonal maskers in a tight cluster: 5.0, 5.2, 5.4 Bark
+        // (consecutive gaps 0.2 each, total span 0.4 — fully inside
+        // the 0.5-Bark window). The single loudest survives.
+        let q1 = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        let loud = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.2,
+            spl_db: 80.0,
+        };
+        let q2 = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.4,
+            spl_db: 55.0,
+        };
+        let out = decimate_tonal_within_half_bark(&[q1, loud, q2]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], loud);
+    }
+
+    #[test]
+    fn step5b_two_separate_clusters_each_collapse_independently() {
+        // Cluster A: 5.0 / 5.2 (loudest at 5.2). Gap to cluster B:
+        // 5.2 → 6.0 = 0.8 Bark (outside the window). Cluster B:
+        // 6.0 / 6.1 (loudest at 6.1). Result: two surviving maskers.
+        let a1 = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 50.0,
+        };
+        let a2_loud = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.2,
+            spl_db: 75.0,
+        };
+        let b1 = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 6.0,
+            spl_db: 60.0,
+        };
+        let b2_loud = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 6.1,
+            spl_db: 65.0,
+        };
+        let out = decimate_tonal_within_half_bark(&[a1, a2_loud, b1, b2_loud]);
+        assert_eq!(out.len(), 2);
+        // Output preserves original-slice ordering.
+        assert_eq!(out[0], a2_loud);
+        assert_eq!(out[1], b2_loud);
+    }
+
+    #[test]
+    fn step5b_ties_resolve_to_first_encountered() {
+        // Two tonal maskers in-cluster with identical SPLs: the
+        // first-encountered (lower-z_bark) wins so the output is
+        // stable across repeated calls.
+        let first = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 60.0,
+        };
+        let second = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.3,
+            spl_db: 60.0,
+        };
+        let out = decimate_tonal_within_half_bark(&[first, second]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], first);
+    }
+
+    #[test]
+    fn step5b_unsorted_input_still_clusters_correctly() {
+        // The caller may pass maskers in arbitrary order (Step 4
+        // emits tonal then non-tonal lists, which Step 5(b) doesn't
+        // necessarily receive sorted by z_bark). Verify a deliberately
+        // shuffled cluster still collapses to its loudest member.
+        let loud = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.2,
+            spl_db: 80.0,
+        };
+        let quiet_a = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        let quiet_b = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.4,
+            spl_db: 50.0,
+        };
+        // Input order: loud, quiet_a, quiet_b (unsorted by z_bark).
+        let out = decimate_tonal_within_half_bark(&[loud, quiet_a, quiet_b]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], loud);
+    }
+
+    #[test]
+    fn step5b_mixed_tonal_and_non_tonal_preserves_non_tonal_in_place() {
+        // Cluster of tonal maskers around 5.0 Bark, two non-tonal
+        // maskers at 3.0 and 7.0 (well outside the tonal cluster).
+        // The non-tonal maskers must survive at their original
+        // positions in the output slice.
+        let nt_low = Masker {
+            kind: MaskerKind::NonTonal,
+            z_bark: 3.0,
+            spl_db: 30.0,
+        };
+        let t_quiet = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        let t_loud = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.2,
+            spl_db: 70.0,
+        };
+        let nt_high = Masker {
+            kind: MaskerKind::NonTonal,
+            z_bark: 7.0,
+            spl_db: 35.0,
+        };
+        let out = decimate_tonal_within_half_bark(&[nt_low, t_quiet, t_loud, nt_high]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], nt_low);
+        assert_eq!(out[1], t_loud);
+        assert_eq!(out[2], nt_high);
+    }
+
+    #[test]
+    fn step5_composes_a_then_b() {
+        // Compositional invariant — Step 5(a) screening followed by
+        // Step 5(b) tonal decimation reproduces the spec's full
+        // Step 5 sieve. Source slice contains:
+        //   - tonal masker below LTq (Step 5(a) drops),
+        //   - tonal cluster with one loud + one quiet member,
+        //     both above LTq (Step 5(b) collapses to loud one),
+        //   - lone tonal masker above LTq + outside any cluster
+        //     (both steps pass through),
+        //   - non-tonal masker above LTq (both steps pass through).
+        let ltq_db = 20.0;
+        let quiet_below = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 4.0,
+            spl_db: 10.0,
+        }; // dropped by (a)
+        let cluster_quiet = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        let cluster_loud = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.3,
+            spl_db: 70.0,
+        };
+        let isolated = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 8.0,
+            spl_db: 60.0,
+        };
+        let non_tonal = Masker {
+            kind: MaskerKind::NonTonal,
+            z_bark: 10.0,
+            spl_db: 50.0,
+        };
+        let src = [
+            quiet_below,
+            cluster_quiet,
+            cluster_loud,
+            isolated,
+            non_tonal,
+        ];
+        let after_a: Vec<Masker> = src
+            .iter()
+            .copied()
+            .filter(|m| masker_above_threshold_in_quiet(m, ltq_db))
+            .collect();
+        // Step 5(a) drops the below-LTq masker; 4 survive.
+        assert_eq!(after_a.len(), 4);
+        let after_b = decimate_tonal_within_half_bark(&after_a);
+        // Step 5(b) collapses the cluster; 3 survive total.
+        assert_eq!(after_b.len(), 3);
+        assert_eq!(after_b[0], cluster_loud);
+        assert_eq!(after_b[1], isolated);
+        assert_eq!(after_b[2], non_tonal);
+    }
+
+    #[test]
+    fn step5_then_step7_feeds_global_threshold_consistently() {
+        // End-to-end compositional smoke: after Step 5(a) + Step 5(b),
+        // feeding the surviving slice through Step 7's
+        // `global_masking_threshold_db` produces an LTg(i) that is
+        // strictly above the floor LTq for a target line near the
+        // surviving loud masker, and matches what we'd get if we
+        // had hand-decimated the input.
+        let z_i = 5.3;
+        let ltq_db = 0.0;
+        // Cluster: dropped + loud (both above LTq). Plus an
+        // out-of-band below-LTq masker that Step 5(a) discards.
+        let drop_a = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 40.0,
+        };
+        let keep = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.3,
+            spl_db: 75.0,
+        };
+        let below_ltq = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 8.0,
+            spl_db: -10.0,
+        };
+        let src = [drop_a, keep, below_ltq];
+        let after_a: Vec<Masker> = src
+            .iter()
+            .copied()
+            .filter(|m| masker_above_threshold_in_quiet(m, ltq_db))
+            .collect();
+        assert_eq!(after_a.len(), 2);
+        let after_b = decimate_tonal_within_half_bark(&after_a);
+        assert_eq!(after_b.len(), 1);
+        assert_eq!(after_b[0], keep);
+        let ltg = global_masking_threshold_db(&after_b, z_i, ltq_db);
+        // The loud masker is at the target line itself, so
+        // LTg = X + av_tm(z) (in dB, after the energy sum
+        // dominates LTq). The result is well above LTq.
+        assert!(ltg > ltq_db + 30.0, "LTg = {ltg} should be >> LTq");
+        // And it must equal the value obtained by manually keeping
+        // only `keep`.
+        let direct = global_masking_threshold_db(&[keep], z_i, ltq_db);
+        assert!((ltg - direct).abs() < 1.0e-12);
     }
 }

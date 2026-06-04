@@ -8,6 +8,43 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 5 decimation primitives
+  (Phase 2 step 47). Two new primitives wire the spec's
+  Step 5 masker sieve between Step 4 placement (r229) and
+  Step 6 individual-masking-threshold calculation (r219):
+  `masker_above_threshold_in_quiet(masker, ltq_db)` is the
+  Step 5(a) threshold-in-quiet screening predicate
+  (`X_tm(k) >= LTq(k)` / `X_nm(k) >= LTq(k)`, identical for
+  tonal and non-tonal maskers per the verbatim spec text),
+  and `decimate_tonal_within_half_bark(maskers)` is the
+  Step 5(b) tonal-cluster decimation pass — a sliding window
+  of width `STEP5_TONAL_DECIMATION_WINDOW_BARK = 0.5` Bark
+  in which two-or-more tonal maskers within strictly less
+  than 0.5 Bark of each other collapse to the loudest member
+  of the cluster (input-order stable on tied SPLs;
+  first-encountered loudest wins). Non-tonal maskers pass
+  through unchanged because §D.1 Step 4(c) already yields
+  at most one non-tonal masker per critical band. The
+  algorithm sorts the tonal subset by `z_bark`, walks
+  consecutive Bark gaps to find clusters, and emits the
+  surviving maskers in original-slice order; non-tonal
+  maskers are interleaved back at their original positions.
+  17 new unit tests cover: Step 5(a) above-LTq keep / below-LTq
+  drop / at-LTq inclusive boundary on both tonal and non-tonal
+  maskers; the `STEP5_TONAL_DECIMATION_WINDOW_BARK` constant
+  reads back 0.5 verbatim; Step 5(b) edge cases (empty input,
+  singleton passthrough, pair within window keeps loudest,
+  pair at exactly 0.5 Bark both survive per the spec's strict
+  "less than" wording, pair outside window both survive,
+  non-tonal cluster pass-through, three-member cluster
+  collapses, two separate clusters collapse independently,
+  ties resolve to first-encountered, unsorted input still
+  clusters correctly, mixed tonal / non-tonal preserves
+  non-tonal in place); a compositional invariant (Step 5(a)
+  then Step 5(b) reproduces the spec's full Step 5 sieve);
+  and an end-to-end smoke that pipes Step 5(a) + 5(b) into
+  Step 7 `global_masking_threshold_db` and confirms the
+  result matches direct evaluation on the decimated slice.
 - psy: Annex D Model 1 §D.1 Step 4 masker placement helper +
   Step 7 nearby-masker Bark-window range pre-filter
   (Phase 2 step 46). `masker_at_band(boundaries, band_no, kind,
