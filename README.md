@@ -2620,17 +2620,48 @@ preserves non-tonal in place); a compositional invariant
 Step 5 sieve); and an end-to-end smoke that pipes
 Step 5(a) + 5(b) into Step 7
 `global_masking_threshold_db` and confirms the result
-matches direct evaluation on the decimated slice — it still
-lacks
+matches direct evaluation on the decimated slice + r237
+Annex D Model 2 §C.1.5.3.2.1 Layer III spreading-function
+primitives. The spec describes Layer III's modification of
+the Model 2 spreading function as two branches —
+`tmpy = 3.0 * (j - i)` for `j >= i` (upward / on-diagonal)
+and `tmpy = 1.5 * (j - i)` for `j < i` (downward) — followed
+by the linear conversion `sprdngf(i, j) = 10^(tmpy/10)`
+and the clamp "Only spreading-function values greater than
+1e-6 are used; all others set to zero".
+`model2_layer3_spread_db(i, j)` returns the per-partition dB
+value and `model2_layer3_spread_linear(i, j)` returns the
+clamped linear factor (with the spec's `1.0e-6` threshold
+exposed as `MODEL2_LAYER3_SPREAD_LINEAR_MIN`); the
+on-diagonal value is exactly `1.0`, the upward branch's
+linear factor grows above unity, and the downward branch
+falls below unity until the clamp boundary at `j - i = -40`
+(`tmpy = -60 dB` → exactly `1.0e-6` linear, collapsed to 0
+by the spec's strict `> 1e-6` survival comparison). 9 new
+unit tests cover: diagonal returns zero across the Model 2
+partition range; upward branch matches the verbatim
+`3.0 * (j - i)` formula at +1 / +5 / +20 partition steps;
+downward branch matches `1.5 * (j - i)` at -1 / -4 / -20
+steps; diagonal linear factor is exactly 1.0; upward linear
+factor strictly exceeds 1.0 and grows monotonically with
+distance (`10^0.3 ≈ 1.9953` at +1); downward linear factor
+is strictly below 1.0 and shrinks monotonically (`10^-0.15
+≈ 0.7079` at -1); clamp boundary holds the spec's strict
+comparison (-39 survives, -40 collapses to exact zero, -50
+stays clamped); the `1.0e-6` constant matches the spec's
+verbatim figure; the upward branch's diagonal value agrees
+with the downward-branch extension — it still lacks
 Model 1 Steps 1–3 (1024-sample FFT + SPL conversion +
 tonality classifier — surrounding Steps still need the FFT
 primitive + a tonality classifier; that's a `core`-level
 numerical primitive that is independent of the Annex D
-tables), the full
-Annex D Model 2 psychoacoustic model (calculation-partition
-table D.3 — PNG-only — plus the Model 2 spreading-function
+tables), the rest of
+Annex D Model 2 (calculation-partition
+table D.3 — PNG-only — the general PM2 spreading-function
 `tmpy` line that is typeset as image in the PDF and is not
-text-extractable),
+text-extractable, the Model 2 absolute-threshold tables
+D.4a–c, and the partition energy / threshold-spreading
+matrix that consumes the new Layer III primitives),
 intensity-stereo encode (§2.4.3.4.9.3), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's

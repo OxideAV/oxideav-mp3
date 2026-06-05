@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 2 §C.1.5.3.2.1 Layer III spreading-function
+  primitives (Phase 2 step 48). Two new functions land the Layer
+  III modification of the Model 2 spreading function as transcribed
+  in `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` from
+  the staged ISO/IEC 11172-3:1993 PDF:
+  `model2_layer3_spread_db(i, j)` returns the per-partition dB
+  value `tmpy(i, j)` — `3.0 * (j - i)` for `j >= i` (upward /
+  on-diagonal branch) and `1.5 * (j - i)` for `j < i` (downward
+  branch); `model2_layer3_spread_linear(i, j)` returns the
+  spec's linear factor `sprdngf(i, j) = 10^(tmpy/10)` with the
+  spec's clamp "values greater than 1e-6 are used; all others
+  set to zero" applied via the new
+  `MODEL2_LAYER3_SPREAD_LINEAR_MIN = 1.0e-6` constant. The
+  diagonal at `i == j` yields exactly `tmpy = 0` / linear = 1.0;
+  the upward branch grows above unity (positive `tmpy`); the
+  downward branch falls below unity (negative `tmpy`) and
+  triggers the clamp at `j - i <= -40` (`tmpy <= -60 dB`). 9 new
+  unit tests cover: diagonal returns zero across the Model 2
+  partition range (1..63); upward branch matches the verbatim
+  `3.0 * (j - i)` formula at +1 / +5 / +20 partition steps;
+  downward branch matches `1.5 * (j - i)` at -1 / -4 / -20
+  steps; diagonal linear factor is exactly 1.0; upward linear
+  factor strictly exceeds 1.0 and grows monotonically with
+  distance (`10^0.3 ≈ 1.9953` at +1); downward linear factor
+  is strictly below 1.0 and shrinks monotonically (`10^-0.15
+  ≈ 0.7079` at -1); the clamp boundary holds the spec's strict
+  `> 1.0e-6` comparison (-39 survives, -40 collapses to exact
+  zero, -50 stays clamped); the `MODEL2_LAYER3_SPREAD_LINEAR_MIN`
+  constant reads back `1.0e-6` verbatim; the upward branch's
+  diagonal value matches what the downward branch would yield if
+  extended through `j == i`. The primitives are pure scalar
+  functions of the two partition indices — the broader Model 2
+  spreading matrix and the inter-partition energy convolution
+  remain follow-up work for a later step.
 - psy: Annex D Model 1 §D.1 Step 5 decimation primitives
   (Phase 2 step 47). Two new primitives wire the spec's
   Step 5 masker sieve between Step 4 placement (r229) and

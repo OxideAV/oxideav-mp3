@@ -1391,6 +1391,112 @@ pub fn decimate_tonal_within_half_bark(maskers: &[Masker]) -> Vec<Masker> {
         .collect()
 }
 
+// =====================================================================
+// Annex D Model 2 — §C.1.5.3.2.1 Layer III spreading function (Phase 2
+// step 48).
+//
+// Spec context (clause C.1.5.3.2.1 — "Layer III modifies the
+// spreading function", as transcribed in
+// docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md from the
+// staged ISO/IEC 11172-3:1993 PDF):
+//
+//   if j >= i : tmpy = 3,0 * (j - i)
+//   else      : tmpy = 1,5 * (j - i)
+//   Only spreading-function values greater than 1e-6 are used; all
+//   others set to zero.
+//
+// Here `i` is the partition index of the *masker* (the partition
+// emitting energy) and `j` is the partition index of the *masked*
+// (the partition receiving spread energy). The two branches encode
+// an asymmetric Bark-domain spread: a steeper roll-off when
+// spreading upward (`j > i`, the high-frequency direction the ear
+// masks well) and a gentler roll-off when spreading downward
+// (`j < i`, the low-frequency direction the ear masks less). At
+// `j == i` the two branches agree (`tmpy = 0`), so the linear
+// spreading factor is `10^0 = 1` on the diagonal.
+//
+// The spec computes `tmpy` in dB and then converts it into a linear
+// energy-domain factor `sprdngf = 10^(tmpy/10)`. The final clamp
+// "values greater than 1e-6 are used; all others set to zero" is
+// stated as a threshold on the linear factor, not on `tmpy`. In
+// linear terms `10^(tmpy/10) > 1.0e-6` is equivalent to
+// `tmpy > -60 dB` (since `10^(-60/10) = 1.0e-6` exactly); the spec's
+// linear-domain phrasing is what this primitive implements (the
+// caller may inspect the unclamped dB value via the separate `_db`
+// accessor).
+// =====================================================================
+
+/// Spec clamp for the Model 2 Layer III spreading-function factor
+/// (verbatim spec text: "Only spreading-function values greater than
+/// 1e-6 are used; all others set to zero").
+///
+/// The threshold is a hard lower bound on the *linear* factor
+/// `10^(tmpy/10)`; spreading-function values at or below this
+/// threshold are clamped to exact zero by the spec procedure.
+pub const MODEL2_LAYER3_SPREAD_LINEAR_MIN: f64 = 1.0e-6;
+
+/// §C.1.5.3.2.1 Layer III spreading-function dB value `tmpy(i, j)` —
+/// the per-partition asymmetric spread in dB before the linear
+/// conversion. `i` is the *masker* partition index, `j` is the
+/// *masked* partition index, and both are in Model 2's partition
+/// space (the `Index` column of Tables D.3a–c).
+///
+/// Spec branches (verbatim text):
+///
+/// ```text
+/// j >= i : tmpy = 3.0 * (j - i)
+/// j <  i : tmpy = 1.5 * (j - i)
+/// ```
+///
+/// At `i == j` the value is exactly `0.0`. For `j > i` (upward
+/// spread, masked partition above masker) `tmpy` is positive and
+/// the linear factor grows above unity; for `j < i` (downward
+/// spread) `tmpy` is negative and the linear factor falls below
+/// unity, eventually triggering the spec's
+/// `MODEL2_LAYER3_SPREAD_LINEAR_MIN` clamp.
+#[inline]
+#[must_use]
+pub fn model2_layer3_spread_db(i: i32, j: i32) -> f64 {
+    let dj = f64::from(j - i);
+    if j >= i {
+        // Upward / on-diagonal branch. At j == i this yields 0.0
+        // (unity spread on the diagonal).
+        3.0 * dj
+    } else {
+        // Downward branch: `dj` is negative, so the result is
+        // negative.
+        1.5 * dj
+    }
+}
+
+/// §C.1.5.3.2.1 Layer III spreading-function **linear** factor
+/// `sprdngf(i, j) = 10^(tmpy(i, j) / 10)`, with the spec's
+/// "greater-than-`1.0e-6` clamp" applied: factors at or below
+/// `MODEL2_LAYER3_SPREAD_LINEAR_MIN` collapse to exact `0.0`.
+///
+/// The clamped factor is suitable as a Model 2 spreading-matrix
+/// entry: zero-valued cells contribute no energy to the partition's
+/// masking sum and can be dropped from sparse-matrix multiplies.
+///
+/// At `i == j` the factor is exactly `1.0`; the spec's `tmpy = 0`
+/// gives `10^0 = 1`, which is well above the clamp threshold. For
+/// `j > i` the factor grows above unity (the upward branch has a
+/// positive `tmpy`); the clamp only takes effect on the downward
+/// branch when `j` is sufficiently far below `i` to drive `tmpy`
+/// below `-60` dB (i.e. `j - i <= -40` for the `1.5 * (j - i)`
+/// branch).
+#[inline]
+#[must_use]
+pub fn model2_layer3_spread_linear(i: i32, j: i32) -> f64 {
+    let tmpy_db = model2_layer3_spread_db(i, j);
+    let linear = (10.0_f64).powf(tmpy_db / 10.0);
+    if linear > MODEL2_LAYER3_SPREAD_LINEAR_MIN {
+        linear
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3068,5 +3174,128 @@ mod tests {
         // only `keep`.
         let direct = global_masking_threshold_db(&[keep], z_i, ltq_db);
         assert!((ltg - direct).abs() < 1.0e-12);
+    }
+
+    // ---- Phase 2 step 48 — §C.1.5.3.2.1 Model 2 Layer III
+    // spreading function primitives.
+
+    #[test]
+    fn model2_layer3_spread_db_on_diagonal_is_zero() {
+        // Spec: both branches collapse at j == i (the `j >= i`
+        // branch evaluates `3.0 * 0 = 0`). Spot-check a handful of
+        // partition indices spanning Model 2's index range (1…63
+        // for Fs = 32 kHz per Table D.3a).
+        for i in [1, 5, 20, 40, 63] {
+            assert_eq!(model2_layer3_spread_db(i, i), 0.0);
+        }
+    }
+
+    #[test]
+    fn model2_layer3_spread_db_upward_branch_matches_spec() {
+        // Spec verbatim: `j >= i : tmpy = 3.0 * (j - i)`. Verify a
+        // 1-Bark step (j = i + 1), a 5-step jump, and a 20-step
+        // jump.
+        let i = 10;
+        assert_eq!(model2_layer3_spread_db(i, i + 1), 3.0);
+        assert_eq!(model2_layer3_spread_db(i, i + 5), 15.0);
+        assert_eq!(model2_layer3_spread_db(i, i + 20), 60.0);
+    }
+
+    #[test]
+    fn model2_layer3_spread_db_downward_branch_matches_spec() {
+        // Spec verbatim: `j < i : tmpy = 1.5 * (j - i)`. `j - i` is
+        // negative on this branch so `tmpy` is negative.
+        let i = 30;
+        assert_eq!(model2_layer3_spread_db(i, i - 1), -1.5);
+        assert_eq!(model2_layer3_spread_db(i, i - 4), -6.0);
+        assert_eq!(model2_layer3_spread_db(i, i - 20), -30.0);
+    }
+
+    #[test]
+    fn model2_layer3_spread_linear_diagonal_is_unity() {
+        // `tmpy = 0` → `10^0 = 1`. Well above the 1e-6 clamp, so
+        // the diagonal entry is exactly 1.0.
+        for i in [1, 7, 25, 50, 63] {
+            assert_eq!(model2_layer3_spread_linear(i, i), 1.0);
+        }
+    }
+
+    #[test]
+    fn model2_layer3_spread_linear_upward_is_above_unity() {
+        // Upward branch carries a positive `tmpy`, so the linear
+        // factor strictly exceeds 1.0 for any `j > i`.
+        let i = 10;
+        let f1 = model2_layer3_spread_linear(i, i + 1);
+        let f3 = model2_layer3_spread_linear(i, i + 3);
+        assert!(f1 > 1.0, "j = i + 1 factor must exceed unity, got {f1}");
+        assert!(f3 > f1, "factor must grow with distance: {f3} vs {f1}");
+        // tmpy(i, i+1) = +3 dB → 10^0.3 ≈ 1.9953.
+        assert!((f1 - 1.995_262_314_968_88).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn model2_layer3_spread_linear_downward_is_below_unity() {
+        // Downward branch carries a negative `tmpy`, so the linear
+        // factor is strictly below 1.0 for any `j < i` (until the
+        // 1e-6 clamp kicks in at very large distances).
+        let i = 30;
+        let f1 = model2_layer3_spread_linear(i, i - 1);
+        let f3 = model2_layer3_spread_linear(i, i - 3);
+        assert!(f1 < 1.0, "j = i - 1 factor must be below unity, got {f1}");
+        assert!(f3 < f1, "factor must shrink with distance: {f3} vs {f1}");
+        assert!(f3 > 0.0, "factor stays positive away from clamp regime");
+        // tmpy(i, i-1) = -1.5 dB → 10^(-0.15) ≈ 0.7079.
+        assert!((f1 - 0.707_945_784_384_138).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn model2_layer3_spread_linear_clamp_kicks_in_at_minus_60_db() {
+        // Spec clamp: `> 1.0e-6` survives; `<= 1.0e-6` becomes 0.
+        // `1.0e-6` in dB is exactly -60 dB. On the downward branch
+        // `tmpy = 1.5 * (j - i)`, so `j - i = -40` gives `tmpy =
+        // -60` dB → linear factor `10^(-6)` which is exactly the
+        // clamp threshold (not strictly greater) → clamped to 0.
+        // `j - i = -39` gives `tmpy = -58.5` dB → linear factor
+        // ~`1.4e-6`, just above the clamp → survives.
+        let i = 50;
+        // Above the clamp threshold (survives).
+        let survives = model2_layer3_spread_linear(i, i - 39);
+        assert!(
+            survives > MODEL2_LAYER3_SPREAD_LINEAR_MIN,
+            "j - i = -39 must survive clamp, got {survives}",
+        );
+        // At the clamp threshold (collapses to exact zero per the
+        // strict `>` comparison in the spec text "values *greater
+        // than* 1e-6 are used").
+        let at_threshold = model2_layer3_spread_linear(i, i - 40);
+        assert_eq!(at_threshold, 0.0);
+        // Below the threshold (clamped).
+        let below = model2_layer3_spread_linear(i, i - 50);
+        assert_eq!(below, 0.0);
+    }
+
+    #[test]
+    fn model2_layer3_spread_constants_match_spec_text() {
+        // Sanity-check the spec text "Only spreading-function
+        // values greater than 1e-6 are used; all others set to
+        // zero" — the constant is exactly the `1e-6` figure as
+        // typeset in the spec.
+        assert_eq!(MODEL2_LAYER3_SPREAD_LINEAR_MIN, 1.0e-6);
+    }
+
+    #[test]
+    fn model2_layer3_spread_branches_agree_at_diagonal() {
+        // Continuity check: the spec's `j >= i` branch with `j = i`
+        // yields exactly the same value as a hypothetical
+        // `1.5 * (j - i)` evaluation at `j = i` (both are zero).
+        // This anchors the diagonal as the boundary between the two
+        // branches and ensures the `>=` half-open interval choice
+        // produces the same physical value the `<` branch would
+        // give if extended.
+        let i = 25;
+        let upward_at_diag = model2_layer3_spread_db(i, i);
+        let downward_extension = 1.5 * f64::from(0);
+        assert_eq!(upward_at_diag, downward_extension);
+        assert_eq!(upward_at_diag, 0.0);
     }
 }
