@@ -1544,6 +1544,49 @@ impl CoderPartitionD5 {
             width,
         }
     }
+
+    /// Read this row's `omega_boundary` under its **`ωhigh_n` role**.
+    ///
+    /// Annex D Table D.5 prints a single column for the partition
+    /// boundary FFT-line index under the dual-role heading
+    /// `ωlow_{n+1} / ωhigh_n`. The cell's value is verbatim the
+    /// printed integer; the column heading names two distinct spec
+    /// roles for it. This accessor returns the value under the
+    /// `ωhigh_n` role — the FFT-line index of the upper boundary of
+    /// partition `n` (where `n = self.index`). It is a pure rename of
+    /// `self.omega_boundary` and performs **no** arithmetic.
+    ///
+    /// Provenance: column heading `ωlow_{n+1} / ωhigh_n` in
+    /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+    /// §"Table D.5 - Layer I and Layer II coder partition table".
+    #[inline]
+    #[must_use]
+    pub const fn omega_high(self) -> u16 {
+        self.omega_boundary
+    }
+
+    /// Read this row's `omega_boundary` under its **`ωlow_{n+1}`
+    /// role**.
+    ///
+    /// The Table D.5 column heading `ωlow_{n+1} / ωhigh_n` names two
+    /// distinct spec roles for the row's verbatim printed integer.
+    /// This accessor returns the value under the `ωlow_{n+1}` role —
+    /// the FFT-line index of the lower boundary of the **next**
+    /// partition `n + 1` (where `n = self.index`). It is a pure
+    /// rename of `self.omega_boundary` and performs **no** arithmetic.
+    ///
+    /// Partition `0`'s own lower boundary `ωlow_0` is **not** in
+    /// Table D.5 — only `ωlow_n` for `n ∈ 1..=33` is recoverable from
+    /// this row set, by reading row `n - 1`'s `omega_low_of_next()`.
+    ///
+    /// Provenance: column heading `ωlow_{n+1} / ωhigh_n` in
+    /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+    /// §"Table D.5 - Layer I and Layer II coder partition table".
+    #[inline]
+    #[must_use]
+    pub const fn omega_low_of_next(self) -> u16 {
+        self.omega_boundary
+    }
 }
 
 /// Annex D **Table D.5** — Layer I / Layer II coder partition table.
@@ -1607,11 +1650,63 @@ pub const CODER_PARTITION_D5_STRIDE: u16 = 16;
 /// `ωlow_{n+1} / ωhigh_n` column heading's dual role: the row's
 /// `omega_boundary` field is the verbatim printed value, and
 /// callers that need either of the two boundary roles must apply
-/// the spec arithmetic explicitly.
+/// the spec arithmetic explicitly. See
+/// [`coder_partition_d5_omega_high`] and
+/// [`coder_partition_d5_omega_low`] for the two role-aware
+/// table-level accessors.
 #[inline]
 #[must_use]
 pub fn coder_partition_d5(n: u16) -> Option<CoderPartitionD5> {
     CODER_PARTITION_TABLE_D5.get(n as usize).copied()
+}
+
+/// Read the upper FFT-line boundary `ωhigh_n` of coder partition
+/// `n` from Table D.5. Returns `None` for any `n` outside the spec
+/// range 0..=32.
+///
+/// Annex D Table D.5 prints a single column for the partition
+/// boundary FFT-line index under the dual-role heading
+/// `ωlow_{n+1} / ωhigh_n`. The row at index `n` carries the
+/// verbatim printed integer in its `omega_boundary` field; under
+/// the `ωhigh_n` role that integer is the **upper** boundary of
+/// partition `n`. This accessor is a pure column rename — it
+/// performs **no** arithmetic and the value matches
+/// `coder_partition_d5(n).map(|r| r.omega_boundary)` exactly.
+///
+/// Provenance: column heading `ωlow_{n+1} / ωhigh_n` in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table".
+#[inline]
+#[must_use]
+pub fn coder_partition_d5_omega_high(n: u16) -> Option<u16> {
+    coder_partition_d5(n).map(CoderPartitionD5::omega_high)
+}
+
+/// Read the lower FFT-line boundary `ωlow_n` of coder partition
+/// `n` from Table D.5. Returns `None` for any `n` outside the spec
+/// range **1..=33** (NOT 0..=32 — see below).
+///
+/// Annex D Table D.5 prints `ωlow_{n+1}` at row `n`'s
+/// `omega_boundary` cell, so the table covers `ωlow_n` for
+/// `n ∈ 1..=33` only — partition 0's own lower boundary `ωlow_0`
+/// is **not** present in the table. Inputs `n = 0` and `n > 33`
+/// both return `None`; inputs `n ∈ 1..=33` return row `n - 1`'s
+/// verbatim `omega_boundary` value (i.e. row `n - 1`'s
+/// [`CoderPartitionD5::omega_low_of_next`] reading). This accessor
+/// is a pure column rename plus the `n → n - 1` row shift required
+/// by the column heading's `ωlow_{n+1}` half — no other arithmetic
+/// is performed.
+///
+/// Provenance: column heading `ωlow_{n+1} / ωhigh_n` in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table".
+#[inline]
+#[must_use]
+pub fn coder_partition_d5_omega_low(n: u16) -> Option<u16> {
+    if n == 0 {
+        return None;
+    }
+    coder_partition_d5(n - 1).map(CoderPartitionD5::omega_low_of_next)
 }
 
 #[cfg(test)]
@@ -3554,5 +3649,112 @@ mod tests {
         let span = CODER_PARTITION_TABLE_D5[32].omega_boundary
             - CODER_PARTITION_TABLE_D5[0].omega_boundary;
         assert_eq!(span, 32 * CODER_PARTITION_D5_STRIDE);
+    }
+
+    // ---- Table D.5 — dual-role accessors --------------------------
+
+    #[test]
+    fn coder_partition_d5_omega_high_method_renames_omega_boundary() {
+        // Per-row method: `omega_high()` is a pure rename of the
+        // verbatim `omega_boundary` field with no arithmetic.
+        for row in &CODER_PARTITION_TABLE_D5 {
+            assert_eq!(row.omega_high(), row.omega_boundary);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_low_of_next_method_renames_omega_boundary() {
+        // Per-row method: `omega_low_of_next()` is a pure rename of
+        // the verbatim `omega_boundary` field with no arithmetic.
+        for row in &CODER_PARTITION_TABLE_D5 {
+            assert_eq!(row.omega_low_of_next(), row.omega_boundary);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_dual_role_methods_return_same_value() {
+        // The two role-aware methods carry distinct spec names but
+        // expose the same printed integer — the column heading
+        // `ωlow_{n+1} / ωhigh_n` literally aliases the cell.
+        for row in &CODER_PARTITION_TABLE_D5 {
+            assert_eq!(row.omega_high(), row.omega_low_of_next());
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_high_table_accessor_anchor_rows() {
+        // Spec-anchored values: row 0 → ωhigh_0 = 1; row 12 →
+        // ωhigh_12 = 193; row 13 → ωhigh_13 = 209; row 32 →
+        // ωhigh_32 = 513.
+        assert_eq!(coder_partition_d5_omega_high(0), Some(1));
+        assert_eq!(coder_partition_d5_omega_high(12), Some(193));
+        assert_eq!(coder_partition_d5_omega_high(13), Some(209));
+        assert_eq!(coder_partition_d5_omega_high(32), Some(513));
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_high_table_accessor_matches_omega_boundary_for_all_rows() {
+        // The role-aware table accessor must equal the verbatim
+        // `omega_boundary` for every in-range index — pure rename.
+        for row in &CODER_PARTITION_TABLE_D5 {
+            assert_eq!(
+                coder_partition_d5_omega_high(row.index),
+                Some(row.omega_boundary),
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_high_table_accessor_rejects_out_of_range() {
+        // Spec range is 0..=32; index 33 and above return None.
+        assert_eq!(coder_partition_d5_omega_high(33), None);
+        assert_eq!(coder_partition_d5_omega_high(64), None);
+        assert_eq!(coder_partition_d5_omega_high(u16::MAX), None);
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_low_table_accessor_anchor_rows() {
+        // Spec-anchored values: ωlow_1 = 1 (row 0); ωlow_13 = 193
+        // (row 12); ωlow_14 = 209 (row 13); ωlow_33 = 513 (row 32).
+        assert_eq!(coder_partition_d5_omega_low(1), Some(1));
+        assert_eq!(coder_partition_d5_omega_low(13), Some(193));
+        assert_eq!(coder_partition_d5_omega_low(14), Some(209));
+        assert_eq!(coder_partition_d5_omega_low(33), Some(513));
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_low_partition_zero_is_not_in_table() {
+        // ωlow_0 — partition 0's own lower boundary — is NOT in
+        // Table D.5. The column heading `ωlow_{n+1} / ωhigh_n`
+        // shifts row n's value to ωlow_{n+1}, so the table covers
+        // ωlow_n only for n ∈ 1..=33. Input n = 0 returns None
+        // verbatim — no DOCS-GAP assumption is inserted.
+        assert_eq!(coder_partition_d5_omega_low(0), None);
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_low_rejects_out_of_range() {
+        // The table covers ωlow_n only for n ∈ 1..=33; n ≥ 34
+        // returns None.
+        assert_eq!(coder_partition_d5_omega_low(34), None);
+        assert_eq!(coder_partition_d5_omega_low(64), None);
+        assert_eq!(coder_partition_d5_omega_low(u16::MAX), None);
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_low_n_plus_1_equals_omega_high_n() {
+        // The column heading `ωlow_{n+1} / ωhigh_n` says these two
+        // roles share the same printed integer per row, so for every
+        // partition n ∈ 0..=32 the dual-role identity must hold:
+        // ωlow_{n+1} == ωhigh_n.
+        for n in 0_u16..=32 {
+            assert_eq!(
+                coder_partition_d5_omega_low(n + 1),
+                coder_partition_d5_omega_high(n),
+                "ωlow_{} != ωhigh_{}",
+                n + 1,
+                n,
+            );
+        }
     }
 }

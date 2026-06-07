@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Table D.5 dual-role boundary accessors (Phase 2
+  step 50). Surface the `ωlow_{n+1} / ωhigh_n` column heading's two
+  spec roles as named accessors so callers no longer have to apply
+  the column-rename arithmetic themselves. Two new per-row methods
+  on `CoderPartitionD5` — `omega_high()` and `omega_low_of_next()`
+  — each return the row's verbatim `omega_boundary` cell under one
+  of the two spec role names. Two new free functions on the
+  table — `coder_partition_d5_omega_high(n)` and
+  `coder_partition_d5_omega_low(n)` — return the same printed
+  integers but as the `ωhigh_n` / `ωlow_n` reading of partition
+  `n`. The `ωhigh_n` accessor covers the full spec range `n ∈
+  0..=32` (returns `None` outside); the `ωlow_n` accessor covers
+  `n ∈ 1..=33` only (returns `None` for `n = 0` and `n ≥ 34`)
+  because Table D.5 prints `ωlow_{n+1}` at row `n`, so partition
+  0's own lower boundary `ωlow_0` is not in the table and no
+  default is invented. All four accessors are pure column / row
+  renames — no arithmetic is performed beyond the verbatim
+  `n → n - 1` row shift that the column heading's `ωlow_{n+1}`
+  half explicitly requires. 10 new unit tests pin: the two per-row
+  methods rename `omega_boundary` for every in-range row; the two
+  methods return the same integer on every row (the dual-role
+  identity); four `ωhigh_n` spec-anchor rows
+  (`ωhigh_0 = 1`, `ωhigh_12 = 193`, `ωhigh_13 = 209`,
+  `ωhigh_32 = 513`); the `ωhigh_n` accessor equals
+  `omega_boundary` for every in-range index; the `ωhigh_n` accessor
+  rejects `n ∈ {33, 64, u16::MAX}`; four `ωlow_n` spec-anchor rows
+  (`ωlow_1 = 1`, `ωlow_13 = 193`, `ωlow_14 = 209`,
+  `ωlow_33 = 513`); the `ωlow_n` accessor returns `None` for
+  partition 0 (the not-in-table case); the `ωlow_n` accessor
+  rejects `n ∈ {34, 64, u16::MAX}`; and the table-wide dual-role
+  identity `ωlow_{n+1} == ωhigh_n` across every `n ∈ 0..=32`.
+  Provenance: only the column heading
+  `ωlow_{n+1} / ωhigh_n` from
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+  §"Table D.5 - Layer I and Layer II coder partition table" is
+  consulted; no external reference implementation read.
 - psy: Annex D Table D.5 Layer I / Layer II coder partition table
   (Phase 2 step 49). The 33-row partition table is transcribed
   verbatim from the staged

@@ -2373,6 +2373,82 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 50 (r249)** — Annex D Table D.5 dual-role
+boundary accessors. The Phase 2 step 49 (r248) commit landed the
+full 33-row Table D.5 — Layer I / Layer II coder partition
+table — as a verbatim `CODER_PARTITION_TABLE_D5: [CoderPartitionD5;
+33]` keyed on the spec column `index n` plus the printed
+`omega_boundary` (the cell under the dual-role column heading
+`ωlow_{n+1} / ωhigh_n`) plus the `width_n` value. That row
+accessor deliberately did **not** interpret the dual role —
+callers had to apply the column-rename arithmetic themselves.
+r249 lands the dual-role accessor surface so the two spec roles
+are visible at the API level:
+
+* `CoderPartitionD5::omega_high()` is a pure rename of the row's
+  `omega_boundary` field under its `ωhigh_n` spec role — the
+  upper boundary FFT-line index of partition `n` (where
+  `n = self.index`).
+* `CoderPartitionD5::omega_low_of_next()` is the same pure rename
+  under the column heading's other role — the lower boundary
+  FFT-line index of the **next** partition `n + 1`.
+* `coder_partition_d5_omega_high(n)` is a table-level wrapper
+  that returns the `ωhigh_n` reading of partition `n` for
+  `n ∈ 0..=32` (and `None` outside).
+* `coder_partition_d5_omega_low(n)` is a table-level wrapper
+  that returns the `ωlow_n` reading of partition `n` for
+  `n ∈ 1..=33` (and `None` outside, including `n = 0`).
+
+The `n = 0` case is deliberate: the column heading
+`ωlow_{n+1} / ωhigh_n` prints `ωlow_{n+1}` at row `n`, so the
+table covers `ωlow_n` only for `n ∈ 1..=33` — partition 0's own
+lower boundary `ωlow_0` is **not** in Table D.5. r249 does
+**not** invent a default; the accessor returns `None` for `n = 0`
+verbatim, and the "what is partition 0's lower boundary?"
+question is logged as a downstream DOCS-GAP for the Specifier
+round that will eventually need to use partition 0 in an actual
+threshold aggregation. (The structural anchor `ωhigh_0 = 1`
+already lands as the row-0 transcription, so callers that need
+the upper boundary of partition 0 are unblocked.)
+
+Every accessor is a pure column / row rename — no arithmetic
+beyond the verbatim `n → n - 1` row shift the column heading's
+`ωlow_{n+1}` half explicitly requires. The four accessors do not
+read the `width_n` column.
+
+Validated by 10 new lib unit tests in `psy::tests`:
+`coder_partition_d5_omega_high_method_renames_omega_boundary` +
+`coder_partition_d5_omega_low_of_next_method_renames_omega_boundary`
+pin the two per-row methods against the verbatim
+`omega_boundary` field on every row;
+`coder_partition_d5_dual_role_methods_return_same_value` pins
+the dual-role identity at the per-row level;
+`coder_partition_d5_omega_high_table_accessor_anchor_rows` pins
+the four spec-anchor `ωhigh_n` values (`ωhigh_0 = 1`,
+`ωhigh_12 = 193`, `ωhigh_13 = 209`, `ωhigh_32 = 513`);
+`coder_partition_d5_omega_high_table_accessor_matches_omega_boundary_for_all_rows`
+pins the table accessor against `omega_boundary` for every
+in-range index;
+`coder_partition_d5_omega_high_table_accessor_rejects_out_of_range`
+pins the `None` return at `n ∈ {33, 64, u16::MAX}`;
+`coder_partition_d5_omega_low_table_accessor_anchor_rows` pins
+the four `ωlow_n` spec anchors (`ωlow_1 = 1`, `ωlow_13 = 193`,
+`ωlow_14 = 209`, `ωlow_33 = 513`);
+`coder_partition_d5_omega_low_partition_zero_is_not_in_table`
+pins the verbatim `None` return for `n = 0` (no default
+invented);
+`coder_partition_d5_omega_low_rejects_out_of_range` pins the
+`None` return at `n ∈ {34, 64, u16::MAX}`; and
+`coder_partition_d5_omega_low_n_plus_1_equals_omega_high_n`
+exercises the table-wide dual-role identity
+`ωlow_{n+1} == ωhigh_n` across every `n ∈ 0..=32`. Tests: 665
+lib (was 655 baseline; +10 unit). No external implementation
+consulted; only the column heading
+`ωlow_{n+1} / ωhigh_n` from
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 - Layer I and Layer II coder partition table" was
+read.
+
 Remaining Phase 2 work: Model 1 Steps 1–5 (1024-sample FFT +
 SPL conversion + tonality classifier + decimation + masker
 selection — these consume the PNG-only Annex D Tables D.1 / D.2
