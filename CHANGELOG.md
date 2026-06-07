@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Table D.5 inclusive-line membership predicate
+  (Phase 2 step 54). Lift the obvious inequality on the Phase 2
+  step 53 `CoderPartitionD5Span` descriptor (`s.omega_low <= ω &&
+  ω <= s.omega_high`) to a named predicate so the downstream
+  Model 1 / Model 2 partition-threshold reduction can read like the
+  spec ("for each line in partition `n` …") and the range-rejection
+  behaviour at the two boundary-table gaps stays in one place. New
+  free function `partition_n_contains_line(n, omega)` returns
+  `Some(true)` if `ω` is inside partition `n`'s inclusive boundary
+  range `[ωlow_n, ωhigh_n]`, `Some(false)` if it isn't, and `None`
+  for any `n` outside `1..=32` (the same range as the descriptor).
+  The predicate is a pure composition of the step 53 descriptor
+  with the inclusive inequality — no arithmetic beyond the
+  inequality on the descriptor's pre-computed boundaries. Under the
+  inclusive-on-both-ends reading the descriptor inherits from
+  Phase 2 step 50, the tiling identity `ωhigh_n = ωlow_{n+1}` means
+  the shared boundary line belongs to both partitions `n` and
+  `n + 1`. The `omega` argument is not range-checked against the
+  table-wide FFT-line domain `[1, 513]`; out-of-band values return
+  `false` at every in-range `n`. 7 new lib unit tests pin: the
+  inclusive-on-both-ends reading at every recoverable partition's
+  `ωlow_n` / `ωhigh_n`; the off-by-one exclusion of `ωlow_n - 1`
+  and `ωhigh_n + 1`; spec-anchored membership at partitions
+  `{1, 12, 13, 32}` including the shared-boundary line; `None` at
+  both edges (`n ∈ {0, 33}`) and above (`n ∈ {34, 64, u16::MAX}`)
+  across a sweep of `omega` values; line-level tiling (boundary
+  lines belong to two consecutive partitions, interior lines
+  belong to exactly one); pure-composition agreement across every
+  `(n, ω) ∈ 1..=32 × 0..=520` pair; and out-of-band `omega`
+  rejection (`omega ∈ {0, 514, 1024, u16::MAX}`). Tests: 696 lib
+  (was 689 baseline; +7 unit). Provenance: only the Phase 2 step 53
+  descriptor and its underlying Table D.5 transcription in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+  §"Table D.5 - Layer I and Layer II coder partition table" are
+  consulted; the inclusive-on-both-ends boundary reading is the
+  spec's, pinned by Phase 2 step 50 (r249).
 - psy: Annex D Table D.5 composed partition descriptor (Phase 2
   step 53). Wire the Phase 2 step 52 `width_n` column accessor into
   the Model 1 / Model 2 partition-threshold reduction by composing

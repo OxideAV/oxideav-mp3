@@ -2373,6 +2373,86 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 54 (r253)** — Annex D Table D.5 inclusive-line
+membership predicate. Phase 2 step 53 (r252) composed the verbatim
+Table D.5 columns of partition `n` into a single
+`CoderPartitionD5Span` descriptor carrying `index`, `omega_low`
+(`ωlow_n`), `omega_high` (`ωhigh_n`) and `width` (`width_n`). The
+downstream Model 1 / Model 2 partition-threshold reduction iterates
+the table row by row and, per iteration, asks "does FFT-line index
+`ω` belong to partition `n`?" — the obvious inequality on the
+descriptor `s.omega_low <= ω && ω <= s.omega_high`. r253 lifts that
+inequality to a named predicate so the reduction can read like the
+spec ("for each line in partition `n` …") and the
+range-rejection behaviour at the two boundary-table gaps stays in
+one place:
+
+* `partition_n_contains_line(n, omega)` returns `Some(true)` if `ω`
+  is inside partition `n`'s inclusive boundary range
+  `[ωlow_n, ωhigh_n]`, `Some(false)` if it isn't, and `None` for
+  any `n` outside `1..=32` (`n = 0` lacks a Table D.5 `ωlow_0`;
+  `n = 33` has no row at all).
+
+The predicate is a **pure composition** of the step 53 descriptor
+with the inclusive inequality — no arithmetic beyond the inequality
+on the descriptor's pre-computed boundaries is introduced. It is
+`coder_partition_d5_span(n).map(|s| s.omega_low <= omega && omega
+<= s.omega_high)` exactly.
+
+The inclusive-on-both-ends reading the predicate uses is the same
+one Phase 2 step 50 (r249) pinned at the dual-role boundary
+accessors: the column heading `ωlow_{n+1} / ωhigh_n` names two
+distinct spec roles for the row's verbatim integer, so the tiling
+identity `ωhigh_n = ωlow_{n+1}` means the shared boundary line
+belongs to **both** partitions `n` and `n + 1` under inclusive-on-
+both-ends membership. The downstream partition reduction handles
+the shared boundary as the spec prescribes (typically: read
+partition `n` up through `ωhigh_n`, then read partition `n + 1`
+from `ωlow_{n+1} = ωhigh_n`); both readings are sample-exact
+against the spec table. The predicate itself is silent on which
+reduction strategy a caller picks — it just answers the
+membership question.
+
+The `omega` argument is **not** range-checked against the
+table-wide FFT-line domain `[1, 513]`. A caller passing an
+out-of-band value (e.g. `omega = 0`, `omega = 514`, `omega =
+u16::MAX`) gets a well-defined `false` answer for every in-range
+`n`, exactly as the inequality on the descriptor's `[ωlow_n,
+ωhigh_n]` dictates — the predicate is a pure boolean over the
+descriptor and does not re-invent the table-wide line domain.
+
+Validated by 7 new lib unit tests in `psy::tests`:
+`partition_n_contains_line_inclusive_at_both_boundaries` pins the
+inclusive-on-both-ends reading at every recoverable partition's
+`ωlow_n` and `ωhigh_n`;
+`…_rejects_just_outside_each_boundary` pins the off-by-one
+exclusion of `ωlow_n - 1` and `ωhigh_n + 1`;
+`…_anchor_lines` pins spec-anchored membership at partitions
+`{1, 12, 13, 32}` covering the lower-block edge, the
+last/first row of each `width_n` block, and the table top
+(including the shared-boundary line at partition 13's `ωlow_13 =
+193`);
+`…_rejects_partition_index_edges_and_out_of_range` pins `None` at
+both edges (`n ∈ {0, 33}`) and above (`n ∈ {34, 64, u16::MAX}`)
+across a sweep of `omega` values, confirming the answer doesn't
+depend on the line argument at an unrecoverable partition index;
+`…_every_in_band_line_belongs_to_exactly_one_partition` pins
+the tiling property at the line level — boundary lines belong to
+two consecutive partitions, interior lines belong to exactly one;
+`…_matches_descriptor_inequality_for_every_in_range_pair` pins
+the pure-composition property across every `(n, ω) ∈ 1..=32 ×
+0..=520` pair (sweeping past the table-wide upper bound to
+exercise the out-of-band false branch);
+`…_out_of_band_omega_is_false_at_every_in_range_partition` pins
+the predicate's silence on out-of-band `omega` values — `false`
+for `omega ∈ {0, 514, 1024, u16::MAX}` at every in-range `n`.
+Tests: 696 lib (was 689 baseline; +7 unit). No external
+implementation consulted; only the Phase 2 step 53 descriptor
+and its underlying Table D.5 transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 - Layer I and Layer II coder partition table" were
+read.
+
 **Phase 2 step 53 (r252)** — Annex D Table D.5 composed partition
 descriptor. Phase 2 steps 51 / 52 (r250 / r251) landed the inclusive
 FFT-line range accessor `(ωlow_n, ωhigh_n)` and the `width_n` value

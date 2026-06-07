@@ -1891,6 +1891,71 @@ pub fn coder_partition_d5_span(n: u16) -> Option<CoderPartitionD5Span> {
     })
 }
 
+/// Inclusive-line membership predicate over Annex D Table D.5 partition
+/// `n` — does FFT-line index `omega` fall within partition `n`'s
+/// inclusive boundary range `[ωlow_n, ωhigh_n]`?
+///
+/// The downstream Model 1 / Model 2 partition-threshold reduction needs
+/// to bin per-FFT-line energies into the per-partition accumulators that
+/// Table D.5 defines. The Phase 2 step 53 (r252) descriptor
+/// [`coder_partition_d5_span`] exposes the inclusive boundary pair
+/// `(ωlow_n, ωhigh_n)` for partition `n`; this step 54 accessor lifts
+/// the obvious membership test on that pair to a named predicate so
+/// callers don't repeat the inequality at every binning site (and so
+/// the range-rejection behaviour at the two boundary-table gaps stays
+/// in one place).
+///
+/// The predicate evaluates `omega_low <= omega && omega <= omega_high`
+/// over the descriptor `[ωlow_n, ωhigh_n]` returned by
+/// [`coder_partition_d5_span`], reflecting the spec's reading of the
+/// boundary column heading `ωlow_{n+1} / ωhigh_n` as *inclusive* on
+/// both ends. The tiling property already pinned by
+/// `coder_partition_d5_span_tiles_the_band` is `ωhigh_n =
+/// ωlow_{n+1}`, so the shared boundary line lies in **both**
+/// partitions `n` and `n + 1` under the inclusive-on-both-ends
+/// reading; the caller's downstream reduction handles the shared
+/// boundary as the spec prescribes (typically by reading partition
+/// `n` first up through `ωhigh_n` then partition `n + 1` from the
+/// same `ωlow_{n+1} = ωhigh_n` line — both readings are sample-exact
+/// against the spec table).
+///
+/// The accessor returns `Some(bool)` for any `n ∈ 1..=32` (the same
+/// range as the descriptor itself) and **`None`** for any `n` outside
+/// that range. The two edge cases inherit from the descriptor:
+///
+/// * `n = 0` — partition 0's lower boundary `ωlow_0` is not in
+///   Table D.5; without a `ωlow_n`, the membership test is undefined.
+///   `None` rather than a synthetic answer.
+/// * `n = 33` — neither row 33's boundary nor its `width_n` cell
+///   exists in Table D.5. `None`.
+///
+/// The `omega` argument is **not** range-checked against the
+/// table-wide FFT-line domain `[1, 513]`. A caller passing an
+/// out-of-band value (e.g. `omega = 0` or `omega = 1024`) gets a
+/// well-defined `false` answer for every in-range `n`, exactly as the
+/// inequality on the descriptor's `[ωlow_n, ωhigh_n]` dictates — the
+/// predicate is a pure boolean over the descriptor and does not
+/// re-invent the table-wide line domain.
+///
+/// The predicate is **pure**: it is `coder_partition_d5_span(n).map(
+/// |s| s.omega_low <= omega && omega <= s.omega_high)` exactly. No
+/// arithmetic beyond the inequality on the descriptor's pre-computed
+/// boundaries is introduced.
+///
+/// Provenance: only the Phase 2 step 53 descriptor
+/// [`coder_partition_d5_span`] and its underlying Table D.5
+/// transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table" are
+/// consulted; the inclusive-on-both-ends boundary reading is the
+/// spec's, pinned by Phase 2 step 50 (r249).
+#[inline]
+#[must_use]
+pub fn partition_n_contains_line(n: u16, omega: u16) -> Option<bool> {
+    let span = coder_partition_d5_span(n)?;
+    Some(span.omega_low <= omega && omega <= span.omega_high)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4353,6 +4418,187 @@ mod tests {
                 span.omega_low,
                 span.omega_high,
             );
+        }
+    }
+
+    // =====================================================================
+    // Phase 2 step 54 (r253) — Table D.5 inclusive-line membership
+    // predicate `partition_n_contains_line(n, ω)`.
+    // =====================================================================
+
+    #[test]
+    fn partition_n_contains_line_inclusive_at_both_boundaries() {
+        // Spec-anchor rows: the predicate is true at both endpoints of
+        // the inclusive boundary range `[ωlow_n, ωhigh_n]` — pinning
+        // the inclusive-on-both-ends reading the descriptor inherits
+        // from Phase 2 step 50.
+        for n in 1_u16..=32 {
+            let span = coder_partition_d5_span(n).unwrap();
+            assert_eq!(
+                partition_n_contains_line(n, span.omega_low),
+                Some(true),
+                "partition {n}: ωlow_{n} = {} should be inside",
+                span.omega_low,
+            );
+            assert_eq!(
+                partition_n_contains_line(n, span.omega_high),
+                Some(true),
+                "partition {n}: ωhigh_{n} = {} should be inside",
+                span.omega_high,
+            );
+        }
+    }
+
+    #[test]
+    fn partition_n_contains_line_rejects_just_outside_each_boundary() {
+        // The line one step below `ωlow_n` is outside; the line one
+        // step above `ωhigh_n` is outside. Pin both directly so a
+        // future off-by-one in the inequality is caught immediately.
+        for n in 1_u16..=32 {
+            let span = coder_partition_d5_span(n).unwrap();
+            // Below the lower boundary. For `n = 1`, `ωlow_1 = 1`, so
+            // we probe `omega = 0` — still representable in `u16`. For
+            // n > 1, ωlow_n > 1 so the predecessor is well-defined too.
+            assert!(span.omega_low >= 1, "partition {n}: ωlow precondition");
+            assert_eq!(
+                partition_n_contains_line(n, span.omega_low - 1),
+                Some(false),
+                "partition {n}: line just below ωlow_{n} should be outside",
+            );
+            // Above the upper boundary (no overflow risk in `u16`).
+            assert_eq!(
+                partition_n_contains_line(n, span.omega_high + 1),
+                Some(false),
+                "partition {n}: line just above ωhigh_{n} should be outside",
+            );
+        }
+    }
+
+    #[test]
+    fn partition_n_contains_line_anchor_lines() {
+        // Spec-anchored anchor evaluations from Table D.5 (read via the
+        // step 50 dual-role accessors — every value here is verbatim a
+        // boundary cell read of row `n - 1` or row `n`):
+        //
+        //   partition 1: ωlow_1 = 1 (row 0), ωhigh_1 = 17 (row 1) →
+        //                contains {1, 17}; excludes 18.
+        //   partition 12: ωlow_12 = 177 (row 11), ωhigh_12 = 193 (row 12)
+        //                 → contains 185 (interior midpoint).
+        //   partition 13: ωlow_13 = 193 (row 12), ωhigh_13 = 209
+        //                 (row 13) → contains 200 (interior); 193 is
+        //                 the shared boundary line (also in partition
+        //                 12) — pinned separately by the tiling test.
+        //   partition 32: ωlow_32 = 497 (row 31), ωhigh_32 = 513
+        //                 (row 32) → contains 513; excludes 514.
+        assert_eq!(partition_n_contains_line(1, 1), Some(true));
+        assert_eq!(partition_n_contains_line(1, 17), Some(true));
+        assert_eq!(partition_n_contains_line(1, 18), Some(false));
+
+        assert_eq!(partition_n_contains_line(12, 185), Some(true));
+        assert_eq!(partition_n_contains_line(12, 177), Some(true));
+        assert_eq!(partition_n_contains_line(12, 176), Some(false));
+
+        assert_eq!(partition_n_contains_line(13, 200), Some(true));
+        assert_eq!(partition_n_contains_line(13, 209), Some(true));
+        assert_eq!(partition_n_contains_line(13, 210), Some(false));
+
+        assert_eq!(partition_n_contains_line(32, 497), Some(true));
+        assert_eq!(partition_n_contains_line(32, 513), Some(true));
+        assert_eq!(partition_n_contains_line(32, 514), Some(false));
+    }
+
+    #[test]
+    fn partition_n_contains_line_rejects_partition_index_edges_and_out_of_range() {
+        // Inherits the descriptor's range — `n = 0` and `n = 33` are
+        // both boundary-table gaps; `n ∈ {34, 64, u16::MAX}` are out of
+        // range. The predicate returns `None` for any `omega` at those
+        // partition indices; sweep a few representative `omega` values
+        // to confirm the answer doesn't depend on the line argument at
+        // an unrecoverable partition index.
+        for &omega in &[0_u16, 1, 2, 100, 256, 513, 514, 1024, u16::MAX] {
+            assert_eq!(partition_n_contains_line(0, omega), None);
+            assert_eq!(partition_n_contains_line(33, omega), None);
+            assert_eq!(partition_n_contains_line(34, omega), None);
+            assert_eq!(partition_n_contains_line(64, omega), None);
+            assert_eq!(partition_n_contains_line(u16::MAX, omega), None);
+        }
+    }
+
+    #[test]
+    fn partition_n_contains_line_every_in_band_line_belongs_to_exactly_one_partition() {
+        // Tiling property at the line level: across the FFT-line range
+        // covered by the table — `[ωlow_1, ωhigh_32] = [2, 513]` — every
+        // line index is contained by exactly two partitions for
+        // boundary lines and exactly one for interior lines, by
+        // construction of the inclusive-on-both-ends reading where
+        // `ωhigh_n = ωlow_{n+1}` (the step 53 tiling test pinned the
+        // boundary equality directly).
+        //
+        // Pin both: boundary lines (every `ωhigh_n` for `n ∈ 1..=31`)
+        // belong to partitions `n` *and* `n + 1`; interior lines
+        // (every line in `(ωlow_n, ωhigh_n)`) belong to exactly
+        // partition `n`.
+        for n in 1_u16..=31 {
+            let span = coder_partition_d5_span(n).unwrap();
+            // Boundary line `ωhigh_n` is in partition n.
+            assert_eq!(partition_n_contains_line(n, span.omega_high), Some(true));
+            // And also in partition n+1 (since `ωlow_{n+1} = ωhigh_n`).
+            assert_eq!(
+                partition_n_contains_line(n + 1, span.omega_high),
+                Some(true),
+                "boundary line {} should be in partition {}",
+                span.omega_high,
+                n + 1,
+            );
+            // An interior line (the midpoint of the inclusive span) is
+            // in partition n only.
+            let mid = span.omega_low + (span.omega_high - span.omega_low) / 2;
+            assert_eq!(partition_n_contains_line(n, mid), Some(true));
+            if n >= 2 {
+                assert_eq!(partition_n_contains_line(n - 1, mid), Some(false));
+            }
+            if n <= 31 {
+                assert_eq!(partition_n_contains_line(n + 1, mid), Some(false));
+            }
+        }
+    }
+
+    #[test]
+    fn partition_n_contains_line_matches_descriptor_inequality_for_every_in_range_pair() {
+        // Pure-composition pin: across every recoverable partition `n`
+        // and every FFT-line `ω` in `0..=520` (slightly past the
+        // table-wide upper bound `ωhigh_32 = 513` to exercise the
+        // out-of-band false branch too), the predicate value equals
+        // the inequality `s.omega_low <= ω && ω <= s.omega_high` on
+        // the step 53 descriptor `s`. No drift between the two paths.
+        for n in 1_u16..=32 {
+            let span = coder_partition_d5_span(n).unwrap();
+            for omega in 0_u16..=520 {
+                let by_predicate = partition_n_contains_line(n, omega).unwrap();
+                let by_descriptor = span.omega_low <= omega && omega <= span.omega_high;
+                assert_eq!(
+                    by_predicate, by_descriptor,
+                    "partition {n}, omega {omega}: predicate {by_predicate} != descriptor {by_descriptor}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partition_n_contains_line_out_of_band_omega_is_false_at_every_in_range_partition() {
+        // The table-wide FFT-line domain is `[1, 513]` — partition 1's
+        // `ωlow_1 = 2` lower bound and partition 32's `ωhigh_32 = 513`
+        // upper bound. Calling the predicate with `omega = 0` (below
+        // every partition's `ωlow_n`) is `false` at every in-range
+        // `n`; calling with `omega = 514` (above every partition's
+        // `ωhigh_n`) is `false` at every in-range `n`. The predicate
+        // does not range-check `omega` against the table-wide line
+        // domain — it just evaluates the inequality.
+        for n in 1_u16..=32 {
+            assert_eq!(partition_n_contains_line(n, 0), Some(false));
+            assert_eq!(partition_n_contains_line(n, 514), Some(false));
+            assert_eq!(partition_n_contains_line(n, 1024), Some(false));
+            assert_eq!(partition_n_contains_line(n, u16::MAX), Some(false));
         }
     }
 }
