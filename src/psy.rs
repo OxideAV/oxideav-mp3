@@ -1497,6 +1497,123 @@ pub fn model2_layer3_spread_linear(i: i32, j: i32) -> f64 {
     }
 }
 
+/// One row of Annex D Table D.5 — *Layer I and Layer II coder
+/// partition table*.
+///
+/// Table D.5 enumerates the **coder partitions** of ISO/IEC 11172-3
+/// Annex D clause D.2 used by Models 1 and 2 to aggregate
+/// per-FFT-line thresholds into the per-partition values fed to the
+/// Layer I / Layer II bit-allocation loop. The table prints three
+/// columns per row, with the second column doubling as both the
+/// previous partition's top line (`ωhigh_n`) and the next
+/// partition's first line (`ωlow_{n+1}`):
+///
+/// 1. `index` — the coder-partition number `n`, 0..=32.
+/// 2. `omega_boundary` — the FFT-line index that sits at the
+///    partition boundary; for row `n` this is simultaneously
+///    `ωlow_{n+1}` (the first line of partition `n+1`) and
+///    `ωhigh_n` (the last line of partition `n`).
+/// 3. `width` — the `width_n` value the spec table prints
+///    against partition `n`. In the table this is 0 for rows
+///    0..=12 and 1 for rows 13..=32.
+///
+/// The fields are transcribed verbatim from the
+/// `mp3-annex-d-psychoacoustic-extracts.md` text extract (which is
+/// itself a verbatim transcription of the PDF page render of
+/// printed p.139, PDF page 145).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoderPartitionD5 {
+    /// Coder-partition index `n`. Spec range: 0..=32.
+    pub index: u16,
+    /// Partition boundary FFT-line index — `ωlow_{n+1}` /
+    /// `ωhigh_n` in the spec table. Spec range: 1..=513.
+    pub omega_boundary: u16,
+    /// `width_n` value the spec table prints for this row. 0 for
+    /// rows 0..=12, 1 for rows 13..=32.
+    pub width: u16,
+}
+
+impl CoderPartitionD5 {
+    /// Construct a row at compile time.
+    #[inline]
+    #[must_use]
+    pub const fn new(index: u16, omega_boundary: u16, width: u16) -> Self {
+        Self {
+            index,
+            omega_boundary,
+            width,
+        }
+    }
+}
+
+/// Annex D **Table D.5** — Layer I / Layer II coder partition table.
+/// 33 rows, transcribed verbatim from
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table".
+///
+/// Each row carries the partition boundary FFT-line index
+/// (`ωlow_{n+1} / ωhigh_n` in the spec table) and the spec's
+/// `width_n` value. The rows are ordered by ascending partition
+/// index `n = 0..=32` and the boundary column is strictly monotonic
+/// in `n` by 16 lines per partition.
+pub const CODER_PARTITION_TABLE_D5: [CoderPartitionD5; 33] = [
+    CoderPartitionD5::new(0, 1, 0),
+    CoderPartitionD5::new(1, 17, 0),
+    CoderPartitionD5::new(2, 33, 0),
+    CoderPartitionD5::new(3, 49, 0),
+    CoderPartitionD5::new(4, 65, 0),
+    CoderPartitionD5::new(5, 81, 0),
+    CoderPartitionD5::new(6, 97, 0),
+    CoderPartitionD5::new(7, 113, 0),
+    CoderPartitionD5::new(8, 129, 0),
+    CoderPartitionD5::new(9, 145, 0),
+    CoderPartitionD5::new(10, 161, 0),
+    CoderPartitionD5::new(11, 177, 0),
+    CoderPartitionD5::new(12, 193, 0),
+    CoderPartitionD5::new(13, 209, 1),
+    CoderPartitionD5::new(14, 225, 1),
+    CoderPartitionD5::new(15, 241, 1),
+    CoderPartitionD5::new(16, 257, 1),
+    CoderPartitionD5::new(17, 273, 1),
+    CoderPartitionD5::new(18, 289, 1),
+    CoderPartitionD5::new(19, 305, 1),
+    CoderPartitionD5::new(20, 321, 1),
+    CoderPartitionD5::new(21, 337, 1),
+    CoderPartitionD5::new(22, 353, 1),
+    CoderPartitionD5::new(23, 369, 1),
+    CoderPartitionD5::new(24, 385, 1),
+    CoderPartitionD5::new(25, 401, 1),
+    CoderPartitionD5::new(26, 417, 1),
+    CoderPartitionD5::new(27, 433, 1),
+    CoderPartitionD5::new(28, 449, 1),
+    CoderPartitionD5::new(29, 465, 1),
+    CoderPartitionD5::new(30, 481, 1),
+    CoderPartitionD5::new(31, 497, 1),
+    CoderPartitionD5::new(32, 513, 1),
+];
+
+/// Coder-partition stride: the difference in the FFT-line boundary
+/// column between two consecutive Table D.5 rows. The spec table
+/// prints a strictly uniform 16-line stride across all 32 row
+/// transitions, so every partition spans 16 FFT lines (the
+/// `width_n` column records a separate orthogonal quantity per the
+/// spec text and is exposed unchanged on each row).
+pub const CODER_PARTITION_D5_STRIDE: u16 = 16;
+
+/// Look up the Table D.5 row for partition index `n`. Returns
+/// `None` for any `n` outside the spec range 0..=32.
+///
+/// This is a direct row accessor — it does **not** interpret the
+/// `ωlow_{n+1} / ωhigh_n` column heading's dual role: the row's
+/// `omega_boundary` field is the verbatim printed value, and
+/// callers that need either of the two boundary roles must apply
+/// the spec arithmetic explicitly.
+#[inline]
+#[must_use]
+pub fn coder_partition_d5(n: u16) -> Option<CoderPartitionD5> {
+    CODER_PARTITION_TABLE_D5.get(n as usize).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3297,5 +3414,145 @@ mod tests {
         let downward_extension = 1.5 * f64::from(0);
         assert_eq!(upward_at_diag, downward_extension);
         assert_eq!(upward_at_diag, 0.0);
+    }
+
+    // ---- Table D.5 — Layer I/II coder partition table -------------
+
+    #[test]
+    fn coder_partition_d5_has_33_rows() {
+        // Spec: Index n = 0..=32 — 33 rows in Table D.5.
+        assert_eq!(CODER_PARTITION_TABLE_D5.len(), 33);
+    }
+
+    #[test]
+    fn coder_partition_d5_indices_are_contiguous_zero_based() {
+        // Every row's `index` field equals its position in the array.
+        for (pos, row) in CODER_PARTITION_TABLE_D5.iter().enumerate() {
+            assert_eq!(
+                u16::try_from(pos).unwrap(),
+                row.index,
+                "row at array position {pos} carries index = {}",
+                row.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_anchor_rows_match_spec() {
+        // Verbatim cross-check against the docs file: first row, the
+        // last row of the width-0 block, the first row of the width-1
+        // block, and the last row.
+        assert_eq!(
+            CODER_PARTITION_TABLE_D5[0],
+            CoderPartitionD5::new(0, 1, 0),
+            "row 0 (ωlow_1 = 1, width_0 = 0)",
+        );
+        assert_eq!(
+            CODER_PARTITION_TABLE_D5[12],
+            CoderPartitionD5::new(12, 193, 0),
+            "row 12 (last width-0 row, ωlow_13 = 193)",
+        );
+        assert_eq!(
+            CODER_PARTITION_TABLE_D5[13],
+            CoderPartitionD5::new(13, 209, 1),
+            "row 13 (first width-1 row, ωlow_14 = 209)",
+        );
+        assert_eq!(
+            CODER_PARTITION_TABLE_D5[32],
+            CoderPartitionD5::new(32, 513, 1),
+            "row 32 (last row, ωlow_33 = 513, width_32 = 1)",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_boundary_is_strictly_monotonic() {
+        // The spec table's ω column is strictly increasing across all
+        // 33 rows — boundary lines never repeat or reverse.
+        for pair in CODER_PARTITION_TABLE_D5.windows(2) {
+            assert!(
+                pair[0].omega_boundary < pair[1].omega_boundary,
+                "ω monotonicity broken at index {}: {} -> {}",
+                pair[0].index,
+                pair[0].omega_boundary,
+                pair[1].omega_boundary,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_stride_is_uniform_16_lines() {
+        // The spec table prints a uniform 16-line stride for all 32
+        // row transitions (1 -> 17, 17 -> 33, …, 497 -> 513). The
+        // module exposes the stride as a `pub const`; this test
+        // pins both the constant value AND the uniformity over the
+        // whole table.
+        assert_eq!(CODER_PARTITION_D5_STRIDE, 16);
+        for pair in CODER_PARTITION_TABLE_D5.windows(2) {
+            assert_eq!(
+                pair[1].omega_boundary - pair[0].omega_boundary,
+                CODER_PARTITION_D5_STRIDE,
+                "non-uniform stride at index {}",
+                pair[0].index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_width_field_partitions_at_row_13() {
+        // Rows 0..=12 carry width = 0; rows 13..=32 carry width = 1.
+        // The split is exactly at row 13 (the docs file's first
+        // width = 1 row) — there is no transitional row.
+        for row in &CODER_PARTITION_TABLE_D5[0..=12] {
+            assert_eq!(
+                row.width, 0,
+                "row {} expected width = 0 in lower block",
+                row.index,
+            );
+        }
+        for row in &CODER_PARTITION_TABLE_D5[13..=32] {
+            assert_eq!(
+                row.width, 1,
+                "row {} expected width = 1 in upper block",
+                row.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_lookup_returns_each_row_by_index() {
+        // `coder_partition_d5(n)` is a thin row accessor — every
+        // in-range index round-trips to the indexed array row.
+        for row in &CODER_PARTITION_TABLE_D5 {
+            assert_eq!(coder_partition_d5(row.index), Some(*row));
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_lookup_rejects_out_of_range_indices() {
+        // Spec range is 0..=32; index 33 and above are not defined.
+        assert_eq!(coder_partition_d5(33), None);
+        assert_eq!(coder_partition_d5(64), None);
+        assert_eq!(coder_partition_d5(u16::MAX), None);
+    }
+
+    #[test]
+    fn coder_partition_d5_first_row_omega_is_one_based() {
+        // The spec's FFT-line column is 1-based: row 0 prints ω = 1,
+        // matching the docs file's prose "lower index ωlow_{n+1}".
+        // This is a structural pin — a 0-based transcription error
+        // would shift every row by one.
+        assert_eq!(CODER_PARTITION_TABLE_D5[0].omega_boundary, 1);
+    }
+
+    #[test]
+    fn coder_partition_d5_top_partition_boundary_is_513() {
+        // The top of the table is ω = 513 at row n = 32 — the 1-based
+        // FFT-line index of the last analysed line in Models 1 / 2's
+        // 1024-sample FFT half-spectrum (lines 1..=513).
+        assert_eq!(CODER_PARTITION_TABLE_D5[32].omega_boundary, 513);
+        // And the total span of the 32 strides equals (513 - 1).
+        let span = CODER_PARTITION_TABLE_D5[32].omega_boundary
+            - CODER_PARTITION_TABLE_D5[0].omega_boundary;
+        assert_eq!(span, 32 * CODER_PARTITION_D5_STRIDE);
     }
 }

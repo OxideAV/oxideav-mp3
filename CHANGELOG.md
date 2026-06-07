@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Table D.5 Layer I / Layer II coder partition table
+  (Phase 2 step 49). The 33-row partition table is transcribed
+  verbatim from the staged
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` extract
+  of ISO/IEC 11172-3:1993 Annex D clause D.2 (PDF page 145 /
+  printed p.139). A new `CoderPartitionD5` struct carries the
+  three spec columns per row — `index` (the partition number
+  `n = 0..=32`), `omega_boundary` (the FFT-line index that the
+  spec table prints under the dual-role heading
+  `ωlow_{n+1} / ωhigh_n`), and `width` (the spec's `width_n`
+  column, 0 for rows 0..=12 and 1 for rows 13..=32). The full
+  table lands as `CODER_PARTITION_TABLE_D5: [CoderPartitionD5;
+  33]`; `coder_partition_d5(n)` is a thin row-index accessor that
+  returns `None` for any `n` outside the spec range. The uniform
+  stride between consecutive rows (16 FFT lines per partition) is
+  exposed as `CODER_PARTITION_D5_STRIDE: u16 = 16`; 10 new unit
+  tests cover row count, index contiguity, four spec-anchor rows
+  (0 = `(1, 0)`, 12 = `(193, 0)`, 13 = `(209, 1)`, 32 =
+  `(513, 1)`), strict monotonicity of the ω column, uniform
+  16-line stride across all 32 row transitions, the
+  width-0/width-1 split at row 13, the row-accessor round-trip on
+  every in-range index, accessor rejection on out-of-range
+  indices, the 1-based FFT-line indexing convention (row 0
+  carries ω = 1), and the top-of-table pin (row 32 carries
+  ω = 513 = 1 + 32·16, matching the 1024-sample FFT's 1..=513
+  one-based half-spectrum).
 - psy: Annex D Model 2 §C.1.5.3.2.1 Layer III spreading-function
   primitives (Phase 2 step 48). Two new functions land the Layer
   III modification of the Model 2 spreading function as transcribed
