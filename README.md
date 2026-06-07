@@ -2373,6 +2373,73 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 53 (r252)** — Annex D Table D.5 composed partition
+descriptor. Phase 2 steps 51 / 52 (r250 / r251) landed the inclusive
+FFT-line range accessor `(ωlow_n, ωhigh_n)` and the `width_n` value
+accessor. The downstream Model 1 / Model 2 partition-threshold
+reduction iterates Table D.5 row by row and, per iteration, reads the
+two boundary FFT-line indices plus the `width_n` value. r252 composes
+the two existing accessors into a single per-partition descriptor that
+the reduction loop can consume verbatim — no new arithmetic, no new
+data, only a composition of the three Table D.5 columns into one
+record:
+
+* `CoderPartitionD5Span { index, omega_low, omega_high, width }` —
+  the three verbatim columns of partition `n` reassembled into one
+  struct, with the dual-role boundary column already resolved into
+  the two distinct spec roles `ωlow_n` and `ωhigh_n` (Phase 2 step 50
+  did the role disambiguation; the descriptor just inherits both).
+* `coder_partition_d5_span(n)` returns `Some(span)` for
+  `n ∈ 1..=32` and `None` outside.
+
+The descriptor's valid range is the **intersection** of the two
+underlying accessors' ranges (`coder_partition_d5_line_range`'s
+`1..=32` and `coder_partition_d5_width`'s `0..=32`), i.e. `1..=32`.
+The two edges are explicitly `None`:
+
+* `n = 0` — partition 0's `width_n = 0` cell **is** in Table D.5, but
+  its lower boundary `ωlow_0` is **not** (the column heading's
+  `ωlow_{n+1}` shift removes it). The descriptor declines verbatim
+  rather than inventing a synthetic lower boundary.
+* `n = 33` — neither row 33's boundary nor its `width_n` cell exists
+  in Table D.5 (the table tops out at row `n = 32` with
+  `ωhigh_32 = 513`). The descriptor returns `None`.
+
+The composition is **pure**: `omega_low` is
+`coder_partition_d5_omega_low(n)`, `omega_high` is
+`coder_partition_d5_omega_high(n)`, `width` is
+`coder_partition_d5_width(n)`. No arithmetic beyond what the three
+underlying accessors already perform is introduced. The composition
+preserves every structural property already pinned at the column-level
+accessors — the uniform 17-line inclusive span, the `width_n` block
+split at `n = 13`, the tiling property — and step 53's tests pin each
+on the composed descriptor explicitly.
+
+Validated by 8 new lib unit tests in `psy::tests`:
+`coder_partition_d5_span_anchor_rows` pins spec-anchored values at
+`n ∈ {1, 12, 13, 32}` covering the lower-block edge, the
+last/first row of each width-block, and the table top;
+`…_rejects_edges_and_out_of_range` pins both edge-`None` cases
+(`n = 0`, `n = 33`) plus out-of-range rejection
+(`n ∈ {34, 64, u16::MAX}`);
+`…_composes_underlying_accessors_for_every_in_range_index` pins per-row
+composition agreement against `coder_partition_d5_line_range` and
+`coder_partition_d5_width`; `…_inclusive_span_is_17_lines_everywhere`
+pins the uniform 17-line inclusive span against
+`CODER_PARTITION_D5_STRIDE + 1`;
+`…_width_block_structure_is_preserved` pins the `width_n = 0`
+(rows `n ∈ 1..=12`) / `width_n = 1` (rows `n ∈ 13..=32`) block
+split through the composition; `…_tiles_the_band` pins the tiling
+property (every span's `omega_high` equals the next span's
+`omega_low`); `…_index_field_matches_input` pins that the
+descriptor's `index` field echoes the input verbatim with no
+off-by-one bleeding through from the `omega_low` row shift; and
+`…_low_is_strictly_less_than_high` pins span non-degeneracy across
+the table. Tests: 689 lib (was 681 baseline; +8 unit). No
+external implementation consulted; only Table D.5 in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 - Layer I and Layer II coder partition table" was read.
+
 **Phase 2 step 52 (r251)** — Annex D Table D.5 `width_n` column
 accessor. Phase 2 steps 49 / 50 / 51 (r248 / r249 / r250) landed the
 33-row verbatim Table D.5 (Layer I / Layer II coder partition table)

@@ -1789,6 +1789,108 @@ pub fn coder_partition_d5_width(n: u16) -> Option<u16> {
     coder_partition_d5(n).map(|r| r.width)
 }
 
+/// A composed per-partition descriptor for Annex D Table D.5 — the
+/// three verbatim columns of coder partition `n` reassembled into a
+/// single record indexable by partition number, with the
+/// dual-role boundary column already resolved into the two
+/// distinct spec roles.
+///
+/// The descriptor carries:
+///
+/// 1. `index` — partition number `n`.
+/// 2. `omega_low` — FFT-line index `ωlow_n` (lower boundary, inclusive),
+///    read from row `n - 1`'s boundary cell under the column heading's
+///    `ωlow_{n+1}` role.
+/// 3. `omega_high` — FFT-line index `ωhigh_n` (upper boundary,
+///    inclusive), read from row `n`'s boundary cell under the column
+///    heading's `ωhigh_n` role.
+/// 4. `width` — the `width_n` value the spec table prints against
+///    partition `n` (0 for `n ∈ 1..=12`, 1 for `n ∈ 13..=32`; the
+///    `n = 0` row's `width_n = 0` cell is not surfaced through this
+///    descriptor — see range restriction below).
+///
+/// The descriptor exists for `n ∈ 1..=32` only — the same range as
+/// [`coder_partition_d5_line_range`]: partition 0's `ωlow_0` is not
+/// in Table D.5 (the column heading's `ωlow_{n+1}` shift removes it)
+/// and partition 33's `ωhigh_33` is not in Table D.5 (the table tops
+/// out at row 32 with `ωhigh_32 = 513`). The descriptor inherits
+/// these two boundary-table gaps verbatim and never invents a
+/// synthetic lower or upper boundary at either edge.
+///
+/// Provenance: the Table D.5 row at index `n` (for `width`) and at
+/// indices `n - 1` and `n` (for the dual-role boundary column) in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoderPartitionD5Span {
+    /// Partition number `n`. Spec range under this descriptor: 1..=32.
+    pub index: u16,
+    /// Lower FFT-line boundary `ωlow_n` (inclusive). Read from row
+    /// `n - 1`'s `omega_boundary` cell under the column heading's
+    /// `ωlow_{n+1}` role.
+    pub omega_low: u16,
+    /// Upper FFT-line boundary `ωhigh_n` (inclusive). Read from row
+    /// `n`'s `omega_boundary` cell under the column heading's
+    /// `ωhigh_n` role.
+    pub omega_high: u16,
+    /// `width_n` value the spec table prints for partition `n`. 0 for
+    /// `n ∈ 1..=12`; 1 for `n ∈ 13..=32`.
+    pub width: u16,
+}
+
+/// Compose Annex D Table D.5 partition `n`'s FFT-line range with its
+/// `width_n` value into a single per-partition descriptor. Returns
+/// `None` for any `n` outside the spec range **1..=32**.
+///
+/// The downstream Model 1 / Model 2 partition-threshold reduction
+/// iterates Table D.5 row by row and, for each in-range partition,
+/// reads three pieces of data: the lower FFT-line boundary `ωlow_n`,
+/// the upper FFT-line boundary `ωhigh_n`, and the `width_n` value
+/// the table prints against the row. The Phase 2 step 51 accessor
+/// [`coder_partition_d5_line_range`] exposed the line-range pair and
+/// the Phase 2 step 52 accessor [`coder_partition_d5_width`] exposed
+/// the `width_n` value; this step 53 accessor composes the two into
+/// the single descriptor that the per-partition reduction loop
+/// consumes per iteration.
+///
+/// The composition is **pure** — no arithmetic beyond what the
+/// underlying accessors already perform:
+///
+/// * `omega_low` is `coder_partition_d5_omega_low(n)` (the `n → n - 1`
+///   row shift that the `ωlow_{n+1}` column-heading half encodes,
+///   then a column rename — both inherited verbatim from step 50);
+/// * `omega_high` is `coder_partition_d5_omega_high(n)` (a column
+///   rename of row `n`'s `omega_boundary` cell — inherited from
+///   step 50);
+/// * `width` is `coder_partition_d5_width(n)` (a rename of row `n`'s
+///   `width` field — inherited from step 52).
+///
+/// The descriptor's valid range is the **intersection** of the
+/// line-range accessor's range (`n ∈ 1..=32`) and the width
+/// accessor's range (`n ∈ 0..=32`) — i.e. `n ∈ 1..=32`. Partition
+/// 0's row carries a valid `width_n = 0` and a valid `ωhigh_0 = 1`,
+/// but no `ωlow_0`, so the descriptor at `n = 0` returns `None`
+/// verbatim. Partition 33 returns `None` because neither
+/// `ωhigh_33` nor a row for `width_33` is in Table D.5.
+///
+/// Provenance: only Table D.5 in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table" is
+/// consulted; the underlying step-50, step-51 and step-52 accessors
+/// already cite the same source.
+#[inline]
+#[must_use]
+pub fn coder_partition_d5_span(n: u16) -> Option<CoderPartitionD5Span> {
+    let (omega_low, omega_high) = coder_partition_d5_line_range(n)?;
+    let width = coder_partition_d5_width(n)?;
+    Some(CoderPartitionD5Span {
+        index: n,
+        omega_low,
+        omega_high,
+        width,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4087,6 +4189,170 @@ mod tests {
         }
         for n in 13_u16..=31 {
             assert_eq!(coder_partition_d5_width(n), coder_partition_d5_width(n + 1));
+        }
+    }
+
+    // ---- Table D.5 — composed partition descriptor ----------------
+
+    #[test]
+    fn coder_partition_d5_span_anchor_rows() {
+        // Spec-anchored values at four reference partitions:
+        //   n = 1  → (ωlow=1,   ωhigh=17,  width=0)  (lower block edge)
+        //   n = 12 → (ωlow=177, ωhigh=193, width=0)  (last width-0)
+        //   n = 13 → (ωlow=193, ωhigh=209, width=1)  (first width-1)
+        //   n = 32 → (ωlow=497, ωhigh=513, width=1)  (table top edge)
+        assert_eq!(
+            coder_partition_d5_span(1),
+            Some(CoderPartitionD5Span {
+                index: 1,
+                omega_low: 1,
+                omega_high: 17,
+                width: 0,
+            }),
+        );
+        assert_eq!(
+            coder_partition_d5_span(12),
+            Some(CoderPartitionD5Span {
+                index: 12,
+                omega_low: 177,
+                omega_high: 193,
+                width: 0,
+            }),
+        );
+        assert_eq!(
+            coder_partition_d5_span(13),
+            Some(CoderPartitionD5Span {
+                index: 13,
+                omega_low: 193,
+                omega_high: 209,
+                width: 1,
+            }),
+        );
+        assert_eq!(
+            coder_partition_d5_span(32),
+            Some(CoderPartitionD5Span {
+                index: 32,
+                omega_low: 497,
+                omega_high: 513,
+                width: 1,
+            }),
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_span_rejects_edges_and_out_of_range() {
+        // Partition 0's row carries valid `width_n` and `ωhigh_0` cells
+        // but no `ωlow_0`; partition 33 has no row at all. Both must
+        // return `None`, matching the line-range accessor's range
+        // restriction. Out-of-range inputs above 33 also return None.
+        assert_eq!(coder_partition_d5_span(0), None);
+        assert_eq!(coder_partition_d5_span(33), None);
+        assert_eq!(coder_partition_d5_span(34), None);
+        assert_eq!(coder_partition_d5_span(64), None);
+        assert_eq!(coder_partition_d5_span(u16::MAX), None);
+    }
+
+    #[test]
+    fn coder_partition_d5_span_composes_underlying_accessors_for_every_in_range_index() {
+        // The descriptor is a pure composition — `omega_low`/`omega_high`
+        // come from `line_range`, `width` from `width`. Pin that
+        // composition across every in-range partition.
+        for n in 1_u16..=32 {
+            let span = coder_partition_d5_span(n).unwrap();
+            let (low, high) = coder_partition_d5_line_range(n).unwrap();
+            let width = coder_partition_d5_width(n).unwrap();
+            assert_eq!(span.index, n);
+            assert_eq!(span.omega_low, low);
+            assert_eq!(span.omega_high, high);
+            assert_eq!(span.width, width);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_span_inclusive_span_is_17_lines_everywhere() {
+        // The boundary column advances by a uniform 16-line stride
+        // (pinned by `CODER_PARTITION_D5_STRIDE` elsewhere), so every
+        // partition's inclusive line span covers exactly 17 lines
+        // (`high - low + 1`). Pin that on the composed descriptor too —
+        // the composition must not drop or shift either boundary.
+        for n in 1_u16..=32 {
+            let span = coder_partition_d5_span(n).unwrap();
+            let inclusive_len = span.omega_high - span.omega_low + 1;
+            assert_eq!(
+                inclusive_len,
+                CODER_PARTITION_D5_STRIDE + 1,
+                "partition {n}: inclusive line span {} expected {}",
+                inclusive_len,
+                CODER_PARTITION_D5_STRIDE + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_span_width_block_structure_is_preserved() {
+        // The composition must not perturb the `width_n` block
+        // structure: width = 0 across `n ∈ 1..=12` and width = 1
+        // across `n ∈ 13..=32`. Note: this descriptor's range starts
+        // at 1 (not 0), so the lower-block test starts at 1 — the
+        // row-0 `width_n = 0` cell is unreachable through this
+        // descriptor.
+        for n in 1_u16..=12 {
+            let span = coder_partition_d5_span(n).unwrap();
+            assert_eq!(span.width, 0, "partition {n}: expected width 0");
+        }
+        for n in 13_u16..=32 {
+            let span = coder_partition_d5_span(n).unwrap();
+            assert_eq!(span.width, 1, "partition {n}: expected width 1");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_span_tiles_the_band() {
+        // The composed descriptor's boundaries must tile: partition
+        // `n`'s upper boundary equals partition `n + 1`'s lower
+        // boundary, for every adjacent in-range pair. This is a
+        // structural consequence of the dual-role boundary column
+        // (one printed integer covers both `ωhigh_n` and
+        // `ωlow_{n+1}`); the composition preserves it.
+        for n in 1_u16..=31 {
+            let cur = coder_partition_d5_span(n).unwrap();
+            let nxt = coder_partition_d5_span(n + 1).unwrap();
+            assert_eq!(
+                cur.omega_high, nxt.omega_low,
+                "partition {n} tile gap: high {} != next low {}",
+                cur.omega_high, nxt.omega_low,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_span_index_field_matches_input() {
+        // The descriptor's `index` field must echo the input partition
+        // number verbatim — no off-by-one and no row-shift bleeding
+        // through from the `omega_low` computation.
+        for n in 1_u16..=32 {
+            let span = coder_partition_d5_span(n).unwrap();
+            assert_eq!(
+                span.index, n,
+                "partition {n}: descriptor index {} should match input",
+                span.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_span_low_is_strictly_less_than_high() {
+        // Every recoverable partition has a non-degenerate FFT-line
+        // span: `omega_low < omega_high` (the inclusive 17-line span
+        // pinned above implies it but pin it explicitly too).
+        for n in 1_u16..=32 {
+            let span = coder_partition_d5_span(n).unwrap();
+            assert!(
+                span.omega_low < span.omega_high,
+                "partition {n}: low {} should be < high {}",
+                span.omega_low,
+                span.omega_high,
+            );
         }
     }
 }

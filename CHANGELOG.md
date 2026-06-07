@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Table D.5 composed partition descriptor (Phase 2
+  step 53). Wire the Phase 2 step 52 `width_n` column accessor into
+  the Model 1 / Model 2 partition-threshold reduction by composing
+  it with the Phase 2 step 51 line-range accessor into a single
+  per-partition descriptor. New struct `CoderPartitionD5Span` carries
+  partition index `n`, the inclusive FFT-line boundaries `ωlow_n` /
+  `ωhigh_n`, and the `width_n` value; new free function
+  `coder_partition_d5_span(n)` returns `Some(span)` for
+  `n ∈ 1..=32` and `None` outside. The valid range is the
+  intersection of the line-range accessor's range (1..=32) and the
+  width accessor's range (0..=32); partitions 0 and 33 return
+  `None` for the same boundary-table-gap reasons step 51 already
+  documents. The composition is pure: `omega_low` is
+  `coder_partition_d5_omega_low(n)`, `omega_high` is
+  `coder_partition_d5_omega_high(n)`, `width` is
+  `coder_partition_d5_width(n)`, and no arithmetic beyond what the
+  three underlying accessors already perform is introduced. 8 new
+  lib unit tests pin: spec-anchored values for `n ∈ {1, 12, 13, 32}`;
+  range rejection at both edges (`n = 0`, `n = 33`) and above
+  (`n ∈ {34, 64, u16::MAX}`); per-row composition agreement against
+  the underlying accessors across `n ∈ 1..=32`; the uniform 17-line
+  inclusive span (`omega_high - omega_low + 1` matches
+  `CODER_PARTITION_D5_STRIDE + 1` everywhere); the `width_n` block
+  structure preserved through the composition (`0` for
+  `n ∈ 1..=12`, `1` for `n ∈ 13..=32`); the tiling property
+  (every span's `omega_high` equals the next span's `omega_low`);
+  the `index` field echoes the input verbatim; and `omega_low <
+  omega_high` on every recoverable partition. Tests: 689 lib (was
+  681 baseline; +8 unit). Provenance: only Table D.5 in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+  §"Table D.5 - Layer I and Layer II coder partition table" is
+  consulted; the step-50, step-51 and step-52 accessors already
+  cite the same source.
 - psy: Annex D Table D.5 `width_n` column accessor (Phase 2 step 52).
   Surface the third column of the verbatim Table D.5 row (after the
   index and the dual-role partition-boundary cell) as a table-level
