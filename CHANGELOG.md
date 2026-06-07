@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Table D.5 partition FFT-line range accessor (Phase 2
+  step 51). Compose the Phase 2 step 50 dual-role accessors into a
+  single per-partition span accessor. New free function
+  `coder_partition_d5_line_range(n)` returns the inclusive
+  `(ωlow_n, ωhigh_n)` tuple of partition `n` for `n ∈ 1..=32`, and
+  `None` outside. The valid range is the intersection of the two
+  step-50 accessors' ranges (`ωlow_n` covers `n ∈ 1..=33`; `ωhigh_n`
+  covers `n ∈ 0..=32`), so two partitions are explicitly missing one
+  boundary each: `n = 0` (Table D.5 prints `ωlow_{n+1}` at row `n`,
+  so partition 0's own lower boundary `ωlow_0` is not in the table);
+  `n = 33` (Table D.5 tops out at row 32 with `ωhigh_32 = 513`, so
+  partition 33's upper boundary is not in the table either). Both
+  return `None` verbatim; no synthetic boundary is invented for
+  either edge. The accessor is a pure composition of
+  `coder_partition_d5_omega_low` and `coder_partition_d5_omega_high`
+  with no additional arithmetic. 9 new lib unit tests pin: four
+  spec-anchor spans (`n = 1` → `(1, 17)`, `n = 13` → `(193, 209)`,
+  `n = 14` → `(209, 225)`, `n = 32` → `(497, 513)`); both
+  edge-`None` cases (`n = 0` and `n = 33`) and out-of-range rejection
+  (`n ∈ {34, 64, u16::MAX}`); span non-degeneracy (`low < high`
+  across all recoverable partitions); the composition contract
+  (`line_range(n) == Some((omega_low(n), omega_high(n)))`); the
+  uniform 17-line inclusive span (open span equals
+  `CODER_PARTITION_D5_STRIDE = 16` per partition); and the tiling
+  property (every partition's `ωhigh` equals the next partition's
+  `ωlow`, the band tops out at line 513 and starts at line 1). Tests:
+  674 lib (was 665 baseline; +9 unit). Provenance: only the column
+  heading `ωlow_{n+1} / ωhigh_n` from
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+  §"Table D.5 - Layer I and Layer II coder partition table" is
+  consulted; no external reference implementation read.
 - psy: Annex D Table D.5 dual-role boundary accessors (Phase 2
   step 50). Surface the `ωlow_{n+1} / ωhigh_n` column heading's two
   spec roles as named accessors so callers no longer have to apply

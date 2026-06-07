@@ -1709,6 +1709,58 @@ pub fn coder_partition_d5_omega_low(n: u16) -> Option<u16> {
     coder_partition_d5(n - 1).map(CoderPartitionD5::omega_low_of_next)
 }
 
+/// Read partition `n`'s **FFT-line span** `[ωlow_n, ωhigh_n]` from
+/// Table D.5 as the inclusive `(ωlow_n, ωhigh_n)` tuple. Returns
+/// `None` for any `n` outside the spec range **1..=32**.
+///
+/// Annex D Table D.5 prints a single FFT-line boundary column under
+/// the dual-role heading `ωlow_{n+1} / ωhigh_n`. The Phase 2 step 50
+/// accessors [`coder_partition_d5_omega_high`] and
+/// [`coder_partition_d5_omega_low`] expose each role separately;
+/// this accessor composes them into the full inclusive line span of
+/// a single partition. The composition rule is verbatim:
+///
+/// * `ωlow_n` comes from row `n - 1`'s `omega_boundary` (the column
+///   heading's `ωlow_{n+1}` role at row `n - 1`).
+/// * `ωhigh_n` comes from row `n`'s `omega_boundary` (the column
+///   heading's `ωhigh_n` role at row `n`).
+///
+/// The valid input range is the intersection of the two underlying
+/// accessors' ranges: `omega_low` is defined for `n ∈ 1..=33`,
+/// `omega_high` for `n ∈ 0..=32`, so a partition's full span is
+/// recoverable only for `n ∈ 1..=32`. Two partitions are missing
+/// one boundary each:
+///
+/// * `n = 0` — `ωlow_0` is **not** in Table D.5 (the column heading
+///   `ωlow_{n+1}` shifts the lower boundary up by one). Returns
+///   `None` verbatim; no default lower boundary is invented.
+/// * `n = 33` — `ωhigh_33` is **not** in Table D.5 (the table tops
+///   out at row `n = 32` with `ωhigh_32 = 513`). Returns `None`
+///   verbatim.
+///
+/// For every `n ∈ 1..=32` the returned tuple is the inclusive
+/// `(lower, upper)` pair: every FFT line index `k ∈ [lower, upper]`
+/// is inside partition `n`. By the spec table's uniform 16-line
+/// stride (pinned by `CODER_PARTITION_D5_STRIDE`) the span always
+/// covers exactly 17 lines (the boundary cells at both ends are
+/// inclusive; the open-interval line count is 16).
+///
+/// This accessor is a pure composition of [`coder_partition_d5_omega_low`]
+/// and [`coder_partition_d5_omega_high`] — no arithmetic beyond the
+/// `n → n - 1` row shift that the `ωlow_{n+1}` column-heading half
+/// already encodes inside `coder_partition_d5_omega_low`.
+///
+/// Provenance: column heading `ωlow_{n+1} / ωhigh_n` in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table".
+#[inline]
+#[must_use]
+pub fn coder_partition_d5_line_range(n: u16) -> Option<(u16, u16)> {
+    let low = coder_partition_d5_omega_low(n)?;
+    let high = coder_partition_d5_omega_high(n)?;
+    Some((low, high))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3756,5 +3808,147 @@ mod tests {
                 n,
             );
         }
+    }
+
+    // ---- Table D.5 — partition FFT-line range accessor ------------
+
+    #[test]
+    fn coder_partition_d5_line_range_anchor_rows() {
+        // Spec-anchored partition spans, derived by composing the two
+        // dual-role accessors at the four anchor partitions exercised
+        // by the step-50 tests:
+        //
+        //  n = 1:  (ωlow_1, ωhigh_1)   = (1,   17)
+        //  n = 13: (ωlow_13, ωhigh_13) = (193, 209)
+        //  n = 14: (ωlow_14, ωhigh_14) = (209, 225)
+        //  n = 32: (ωlow_32, ωhigh_32) = (497, 513)
+        assert_eq!(coder_partition_d5_line_range(1), Some((1, 17)));
+        assert_eq!(coder_partition_d5_line_range(13), Some((193, 209)));
+        assert_eq!(coder_partition_d5_line_range(14), Some((209, 225)));
+        assert_eq!(coder_partition_d5_line_range(32), Some((497, 513)));
+    }
+
+    #[test]
+    fn coder_partition_d5_line_range_partition_zero_missing_low_boundary() {
+        // ωlow_0 is NOT in Table D.5 (the column heading shifts the
+        // lower boundary up by one), so the full span of partition 0
+        // is not recoverable. The accessor returns None verbatim —
+        // no synthetic lower boundary is invented.
+        assert_eq!(coder_partition_d5_line_range(0), None);
+    }
+
+    #[test]
+    fn coder_partition_d5_line_range_partition_thirty_three_missing_high_boundary() {
+        // Although ωlow_33 = 513 is present (as row 32's value under
+        // its `ωlow_{n+1}` role), ωhigh_33 is NOT — the table tops
+        // out at row n = 32. Partition 33's upper boundary is not
+        // recoverable from Table D.5 alone, so the accessor returns
+        // None verbatim.
+        assert_eq!(coder_partition_d5_line_range(33), None);
+    }
+
+    #[test]
+    fn coder_partition_d5_line_range_rejects_out_of_range() {
+        // Indices well above the spec range trivially return None on
+        // both component accessors.
+        assert_eq!(coder_partition_d5_line_range(34), None);
+        assert_eq!(coder_partition_d5_line_range(64), None);
+        assert_eq!(coder_partition_d5_line_range(u16::MAX), None);
+    }
+
+    #[test]
+    fn coder_partition_d5_line_range_low_le_high_for_all_in_range() {
+        // For every recoverable partition the lower boundary sits at
+        // or below the upper boundary (it sits strictly below in
+        // practice; the equality case is allowed by the accessor's
+        // contract but doesn't occur in Table D.5).
+        for n in 1_u16..=32 {
+            let (low, high) = coder_partition_d5_line_range(n).unwrap_or_else(|| {
+                panic!("expected Some span for n = {n}");
+            });
+            assert!(
+                low <= high,
+                "partition {n}: ωlow = {low} must be ≤ ωhigh = {high}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_line_range_strict_inequality_for_all_in_range() {
+        // Stronger structural pin: every span is non-degenerate
+        // (low < high). Table D.5's stride is 16 FFT lines per
+        // partition and the boundary cells are inclusive at both
+        // ends, so a recoverable partition always covers more than
+        // a single line.
+        for n in 1_u16..=32 {
+            let (low, high) = coder_partition_d5_line_range(n).unwrap();
+            assert!(
+                low < high,
+                "partition {n}: span {low}..={high} should be non-degenerate",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_line_range_composes_omega_low_and_omega_high() {
+        // The accessor is a pure composition of the two step-50
+        // dual-role accessors. Pin that contract at every recoverable
+        // partition: the returned tuple is exactly
+        // (omega_low(n), omega_high(n)) — no rearrangement.
+        for n in 1_u16..=32 {
+            let low = coder_partition_d5_omega_low(n).unwrap();
+            let high = coder_partition_d5_omega_high(n).unwrap();
+            assert_eq!(
+                coder_partition_d5_line_range(n),
+                Some((low, high)),
+                "partition {n}: span must compose verbatim",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_line_range_uses_stride_plus_one_lines() {
+        // The spec table's uniform 16-line stride implies an
+        // inclusive span width of `stride + 1` lines per partition
+        // (both endpoints are inclusive). Pin this across all 32
+        // recoverable partitions as a structural check on the
+        // composition.
+        for n in 1_u16..=32 {
+            let (low, high) = coder_partition_d5_line_range(n).unwrap();
+            // The `high - low` open span equals one stride; the
+            // inclusive span is `stride + 1` lines (here 17).
+            assert_eq!(
+                high - low,
+                CODER_PARTITION_D5_STRIDE,
+                "partition {n}: open span must equal stride",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_line_range_partitions_tile_fft_line_band_two_to_513() {
+        // The 32 recoverable partition spans tile the FFT-line band
+        // `[2, 513]` with adjacent partitions sharing a single
+        // boundary line — partition n's ωhigh equals partition n+1's
+        // ωlow (the dual-role identity at the table level). Pin both
+        // halves: the band's lower edge is partition 1's ωlow (= 1)
+        // shifted up by one (since partition 1's `ωlow_1 = 1` is the
+        // top edge of partition 0's missing span); and adjacent
+        // spans share a boundary line.
+        let mut prev_high = None;
+        for n in 1_u16..=32 {
+            let (low, high) = coder_partition_d5_line_range(n).unwrap();
+            if let Some(p) = prev_high {
+                assert_eq!(
+                    low, p,
+                    "partition {n}: ωlow {low} must equal previous partition's ωhigh {p}",
+                );
+            }
+            prev_high = Some(high);
+        }
+        // The top of the band is partition 32's ωhigh = 513.
+        assert_eq!(prev_high, Some(513));
+        // And the bottom recoverable line is partition 1's ωlow = 1.
+        assert_eq!(coder_partition_d5_line_range(1).map(|t| t.0), Some(1));
     }
 }

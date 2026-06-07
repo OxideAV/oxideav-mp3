@@ -2373,6 +2373,67 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 51 (r250)** — Annex D Table D.5 partition FFT-line
+range accessor. The Phase 2 step 50 (r249) commit landed the
+`ωhigh_n` and `ωlow_n` dual-role accessors for the partition
+boundary column; r250 composes them into the single per-partition
+FFT-line span accessor that downstream Model 1 / Model 2 threshold
+aggregation needs:
+
+* `coder_partition_d5_line_range(n)` returns the inclusive
+  `(ωlow_n, ωhigh_n)` tuple of partition `n` for `n ∈ 1..=32`
+  (and `None` outside).
+
+The valid range is exactly the intersection of the two step-50
+accessors' ranges: `coder_partition_d5_omega_low` covers
+`n ∈ 1..=33`, `coder_partition_d5_omega_high` covers `n ∈ 0..=32`,
+so the full span `(ωlow_n, ωhigh_n)` is recoverable from Table D.5
+only for `n ∈ 1..=32` — i.e. **32 partitions of 16 lines each**,
+inclusive at both ends. Two partitions are explicitly missing one
+boundary each:
+
+* `n = 0` — `ωlow_0` is **not** in Table D.5 (the column heading
+  `ωlow_{n+1}` shifts the lower-boundary cell up by one). The
+  accessor returns `None` verbatim; no synthetic lower boundary is
+  invented. The "what is partition 0's lower boundary?" question
+  remains a downstream DOCS-GAP for the eventual Model 1 / Model 2
+  threshold-aggregation work that needs partition 0 in practice.
+* `n = 33` — `ωhigh_33` is **not** in Table D.5 (the table tops
+  out at row 32 with `ωhigh_32 = 513`). The accessor returns
+  `None` verbatim. The structural anchor `ωlow_33 = 513` already
+  lands as row 32's `ωlow_{n+1}` reading, so the table's top edge
+  is the partition-32 / partition-33 boundary line.
+
+The accessor is a **pure composition** of
+`coder_partition_d5_omega_low` and `coder_partition_d5_omega_high`
+— no arithmetic beyond the verbatim `n → n - 1` row shift that the
+column heading's `ωlow_{n+1}` half already encodes inside
+`coder_partition_d5_omega_low`. The `width_n` column is not
+consulted.
+
+Validated by 9 new lib unit tests in `psy::tests`:
+`coder_partition_d5_line_range_anchor_rows` pins the four
+spec-anchor partition spans (`n = 1` → `(1, 17)`, `n = 13` →
+`(193, 209)`, `n = 14` → `(209, 225)`, `n = 32` → `(497, 513)`);
+`coder_partition_d5_line_range_partition_zero_missing_low_boundary`
++ `…_partition_thirty_three_missing_high_boundary` pin the two
+edge-`None` cases; `…_rejects_out_of_range` pins the `None`
+return at `n ∈ {34, 64, u16::MAX}`; `…_low_le_high_for_all_in_range`
++ `…_strict_inequality_for_all_in_range` pin non-degeneracy across
+the 32 recoverable partitions; `…_composes_omega_low_and_omega_high`
+pins the verbatim composition contract; `…_uses_stride_plus_one_lines`
+pins the uniform 17-line inclusive span (open span equals
+`CODER_PARTITION_D5_STRIDE = 16` per partition); and
+`…_partitions_tile_fft_line_band_two_to_513` pins the tiling
+property (every partition's `ωhigh` equals the next partition's
+`ωlow`, the band starts at line 1 and tops out at line 513).
+Tests: 674 lib (was 665 baseline; +9 unit). No external
+implementation consulted; only the column heading
+`ωlow_{n+1} / ωhigh_n` from
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 - Layer I and Layer II coder partition table" was
+read.
+
 **Phase 2 step 50 (r249)** — Annex D Table D.5 dual-role
 boundary accessors. The Phase 2 step 49 (r248) commit landed the
 full 33-row Table D.5 — Layer I / Layer II coder partition
