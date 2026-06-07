@@ -2373,6 +2373,56 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 52 (r251)** — Annex D Table D.5 `width_n` column
+accessor. Phase 2 steps 49 / 50 / 51 (r248 / r249 / r250) landed the
+33-row verbatim Table D.5 (Layer I / Layer II coder partition table)
+and its two boundary-column readings: the dual-role `ωhigh_n` /
+`ωlow_n` accessors at step 50 and the composed `(ωlow_n, ωhigh_n)`
+inclusive line range at step 51. The third column of the row —
+`width_n` — was only accessible by going through the
+`CoderPartitionD5` row struct directly; r251 lifts it to a
+table-level free function so callers track the same surface as the
+boundary column:
+
+* `coder_partition_d5_width(n)` returns `Some(width_n)` for
+  `n ∈ 0..=32` and `None` otherwise.
+
+The transcribed `width_n` column carries exactly two values: **0**
+for the lower block (rows `n ∈ 0..=12`) and **1** for the upper
+block (rows `n ∈ 13..=32`). The transition between the two blocks
+is a single step at row 13 — no transitional row. The accessor is a
+**pure rename** of the row struct's `width` field — no arithmetic
+and no interpretation — matching
+`coder_partition_d5(n).map(|r| r.width)` exactly.
+
+The `width_n` column is structurally orthogonal to the partition
+boundary column already exposed by step 51's
+`coder_partition_d5_line_range`: the boundary column advances by a
+uniform 16-line stride across every row pair, whereas `width_n` is
+constant within each block. No boundary value or stride is consulted
+by this accessor.
+
+Validated by 7 new lib unit tests in `psy::tests`:
+`coder_partition_d5_width_anchor_rows` pins the four spec-anchor
+rows (`n ∈ {0, 12, 13, 32}` → `{0, 0, 1, 1}`);
+`…_matches_row_field_for_every_in_range_index` pins full-table
+parity with the row-field view;
+`…_is_zero_for_lower_block_one_for_upper_block` pins the
+constant-within-block structure across all 33 in-range partitions;
+`…_rejects_out_of_range` pins the `None` return at
+`n ∈ {33, 64, u16::MAX}`; `…_range_is_exactly_zero_or_one` pins
+the `{0, 1}` value constraint; `…_transition_is_a_single_step_at_row_thirteen`
+pins the single-step structural property (exactly one
+neighbour-pair across the 32 transitions changes value, and it is
+the row 12 → row 13 step going 0 → 1); and
+`…_is_orthogonal_to_omega_boundary` pins the constant-within-block
+orthogonality between the `width_n` column and the partition
+boundary column. Tests: 681 lib (was 674 baseline; +7 unit). No
+external implementation consulted; only the `width_n` column from
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 - Layer I and Layer II coder partition table" was
+read.
+
 **Phase 2 step 51 (r250)** — Annex D Table D.5 partition FFT-line
 range accessor. The Phase 2 step 50 (r249) commit landed the
 `ωhigh_n` and `ωlow_n` dual-role accessors for the partition

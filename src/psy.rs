@@ -1761,6 +1761,34 @@ pub fn coder_partition_d5_line_range(n: u16) -> Option<(u16, u16)> {
     Some((low, high))
 }
 
+/// Read the `width_n` value of coder partition `n` from Table D.5.
+/// Returns `None` for any `n` outside the spec range 0..=32.
+///
+/// Annex D Table D.5 prints three columns per row: the partition
+/// index `n`, the dual-role partition-boundary FFT-line cell
+/// `ωlow_{n+1} / ωhigh_n`, and a third column `width_n`. The
+/// previously-landed accessors expose the first two columns; this
+/// accessor exposes the third. The verbatim transcribed values are:
+///
+/// * rows `n ∈ 0..=12` — `width_n = 0`;
+/// * rows `n ∈ 13..=32` — `width_n = 1`.
+///
+/// The column is structurally orthogonal to the boundary column
+/// (the row `n = 13` transition from 0 to 1 does NOT coincide with
+/// any other discontinuity in the table) and is exposed here as a
+/// pure rename of `CoderPartitionD5::width` — no arithmetic and no
+/// interpretation. This accessor matches
+/// `coder_partition_d5(n).map(|r| r.width)` exactly.
+///
+/// Provenance: the `width_n` column in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table".
+#[inline]
+#[must_use]
+pub fn coder_partition_d5_width(n: u16) -> Option<u16> {
+    coder_partition_d5(n).map(|r| r.width)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3950,5 +3978,115 @@ mod tests {
         assert_eq!(prev_high, Some(513));
         // And the bottom recoverable line is partition 1's ωlow = 1.
         assert_eq!(coder_partition_d5_line_range(1).map(|t| t.0), Some(1));
+    }
+
+    // ---- Table D.5 — width_n accessor -----------------------------
+
+    #[test]
+    fn coder_partition_d5_width_anchor_rows() {
+        // Spec-anchored values at the four reference rows used by the
+        // earlier step's tests: row 0 → 0; row 12 (last width-0 row)
+        // → 0; row 13 (first width-1 row) → 1; row 32 (last row) → 1.
+        assert_eq!(coder_partition_d5_width(0), Some(0));
+        assert_eq!(coder_partition_d5_width(12), Some(0));
+        assert_eq!(coder_partition_d5_width(13), Some(1));
+        assert_eq!(coder_partition_d5_width(32), Some(1));
+    }
+
+    #[test]
+    fn coder_partition_d5_width_matches_row_field_for_every_in_range_index() {
+        // The accessor is a pure rename of the row's `width` field.
+        // Pin that contract across every in-range partition.
+        for row in &CODER_PARTITION_TABLE_D5 {
+            assert_eq!(
+                coder_partition_d5_width(row.index),
+                Some(row.width),
+                "row {} expected width = {}",
+                row.index,
+                row.width,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_width_is_zero_for_lower_block_one_for_upper_block() {
+        // The spec table's `width_n` column is exactly two values:
+        // 0 for the lower block (rows 0..=12) and 1 for the upper
+        // block (rows 13..=32). The split is a step function at
+        // row 13 — no transitional row. Pin this at the table-level
+        // accessor (the row-field version is pinned separately
+        // above).
+        for n in 0_u16..=12 {
+            assert_eq!(
+                coder_partition_d5_width(n),
+                Some(0),
+                "partition {n}: expected width = 0 in lower block",
+            );
+        }
+        for n in 13_u16..=32 {
+            assert_eq!(
+                coder_partition_d5_width(n),
+                Some(1),
+                "partition {n}: expected width = 1 in upper block",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_width_rejects_out_of_range() {
+        // Spec range is 0..=32; index 33 and above return None.
+        assert_eq!(coder_partition_d5_width(33), None);
+        assert_eq!(coder_partition_d5_width(64), None);
+        assert_eq!(coder_partition_d5_width(u16::MAX), None);
+    }
+
+    #[test]
+    fn coder_partition_d5_width_range_is_exactly_zero_or_one() {
+        // The spec table never prints a `width_n` other than 0 or 1.
+        // Pin this across every in-range partition.
+        for n in 0_u16..=32 {
+            let w = coder_partition_d5_width(n).unwrap();
+            assert!(w == 0 || w == 1, "partition {n}: width {w} must be 0 or 1",);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_width_transition_is_a_single_step_at_row_thirteen() {
+        // Stronger structural pin: across the 32 consecutive partition
+        // pairs `(n, n+1)` for `n ∈ 0..=31`, the `width_n` column
+        // changes value at exactly one place — between rows 12 and 13.
+        // Anywhere else the value is unchanged. The split is a step
+        // function, not a ramp.
+        let mut transitions = 0_u16;
+        for n in 0_u16..=31 {
+            let cur = coder_partition_d5_width(n).unwrap();
+            let nxt = coder_partition_d5_width(n + 1).unwrap();
+            if cur != nxt {
+                transitions += 1;
+                // The single transition must be at the 12 → 13 step,
+                // going from 0 to 1.
+                assert_eq!(n, 12, "unexpected transition at partition {n}");
+                assert_eq!(cur, 0, "transition must rise from 0");
+                assert_eq!(nxt, 1, "transition must rise to 1");
+            }
+        }
+        assert_eq!(transitions, 1, "expected exactly one width transition");
+    }
+
+    #[test]
+    fn coder_partition_d5_width_is_orthogonal_to_omega_boundary() {
+        // The `width_n` column is structurally orthogonal to the
+        // boundary column — the boundary column is strictly monotonic
+        // in `n` with a uniform 16-line stride (pinned elsewhere),
+        // whereas `width_n` is constant within each of the two blocks.
+        // Pin the constant-within-block half here: for every consecutive
+        // pair inside one block, width is unchanged even as the
+        // boundary cell advances by `CODER_PARTITION_D5_STRIDE`.
+        for n in 0_u16..=11 {
+            assert_eq!(coder_partition_d5_width(n), coder_partition_d5_width(n + 1));
+        }
+        for n in 13_u16..=31 {
+            assert_eq!(coder_partition_d5_width(n), coder_partition_d5_width(n + 1));
+        }
     }
 }

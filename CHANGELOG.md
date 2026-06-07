@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Table D.5 `width_n` column accessor (Phase 2 step 52).
+  Surface the third column of the verbatim Table D.5 row (after the
+  index and the dual-role partition-boundary cell) as a table-level
+  free function so callers don't have to round-trip through the row
+  struct's `width` field. New free function
+  `coder_partition_d5_width(n)` returns `Some(width_n)` for
+  `n ∈ 0..=32` and `None` otherwise. The verbatim transcribed
+  values are 0 for rows `n ∈ 0..=12` and 1 for rows `n ∈ 13..=32`;
+  the split is a single step transition at row 13 with no
+  transitional row. The accessor is a pure rename of
+  `CoderPartitionD5::width` — no arithmetic and no interpretation —
+  and matches `coder_partition_d5(n).map(|r| r.width)` exactly. The
+  `width_n` column is structurally orthogonal to the partition
+  boundary column already exposed by step 51's
+  `coder_partition_d5_line_range`; no boundary value or stride is
+  consulted. 7 new lib unit tests pin: four spec-anchor rows
+  (`n ∈ {0, 12, 13, 32}` → `{0, 0, 1, 1}`); full-table parity with
+  the row-field view; the two-block constant-within-block structure
+  (0 for `n ∈ 0..=12`, 1 for `n ∈ 13..=32`); out-of-range rejection
+  (`n ∈ {33, 64, u16::MAX}` → `None`); the {0, 1} range constraint;
+  the single-step transition at row 13 (exactly one neighbour-pair
+  changes value across the table, and it's the 12 → 13 step going
+  0 → 1); and the constant-within-block orthogonality with the
+  boundary column. Tests: 681 lib (was 674 baseline; +7 unit).
+  Provenance: only the `width_n` column from
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+  §"Table D.5 - Layer I and Layer II coder partition table" is
+  consulted; no external reference implementation read.
 - psy: Annex D Table D.5 partition FFT-line range accessor (Phase 2
   step 51). Compose the Phase 2 step 50 dual-role accessors into a
   single per-partition span accessor. New free function
