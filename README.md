@@ -2373,6 +2373,78 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 56 (r255)** — Annex D Table D.5 inverse line→partition
+lookup. Phase 2 step 53 (r252) composed each partition's three
+Table D.5 columns into a `CoderPartitionD5Span` descriptor with the
+inclusive boundary pair `(ωlow_n, ωhigh_n)`. Phase 2 step 54 (r253)
+lifted the membership inequality to the named predicate
+`partition_n_contains_line`. Phase 2 step 55 (r254) added the
+row-order iterator `coder_partition_d5_spans` over the recoverable
+descriptors. r255 closes the inverse direction: instead of asking
+"is line `ω` in partition `n`?", the downstream Model 1 / Model 2
+reduction asks "given line `ω`, which partition `n` does it land
+in?" — the natural question when walking the FFT-line domain and
+binning each line into its partition:
+
+* `first_partition_containing_line(omega) -> Option<u16>` returns
+  the index `n` of the **lowest** partition whose inclusive boundary
+  range `[ωlow_n, ωhigh_n]` contains the FFT line `omega`. The
+  accessor yields `Some(n)` with `n ∈ 1..=32` for `omega ∈ [1, 513]`
+  (the table-wide FFT-line domain Table D.5 covers) and `None` for
+  any out-of-band `omega`.
+
+**Shared-boundary disambiguation.** Phase 2 step 50 (r249) pinned
+the column-heading `ωlow_{n+1} / ωhigh_n` dual reading, and Phase 2
+step 54 (r253) pinned the inclusive-on-both-ends boundary
+semantics: every shared boundary line `ω = ωhigh_n = ωlow_{n+1}` is
+a member of **both** partition `n` (as its `ωhigh_n`) and partition
+`n + 1` (as its `ωlow_{n+1}`). When the caller asks the inverse
+question, this accessor returns the **lower** index `n` — the
+unique deterministic choice that does not double-count the
+boundary lines, matching both the spec table's row-order
+presentation (the boundary cell is printed on row `n`'s line, not
+on row `n + 1`'s) and the row-order iterator's ascending walk
+pinned by step 55. Implementation is one line —
+`coder_partition_d5_spans().find(|s| s.omega_low <= omega && omega
+<= s.omega_high).map(|s| s.index)` — with no arithmetic beyond the
+inequality on each descriptor's pre-computed boundaries. Complexity
+is `O(32)` worst case; for a Model 1 / Model 2 reduction sweeping
+all 513 lines this is `O(513 × 32) ≈ 16 K` boundary comparisons,
+well below any threshold worth complicating the accessor over.
+
+Validated by 9 new lib unit tests in `psy::tests`:
+`first_partition_returns_none_below_band` and
+`…_above_band` pin the out-of-band `None` branches at `omega = 0`,
+`omega = 514`, `omega = 10_000`, and `omega = u16::MAX`;
+`…_at_table_wide_lower_edge_is_partition_one` and
+`…_at_table_wide_upper_edge_is_partition_thirty_two` pin the
+table-wide boundary identities `first_partition_containing_line(1)
+= Some(1)` and `first_partition_containing_line(513) = Some(32)`;
+`…_at_shared_boundary_picks_lower_index` pins the lower-index pick
+at every shared boundary `ω = ωhigh_n` for `n ∈ 1..=31` (sweeping
+the table directly, no representative subset);
+`…_at_strict_interior_lines_matches_step_53_descriptor` pins the
+per-partition strict-interior agreement at `ω = ωlow_n + 1`
+against the step 53 descriptor;
+`…_walks_the_full_band_with_no_gaps` pins the table-wide `[1,
+513]` no-gap coverage property;
+`…_n_agrees_with_step_54_membership_predicate` pins the agreement
+with the step 54 predicate
+`partition_n_contains_line(n, ω) = Some(true)` for every in-band
+`ω`; and `…_n_is_the_minimum_of_all_containing_partitions` pins
+the "lowest partition first" semantics directly — the inverse
+accessor's answer is computed from first principles as the minimum
+`n` across all partitions that contain `ω` under the step 54
+predicate (sweeping every in-band line).
+Tests: 712 lib (was 703 baseline; +9 unit). No external
+implementation consulted; only the Phase 2 step 55 iterator
+`coder_partition_d5_spans` and (through it) the Phase 2 step 53
+descriptor `coder_partition_d5_span` and its underlying Table D.5
+transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 - Layer I and Layer II coder partition table" were
+read.
+
 **Phase 2 step 55 (r254)** — Annex D Table D.5 row-order iteration
 helper. Phase 2 step 53 (r252) composed the verbatim Table D.5
 columns of partition `n` into a single `CoderPartitionD5Span`

@@ -2012,6 +2012,80 @@ pub fn coder_partition_d5_spans() -> impl Iterator<Item = CoderPartitionD5Span> 
     (1_u16..=32).map(|n| coder_partition_d5_span(n).expect("n ∈ 1..=32 is recoverable"))
 }
 
+/// Inverse lookup over Annex D Table D.5 — given an FFT line `omega`,
+/// return the index `n` of the **lowest** partition whose inclusive
+/// boundary range `[ωlow_n, ωhigh_n]` contains it.
+///
+/// Phase 2 step 53 (r252) composed each partition's three Table D.5
+/// columns into a [`CoderPartitionD5Span`] descriptor with the
+/// inclusive boundary pair `(ωlow_n, ωhigh_n)`. Phase 2 step 54 (r253)
+/// lifted the membership inequality to the named predicate
+/// [`partition_n_contains_line`]. Phase 2 step 55 (r254) added a
+/// row-order iterator [`coder_partition_d5_spans`] over the
+/// recoverable descriptors. This step 56 accessor closes the inverse
+/// direction: instead of asking "is line `ω` in partition `n`?", the
+/// Model 1 / Model 2 reduction asks "given line `ω`, which partition
+/// `n` does it land in?" — the natural question when walking the
+/// FFT-line domain and binning each line into its partition.
+///
+/// The accessor returns `Some(n)` with `n ∈ 1..=32` for any
+/// `omega ∈ [1, 513]` (the in-band FFT-line domain Table D.5 covers)
+/// and `None` for any `omega` outside that band.
+///
+/// **Shared-boundary disambiguation.** Phase 2 step 50 (r249) pinned
+/// the column-heading `ωlow_{n+1} / ωhigh_n` dual reading, and Phase 2
+/// step 54 (r253) pinned the inclusive-on-both-ends boundary
+/// semantics: every shared boundary line is a member of **both**
+/// partition `n` (as its `ωhigh_n`) and partition `n + 1` (as its
+/// `ωlow_{n+1}`). When the caller asks the inverse question, this
+/// accessor returns the **lower** index `n` — the first ascending-row
+/// match — matching both the spec table's row-order presentation
+/// (the boundary cell is printed on row `n`'s line, not on row
+/// `n + 1`'s) and the row-order iterator's ascending walk pinned by
+/// Phase 2 step 55. The downstream reduction is free to walk
+/// partitions in either direction; the "lowest partition first"
+/// convention is the unique deterministic choice that does not
+/// double-count the boundary lines.
+///
+/// The accessor is **pure** with respect to the spec — it is exactly
+/// `coder_partition_d5_spans().find(|s| s.omega_low <= omega &&
+/// omega <= s.omega_high).map(|s| s.index)`. No arithmetic beyond the
+/// inequality on each descriptor's pre-computed boundaries is
+/// introduced; no division, no modulus, no bit-tricks. The row-order
+/// iterator + first-match composition is the spec table's own
+/// row-by-row search, hoisted into a single accessor so the reduction
+/// doesn't re-implement it at every site.
+///
+/// Complexity is `O(32)` worst case (a linear scan of the table). For
+/// a Model 1 / Model 2 reduction sweeping all 513 FFT lines this is
+/// `O(513 × 32) ≈ 16 K` boundary comparisons — well below any
+/// performance threshold worth complicating the accessor over. A
+/// stride-based `O(1)` variant is theoretically derivable from the
+/// mostly-16-wide partition stride (Phase 2 step 49 pinned
+/// `CODER_PARTITION_D5_STRIDE = 16`), but the table's first row
+/// (`width = 0`, single-line partition 0 with `ωhigh_0` absent) and
+/// the dual-role `ωlow_{n+1} / ωhigh_n` boundary column would force
+/// the closed form to encode three special cases against the simple
+/// linear scan's one (the in/out-of-band check). This accessor stays
+/// with the spec-faithful row-walk; the `O(1)` variant can be added
+/// later as a separate accessor if a profile ever demands it.
+///
+/// Provenance: only the Phase 2 step 55 iterator
+/// [`coder_partition_d5_spans`] and (through it) the Phase 2 step 53
+/// descriptor [`coder_partition_d5_span`] and its underlying Table D.5
+/// transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table" are
+/// consulted; the lowest-index-first convention is the spec table's
+/// row-order presentation, already pinned by Phase 2 steps 50 and 55.
+#[inline]
+#[must_use]
+pub fn first_partition_containing_line(omega: u16) -> Option<u16> {
+    coder_partition_d5_spans()
+        .find(|s| s.omega_low <= omega && omega <= s.omega_high)
+        .map(|s| s.index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4767,5 +4841,172 @@ mod tests {
         let second_walk: Vec<CoderPartitionD5Span> = coder_partition_d5_spans().collect();
         assert_eq!(first_walk, second_walk);
         assert_eq!(first_walk.len(), 32);
+    }
+
+    // Phase 2 step 56 (r255) — Table D.5 inverse line→partition
+    // lookup. The accessor `first_partition_containing_line(ω)` returns
+    // `Some(n)` for the lowest partition whose inclusive boundary
+    // range `[ωlow_n, ωhigh_n]` contains `ω`, and `None` for any
+    // out-of-band `ω`.
+
+    #[test]
+    fn first_partition_returns_none_below_band() {
+        // ω = 0 is below the table-wide lower edge ωlow_1 = 1; no
+        // partition contains it. Pin the out-of-band None branch on
+        // the low side.
+        assert_eq!(first_partition_containing_line(0), None);
+    }
+
+    #[test]
+    fn first_partition_returns_none_above_band() {
+        // ω = 514 is one line above the table-wide upper edge
+        // ωhigh_32 = 513; no partition contains it. Pin the
+        // out-of-band None branch on the high side.
+        assert_eq!(first_partition_containing_line(514), None);
+        // A clearly far-above-band value reports None too — the
+        // accessor doesn't accidentally clamp into the table.
+        assert_eq!(first_partition_containing_line(10_000), None);
+        // u16::MAX exercises the saturating upper edge.
+        assert_eq!(first_partition_containing_line(u16::MAX), None);
+    }
+
+    #[test]
+    fn first_partition_at_table_wide_lower_edge_is_partition_one() {
+        // ω = 1 is partition 1's ωlow_1 (the table-wide lower edge).
+        // Partition 1 is the unique container — partition 0 is gone
+        // (the descriptor returns None for n = 0, pinned by step 53)
+        // and partition 2 starts at ωlow_2 = 17.
+        assert_eq!(first_partition_containing_line(1), Some(1));
+    }
+
+    #[test]
+    fn first_partition_at_table_wide_upper_edge_is_partition_thirty_two() {
+        // ω = 513 is partition 32's ωhigh_32 (the table-wide upper
+        // edge). Partition 32 is the unique container — there is no
+        // partition 33 by the boundary-table gap pinned by step 53.
+        assert_eq!(first_partition_containing_line(513), Some(32));
+    }
+
+    #[test]
+    fn first_partition_at_shared_boundary_picks_lower_index() {
+        // Every shared boundary line ω = ωhigh_n = ωlow_{n+1} is a
+        // member of BOTH partition n and partition n + 1 under the
+        // inclusive-on-both-ends reading pinned by Phase 2 step 54.
+        // The inverse accessor breaks the tie in favour of the LOWER
+        // partition n — the spec table's row-order presentation prints
+        // the boundary cell on row n's line, not on row n + 1's.
+        //
+        // Test every shared boundary in the table directly: for each
+        // n ∈ 1..=31, the value ωhigh_n is a shared boundary and the
+        // accessor must return n (not n + 1).
+        for n in 1_u16..=31 {
+            let high = coder_partition_d5_omega_high(n).expect("step 51 accessor recovers ωhigh_n");
+            let next_low =
+                coder_partition_d5_omega_low(n + 1).expect("step 51 accessor recovers ωlow_{n+1}");
+            assert_eq!(
+                high, next_low,
+                "step 50 dual-role identity should hold at partition boundary n = {n}",
+            );
+            assert_eq!(
+                first_partition_containing_line(high),
+                Some(n),
+                "shared boundary ω = {high} should pick lower partition n = {n}, not {}",
+                n + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn first_partition_at_strict_interior_lines_matches_step_53_descriptor() {
+        // For every n ∈ 1..=32 the strictly-interior line
+        // ω = ωlow_n + 1 (exists whenever ωhigh_n > ωlow_n, i.e. the
+        // partition is not degenerate) is unambiguously in partition
+        // n and nowhere else. Pin the accessor against the step 53
+        // descriptor directly on those interior lines.
+        for span in coder_partition_d5_spans() {
+            if span.omega_high > span.omega_low {
+                let interior = span.omega_low + 1;
+                // The interior line is strictly inside the partition
+                // (interior > ωlow, and interior ≤ ωhigh since
+                // ωhigh ≥ ωlow + 1 by the strict inequality above),
+                // so the accessor must return exactly span.index.
+                assert_eq!(
+                    first_partition_containing_line(interior),
+                    Some(span.index),
+                    "interior ω = {interior} of partition {} should map to {}",
+                    span.index,
+                    span.index,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_partition_walks_the_full_band_with_no_gaps() {
+        // Sweep every ω ∈ [1, 513] across the table-wide FFT-line
+        // domain: the accessor must return Some(n) at every line —
+        // no gaps in coverage. Pin the table-wide coverage property
+        // already verified at the descriptor level by Phase 2 step 55
+        // (`…_tiles_the_full_band`), now exposed through the inverse
+        // accessor.
+        for omega in 1_u16..=513 {
+            assert!(
+                first_partition_containing_line(omega).is_some(),
+                "in-band ω = {omega} should map to some partition",
+            );
+        }
+    }
+
+    #[test]
+    fn first_partition_n_agrees_with_step_54_membership_predicate() {
+        // Pin the agreement between the inverse accessor and the
+        // step 54 membership predicate: if
+        // `first_partition_containing_line(ω) = Some(n)`, then
+        // `partition_n_contains_line(n, ω) = Some(true)`. The
+        // inverse accessor returns a partition that genuinely
+        // contains ω under step 54's reading.
+        //
+        // Sweep slightly past the upper band edge so the out-of-band
+        // None branch is exercised; that branch propagates through
+        // both accessors consistently (no membership claim is made
+        // when no partition contains ω).
+        for omega in 0_u16..=520 {
+            if let Some(n) = first_partition_containing_line(omega) {
+                assert_eq!(
+                    partition_n_contains_line(n, omega),
+                    Some(true),
+                    "first-partition {n} for ω = {omega} should also be a member by step 54",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_partition_n_is_the_minimum_of_all_containing_partitions() {
+        // Pin the "lowest partition first" semantics directly: for
+        // every in-band ω, the inverse accessor's answer is the
+        // minimum n across all partitions that contain ω under the
+        // step 54 membership predicate.
+        //
+        // Computed from first principles: collect every partition n
+        // that contains ω, then assert the inverse accessor returns
+        // the min. At shared boundary lines the containing-set has
+        // exactly two elements {n, n + 1} and the min is n; at
+        // interior lines the containing-set is the singleton {n} and
+        // the min is trivially that n.
+        for omega in 1_u16..=513 {
+            let containing: Vec<u16> = (1_u16..=32)
+                .filter(|&n| partition_n_contains_line(n, omega) == Some(true))
+                .collect();
+            let expected = *containing
+                .iter()
+                .min()
+                .expect("every in-band ω lies in some partition");
+            assert_eq!(
+                first_partition_containing_line(omega),
+                Some(expected),
+                "ω = {omega} should map to min partition; containing set = {containing:?}",
+            );
+        }
     }
 }

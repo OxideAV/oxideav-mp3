@@ -8,6 +8,55 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Table D.5 inverse line→partition lookup (Phase 2
+  step 56). Phase 2 step 53 (r252) composed each partition's three
+  Table D.5 columns into a `CoderPartitionD5Span` descriptor with the
+  inclusive boundary pair `(ωlow_n, ωhigh_n)`. Phase 2 step 54 (r253)
+  lifted the membership inequality to the named predicate
+  `partition_n_contains_line`. Phase 2 step 55 (r254) added a
+  row-order iterator `coder_partition_d5_spans` over the recoverable
+  descriptors. r255 closes the inverse direction: a new free function
+  `first_partition_containing_line(omega) -> Option<u16>` returns the
+  lowest partition index `n` whose inclusive boundary range
+  `[ωlow_n, ωhigh_n]` contains the FFT line `omega`. The accessor
+  yields `Some(n)` with `n ∈ 1..=32` for `omega ∈ [1, 513]` and `None`
+  for any out-of-band `omega`. Shared-boundary disambiguation matches
+  the spec table's row-order presentation: every shared boundary line
+  `ω = ωhigh_n = ωlow_{n+1}` lies in both partition `n` and partition
+  `n + 1` under the inclusive-on-both-ends reading pinned by step 54,
+  and the inverse accessor returns the **lower** index `n` — the
+  unique deterministic choice that does not double-count the boundary
+  lines and matches the row-order iterator's ascending walk pinned by
+  step 55. Implementation is one line —
+  `coder_partition_d5_spans().find(|s| s.omega_low <= omega && omega
+  <= s.omega_high).map(|s| s.index)` — with no arithmetic beyond the
+  inequality on each descriptor's pre-computed boundaries.
+  Complexity is `O(32)` worst case; for a Model 1 / Model 2 reduction
+  sweeping all 513 lines this is `O(513 × 32) ≈ 16 K` boundary
+  comparisons, well below any performance threshold worth complicating
+  the accessor over. 9 new lib unit tests pin: the out-of-band `None`
+  branches at `omega = 0`, `omega = 514`, `omega = 10_000`, and
+  `omega = u16::MAX`; the table-wide-lower-edge identity
+  `first_partition_containing_line(1) = Some(1)`; the table-wide-
+  upper-edge identity `first_partition_containing_line(513) =
+  Some(32)`; the lower-index-pick at every shared boundary
+  `ω = ωhigh_n` for `n ∈ 1..=31`; per-partition strict-interior
+  agreement at `ω = ωlow_n + 1` against the step 53 descriptor; the
+  table-wide `[1, 513]` no-gap coverage property; the agreement with
+  the step 54 membership predicate
+  `partition_n_contains_line(n, ω) = Some(true)` for every in-band
+  `ω`; and the "lowest partition first" semantics directly — the
+  inverse accessor's answer is the minimum `n` across all partitions
+  that contain `ω` under the step 54 predicate (sweeping every
+  in-band line). Tests: 712 lib (was 703 baseline; +9 unit).
+  Provenance: only the Phase 2 step 55 iterator
+  `coder_partition_d5_spans` and (through it) the Phase 2 step 53
+  descriptor `coder_partition_d5_span` and its underlying Table D.5
+  transcription in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+  §"Table D.5 - Layer I and Layer II coder partition table" are
+  consulted.
+
 - psy: Annex D Table D.5 row-order iteration helper (Phase 2
   step 55). Pair the Phase 2 step 54 `partition_n_contains_line`
   membership predicate with a row-order iterator over the recoverable
