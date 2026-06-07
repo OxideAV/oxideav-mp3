@@ -51,8 +51,7 @@
 //! coefficients and the `N[i,k]` matrixing formula — was transcribed
 //! from the staged ISO/IEC 11172-3:1993 PDF (Annex B Table B.3 pages
 //! 50–52 of the body; the formula and Figure A.2 pseudo code on pages
-//! 31, 32 and 39). No external implementation (FFmpeg, libmad, mpg123,
-//! LAME, minimp3, …) was consulted for any reason.
+//! 31, 32 and 39). No external library source consulted.
 
 use crate::imdct::{NUM_SUBBANDS, SAMPLES_PER_SUBBAND};
 
