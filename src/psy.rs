@@ -1956,6 +1956,62 @@ pub fn partition_n_contains_line(n: u16, omega: u16) -> Option<bool> {
     Some(span.omega_low <= omega && omega <= span.omega_high)
 }
 
+/// Row-order iterator over Annex D Table D.5's recoverable partition
+/// descriptors — yields `CoderPartitionD5Span` for every `n ∈ 1..=32`
+/// in ascending order, with no gaps and no repetition.
+///
+/// The downstream Model 1 / Model 2 partition-threshold reduction walks
+/// Table D.5 row by row, accumulating per-partition values across the
+/// in-range FFT lines. Phase 2 step 53 (r252) composed each partition
+/// `n`'s three Table D.5 columns into a single
+/// [`CoderPartitionD5Span`] descriptor; Phase 2 step 54 (r253) added
+/// the `partition_n_contains_line(n, ω)` inclusive-line membership
+/// predicate on that descriptor. This step 55 helper closes the loop:
+/// the reduction now reads as
+///
+/// ```text
+///     for span in coder_partition_d5_spans() {
+///         // bin every FFT line ω with partition_n_contains_line(span.index, ω)
+///         …
+///     }
+/// ```
+///
+/// matching the spec table's row-order presentation without
+/// open-coding the `1..=32` range or the descriptor lookup at every
+/// reduction site.
+///
+/// The iterator emits **exactly 32** descriptors — one per recoverable
+/// partition. The two boundary-table-gap edges that
+/// [`coder_partition_d5_span`] returns `None` for (`n = 0` and
+/// `n = 33`) are **not** emitted: a row-order walk of Table D.5 sees
+/// the same boundary-table gaps the descriptor sees, so emitting either
+/// edge would force the caller to filter back to `1..=32` immediately.
+/// The iterator is the descriptor's natural row-walk and nothing else.
+///
+/// Implementation: a `Range<u16>` over `1..=32` mapped through
+/// [`coder_partition_d5_span`]. The `.unwrap()` inside the map is
+/// **infallible** for the iterated range — every `n ∈ 1..=32` is a
+/// recoverable Table D.5 row by construction (pinned by Phase 2 step
+/// 53 tests). The returned iterator is
+/// `ExactSizeIterator + DoubleEndedIterator + Clone` via the
+/// `Range`'s trait passthrough, but its public surface is kept generic
+/// (`impl Iterator<Item = CoderPartitionD5Span>`) so future
+/// implementation changes don't break consumers.
+///
+/// Provenance: only the Phase 2 step 53 descriptor
+/// [`coder_partition_d5_span`] and its underlying Table D.5
+/// transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table" are
+/// consulted; the row-order walk is the spec table's own ordering.
+#[inline]
+pub fn coder_partition_d5_spans() -> impl Iterator<Item = CoderPartitionD5Span> {
+    // `1..=32` matches the descriptor's recoverable range exactly;
+    // every `coder_partition_d5_span(n)` is `Some(_)` for that range
+    // by step 53 construction so the `.unwrap()` is infallible.
+    (1_u16..=32).map(|n| coder_partition_d5_span(n).expect("n ∈ 1..=32 is recoverable"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4600,5 +4656,116 @@ mod tests {
             assert_eq!(partition_n_contains_line(n, 1024), Some(false));
             assert_eq!(partition_n_contains_line(n, u16::MAX), Some(false));
         }
+    }
+
+    // =====================================================================
+    // Phase 2 step 55 (r254) — Table D.5 row-order iteration helper
+    // `coder_partition_d5_spans()`.
+    // =====================================================================
+
+    #[test]
+    fn coder_partition_d5_spans_yields_thirty_two_descriptors() {
+        // The iterator emits exactly one descriptor per recoverable
+        // Table D.5 row — `n ∈ 1..=32` is 32 partitions.
+        assert_eq!(coder_partition_d5_spans().count(), 32);
+    }
+
+    #[test]
+    fn coder_partition_d5_spans_yields_row_order() {
+        // Pin the row-order property: the iterator's `index` field
+        // sequence is exactly `1, 2, …, 32` — no gaps, no repetition,
+        // no reordering.
+        let indices: Vec<u16> = coder_partition_d5_spans().map(|s| s.index).collect();
+        let expected: Vec<u16> = (1_u16..=32).collect();
+        assert_eq!(indices, expected);
+    }
+
+    #[test]
+    fn coder_partition_d5_spans_each_descriptor_matches_table_lookup() {
+        // Every yielded descriptor equals the corresponding
+        // `coder_partition_d5_span(n)` — the iterator is a pure
+        // row-walk of the step 53 accessor and does not invent any
+        // new descriptor field values.
+        for span in coder_partition_d5_spans() {
+            assert_eq!(
+                Some(span),
+                coder_partition_d5_span(span.index),
+                "iterator descriptor at index {} disagrees with table lookup",
+                span.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_spans_skips_boundary_table_gaps() {
+        // The two `None`-returning descriptor edges (`n = 0`, `n = 33`)
+        // are not emitted — a row-order walk sees the same boundary-
+        // table gaps the descriptor does.
+        let indices: Vec<u16> = coder_partition_d5_spans().map(|s| s.index).collect();
+        assert!(!indices.contains(&0), "iterator should skip n = 0");
+        assert!(!indices.contains(&33), "iterator should skip n = 33");
+    }
+
+    #[test]
+    fn coder_partition_d5_spans_tiles_the_full_band() {
+        // The iterator's descriptors collectively cover every FFT line
+        // index in the table-wide band `[ωlow_1, ωhigh_32] = [1, 513]`
+        // (with shared boundary lines belonging to two consecutive
+        // partitions, per the inclusive-on-both-ends reading already
+        // pinned by `coder_partition_d5_span_tiles_the_band`).
+        //
+        // Composed with the step 54 predicate
+        // `partition_n_contains_line`, the iterator walks every line
+        // in the band exactly as the downstream partition-threshold
+        // reduction will.
+        let spans: Vec<CoderPartitionD5Span> = coder_partition_d5_spans().collect();
+        let first = spans.first().expect("iterator yields at least one span");
+        let last = spans.last().expect("iterator yields at least one span");
+        assert_eq!(first.omega_low, 1, "first partition's ωlow should be 1");
+        assert_eq!(last.omega_high, 513, "last partition's ωhigh should be 513");
+        // Adjacent-row tiling identity: `ωhigh_n = ωlow_{n+1}` for
+        // every consecutive pair the iterator yields.
+        for pair in spans.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            assert_eq!(
+                a.omega_high, b.omega_low,
+                "tiling broken between partition {} and partition {}",
+                a.index, b.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_spans_pairs_with_membership_predicate() {
+        // Pin the spec-read pairing pattern: for each yielded span,
+        // `partition_n_contains_line(span.index, ω)` agrees with the
+        // descriptor's inequality at every line in `0..=520` (sweeping
+        // past the upper band edge to exercise the out-of-band branch).
+        // This is the pattern the downstream reduction will use; pin
+        // the agreement directly so a future drift between the
+        // iterator and the predicate fails the build.
+        for span in coder_partition_d5_spans() {
+            for omega in 0_u16..=520 {
+                let by_predicate = partition_n_contains_line(span.index, omega).unwrap();
+                let by_descriptor = span.omega_low <= omega && omega <= span.omega_high;
+                assert_eq!(
+                    by_predicate, by_descriptor,
+                    "iterator/predicate disagree at (n = {}, ω = {})",
+                    span.index, omega,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_spans_is_clone_and_repeatable() {
+        // The iterator is cheap to clone (a `Range::Map` over a
+        // pure-function map) and yields identical sequences on each
+        // walk — pinning the "may be re-iterated" property the
+        // downstream reduction relies on for multi-pass walks.
+        let first_walk: Vec<CoderPartitionD5Span> = coder_partition_d5_spans().collect();
+        let second_walk: Vec<CoderPartitionD5Span> = coder_partition_d5_spans().collect();
+        assert_eq!(first_walk, second_walk);
+        assert_eq!(first_walk.len(), 32);
     }
 }

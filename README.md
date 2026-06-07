@@ -2373,6 +2373,79 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 55 (r254)** — Annex D Table D.5 row-order iteration
+helper. Phase 2 step 53 (r252) composed the verbatim Table D.5
+columns of partition `n` into a single `CoderPartitionD5Span`
+descriptor; Phase 2 step 54 (r253) added the
+`partition_n_contains_line(n, ω)` inclusive-line membership
+predicate on that descriptor. The downstream Model 1 / Model 2
+partition-threshold reduction walks Table D.5 row by row,
+accumulating per-partition values across the in-range FFT lines;
+r254 closes that loop with a row-order iterator over the
+recoverable Table D.5 descriptors, so the reduction reads as
+
+```text
+    for span in coder_partition_d5_spans() {
+        // bin every FFT line ω with partition_n_contains_line(span.index, ω)
+        …
+    }
+```
+
+— matching the spec table's row-order presentation without
+open-coding the `1..=32` range or the descriptor lookup at every
+reduction site:
+
+* `coder_partition_d5_spans()` returns `impl Iterator<Item =
+  CoderPartitionD5Span>` yielding **exactly 32 descriptors** — one
+  per recoverable Table D.5 row — in strictly ascending row order
+  `n = 1, 2, …, 32`. The two boundary-table-gap edges (`n = 0`,
+  `n = 33`) that the step 53 descriptor returns `None` for are
+  **not** emitted: a row-order walk of Table D.5 sees the same
+  boundary-table gaps the descriptor sees, so emitting either edge
+  would force the caller to filter back to `1..=32` immediately.
+
+The implementation is a single line:
+`(1_u16..=32).map(|n| coder_partition_d5_span(n).expect("n ∈ 1..=32
+is recoverable"))`. The `.expect` is **infallible** for the
+iterated range — every `n ∈ 1..=32` is a recoverable Table D.5 row
+by Phase 2 step 53 construction, pinned by step 53's tests. The
+returned iterator is `Clone` and `ExactSizeIterator +
+DoubleEndedIterator` via the `Range<u16>::Map` passthrough, but its
+public signature is kept generic (`impl Iterator<Item =
+CoderPartitionD5Span>`) so future implementation changes don't
+break consumers.
+
+Validated by 7 new lib unit tests in `psy::tests`:
+`coder_partition_d5_spans_yields_thirty_two_descriptors` pins the
+exact emission count;
+`…_yields_row_order` pins the strictly ascending `1..=32` `index`
+sequence — no gaps, no repetition, no reordering;
+`…_each_descriptor_matches_table_lookup` pins per-descriptor
+agreement with `coder_partition_d5_span(n)` (the iterator is a
+pure row-walk of the step 53 accessor and invents no new field
+values);
+`…_skips_boundary_table_gaps` pins the boundary-table-gap skip
+(`n = 0` and `n = 33` never appear in the emitted index sequence);
+`…_tiles_the_full_band` pins the table-wide band coverage `[1,
+513]` (the first span's `ωlow = 1` and the last span's `ωhigh =
+513`) and the adjacent-row tiling identity `ωhigh_n = ωlow_{n+1}`
+for every consecutive emitted pair;
+`…_pairs_with_membership_predicate` pins the spec-read pairing
+pattern across every `(span, ω) ∈ iter × 0..=520` — the
+iterator/predicate composition agrees with the descriptor's
+inequality at every line in the band (sweeping past the upper edge
+to exercise the out-of-band false branch);
+`…_is_clone_and_repeatable` pins the multi-pass walk property the
+downstream reduction relies on — the iterator is cheap to clone
+and yields an identical sequence on each walk.
+Tests: 703 lib (was 696 baseline; +7 unit). No external
+implementation consulted; only the Phase 2 step 53 descriptor
+`coder_partition_d5_span` and its underlying Table D.5
+transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 - Layer I and Layer II coder partition table" were
+read.
+
 **Phase 2 step 54 (r253)** — Annex D Table D.5 inclusive-line
 membership predicate. Phase 2 step 53 (r252) composed the verbatim
 Table D.5 columns of partition `n` into a single

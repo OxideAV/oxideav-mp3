@@ -8,6 +8,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Table D.5 row-order iteration helper (Phase 2
+  step 55). Pair the Phase 2 step 54 `partition_n_contains_line`
+  membership predicate with a row-order iterator over the recoverable
+  Table D.5 descriptors so the downstream Model 1 / Model 2
+  partition-threshold reduction can walk the table in spec order
+  without open-coding the `1..=32` range or the descriptor lookup at
+  every reduction site. New free function `coder_partition_d5_spans()`
+  returns `impl Iterator<Item = CoderPartitionD5Span>` yielding
+  exactly 32 descriptors in ascending row order — `n = 1` through
+  `n = 32` — and skips the two boundary-table-gap edges (`n = 0` and
+  `n = 33`) the step 53 descriptor returns `None` for. Implementation
+  is `(1_u16..=32).map(|n| coder_partition_d5_span(n).expect(...))`;
+  the `.expect` is infallible by step 53 construction (every iterated
+  `n` is a recoverable Table D.5 row). 7 new lib unit tests pin: the
+  exact 32-descriptor count; the strictly ascending row-order
+  `1..=32` sequence; per-descriptor agreement with
+  `coder_partition_d5_span(n)`; the boundary-table-gap skip at `n = 0`
+  and `n = 33`; the table-wide band coverage `[1, 513]` and the
+  adjacent-row tiling identity `ωhigh_n = ωlow_{n+1}` for every
+  consecutive pair; the spec-read pairing pattern with
+  `partition_n_contains_line` across every `(span, ω) ∈ iter ×
+  0..=520`; and the re-iteration property (cheap clone, identical
+  sequence on each walk — the multi-pass walks the downstream
+  reduction relies on). Tests: 703 lib (was 696 baseline; +7 unit).
+  Provenance: only the Phase 2 step 53 descriptor
+  `coder_partition_d5_span` and its underlying Table D.5
+  transcription in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+  §"Table D.5 - Layer I and Layer II coder partition table" are
+  consulted; the row-order walk is the spec table's own ordering.
 - psy: Annex D Table D.5 inclusive-line membership predicate
   (Phase 2 step 54). Lift the obvious inequality on the Phase 2
   step 53 `CoderPartitionD5Span` descriptor (`s.omega_low <= ω &&
