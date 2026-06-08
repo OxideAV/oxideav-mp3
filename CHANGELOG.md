@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 8 row-order `width_n` vector over
+  Table D.5 (Phase 2 step 60). Phase 2 step 59 (r258) broadcast the
+  Phase 2 step 58 (r257) per-partition `LTg` minimum reducer
+  `coder_partition_d5_ltg_min` across the Phase 2 step 55 (r254)
+  row-order iterator `coder_partition_d5_spans`, producing the
+  32-element row-order LTmin vector `[LTmin_1, LTmin_2, …, LTmin_32]`
+  the Layer I / Layer II bit-allocation loop consumes per frame.
+  r259 closes the second half of that per-frame input: a row-order
+  vector of the `width_n` column the bit-allocation loop pairs with
+  the LTmin vector at every row. A new free function
+  `coder_partition_d5_width_row_order() -> [u16; 32]` broadcasts the
+  Phase 2 step 52 (r251) per-partition `width_n` accessor
+  `coder_partition_d5_width` across the same step 55 row-order
+  iterator, returning the static 32-element 0-based array
+  `[0, 0, …, 0, 1, 1, …, 1]` — twelve zeros followed by twenty ones
+  per the Table D.5 transcription ("rows 0..=12 have width 0; rows
+  13..=32 have width 1"). The vector is fully determined by the
+  static table (no run-time inputs), unlike step 59's LTmin vector
+  which closes over a caller-supplied `LTg(ω)` callback. The 0-based
+  index convention matches step 59's exactly:
+  `out[i] = width_{i + 1}`, partition 0 excluded. Tests: 757 lib
+  (was 745 baseline; +12 unit) covering length pin (32), lower-block
+  rule (n ∈ 1..=12 → 0), upper-block rule (n ∈ 13..=32 → 1), the
+  single-step 0 → 1 transition at array index 12 (partition 13),
+  binary-only cell-value pin, strict-composition cross-check against
+  the per-partition step 52 lookup, table-literal pin against the
+  verbatim 32-element constant, table-wide endpoint pin
+  (`out[0] = 0`, `out[31] = 1`), upper-block-count sum pin (Σ = 20),
+  idempotence across back-to-back calls, non-decreasing monotonicity,
+  and ascending-partition iteration order. No external implementation
+  consulted; only the Phase 2 step 52 per-partition `width_n`
+  accessor and the Phase 2 step 55 row-order iterator (and through
+  them the Table D.5 transcription in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) were read.
+
 - psy: Annex D Model 1 §D.1 Step 8 row-order LTmin vector over
   Table D.5 (Phase 2 step 59). Phase 2 step 58 (r257) reduced the
   per-FFT-line global masking threshold `LTg(ω)` over a single

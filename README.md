@@ -2373,6 +2373,98 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 60 (r259)** — Annex D Model 1 §D.1 Step 8 row-order
+`width_n` vector over Table D.5. Phase 2 step 59 (r258) broadcast
+the Phase 2 step 58 (r257) per-partition `LTg` minimum reducer
+across the Phase 2 step 55 (r254) row-order iterator, producing the
+32-element row-order LTmin vector `[LTmin_1, LTmin_2, …, LTmin_32]`
+the Layer I / Layer II bit-allocation loop consumes per frame. r259
+closes the second half of that per-frame input: a row-order vector
+of the `width_n` column the bit-allocation loop pairs with the
+LTmin vector at every row. Together steps 59 + 60 expose the
+complete per-frame coder-partition input the bit-allocation loop
+consumes:
+
+```text
+step 59 LTmin: [LTmin_1, LTmin_2, …, LTmin_32]  (f64,  dB)
+step 60 width: [width_1, width_2, …, width_32]  (u16,  0/1)
+```
+
+A new free function:
+
+* `coder_partition_d5_width_row_order() -> [u16; 32]` — broadcasts
+  the Phase 2 step 52 per-partition `width_n` accessor across the
+  Phase 2 step 55 row-order iterator, returning the static 32-
+  element 0-based array where element `i` holds `width_{i + 1}`
+  (the spec's 1-based partition index in 0-based array form).
+
+**Index convention.** 0-based on the returned slice;
+`out[i] = width_{i + 1}`. The spec's 1-based partition index
+`n ∈ 1..=32` maps to array index `i = n - 1 ∈ 0..=31`. Partition 0
+(the degenerate single-line `width_n = 0` row carrying `ωlow_0`
+only) is excluded from the vector for index consistency with Phase
+2 step 59 (r258)'s LTmin vector — the downstream bit-allocation
+loop walks partitions `1..=32` in lockstep across the LTmin and
+width vectors and does not consult partition 0.
+
+**Composition rather than introduction.** A pure broadcast of
+Phase 2 step 52's per-partition `width_n` accessor
+`coder_partition_d5_width` across the Phase 2 step 55 row-order
+iterator `coder_partition_d5_spans`. No spec arithmetic is
+introduced — only the broadcast of step 52's single-partition
+lookup across all 32 recoverable partitions. Unlike step 59, this
+accessor has **no run-time inputs**: the `width_n` column is a
+static property of Table D.5, so the returned vector is the same
+`[u16; 32]` on every call. The output is structurally orthogonal
+to the LTmin column (the run-time-dependent half of the per-frame
+bit-allocation input pair), keeping the two columns as independent
+accessors the downstream loop pairs at the call site rather than
+fused into a single `(LTmin, width)` carrier.
+
+**Constant values.** Per the Table D.5 transcription the vector is
+exactly twelve zeros followed by twenty ones:
+
+```text
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+```
+
+The single 0 → 1 transition lies between array indices 11 and 12
+(partitions 12 and 13), pinned by Phase 2 step 52's transcription
+rule "rows 0..=12 have width 0; rows 13..=32 have width 1" and the
+step 55 row-order iterator's ascending-`n` ordering.
+
+Validated by 12 new lib unit tests in `psy::tests`. The 32-element
+length is pinned. The lower-block rule (n ∈ 1..=12 → 0) is
+verified across array indices 0..=11; the upper-block rule
+(n ∈ 13..=32 → 1) is verified across array indices 12..=31. The
+single-step 0 → 1 transition at array index 12 (partition 13) is
+pinned by asserting `v[11] = 0` and `v[12] = 1`. Every cell is
+verified to carry only 0 or 1 (the binary `width_n` column has no
+intermediate values). A strict-composition cross-check asserts the
+row-order vector matches the per-partition step 52 lookup
+`coder_partition_d5_width(n)` at every n ∈ 1..=32. A
+table-literal pin asserts the row-order vector equals the verbatim
+32-element constant `[0×12, 1×20]` — any future change to Table
+D.5's `width_n` column would surface here independently of the
+step 52 / step 55 underlying accessors. Table-wide endpoints are
+pinned (`out[0] = width_1 = 0`, `out[31] = width_32 = 1`). The
+upper-block sum is pinned as `Σ v = 20` (twenty partitions in the
+upper block, each contributing 1). Idempotence across back-to-back
+calls is pinned (the accessor has no run-time state). Non-
+decreasing monotonicity across array indices is pinned (one
+ascending step from 0 to 1, no later drops). Finally, the
+ascending-partition iteration order is verified by reconstructing
+the vector via a manual `n ∈ 1..=32` walk and comparing it to the
+function's output. Tests: 757 lib (was 745 baseline; +12 unit). No
+external implementation consulted; only the Phase 2 step 52 per-
+partition `width_n` accessor `coder_partition_d5_width` and the
+Phase 2 step 55 row-order iterator `coder_partition_d5_spans` (and
+through them the Table D.5 transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 - Layer I and Layer II coder partition table") were
+read.
+
 **Phase 2 step 59 (r258)** — Annex D Model 1 §D.1 Step 8 row-order
 LTmin vector over Table D.5. Phase 2 step 58 (r257) reduced the
 per-FFT-line global masking threshold `LTg(ω)` over a single

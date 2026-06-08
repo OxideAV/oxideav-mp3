@@ -2458,6 +2458,144 @@ where
     out
 }
 
+// =====================================================================
+// Annex D Model 1 — §D.1 Step 8 row-order width vector over Table D.5
+// (Phase 2 step 60 / r259).
+//
+// Spec context (clause D.1, ISO/IEC 11172-3:1993, informative annex):
+//
+//   Table D.5 prints three columns per row — the partition index `n`,
+//   the dual-role partition-boundary FFT-line cell `ωlow_{n+1} / ωhigh_n`,
+//   and the `width_n` column. Phase 2 step 52 (r251) exposed the
+//   `width_n` value of a single partition `n ∈ 1..=32` via
+//   `coder_partition_d5_width`. The verbatim transcribed values from
+//   the §"Table D.5 - Layer I and Layer II coder partition table"
+//   render are:
+//
+//       n ∈ 1..=12 → width_n = 0
+//       n ∈ 13..=32 → width_n = 1
+//
+//   The Layer I / Layer II bit-allocation loop consumes the **full
+//   vector** `[width_1, width_2, …, width_32]` per frame alongside the
+//   row-order LTmin vector landed by Phase 2 step 59 (r258), walking
+//   the 32 coder partitions in row order (the spec table's
+//   ascending-`n` presentation, pinned at iteration order by Phase 2
+//   step 55 / r254's `coder_partition_d5_spans`). The width vector
+//   pairs each `LTmin_n` element with its partition's `width_n`
+//   value, and the downstream bit-allocation step pairs the two
+//   columns per row.
+//
+// Composition rather than introduction: this step is a strict
+// composition of the Phase 2 step 55 row-order partition iterator
+// `coder_partition_d5_spans` (which yields every recoverable
+// `n ∈ 1..=32` in ascending order) with the Phase 2 step 52 per-
+// partition `width_n` accessor `coder_partition_d5_width`. No new
+// spec arithmetic is introduced — only the broadcast of step 52's
+// single-partition lookup across all 32 recoverable partitions. The
+// output is a **pure constant** of Table D.5 (the `width_n` column
+// has no run-time inputs) — unlike step 59's `LTmin` vector, which
+// closes over a caller-supplied `LTg(ω)` callback, the width vector
+// is fully determined by the static table.
+//
+// The output is a 32-element `[u16; 32]` indexed 0-based, with
+// element `i` holding `width_{i + 1}` (the spec's 1-based `n` in
+// 0-based array form). This matches the spec's row-order
+// presentation of Table D.5 and the same index convention pinned by
+// step 59. Partition 0 (the degenerate single-line `width_n = 0` row
+// carrying `ωlow_0` only) is excluded from the vector for index
+// consistency with step 59 — the downstream bit-allocation loop
+// walks partitions `1..=32` and does not consult partition 0,
+// matching the spec's coder-partition usage.
+// =====================================================================
+
+/// §D.1 Step 8 row-order `width_n` vector
+/// `[width_1, width_2, …, width_32]` for every Layer I / Layer II
+/// coder partition `n ∈ 1..=32`. Element `i` of the returned
+/// `[u16; 32]` holds `width_{i + 1}` (the spec's 1-based `n` in
+/// 0-based array form):
+///
+/// ```text
+/// out[0]  = width_1  = 0
+/// out[1]  = width_2  = 0
+/// …
+/// out[11] = width_12 = 0
+/// out[12] = width_13 = 1
+/// …
+/// out[31] = width_32 = 1
+/// ```
+///
+/// The vector is the static per-frame input the Layer I / Layer II
+/// bit-allocation loop consumes alongside the row-order LTmin vector
+/// landed by Phase 2 step 59 (r258), pairing each `LTmin_n` element
+/// with its partition's `width_n` value at the same array index.
+///
+/// **Index convention.** 0-based on the returned slice;
+/// `out[i] = width_{i + 1}`. The spec's 1-based partition index
+/// `n ∈ 1..=32` maps to array index `i = n - 1 ∈ 0..=31`. Partition
+/// 0 (the degenerate single-line `width_n = 0` row carrying `ωlow_0`
+/// only) is excluded from the vector for index consistency with
+/// Phase 2 step 59 (r258)'s LTmin vector. The downstream bit-
+/// allocation loop walks partitions `1..=32` and does not consult
+/// partition 0, matching the spec's coder-partition usage.
+///
+/// **Composition.** A pure broadcast of Phase 2 step 52's per-
+/// partition `width_n` accessor [`coder_partition_d5_width`] across
+/// the Phase 2 step 55 row-order iterator [`coder_partition_d5_spans`].
+/// No spec arithmetic is introduced — only the broadcast of step
+/// 52's single-partition lookup across all 32 recoverable
+/// partitions, which is the row-order vector form the Layer I /
+/// Layer II bit-allocation loop pairs with the step 59 LTmin vector
+/// per frame. Unlike step 59, this accessor has no run-time inputs:
+/// the `width_n` column is a static property of Table D.5, so the
+/// returned vector is the same `[u16; 32]` on every call.
+///
+/// **Constant values.** Per the Table D.5 transcription the vector
+/// is exactly twelve zeros followed by twenty ones:
+///
+/// ```text
+/// [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+///  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+/// ```
+///
+/// The single 0 → 1 transition lies between array indices 11 and 12
+/// (partitions 12 and 13), pinned by Phase 2 step 52's transcription
+/// rule "rows 0..=12 have width 0; rows 13..=32 have width 1" and
+/// the step 55 row-order iterator's ascending-`n` ordering.
+///
+/// **Implementation.** A pure composition of
+/// [`coder_partition_d5_spans`] (Phase 2 step 55) and
+/// [`coder_partition_d5_width`] (Phase 2 step 52): for each
+/// recoverable span the function calls the step 52 lookup with the
+/// span's `index`. The `.expect("…")` on the step 52 result is
+/// infallible by construction — every span emitted by
+/// [`coder_partition_d5_spans`] has `index ∈ 1..=32`, the exact
+/// range step 52 returns `Some(_)` over. Complexity is `O(32)` per
+/// call — one lookup per span — with no per-line work (the
+/// `width_n` column does not span FFT lines).
+///
+/// Provenance: only the Phase 2 step 52 per-partition `width_n`
+/// accessor [`coder_partition_d5_width`] and the Phase 2 step 55
+/// row-order iterator [`coder_partition_d5_spans`] (and through them
+/// the underlying Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") are
+/// consulted. The row-order broadcast reading is the spec's per
+/// Annex D Step 8 (informative Model 1 reduction) row-by-row
+/// presentation; no external implementation was read.
+#[must_use]
+pub fn coder_partition_d5_width_row_order() -> [u16; 32] {
+    let mut out = [0u16; 32];
+    for span in coder_partition_d5_spans() {
+        // `span.index ∈ 1..=32` by step 55 construction; the step 52
+        // accessor is `Some(_)` exactly over that range so the
+        // `.expect` is infallible.
+        let i = (span.index - 1) as usize;
+        out[i] = coder_partition_d5_width(span.index)
+            .expect("n ∈ 1..=32 is recoverable by step 52 / Table D.5");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6067,5 +6205,162 @@ mod tests {
                 "partition {n}: got {got}, expected -ωhigh_n = {expected}",
             );
         }
+    }
+
+    // ---------- Phase 2 step 60 / r259 — row-order width vector ----------
+
+    #[test]
+    fn coder_partition_d5_width_row_order_returns_exactly_thirty_two_elements() {
+        // Vector size is pinned by the Table D.5 transcription: 32
+        // recoverable partitions n ∈ 1..=32 (partition 0 excluded).
+        let v = coder_partition_d5_width_row_order();
+        assert_eq!(v.len(), 32);
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_lower_block_is_zero() {
+        // Spec rule: rows n ∈ 1..=12 carry width_n = 0. Array indices
+        // 0..=11 hold partitions 1..=12 in 0-based form.
+        let v = coder_partition_d5_width_row_order();
+        for (i, &w) in v.iter().enumerate().take(12) {
+            assert_eq!(
+                w,
+                0,
+                "array index {i} (partition n = {}) should be 0",
+                i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_upper_block_is_one() {
+        // Spec rule: rows n ∈ 13..=32 carry width_n = 1. Array indices
+        // 12..=31 hold partitions 13..=32 in 0-based form.
+        let v = coder_partition_d5_width_row_order();
+        for (i, &w) in v.iter().enumerate().skip(12) {
+            assert_eq!(
+                w,
+                1,
+                "array index {i} (partition n = {}) should be 1",
+                i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_transition_is_a_single_step_at_index_twelve() {
+        // The 0 → 1 transition is a single step at array index 12
+        // (partition 13). No partition holds an intermediate value
+        // (the column is binary 0/1).
+        let v = coder_partition_d5_width_row_order();
+        assert_eq!(v[11], 0, "array index 11 (partition 12) should be 0");
+        assert_eq!(v[12], 1, "array index 12 (partition 13) should be 1");
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_every_cell_is_zero_or_one() {
+        // The width_n column carries only 0 or 1 (binary per
+        // transcription). Verify no cell holds any other value.
+        let v = coder_partition_d5_width_row_order();
+        for (i, &w) in v.iter().enumerate() {
+            assert!(
+                w == 0 || w == 1,
+                "array index {i} carries non-binary width {w}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_matches_per_partition_lookup() {
+        // Strict-composition cross-check: each cell equals the step
+        // 52 per-partition accessor `coder_partition_d5_width(n)`
+        // applied at n = i + 1. The row-order vector is exactly that
+        // broadcast.
+        let v = coder_partition_d5_width_row_order();
+        for n in 1_u16..=32 {
+            let direct = coder_partition_d5_width(n).expect("n ∈ 1..=32 is recoverable by step 52");
+            let from_row = v[(n - 1) as usize];
+            assert_eq!(
+                from_row, direct,
+                "partition {n}: row-order vector {from_row} vs direct lookup {direct}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_matches_full_table_literal() {
+        // Pin the exact 32-element vector: twelve zeros followed by
+        // twenty ones. Any future change to Table D.5's width_n column
+        // would surface here as a literal mismatch (independent of the
+        // step 52 / step 55 underlying accessors).
+        let v = coder_partition_d5_width_row_order();
+        let expected: [u16; 32] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // partitions 1..=12
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 13..=32
+        ];
+        assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_endpoints_match_table_d5_edges() {
+        // Table-wide endpoint pin: array index 0 holds partition 1's
+        // width (= 0, lower-block edge); array index 31 holds
+        // partition 32's width (= 1, upper-block edge).
+        let v = coder_partition_d5_width_row_order();
+        assert_eq!(v[0], 0, "array index 0 (partition 1) should be 0");
+        assert_eq!(v[31], 1, "array index 31 (partition 32) should be 1");
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_sum_matches_upper_block_count() {
+        // Sum of every cell equals the number of partitions in the
+        // upper block (each contributing 1; the lower block
+        // contributes 0). The upper block is n ∈ 13..=32 — twenty
+        // partitions — so the sum is 20.
+        let v = coder_partition_d5_width_row_order();
+        let total: u32 = v.iter().map(|&w| u32::from(w)).sum();
+        assert_eq!(total, 20);
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_is_idempotent_across_calls() {
+        // The function has no run-time inputs and reads only Table
+        // D.5's static width_n column. Every call returns the same
+        // vector — verify two back-to-back calls agree.
+        let a = coder_partition_d5_width_row_order();
+        let b = coder_partition_d5_width_row_order();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_is_non_decreasing() {
+        // The width_n column rises monotonically from 0 (rows 1..=12)
+        // to 1 (rows 13..=32) with a single step. Verify the vector
+        // is non-decreasing in 0-based array order.
+        let v = coder_partition_d5_width_row_order();
+        for i in 1_usize..32 {
+            assert!(
+                v[i] >= v[i - 1],
+                "non-monotone at index {i}: v[{}] = {} > v[{}] = {}",
+                i - 1,
+                v[i - 1],
+                i,
+                v[i],
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_width_row_order_walks_partitions_in_ascending_order() {
+        // The row-order iterator visits every recoverable partition
+        // exactly once in ascending n order. Verify by reconstructing
+        // the vector via a manual ascending walk and comparing it to
+        // the function's output.
+        let v = coder_partition_d5_width_row_order();
+        let mut manual = [0u16; 32];
+        for n in 1_u16..=32 {
+            manual[(n - 1) as usize] = coder_partition_d5_width(n).unwrap();
+        }
+        assert_eq!(v, manual);
     }
 }
