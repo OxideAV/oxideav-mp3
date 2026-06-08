@@ -2160,6 +2160,163 @@ pub fn coder_partition_d5_omega_iter(n: u16) -> Option<core::ops::RangeInclusive
     Some(low..=high)
 }
 
+// =====================================================================
+// Annex D Model 1 — §D.1 Step 8 per-partition LTg minimum reduction
+// (Phase 2 step 58 / r257).
+//
+// Spec context (clause D.1, ISO/IEC 11172-3:1993, informative annex):
+//
+//   Step 7 (already landed at Phase 2 step 44 / r219 as
+//   `global_masking_threshold_db`) produces the per-FFT-line global
+//   masking threshold `LTg(i)` (dB) by summing the energy contributions
+//   of every in-range tonal/non-tonal masker with the threshold in
+//   quiet `LTq(i)`.
+//
+//   The Layer I / Layer II coder partition table (Table D.5, transcribed
+//   at Phase 2 step 49 / r248) groups the 513 FFT lines into 32 coder
+//   partitions `n ∈ 1..=32` (partition `0` is a single-line degenerate
+//   carrying `ωlow_0` only and is not used as a reduction target — see
+//   the §D.1 Step 4 critical-band-boundary reading at Phase 2 step 50).
+//
+//   Step 8 reduces the per-line `LTg(i)` over each coder partition by
+//   taking the minimum:
+//
+//       LTmin_n = min_{ω ∈ [ωlow_n, ωhigh_n]} LTg(ω)   dB
+//
+//   The minimum is the most-conservative per-partition perceptual
+//   threshold — a single FFT line dipping below the partition's average
+//   threshold pulls the whole partition's bit-allocation budget down to
+//   that line's level (the encoder cannot afford to leak any
+//   sub-threshold noise into the partition without becoming audible).
+//   This is the value the Layer I / Layer II bit-allocation loop (the
+//   Layer III analogue is the outer-loop SNR budget) consumes per
+//   partition.
+//
+// Composition rather than introduction: this step is a strict
+// composition of the Phase 2 step 57 per-partition FFT-line iterator
+// `coder_partition_d5_omega_iter` (which yields every `ω ∈ [ωlow_n,
+// ωhigh_n]` in ascending order) with the caller-supplied `LTg(ω)`
+// callback. No spec arithmetic is introduced — only the per-line
+// minimum fold over the recoverable line range. The Step 7 LTg
+// callback itself is provided by the caller (typically a closure
+// closing over the static masker list + threshold-in-quiet curve);
+// this accessor stays pure with respect to the masker selection
+// pipeline (Steps 1-5), which remain blocked on the PNG-only Table
+// D.1 / D.2 / D.3 transcription gap. Once Steps 1-5 land the
+// concrete `LTg(ω)` closure will be the one produced by Step 7's
+// `global_masking_threshold_db` applied per line.
+//
+// Boundary semantics: the underlying step 57 iterator is inclusive
+// on both ends and emits the shared boundary line `ωhigh_n =
+// ωlow_{n+1}` to both adjacent partitions `n` and `n + 1`. That
+// matches the spec's per-partition reduction reading (a shared
+// boundary line legitimately enters both partitions' minimums),
+// and `coder_partition_d5_ltg_min` inherits the semantics
+// unchanged — a sharp dip located exactly on a shared boundary
+// reduces the LTmin of both adjacent partitions, which is the
+// conservative-bit-allocation reading the spec intends.
+//
+// Shared-boundary disambiguation: a caller that wants every FFT
+// line to enter exactly one partition's minimum (single-assignment
+// binning, no shared-boundary double-influence) uses the step 56
+// inverse accessor `first_partition_containing_line` to bin per
+// line, then folds per partition. This module exposes both
+// reductions because the spec text is silent on which reading is
+// "correct" — both are defensible, and the choice depends on the
+// downstream bit-allocation loop's preference. The step 58 default
+// (this accessor) matches the per-partition `Σ_{ω ∈ partition}`
+// composition pattern Phase 2 step 57 (r256) wired into Step 7's
+// own sum-over-lines.
+// =====================================================================
+
+/// §D.1 Step 8 per-partition minimum global masking threshold
+/// `LTmin_n` (dB) for the Layer I / Layer II coder partition
+/// `n ∈ 1..=32`. Reduces the caller-supplied per-FFT-line global
+/// threshold `ltg_per_line(ω)` (from Step 7's
+/// [`global_masking_threshold_db`], applied per line) over every
+/// `ω ∈ [ωlow_n, ωhigh_n]` by taking the minimum:
+///
+/// ```text
+/// LTmin_n = min_{ω ∈ [ωlow_n, ωhigh_n]} LTg(ω)   dB
+/// ```
+///
+/// The reduction is the spec's most-conservative per-partition
+/// threshold reading — a single FFT line dipping below the partition's
+/// average threshold pulls the whole partition's bit-allocation budget
+/// down to that line's level (the encoder cannot afford to leak
+/// sub-threshold noise into the partition without becoming audible).
+/// This is the value the Layer I / Layer II bit-allocation loop
+/// consumes per partition (Layer III's outer-loop SNR budget is the
+/// analogue).
+///
+/// Returns:
+///
+/// * `Some(LTmin_n)` for any `n ∈ 1..=32` — the inclusive minimum of
+///   `ltg_per_line(ω)` over every `ω ∈ [ωlow_n, ωhigh_n]` (table-
+///   wide bounds [`coder_partition_d5_line_range`] exposes the
+///   `(ωlow_n, ωhigh_n)` pair). The minimum is taken in IEEE-754 f64
+///   total-order semantics through `f64::min`, so any `NaN` value
+///   passed through by the caller propagates per the standard rules
+///   — the caller is responsible for ensuring `ltg_per_line` is
+///   finite (the Step 7 `global_masking_threshold_db` guarantees this
+///   for any non-empty masker list with `LTq(i)` finite, the only
+///   reachable path in practice).
+/// * `None` for any `n` outside `1..=32` — the two edge cases inherit
+///   from [`coder_partition_d5_omega_iter`]:
+///   * `n = 0` — partition 0's lower boundary `ωlow_0` is not in
+///     Table D.5; without a `ωlow_n`, the reduction range is
+///     undefined.
+///   * `n = 33` — neither row 33's boundary nor its `width_n` cell
+///     exists in Table D.5; the reduction range is undefined.
+///
+/// **Boundary semantics.** The reduction is inclusive on both ends,
+/// matching the per-partition sum-over-lines pattern Phase 2 step 57
+/// (r256) wired into Step 7's own `Σ_{ω ∈ partition}` form. Two
+/// consecutive partitions `n` and `n + 1` therefore both consider the
+/// shared boundary line `ω = ωhigh_n = ωlow_{n+1}` in their minimum
+/// — a sharp dip located exactly on a shared boundary reduces both
+/// adjacent partitions' `LTmin`, which is the conservative-bit-
+/// allocation reading the spec intends. A caller that wants every
+/// FFT line to enter exactly one partition's minimum (single-
+/// assignment binning, no shared-boundary double-influence) uses
+/// [`first_partition_containing_line`] to bin per line, then folds
+/// per partition outside this accessor.
+///
+/// **Implementation.** A pure composition of
+/// [`coder_partition_d5_omega_iter`] (Phase 2 step 57) and
+/// `Iterator::map ∘ Iterator::fold(f64::INFINITY, f64::min)`. No spec
+/// arithmetic is introduced — only the per-line minimum fold over the
+/// recoverable line range. The `f64::INFINITY` seed pairs with
+/// `f64::min` to produce the per-partition minimum for any partition
+/// with at least one line (every `n ∈ 1..=32` has `width_n ≥ 0` and
+/// produces at least one inclusive line per
+/// [`coder_partition_d5_omega_iter`]'s non-empty range guarantee).
+///
+/// Complexity is `O(ωhigh_n − ωlow_n + 1)` per partition, dominated by
+/// the caller's `ltg_per_line` cost per line. For the spec's mostly-
+/// 16-wide partitions this is `O(16)` per partition, `O(513)` across
+/// the whole table (matching the per-partition iterator's own
+/// complexity).
+///
+/// Provenance: only the Phase 2 step 57 per-partition iterator
+/// [`coder_partition_d5_omega_iter`] (and through it the Phase 2 step
+/// 51 line-range accessor and its underlying Table D.5 transcription
+/// in `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") and
+/// the Step 7 `LTg(ω)` reading (Phase 2 step 44 /
+/// [`global_masking_threshold_db`]) are consulted. The minimum-
+/// reduction reading is the spec's per Annex D Step 8 (informative
+/// Model 1 reduction); no external implementation was read.
+#[inline]
+#[must_use]
+pub fn coder_partition_d5_ltg_min<F>(n: u16, ltg_per_line: F) -> Option<f64>
+where
+    F: Fn(u16) -> f64,
+{
+    let range = coder_partition_d5_omega_iter(n)?;
+    Some(range.map(ltg_per_line).fold(f64::INFINITY, f64::min))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5297,6 +5454,215 @@ mod tests {
             assert!(
                 (sum - expected).abs() < 1.0e-9,
                 "partition {}: sum-over-ω = {sum}, expected closed-form {expected}",
+                span.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_returns_none_for_partition_zero() {
+        // Partition 0 has no `ωlow_0` in Table D.5, so the step 57
+        // iterator is `None` — the step 58 reduction inherits that.
+        let v = coder_partition_d5_ltg_min(0, |_| 0.0);
+        assert!(v.is_none(), "partition 0 must return None, got {v:?}");
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_returns_none_for_partition_thirty_three() {
+        // Row 33 isn't in Table D.5; the reduction range is undefined.
+        let v = coder_partition_d5_ltg_min(33, |_| 0.0);
+        assert!(v.is_none(), "partition 33 must return None, got {v:?}");
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_returns_none_for_far_out_of_range_indices() {
+        // Same boundary semantics as the underlying step 57 iterator:
+        // any `n` outside `1..=32` is None.
+        for n in [100_u16, 1_000, u16::MAX] {
+            let v = coder_partition_d5_ltg_min(n, |_| 0.0);
+            assert!(v.is_none(), "n = {n} must return None, got {v:?}");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_constant_ltg_returns_that_constant() {
+        // If LTg(ω) is the same constant C at every line, the per-
+        // partition minimum is C for every partition.
+        const C: f64 = -3.5;
+        for span in coder_partition_d5_spans() {
+            let v = coder_partition_d5_ltg_min(span.index, |_| C)
+                .expect("span.index ∈ 1..=32 is recoverable");
+            assert!(
+                (v - C).abs() < 1.0e-12,
+                "partition {}: LTmin = {v}, expected constant {C}",
+                span.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_identity_ltg_returns_omega_low() {
+        // If LTg(ω) = ω as f64, the per-partition minimum is exactly
+        // ωlow_n (the lowest line in the partition's inclusive range).
+        for span in coder_partition_d5_spans() {
+            let v = coder_partition_d5_ltg_min(span.index, f64::from)
+                .expect("span.index ∈ 1..=32 is recoverable");
+            let expected = f64::from(span.omega_low);
+            assert!(
+                (v - expected).abs() < 1.0e-12,
+                "partition {}: LTmin = {v}, expected ωlow_n = {expected}",
+                span.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_negative_identity_returns_omega_high() {
+        // If LTg(ω) = -ω as f64, the per-partition minimum is exactly
+        // -ωhigh_n (the highest line in the partition's inclusive range
+        // produces the most-negative value).
+        for span in coder_partition_d5_spans() {
+            let v = coder_partition_d5_ltg_min(span.index, |omega| -f64::from(omega))
+                .expect("span.index ∈ 1..=32 is recoverable");
+            let expected = -f64::from(span.omega_high);
+            assert!(
+                (v - expected).abs() < 1.0e-12,
+                "partition {}: LTmin = {v}, expected -ωhigh_n = {expected}",
+                span.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_single_dip_pulls_partition_minimum() {
+        // The conservative-bit-allocation reading: a single FFT line
+        // dipping below the partition's average threshold pulls the
+        // whole partition's LTmin down to that line's level. Place a
+        // -100 dB dip at the middle line of each partition and assert
+        // the partition's LTmin is exactly -100 dB (not the +0 dB
+        // baseline of every other line).
+        const DIP_DB: f64 = -100.0;
+        for span in coder_partition_d5_spans() {
+            let middle = (span.omega_low + span.omega_high) / 2;
+            let v =
+                coder_partition_d5_ltg_min(
+                    span.index,
+                    |omega| if omega == middle { DIP_DB } else { 0.0 },
+                )
+                .expect("span.index ∈ 1..=32 is recoverable");
+            assert!(
+                (v - DIP_DB).abs() < 1.0e-12,
+                "partition {} with dip at ω={middle}: LTmin = {v}, expected {DIP_DB}",
+                span.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_matches_explicit_per_line_fold() {
+        // Cross-check: the accessor returns the same value as an
+        // explicit fold over the step 57 iterator with the same
+        // callback. This pins the accessor as a strict composition of
+        // step 57 + min-fold, no spec arithmetic introduced.
+        // Use a deterministic non-trivial per-line value: ω * 0.7 - 13.
+        let ltg = |omega: u16| f64::from(omega) * 0.7 - 13.0;
+        for span in coder_partition_d5_spans() {
+            let via_accessor = coder_partition_d5_ltg_min(span.index, ltg)
+                .expect("span.index ∈ 1..=32 is recoverable");
+            let via_explicit = coder_partition_d5_omega_iter(span.index)
+                .expect("span.index ∈ 1..=32 is recoverable")
+                .map(ltg)
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                (via_accessor - via_explicit).abs() < 1.0e-12,
+                "partition {}: accessor {via_accessor} != explicit fold {via_explicit}",
+                span.index,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_shared_boundary_pulls_both_neighbours() {
+        // Boundary-semantics pin: the step 57 iterator emits the
+        // shared boundary `ωhigh_n = ωlow_{n+1}` to both adjacent
+        // partitions. Place a single dip at every shared boundary
+        // line and verify partition n AND partition n+1 both record
+        // the dip as their LTmin.
+        const DIP_DB: f64 = -50.0;
+        for span_n in coder_partition_d5_spans().filter(|s| s.index < 32) {
+            let shared = span_n.omega_high; // shared with partition n+1
+            let f = |omega: u16| if omega == shared { DIP_DB } else { 0.0 };
+            let ltmin_n = coder_partition_d5_ltg_min(span_n.index, f)
+                .expect("span_n.index ∈ 1..=32 is recoverable");
+            let ltmin_n_plus_1 = coder_partition_d5_ltg_min(span_n.index + 1, f)
+                .expect("span_n.index + 1 ∈ 1..=32 is recoverable");
+            assert!(
+                (ltmin_n - DIP_DB).abs() < 1.0e-12,
+                "partition {} (shared with {}+1 at ω={shared}): LTmin = {ltmin_n}, expected {DIP_DB}",
+                span_n.index,
+                span_n.index,
+            );
+            assert!(
+                (ltmin_n_plus_1 - DIP_DB).abs() < 1.0e-12,
+                "partition {} (shared with {}-1 at ω={shared}): LTmin = {ltmin_n_plus_1}, expected {DIP_DB}",
+                span_n.index + 1,
+                span_n.index + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_composes_with_step_seven_global_threshold() {
+        // End-to-end composition pin: feed the step 58 reducer the
+        // actual Step 7 `global_masking_threshold_db` value at every
+        // FFT line and assert it returns the minimum of those values
+        // across the partition. The line-to-Hz mapping for the per-
+        // partition coder-table (Table D.5) isn't pinned by this
+        // accessor — Step 7 is being exercised here as the black-box
+        // dB callback; the per-line frequency mapping is the caller's
+        // responsibility (Step 1's FFT-bin → Hz mapping, currently
+        // gated on the PNG-only Table D.1 transcription gap).
+        //
+        // Use a synthetic mapping: line ω → Hz = ω * 50 (a stand-in
+        // for the FFT-bin-to-Hz mapping until Step 1 lands). Place
+        // one tonal masker at z = 5 Bark with SPL = 60 dB and verify
+        // every partition's LTmin matches the minimum of Step 7's
+        // own LTg values at the partition's FFT lines.
+        let masker = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 60.0,
+        };
+        let maskers = [masker];
+        // Synthetic z(ω) mapping: ω → ω * 0.05 Bark. The mapping is a
+        // stand-in for the Table D.1 lookup; what matters here is that
+        // it's a monotonically-increasing total function from FFT
+        // line → Bark, exercising the masking-function piecewise
+        // branches across the partition.
+        let z_of = |omega: u16| f64::from(omega) * 0.05;
+        let ltg = |omega: u16| {
+            let z_i = z_of(omega);
+            // Use a flat LTq of -5 dB (stand-in until Step 1 lands the
+            // line → Hz mapping that feeds `ltq_db_at_hz`).
+            global_masking_threshold_db(&maskers, z_i, -5.0)
+        };
+        for span in coder_partition_d5_spans() {
+            let via_step58 = coder_partition_d5_ltg_min(span.index, ltg)
+                .expect("span.index ∈ 1..=32 is recoverable");
+            // Spec-faithful explicit fold via step 57's iterator.
+            let via_explicit = coder_partition_d5_omega_iter(span.index)
+                .expect("span.index ∈ 1..=32 is recoverable")
+                .map(ltg)
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                (via_step58 - via_explicit).abs() < 1.0e-9,
+                "partition {}: step-58 reduction {via_step58} != explicit fold {via_explicit}",
+                span.index,
+            );
+            // Sanity: every partition is finite (no NaN/inf escape).
+            assert!(
+                via_step58.is_finite(),
+                "partition {}: LTmin = {via_step58} is not finite",
                 span.index,
             );
         }

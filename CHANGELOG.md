@@ -8,6 +8,63 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 8 per-partition `LTg` minimum
+  reduction (Phase 2 step 58). Phase 2 step 44 (r219) landed Step 7's
+  per-FFT-line global masking threshold `LTg(i)` as
+  `global_masking_threshold_db`; Phase 2 step 49 (r248) transcribed
+  Table D.5 (the Layer I / Layer II coder partition table); Phase 2
+  step 57 (r256) closed the per-partition FFT-line walk as
+  `coder_partition_d5_omega_iter`. r257 wires the two halves
+  together into the spec's Step 8 reduction
+  `LTmin_n = min_{ω ∈ [ωlow_n, ωhigh_n]} LTg(ω)`. A new free
+  function `coder_partition_d5_ltg_min<F: Fn(u16) -> f64>(n,
+  ltg_per_line) -> Option<f64>` reduces the caller-supplied per-FFT-
+  line `LTg(ω)` callback (from Step 7's `global_masking_threshold_db`,
+  applied per line) over every `ω ∈ [ωlow_n, ωhigh_n]` by taking the
+  minimum; returns `Some(LTmin_n)` for any `n ∈ 1..=32` and `None`
+  for the two edge cases inherited from `coder_partition_d5_omega_iter`
+  (`n = 0` — `ωlow_0` not in Table D.5; `n = 33` — row absent). The
+  reduction is the spec's most-conservative per-partition reading —
+  a single FFT line dipping below the partition's average threshold
+  pulls the whole partition's bit-allocation budget down to that
+  line's level. Composition rather than introduction: the accessor
+  is a strict composition of the Phase 2 step 57 iterator and
+  `Iterator::map ∘ Iterator::fold(f64::INFINITY, f64::min)` — no
+  spec arithmetic introduced, only the per-line minimum fold over
+  the recoverable line range. The Step 7 `LTg` callback is the
+  caller's, keeping this accessor pure with respect to the masker
+  selection pipeline (Steps 1-5), which remain blocked on the PNG-
+  only Table D.1 / D.2 / D.3 transcription gap. Boundary semantics:
+  inclusive on both ends, matching the per-partition sum-over-lines
+  pattern Phase 2 step 57 wired into Step 7's `Σ_{ω ∈ partition}`
+  form; a sharp dip on a shared boundary `ωhigh_n = ωlow_{n+1}`
+  reduces both adjacent partitions' `LTmin`. A caller that wants
+  single-assignment binning uses the step 56 inverse accessor
+  `first_partition_containing_line` to bin per line, then folds
+  outside this accessor. 10 new lib unit tests pin: out-of-band
+  `None` at `n = 0`, `n = 33`, `n = 100`, `n = 1000`, `n = u16::MAX`;
+  constant-`LTg` returns the constant for every partition; identity
+  `LTg(ω) = ω` returns `ωlow_n` for every partition; negative
+  identity `LTg(ω) = -ω` returns `-ωhigh_n` for every partition;
+  a single `-100 dB` dip at each partition's middle line pulls the
+  whole partition's `LTmin` to `-100 dB`; cross-check against an
+  explicit `coder_partition_d5_omega_iter ∘ map ∘ fold` fold for a
+  non-trivial callback `ω * 0.7 - 13`; shared-boundary double-
+  influence at every `ωhigh_n = ωlow_{n+1}` (a `-50 dB` dip pulls
+  both adjacent partitions' `LTmin`); end-to-end composition pin
+  feeding `global_masking_threshold_db` per line with a tonal
+  masker at z = 5 Bark, SPL = 60 dB and a synthetic `z(ω) = ω · 0.05`
+  Bark stand-in mapping (until Step 1's FFT-bin → Hz table lands)
+  matched against the explicit per-line fold. Tests: 734 lib (was
+  724 baseline; +10 unit). Provenance: only the Phase 2 step 57
+  per-partition iterator `coder_partition_d5_omega_iter`, the Phase 2
+  step 44 Step 7 `global_masking_threshold_db`, and (transitively)
+  the Table D.5 transcription in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` §"Table D.5
+  - Layer I and Layer II coder partition table" are consulted; the
+  minimum-reduction reading is the spec's per Annex D Step 8
+  (informative Model 1 reduction).
+
 - psy: Annex D Table D.5 per-partition FFT-line iterator (Phase 2
   step 57). Phase 2 step 51 (r250) exposed each partition's
   `(ωlow_n, ωhigh_n)` boundary pair via

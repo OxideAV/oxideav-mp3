@@ -2373,6 +2373,93 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 58 (r257)** — Annex D Model 1 §D.1 Step 8 per-partition
+`LTg` minimum reduction. Phase 2 step 44 (r219) landed Step 7's
+per-FFT-line global masking threshold `LTg(i)` as
+`global_masking_threshold_db`; Phase 2 step 49 (r248) transcribed
+Table D.5 (the Layer I / Layer II coder partition table); Phase 2
+step 57 (r256) closed the per-partition FFT-line walk as
+`coder_partition_d5_omega_iter`. r257 wires the two halves together
+into the spec's Step 8 reduction:
+
+```text
+LTmin_n = min_{ω ∈ [ωlow_n, ωhigh_n]} LTg(ω)   dB
+```
+
+A new free function:
+
+* `coder_partition_d5_ltg_min<F: Fn(u16) -> f64>(n, ltg_per_line) ->
+  Option<f64>` — reduces the caller-supplied per-FFT-line `LTg(ω)`
+  callback (from Step 7's `global_masking_threshold_db`, applied per
+  line) over every `ω ∈ [ωlow_n, ωhigh_n]` by taking the minimum.
+  Returns `Some(LTmin_n)` for any `n ∈ 1..=32` and `None` for the
+  two edge cases inherited from `coder_partition_d5_omega_iter`
+  (`n = 0` — `ωlow_0` not in Table D.5; `n = 33` — row absent).
+
+The reduction is the spec's most-conservative per-partition reading
+— a single FFT line dipping below the partition's average threshold
+pulls the whole partition's bit-allocation budget down to that
+line's level. This is the value the Layer I / Layer II bit-allocation
+loop consumes per partition (Layer III's outer-loop SNR budget is
+the analogue).
+
+**Composition rather than introduction.** The accessor is a strict
+composition of the Phase 2 step 57 per-partition FFT-line iterator
+and `Iterator::map ∘ Iterator::fold(f64::INFINITY, f64::min)`. No
+spec arithmetic is introduced — only the per-line minimum fold over
+the recoverable line range. The `f64::INFINITY` seed pairs with
+`f64::min` to produce the per-partition minimum for any partition
+with at least one line. The Step 7 `LTg` callback is the caller's
+— typically a closure closing over the static masker list +
+threshold-in-quiet curve — keeping this accessor pure with respect
+to the masker selection pipeline (Steps 1-5), which remain blocked
+on the PNG-only Table D.1 / D.2 / D.3 transcription gap.
+
+**Boundary semantics.** The reduction is inclusive on both ends,
+matching the per-partition sum-over-lines pattern Phase 2 step 57
+(r256) wired into Step 7's own `Σ_{ω ∈ partition}` form. Two
+consecutive partitions `n` and `n + 1` therefore both consider the
+shared boundary line `ω = ωhigh_n = ωlow_{n+1}` in their minimum
+— a sharp dip located exactly on a shared boundary reduces both
+adjacent partitions' `LTmin`, which is the conservative-bit-
+allocation reading the spec intends. A caller that wants every FFT
+line to enter exactly one partition's minimum (single-assignment
+binning, no shared-boundary double-influence) uses the step 56
+inverse accessor `first_partition_containing_line` to bin per line,
+then folds per partition outside this accessor.
+
+Validated by 10 new lib unit tests in `psy::tests`. The out-of-band
+`None` branches are pinned at `n = 0`, `n = 33`, `n = 100`,
+`n = 1000`, and `n = u16::MAX`. A constant `LTg ≡ C` callback
+returns exactly `C` for every partition. An identity `LTg(ω) = ω`
+callback returns exactly `ωlow_n` (the minimum line in the
+partition's inclusive range). A negative-identity `LTg(ω) = -ω`
+callback returns exactly `-ωhigh_n` (the highest line produces the
+most-negative reduction). A single `-100 dB` dip placed at each
+partition's middle line is verified to pull the whole partition's
+`LTmin` down to `-100 dB`, pinning the conservative-bit-allocation
+reading. The accessor's output is cross-checked against an explicit
+`coder_partition_d5_omega_iter ∘ map ∘ fold` fold with the same
+callback for a non-trivial value `ω * 0.7 − 13`, pinning the
+strict-composition implementation. The shared-boundary double-
+influence property is pinned by placing a `-50 dB` dip at every
+shared boundary `ωhigh_n = ωlow_{n+1}` and asserting both
+neighbouring partitions record the dip. Finally an end-to-end
+composition pin feeds the step 58 reducer the Phase 2 step 44
+`global_masking_threshold_db` value at every FFT line (with a
+tonal masker at z = 5 Bark, SPL = 60 dB, and a synthetic
+`z(ω) = ω · 0.05` Bark mapping until Step 1's FFT-bin → Hz table
+lands) and asserts agreement with the explicit per-line fold —
+exercising the masking-function piecewise branches through the
+reduction without introducing any new spec arithmetic. Tests: 734
+lib (was 724 baseline; +10 unit). No external implementation
+consulted; only the Phase 2 step 57 per-partition iterator
+`coder_partition_d5_omega_iter`, the Phase 2 step 44 Step 7
+`global_masking_threshold_db`, and (transitively) the Table D.5
+transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` §"Table D.5
+- Layer I and Layer II coder partition table" were read.
+
 **Phase 2 step 57 (r256)** — Annex D Table D.5 per-partition FFT-line
 iterator. Phase 2 step 51 (r250) exposed each partition's
 `(ωlow_n, ωhigh_n)` boundary pair via
