@@ -3116,6 +3116,182 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// Annex D Model 1 — §D.1 Step 8 width-gated `LTmin_n` column projection
+// converted to linear energy `10^(LTmin_n / 10)` over Table D.5
+// (Phase 2 step 64 / r263).
+//
+// Step 8 (Phase 2 steps 58 / 59 / 60 / 61 / 62 / 63) produces, per
+// coder partition `n ∈ 1..=32`, the per-partition minimum global
+// masking threshold `LTmin_n` (dB) and width column flag
+// `width_n ∈ {0, 1}`. Phase 2 step 63 (r262) projected the row-order
+// paired `(LTmin_n, width_n)` vector — already pre-split at the
+// single width-column 0 → 1 transition (between rows 12 and 13) —
+// onto the `ltmin_db` field of each subarray:
+//
+//   narrow_band[i] = LTmin_{i + 1}   (dB)  for i ∈ 0..=11  (width_n = 0)
+//   wide_band[j]   = LTmin_{j + 13}  (dB)  for j ∈ 0..=19  (width_n = 1)
+//
+// Several Step 9 / Step 10 / outer-loop consumers do not read the
+// per-band masking threshold in dB — they read it in the linear
+// energy domain `10^(LTmin_n / 10)`. The dB → linear conversion is a
+// strict mathematical primitive: it is the same `10^(·/10)`
+// transformation `db_to_xfsf_energy` already uses (line 411), the
+// same Step 7 `Σ 10^(LTtm/10)` global-threshold summer uses (lines
+// 702 / 705), and the same Model 2 Layer III spread linearisation
+// uses (line 1492). It introduces no new spec arithmetic.
+//
+// Step 64 exposes that conversion as a free function returning a new
+// `CoderPartitionD5LtminLinearByWidth` carrying the same row-order
+// subarray split (12 narrow + 20 wide) but with each cell holding a
+// non-negative linear energy value `10^(dB/10)` instead of a dB
+// value. Like step 63, the function is a pure projection of step
+// 62's struct — it invokes the caller's `LTg(ω)` callback exactly
+// the same number of times as step 62 (and through it steps 61 / 60
+// / 59 / 58) invokes it (one call per FFT line in
+// `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`), and applies one
+// `(10.0_f64).powf(db / 10.0)` per output cell.
+// ---------------------------------------------------------------------------
+
+/// Per-partition minimum global masking threshold `LTmin_n` over
+/// Table D.5 in **linear energy** (`10^(LTmin_n / 10)`), split by
+/// the `width_n` column.
+///
+/// Produced by [`coder_partition_d5_ltmin_linear_row_order_by_width`]
+/// (the linear-energy projection of Phase 2 step 63's
+/// [`coder_partition_d5_ltmin_db_row_order_by_width`]).
+///
+/// The two subarrays carry the partition's minimum global masking
+/// threshold per row of Table D.5, but in the linear energy domain
+/// rather than the dB domain. They preserve step 63's row-order
+/// indexing and the same split point (12) Table D.5's `width_n`
+/// column pins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoderPartitionD5LtminLinearByWidth {
+    /// Per-partition minimum global masking threshold `LTmin_n`
+    /// converted to linear energy `10^(LTmin_n / 10)` for the
+    /// contiguous prefix of rows with `width_n = 0` (partitions
+    /// `n ∈ 1..=12`, the lower FFT-line block). Twelve elements in
+    /// row order; element `i` carries `10^(LTmin_{i + 1} / 10)`.
+    /// Every cell is strictly positive (the conversion preserves the
+    /// non-negativity of `10^x`); `INFINITY` if step 62's reduction
+    /// over that partition's FFT-line range yielded `INFINITY` (an
+    /// empty partition or an all-`INFINITY` callback).
+    pub narrow_band: [f64; 12],
+    /// Per-partition minimum global masking threshold `LTmin_n`
+    /// converted to linear energy `10^(LTmin_n / 10)` for the
+    /// contiguous suffix of rows with `width_n = 1` (partitions
+    /// `n ∈ 13..=32`, the upper FFT-line block). Twenty elements in
+    /// row order; element `j` carries `10^(LTmin_{j + 13} / 10)`.
+    /// Every cell is strictly positive; `INFINITY` under the same
+    /// degenerate condition described for `narrow_band`.
+    pub wide_band: [f64; 20],
+}
+
+/// §D.1 Step 8 width-gated `LTmin_n` column projection over Table
+/// D.5 converted to **linear energy** (`10^(LTmin_n / 10)`). Returns
+/// a [`CoderPartitionD5LtminLinearByWidth`] holding:
+///
+/// ```text
+/// narrow_band[i] = 10^(LTmin_{i + 1}  / 10)   for i ∈ 0..=11  (width_n = 0)
+/// wide_band[j]   = 10^(LTmin_{j + 13} / 10)   for j ∈ 0..=19  (width_n = 1)
+/// ```
+///
+/// This is the linear-energy presentation of Phase 2 step 63's
+/// width-gated per-band `LTmin_n` (dB) column. The dB → linear
+/// conversion is the same monotone transformation
+/// `db_to_xfsf_energy` already applies to the threshold-in-quiet
+/// curve, the same `Σ 10^(LTtm/10)` Step 7 global-threshold summer
+/// applies to per-line masker dB contributions, and the same Model 2
+/// Layer III spread linearisation applies — it introduces no new
+/// spec arithmetic.
+///
+/// **Index convention.** 0-based on each subarray independently.
+/// `narrow_band[i]` carries `10^(LTmin_{i + 1} / 10)`;
+/// `wide_band[j]` carries `10^(LTmin_{j + 13} / 10)`. The split
+/// point (12) is constant — preserved verbatim from Phase 2 step 63
+/// (and through it step 62 / 60).
+///
+/// **Composition.** A pure linearisation of Phase 2 step 63's
+/// [`coder_partition_d5_ltmin_db_row_order_by_width`]. The `LTg(ω)`
+/// callback is invoked exactly as many times as step 63 invokes it
+/// (one call per FFT line in
+/// `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`); each output cell is
+/// `(10.0_f64).powf(input_cell_db / 10.0)`.
+///
+/// **Monotonicity.** The conversion is strictly monotone in dB —
+/// `a_db < b_db ⇔ 10^(a_db / 10) < 10^(b_db / 10)` — so ordering is
+/// preserved cell-wise. A partition whose `LTmin_n` in dB is strictly
+/// less than another partition's `LTmin_n` in dB will have a strictly
+/// smaller linear-energy cell at the corresponding row index, and
+/// vice versa.
+///
+/// **Non-negativity.** Every output cell is strictly positive (the
+/// conversion `10^x` is strictly positive for every finite real
+/// `x`). The only way an output cell can be `INFINITY` is if the
+/// corresponding step 63 cell's dB value is `INFINITY` (which
+/// happens only under a degenerate callback that returns `INFINITY`
+/// for every FFT line in some partition's range).
+///
+/// **Width invariant.** The width column is implicit in the choice
+/// of subarray — every cell of the returned `narrow_band`
+/// corresponds to a partition with `width_n = 0`; every cell of the
+/// returned `wide_band` corresponds to a partition with
+/// `width_n = 1`. The invariant is structural — pinned at the same
+/// split point (12) Phase 2 step 63 pins.
+///
+/// **Boundary semantics.** Inherits Phase 2 step 63's (and through
+/// it step 62 / 61 / 58 / 59's) inclusive-on-both-ends `LTmin_n`
+/// reduction semantics unchanged. The linearisation has no boundary
+/// semantics of its own — it is a pure cell-wise transformation
+/// reading exactly one input cell per output cell.
+///
+/// **Implementation.** Calls
+/// [`coder_partition_d5_ltmin_db_row_order_by_width`] once (folding
+/// the caller's callback over every recoverable partition's FFT-line
+/// range) and applies `(10.0_f64).powf(db / 10.0)` to each cell of
+/// each subarray into the matching output subarray. The conversion
+/// is structurally pinned at the same index 12 the static
+/// width-column transition lives at — Phase 2 step 60's row-order
+/// width vector matches the pattern `[0; 12]` followed by `[1; 20]`
+/// exactly and Phase 2 step 63 inherits the split point verbatim.
+///
+/// Provenance: only the Phase 2 step 63 width-gated `LTmin_n` (dB)
+/// column accessor [`coder_partition_d5_ltmin_db_row_order_by_width`]
+/// (and through it the Phase 2 step 62 width-gated paired-vector
+/// accessor, the Phase 2 step 61 row-order paired vector, the Phase
+/// 2 step 59 / 60 row-order LTmin and width vectors, the Phase 2
+/// step 58 per-partition reducer, the Phase 2 step 52 per-partition
+/// width accessor, and the underlying Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") is
+/// consulted. The `10^(x / 10)` dB → linear conversion is the
+/// in-tree convention used by `db_to_xfsf_energy` (line 411), the
+/// Step 7 `global_masking_threshold_db` summer (lines 702 / 705),
+/// and the Model 2 Layer III spread linearisation (line 1492); no
+/// external implementation was read.
+#[must_use]
+pub fn coder_partition_d5_ltmin_linear_row_order_by_width<F>(
+    ltg_per_line: F,
+) -> CoderPartitionD5LtminLinearByWidth
+where
+    F: Fn(u16) -> f64,
+{
+    let db = coder_partition_d5_ltmin_db_row_order_by_width(ltg_per_line);
+    let mut narrow = [f64::INFINITY; 12];
+    let mut wide = [f64::INFINITY; 20];
+    for (i, &cell_db) in db.narrow_band.iter().enumerate() {
+        narrow[i] = (10.0_f64).powf(cell_db / 10.0);
+    }
+    for (j, &cell_db) in db.wide_band.iter().enumerate() {
+        wide[j] = (10.0_f64).powf(cell_db / 10.0);
+    }
+    CoderPartitionD5LtminLinearByWidth {
+        narrow_band: narrow,
+        wide_band: wide,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7719,6 +7895,246 @@ mod tests {
         for (j, paired_cell) in paired.iter().enumerate().skip(12) {
             let idx = j - 12;
             assert!((split.wide_band[idx] - paired_cell.ltmin_db).abs() < 1.0e-12);
+        }
+    }
+
+    // ---- Phase 2 step 64 / r263 — width-gated `LTmin_n` linear-energy
+    // projection over Table D.5 (linearisation of step 63's per-band dB
+    // column).
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_lengths_are_twelve_and_twenty() {
+        // Structural pin: 12 narrow + 20 wide cells, matching step 63.
+        let split = coder_partition_d5_ltmin_linear_row_order_by_width(|_| 0.0);
+        assert_eq!(split.narrow_band.len(), 12);
+        assert_eq!(split.wide_band.len(), 20);
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_zero_db_is_unit_energy() {
+        // 10^(0/10) = 1.0 in every cell when the callback returns 0 dB
+        // for every FFT line — every partition's minimum reduces to 0
+        // dB, which linearises to unit energy.
+        let split = coder_partition_d5_ltmin_linear_row_order_by_width(|_| 0.0);
+        for &v in &split.narrow_band {
+            assert!((v - 1.0).abs() < 1.0e-12, "narrow cell {v} != 1.0");
+        }
+        for &v in &split.wide_band {
+            assert!((v - 1.0).abs() < 1.0e-12, "wide cell {v} != 1.0");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_strictly_positive() {
+        // Linearisation preserves non-negativity: 10^x > 0 for every
+        // finite real x. A callback returning −∞ < db_value < +∞
+        // produces strictly positive cells.
+        let cb = |omega: u16| -> f64 { -50.0 + f64::from(omega) * 0.1 };
+        let split = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
+        for &v in &split.narrow_band {
+            assert!(v > 0.0, "narrow cell {v} is not strictly positive");
+            assert!(v.is_finite(), "narrow cell {v} is not finite");
+        }
+        for &v in &split.wide_band {
+            assert!(v > 0.0, "wide cell {v} is not strictly positive");
+            assert!(v.is_finite(), "wide cell {v} is not finite");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_matches_step63_pow10_div10() {
+        // Cell-wise relation: linear[i] = 10^(db[i] / 10) exactly,
+        // reusing the same callback for both projections.
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.5 - 2.0 };
+        let lin = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
+        let db = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        for (i, (&l, &d)) in lin
+            .narrow_band
+            .iter()
+            .zip(db.narrow_band.iter())
+            .enumerate()
+        {
+            let expect = (10.0_f64).powf(d / 10.0);
+            assert!(
+                (l - expect).abs() < 1.0e-12,
+                "narrow {i}: lin {l} != 10^({d}/10) = {expect}",
+            );
+        }
+        for (j, (&l, &d)) in lin.wide_band.iter().zip(db.wide_band.iter()).enumerate() {
+            let expect = (10.0_f64).powf(d / 10.0);
+            assert!(
+                (l - expect).abs() < 1.0e-12,
+                "wide {j}: lin {l} != 10^({d}/10) = {expect}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_ten_db_is_factor_ten() {
+        // Spot pin: a uniform 10 dB callback linearises to 10.0
+        // (since `LTmin_n = min(10 dB) = 10 dB` for every n,
+        // 10^(10/10) = 10.0).
+        let split = coder_partition_d5_ltmin_linear_row_order_by_width(|_| 10.0);
+        for &v in &split.narrow_band {
+            assert!((v - 10.0).abs() < 1.0e-12, "narrow cell {v} != 10.0");
+        }
+        for &v in &split.wide_band {
+            assert!((v - 10.0).abs() < 1.0e-12, "wide cell {v} != 10.0");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_minus_ten_db_is_one_tenth() {
+        // Spot pin: a uniform −10 dB callback linearises to 0.1
+        // (10^(−10/10) = 0.1).
+        let split = coder_partition_d5_ltmin_linear_row_order_by_width(|_| -10.0);
+        for &v in &split.narrow_band {
+            assert!((v - 0.1).abs() < 1.0e-12, "narrow cell {v} != 0.1");
+        }
+        for &v in &split.wide_band {
+            assert!((v - 0.1).abs() < 1.0e-12, "wide cell {v} != 0.1");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_monotone_in_db_per_cell() {
+        // Strict monotonicity: a callback that everywhere returns
+        // (cb_a - 1.0) dB produces a linear cell that is strictly
+        // smaller (in fact, 10^(−1/10) ≈ 0.794 of) the linear cell of
+        // a callback that returns cb_a dB. Because every partition's
+        // min is shifted by exactly −1 dB, the linear ratio is
+        // identical at every cell.
+        let cb_hi = |omega: u16| -> f64 { f64::from(omega) * 0.25 + 3.0 };
+        let cb_lo = |omega: u16| -> f64 { f64::from(omega) * 0.25 + 2.0 };
+        let hi = coder_partition_d5_ltmin_linear_row_order_by_width(cb_hi);
+        let lo = coder_partition_d5_ltmin_linear_row_order_by_width(cb_lo);
+        let ratio = (10.0_f64).powf(-1.0 / 10.0);
+        for (i, (&h, &l)) in hi.narrow_band.iter().zip(lo.narrow_band.iter()).enumerate() {
+            assert!(l < h, "narrow {i}: lo {l} not < hi {h}");
+            let r = l / h;
+            assert!(
+                (r - ratio).abs() < 1.0e-12,
+                "narrow {i}: ratio {r} != {ratio}",
+            );
+        }
+        for (j, (&h, &l)) in hi.wide_band.iter().zip(lo.wide_band.iter()).enumerate() {
+            assert!(l < h, "wide {j}: lo {l} not < hi {h}");
+            let r = l / h;
+            assert!(
+                (r - ratio).abs() < 1.0e-12,
+                "wide {j}: ratio {r} != {ratio}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_is_idempotent_for_pure_callback() {
+        // Pure callback → same linear projection on repeated invocation.
+        let cb = |omega: u16| -> f64 { f64::from(omega).sin() * 6.0 + 0.5 };
+        let a = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
+        let b = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
+        for i in 0..12 {
+            assert!((a.narrow_band[i] - b.narrow_band[i]).abs() < 1.0e-12);
+        }
+        for j in 0..20 {
+            assert!((a.wide_band[j] - b.wide_band[j]).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_dip_in_narrow_only_affects_narrow() {
+        // A −20 dB dip in a single FFT line that lives inside the
+        // narrow block (line ω = 50 lives in partition 3, narrow row
+        // index 2) lowers exactly one narrow-band cell relative to the
+        // baseline; wide-band cells are unchanged.
+        let baseline = coder_partition_d5_ltmin_linear_row_order_by_width(|_| 0.0);
+        let cb = |omega: u16| -> f64 {
+            if omega == 50 {
+                -20.0
+            } else {
+                0.0
+            }
+        };
+        let split = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
+        for j in 0..20 {
+            assert!(
+                (split.wide_band[j] - baseline.wide_band[j]).abs() < 1.0e-12,
+                "wide band cell {j} should be unaffected by a narrow-line dip",
+            );
+        }
+        let mut narrow_dipped = 0u32;
+        for i in 0..12 {
+            if (split.narrow_band[i] - baseline.narrow_band[i]).abs() > 1.0e-12 {
+                narrow_dipped += 1;
+                assert!(
+                    split.narrow_band[i] < baseline.narrow_band[i],
+                    "narrow band cell {i} should have dipped",
+                );
+            }
+        }
+        assert_eq!(
+            narrow_dipped, 1,
+            "exactly one narrow band cell should dip from a single-line callback",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_dip_in_wide_only_affects_wide() {
+        // A −20 dB dip in a single FFT line that lives inside the
+        // wide block (line ω = 300 lives in partition 18, wide row
+        // index 5) lowers exactly one wide-band cell relative to the
+        // baseline; narrow-band cells are unchanged.
+        let baseline = coder_partition_d5_ltmin_linear_row_order_by_width(|_| 0.0);
+        let cb = |omega: u16| -> f64 {
+            if omega == 300 {
+                -20.0
+            } else {
+                0.0
+            }
+        };
+        let split = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
+        for i in 0..12 {
+            assert!(
+                (split.narrow_band[i] - baseline.narrow_band[i]).abs() < 1.0e-12,
+                "narrow band cell {i} should be unaffected by a wide-line dip",
+            );
+        }
+        let mut wide_dipped = 0u32;
+        for j in 0..20 {
+            if (split.wide_band[j] - baseline.wide_band[j]).abs() > 1.0e-12 {
+                wide_dipped += 1;
+                assert!(
+                    split.wide_band[j] < baseline.wide_band[j],
+                    "wide band cell {j} should have dipped",
+                );
+            }
+        }
+        assert_eq!(
+            wide_dipped, 1,
+            "exactly one wide band cell should dip from a single-line callback",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_linear_row_order_by_width_split_yields_a_partition_of_step59() {
+        // narrow_band ++ wide_band, when log-mapped back to dB, equals
+        // step 59's row-order LTmin vector index-by-index.
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.03 - 1.5 };
+        let split = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
+        let row_order = coder_partition_d5_ltg_min_row_order(cb);
+        for (i, &row_db) in row_order.iter().enumerate().take(12) {
+            let recovered_db = 10.0 * split.narrow_band[i].log10();
+            assert!(
+                (recovered_db - row_db).abs() < 1.0e-9,
+                "narrow band index {i}: recovered {recovered_db} dB != step 59 {row_db} dB",
+            );
+        }
+        for (j, &row_db) in row_order.iter().enumerate().skip(12) {
+            let idx = j - 12;
+            let recovered_db = 10.0 * split.wide_band[idx].log10();
+            assert!(
+                (recovered_db - row_db).abs() < 1.0e-9,
+                "wide band index {idx}: recovered {recovered_db} dB != step 59 {row_db} dB",
+            );
         }
     }
 }

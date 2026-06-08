@@ -9,6 +9,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 ### Other
 
 - psy: Annex D Model 1 §D.1 Step 8 width-gated `LTmin_n` column
+  projection over Table D.5 converted to linear energy
+  (`10^(LTmin_n / 10)`) (Phase 2 step 64). Phase 2 step 63 (r262)
+  projected the width-gated paired `(LTmin_n, width_n)` vector onto
+  its `ltmin_db` field, exposing two per-band dB subarrays
+  (`narrow_band: [f64; 12]` for partitions `n ∈ 1..=12` with
+  `width_n = 0`; `wide_band: [f64; 20]` for partitions `n ∈ 13..=32`
+  with `width_n = 1`). Several Step 9 / Step 10 / outer-loop
+  consumers read the per-band masking threshold in the linear energy
+  domain `10^(LTmin_n / 10)` rather than in dB; the dB → linear
+  conversion is the same monotone `10^(·/10)` transformation
+  `db_to_xfsf_energy` already uses (line 411 of `src/psy.rs`), the
+  same Step 7 `Σ 10^(LTtm/10)` global-threshold summer uses (lines
+  702 / 705), and the same Model 2 Layer III spread linearisation
+  uses (line 1492) — it introduces no new spec arithmetic. A new
+  free function
+  `coder_partition_d5_ltmin_linear_row_order_by_width<F: Fn(u16) ->
+  f64>(ltg_per_line) -> CoderPartitionD5LtminLinearByWidth` calls
+  Phase 2 step 63's
+  `coder_partition_d5_ltmin_db_row_order_by_width` once and applies
+  `(10.0_f64).powf(db / 10.0)` to each of the 12 + 20 cells, producing
+  a new struct `CoderPartitionD5LtminLinearByWidth { narrow_band:
+  [f64; 12], wide_band: [f64; 20] }` whose entries are strictly
+  positive linear energy values (or `INFINITY` only under the
+  degenerate condition step 63 already documents). The `LTg(ω)`
+  callback is invoked exactly as many times as Phase 2 step 63
+  invokes it (one call per FFT line in
+  `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`). Monotonicity is preserved
+  cell-wise (the conversion is strictly monotone in dB). Width
+  invariant pinned structurally (implicit in subarray choice).
+  Tests: 810 lib (was 799 baseline; +11 unit) covering subarray
+  lengths (12 / 20), zero-dB callback linearises to unit energy
+  everywhere, strict positivity for any finite callback, cell-wise
+  equality with `10^(step63_db / 10)` under a non-trivial callback
+  (strict-projection cross-check), spot pins at uniform +10 dB
+  (factor 10) and −10 dB (factor 0.1), strict monotonicity under a
+  uniform −1 dB shift (every cell shrinks by the same constant ratio
+  `10^(−1/10) ≈ 0.7943`), idempotent for a pure callback, dip in
+  narrow band only affects narrow band (cross-block insulation),
+  dip in wide band only affects wide band (cross-block insulation),
+  and a recovery test that log-maps `narrow_band ++ wide_band` back
+  to dB and pins index-by-index against step 59's row-order LTmin
+  vector. Implementation 18 lines (in `src/psy.rs`); tests 168 lines.
+
+- psy: Annex D Model 1 §D.1 Step 8 width-gated `LTmin_n` column
   projection over Table D.5 (Phase 2 step 63). Phase 2 step 62 (r261)
   exposed the width-gated split of the row-order paired
   `(LTmin_n, width_n)` vector as `CoderPartitionD5ReductionByWidth`
