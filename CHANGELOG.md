@@ -8,6 +8,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 8 width-gated `LTmin_n` column
+  projection over Table D.5 (Phase 2 step 63). Phase 2 step 62 (r261)
+  exposed the width-gated split of the row-order paired
+  `(LTmin_n, width_n)` vector as `CoderPartitionD5ReductionByWidth`
+  with `narrow_band: [_; 12]` (partitions `n ∈ 1..=12`, `width_n = 0`)
+  and `wide_band: [_; 20]` (partitions `n ∈ 13..=32`, `width_n = 1`).
+  Some downstream consumers (a per-band dB→linear conversion, a
+  width-block bit-target-budget summation that reads only the
+  threshold column) do not need the `width_n` field at the call site
+  once the call site has already chosen which subarray to walk —
+  `width_n` is implicit in the choice of `narrow_band` versus
+  `wide_band`. A new free function
+  `coder_partition_d5_ltmin_db_row_order_by_width<F: Fn(u16) -> f64>(
+  ltg_per_line) -> CoderPartitionD5LtminDbByWidth` projects Phase 2
+  step 62's struct onto the `ltmin_db` field of each subarray,
+  producing a new struct
+  `CoderPartitionD5LtminDbByWidth { narrow_band: [f64; 12],
+  wide_band: [f64; 20] }`. No spec arithmetic is introduced — every
+  output cell is a copy of a cell in the step 62 struct at the same
+  array index. The `LTg(ω)` callback is invoked exactly as many times
+  as Phase 2 step 62 invokes it (one call per FFT line in
+  `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`). Width invariant pinned
+  structurally (implicit in subarray choice). Tests: 799 lib (was 784
+  baseline; +15 unit) covering subarray lengths (12 / 20), total
+  length pin (12 + 20 = 32), constant callback carries the constant
+  in both subarrays, narrow matches step 62 narrow field under a non-
+  trivial callback (strict-projection cross-check), wide matches step
+  62 wide field under a non-trivial callback (strict-projection
+  cross-check), narrow matches paired-vector prefix under a non-
+  trivial callback, wide matches paired-vector suffix under a non-
+  trivial callback, concatenation back to step 59's row-order LTmin
+  vector (partition pin), endpoints match Table D.5 edges (identity
+  callback returns ωlow_n per row, pins partitions 1 / 12 / 13 / 32),
+  split point pinned at partition 12 / 13 boundary, idempotent for a
+  pure callback, dip in narrow band only affects narrow band (cross-
+  band isolation), dip in wide band only affects wide band (dual
+  cross-band isolation), and independence from width column (the
+  projection reads only `ltmin_db`). Compositional — the projection
+  itself adds no callback evaluations. Public struct
+  `CoderPartitionD5LtminDbByWidth { narrow_band, wide_band }` added.
+  Step 63 keeps the Phase 2 chain on the row-order paired vector —
+  Steps 1-5 (FFT / SPL / tonality classifier) and the Layer III
+  §D.2 / Model 2 calc-partition replacement remain blocked on the
+  Table D.1 / D.3 PNG-only transcription gap. No external
+  implementation read; all truth from
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` §"Table
+  D.5 - Layer I and Layer II coder partition table".
+
 - psy: Annex D Model 1 §D.1 Step 8 width-gated split of the row-order
   paired vector over Table D.5 (Phase 2 step 62). Phase 2 step 61
   (r260) exposed the row-order paired vector

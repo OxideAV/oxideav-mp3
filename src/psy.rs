@@ -2942,6 +2942,180 @@ where
     }
 }
 
+// =====================================================================
+// Annex D Model 1 — §D.1 Step 8 width-gated `LTmin_n` column
+// projection over Table D.5 (Phase 2 step 63 / r262).
+//
+// Spec context (clause D.1, ISO/IEC 11172-3:1993, informative annex):
+//
+//   Step 8 produces, per coder partition n ∈ 1..=32, a per-partition
+//   minimum global masking threshold `LTmin_n` (dB). Phase 2 step 62
+//   (r261) exposed the width-gated split of the row-order paired
+//   `(LTmin_n, width_n)` vector as the two contiguous subarrays the
+//   Layer I / Layer II bit-allocation loop branches on per the
+//   `width_n` column of Table D.5. Some downstream consumers (e.g. a
+//   subsequent dB→linear conversion that operates per width band, or
+//   a width-block bit-target-budget summation that consumes only the
+//   threshold column) do not need the `width_n` field at the call
+//   site once the call site has already chosen which subarray to
+//   walk — `width_n` is implicit in the choice of `narrow_band`
+//   versus `wide_band`.
+//
+// Composition rather than introduction: this step is a strict
+// projection of Phase 2 step 62's `CoderPartitionD5ReductionByWidth`
+// onto the `ltmin_db` field of each subarray. It introduces no spec
+// arithmetic — every output cell is a copy of a cell in the step 62
+// struct at the same array index. The `LTg(ω)` callback is invoked
+// exactly as many times as Phase 2 step 62 invokes it (one call per
+// FFT line in `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`); the projection
+// itself adds no callback evaluations.
+//
+// The output is a `CoderPartitionD5LtminDbByWidth` carrying:
+//
+//   narrow_band[i] = LTmin_{i + 1}   for i ∈ 0..=11  (width_n = 0)
+//   wide_band[j]   = LTmin_{j + 13}  for j ∈ 0..=19  (width_n = 1)
+//
+// The 0-based index convention on each subarray matches Phase 2
+// step 62's exactly. Partition 0 is excluded for the same reason
+// step 62 (and through it steps 58/59/61) excludes it — the
+// reduction range is undefined without an `ωlow_n` boundary in
+// Table D.5.
+//
+// Boundary semantics inherit from Phase 2 step 62 unchanged: a sharp
+// dip on a shared boundary `ω = ωhigh_n = ωlow_{n+1}` enters both
+// adjacent partitions' `LTmin` and therefore both columns. The
+// projection has no boundary semantics of its own — it is a pure
+// field-selection operation that reads exactly one field per row.
+// =====================================================================
+
+/// A width-gated view of the §D.1 Step 8 row-order `LTmin_n` column,
+/// split into the two contiguous halves the Layer I / Layer II bit-
+/// allocation loop branches on per the `width_n` column of Table D.5
+/// with the (implicit-in-subarray-choice) `width_n` field elided.
+///
+/// Produced by [`coder_partition_d5_ltmin_db_row_order_by_width`]
+/// (Phase 2 step 63 / r262).
+///
+/// **Field semantics.** `narrow_band` carries the contiguous prefix
+/// of `LTmin_n` values (dB) for the rows with `width_n = 0`
+/// (partitions `n ∈ 1..=12`, the lower FFT-line block). `wide_band`
+/// carries the contiguous suffix of `LTmin_n` values (dB) for the
+/// rows with `width_n = 1` (partitions `n ∈ 13..=32`, the upper FFT-
+/// line block). The two subarrays preserve the row-order ordering of
+/// the paired vector — element `i` of `narrow_band` carries
+/// `LTmin_{i + 1}`; element `j` of `wide_band` carries
+/// `LTmin_{j + 13}`.
+///
+/// **Width invariant.** The width column is implicit in the choice
+/// of subarray — every cell of `narrow_band` corresponds to a
+/// partition with `width_n = 0`; every cell of `wide_band`
+/// corresponds to a partition with `width_n = 1`. The invariant is
+/// structural — pinned at construction by the split point (12)
+/// coming from Phase 2 step 60's row-order width vector and
+/// preserved verbatim from Phase 2 step 62's `narrow_band` /
+/// `wide_band` lengths.
+#[derive(Clone, Copy, Debug)]
+pub struct CoderPartitionD5LtminDbByWidth {
+    /// Per-partition minimum global masking threshold `LTmin_n` (dB)
+    /// for the contiguous prefix of rows with `width_n = 0`
+    /// (partitions `n ∈ 1..=12`, the lower FFT-line block). Twelve
+    /// elements in row order; element `i` carries `LTmin_{i + 1}`.
+    pub narrow_band: [f64; 12],
+    /// Per-partition minimum global masking threshold `LTmin_n` (dB)
+    /// for the contiguous suffix of rows with `width_n = 1`
+    /// (partitions `n ∈ 13..=32`, the upper FFT-line block). Twenty
+    /// elements in row order; element `j` carries `LTmin_{j + 13}`.
+    pub wide_band: [f64; 20],
+}
+
+/// §D.1 Step 8 width-gated `LTmin_n` column projection over Table
+/// D.5. Returns a [`CoderPartitionD5LtminDbByWidth`] holding:
+///
+/// ```text
+/// narrow_band[i] = LTmin_{i + 1}   for i ∈ 0..=11  (width_n = 0)
+/// wide_band[j]   = LTmin_{j + 13}  for j ∈ 0..=19  (width_n = 1)
+/// ```
+///
+/// This is the width-gated split of the per-frame `LTmin_n` column
+/// the Layer I / Layer II bit-allocation loop reads when the call
+/// site has already chosen which width subarray to walk — the
+/// `width_n` value is implicit in the choice of `narrow_band` versus
+/// `wide_band` and is therefore elided.
+///
+/// **Index convention.** 0-based on each subarray independently.
+/// `narrow_band[i]` carries `LTmin_{i + 1}`; `wide_band[j]` carries
+/// `LTmin_{j + 13}`. The split point (12) is constant — it is the
+/// single 0 → 1 transition in Table D.5's `width_n` column, pinned
+/// by Phase 2 step 60's row-order width vector and preserved
+/// verbatim from Phase 2 step 62's split.
+///
+/// **Composition.** A pure projection of Phase 2 step 62's
+/// [`coder_partition_d5_reduction_row_order_by_width`] onto the
+/// `ltmin_db` field of each subarray. No spec arithmetic is
+/// introduced — only the field-selection re-presentation of the
+/// width-gated paired vector as two width-gated column vectors. The
+/// `LTg(ω)` callback is invoked exactly as many times as Phase 2
+/// step 62 invokes it (one call per FFT line in
+/// `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`).
+///
+/// **Width invariant.** The width column is implicit in the choice
+/// of subarray — every cell of the returned `narrow_band`
+/// corresponds to a partition with `width_n = 0`; every cell of the
+/// returned `wide_band` corresponds to a partition with
+/// `width_n = 1`. The invariant is structural — pinned at the same
+/// split point (12) Phase 2 step 62 pins.
+///
+/// **Boundary semantics.** Inherits Phase 2 step 62's (and through
+/// it step 61 / 58 / 59's) inclusive-on-both-ends `LTmin_n`
+/// reduction semantics unchanged. The projection has no boundary
+/// semantics of its own — it is a pure field-selection operation
+/// reading exactly one field per row.
+///
+/// **Implementation.** Calls
+/// [`coder_partition_d5_reduction_row_order_by_width`] once (folding
+/// the caller's callback over every recoverable partition's FFT-line
+/// range) and reads the `ltmin_db` field of each cell into the
+/// matching output subarray. The projection is structurally pinned
+/// at the same index 12 the static width-column transition lives at
+/// — Phase 2 step 60's row-order width vector matches the pattern
+/// `[0; 12]` followed by `[1; 20]` exactly and Phase 2 step 62
+/// inherits the split point verbatim.
+///
+/// Provenance: only the Phase 2 step 62 width-gated paired-vector
+/// accessor [`coder_partition_d5_reduction_row_order_by_width`] (and
+/// through it the Phase 2 step 61 row-order paired vector, the Phase
+/// 2 step 59 / 60 row-order LTmin and width vectors, the Phase 2
+/// step 58 per-partition reducer, the Phase 2 step 52 per-partition
+/// width accessor, and the underlying Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") is
+/// consulted. The width-gated column-projection reading is the
+/// spec's per the Table D.5 `width_n` column's role as a per-row
+/// Layer I / Layer II bit-allocation branch flag (Annex D
+/// informative Model 1 reduction); no external implementation was
+/// read.
+#[must_use]
+pub fn coder_partition_d5_ltmin_db_row_order_by_width<F>(
+    ltg_per_line: F,
+) -> CoderPartitionD5LtminDbByWidth
+where
+    F: Fn(u16) -> f64,
+{
+    let split = coder_partition_d5_reduction_row_order_by_width(ltg_per_line);
+    let mut narrow = [f64::INFINITY; 12];
+    let mut wide = [f64::INFINITY; 20];
+    for (i, cell) in split.narrow_band.iter().enumerate() {
+        narrow[i] = cell.ltmin_db;
+    }
+    for (j, cell) in split.wide_band.iter().enumerate() {
+        wide[j] = cell.ltmin_db;
+    }
+    CoderPartitionD5LtminDbByWidth {
+        narrow_band: narrow,
+        wide_band: wide,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7239,6 +7413,312 @@ mod tests {
                 "wide band index {j}: ltmin_db {} != expected {expected}",
                 pair.ltmin_db,
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 2 step 63 (r262): §D.1 Step 8 width-gated `LTmin_n` column
+    // projection over Table D.5. Strict projection of step 62's
+    // width-gated paired vector onto the `ltmin_db` field of each
+    // subarray.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_lengths_are_twelve_and_twenty() {
+        // Narrow band is 12 rows (partitions 1..=12, width = 0); wide
+        // band is 20 rows (partitions 13..=32, width = 1). Match step 62.
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(|_| 0.0);
+        assert_eq!(split.narrow_band.len(), 12);
+        assert_eq!(split.wide_band.len(), 20);
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_total_length_matches_paired_vector() {
+        // 12 + 20 = 32 — the total number of recoverable partitions.
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(|_| 0.0);
+        assert_eq!(split.narrow_band.len() + split.wide_band.len(), 32);
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_constant_callback_carries_constant() {
+        // A constant `LTg(ω)` callback reduces to itself in every
+        // partition (min of a constant is the constant) — every cell
+        // in both subarrays equals the constant.
+        let c = -3.5_f64;
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(|_| c);
+        for (i, v) in split.narrow_band.iter().enumerate() {
+            assert!(
+                (v - c).abs() < 1.0e-12,
+                "narrow band index {i}: ltmin_db {v} != constant {c}",
+            );
+        }
+        for (j, v) in split.wide_band.iter().enumerate() {
+            assert!(
+                (v - c).abs() < 1.0e-12,
+                "wide band index {j}: ltmin_db {v} != constant {c}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_narrow_matches_step_62_narrow_field() {
+        // Strict-projection cross-check: every narrow cell equals the
+        // matching step 62 narrow cell's `ltmin_db` field at the same
+        // array index, under a non-trivial line-dependent callback.
+        let cb = |omega: u16| -> f64 { (f64::from(omega) * 0.011).sin() };
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let paired_split = coder_partition_d5_reduction_row_order_by_width(cb);
+        for i in 0..12 {
+            assert!(
+                (split.narrow_band[i] - paired_split.narrow_band[i].ltmin_db).abs() < 1.0e-12,
+                "narrow band index {i}: projected {} != step 62 ltmin_db {}",
+                split.narrow_band[i],
+                paired_split.narrow_band[i].ltmin_db,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_wide_matches_step_62_wide_field() {
+        // Strict-projection cross-check on the wide subarray.
+        let cb = |omega: u16| -> f64 { (f64::from(omega) * 0.013).cos() };
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let paired_split = coder_partition_d5_reduction_row_order_by_width(cb);
+        for j in 0..20 {
+            assert!(
+                (split.wide_band[j] - paired_split.wide_band[j].ltmin_db).abs() < 1.0e-12,
+                "wide band index {j}: projected {} != step 62 ltmin_db {}",
+                split.wide_band[j],
+                paired_split.wide_band[j].ltmin_db,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_narrow_matches_paired_prefix() {
+        // The narrow subarray's projected ltmin_db column matches the
+        // first 12 entries of step 61's row-order paired vector's
+        // `ltmin_db` column.
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.5 - 2.0 };
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let paired = coder_partition_d5_reduction_row_order(cb);
+        for (i, paired_cell) in paired.iter().enumerate().take(12) {
+            assert!(
+                (split.narrow_band[i] - paired_cell.ltmin_db).abs() < 1.0e-12,
+                "narrow band index {i}: projected {} != step 61 prefix ltmin_db {}",
+                split.narrow_band[i],
+                paired_cell.ltmin_db,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_wide_matches_paired_suffix() {
+        // The wide subarray's projected ltmin_db column matches the
+        // last 20 entries of step 61's row-order paired vector's
+        // `ltmin_db` column.
+        let cb = |omega: u16| -> f64 { -f64::from(omega) * 0.25 + 1.0 };
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let paired = coder_partition_d5_reduction_row_order(cb);
+        for j in 0..20 {
+            assert!(
+                (split.wide_band[j] - paired[j + 12].ltmin_db).abs() < 1.0e-12,
+                "wide band index {j}: projected {} != step 61 suffix ltmin_db {}",
+                split.wide_band[j],
+                paired[j + 12].ltmin_db,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_concatenates_to_step_59_vector() {
+        // narrow_band ++ wide_band equals the 32-element step 59
+        // row-order LTmin vector index-by-index.
+        let cb = |omega: u16| -> f64 { (f64::from(omega) * 0.017).tan() };
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let row_order = coder_partition_d5_ltg_min_row_order(cb);
+        for (i, &row) in row_order.iter().enumerate().take(12) {
+            assert!(
+                (split.narrow_band[i] - row).abs() < 1.0e-12,
+                "narrow band index {i}: projected {} != step 59 row {row}",
+                split.narrow_band[i],
+            );
+        }
+        for (j, &row) in row_order.iter().enumerate().skip(12) {
+            let idx = j - 12;
+            assert!(
+                (split.wide_band[idx] - row).abs() < 1.0e-12,
+                "wide band index {idx}: projected {} != step 59 row {row}",
+                split.wide_band[idx],
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_endpoints_match_table_d5_edges() {
+        // Endpoint pins: narrow_band[0] is partition 1 (lowest narrow
+        // row), narrow_band[11] is partition 12 (highest narrow row),
+        // wide_band[0] is partition 13 (lowest wide row),
+        // wide_band[19] is partition 32 (highest wide row).
+        let cb = |omega: u16| -> f64 { f64::from(omega) };
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        // identity callback under inclusive-min reduces to ωlow_n per row.
+        let (lo_1, _) = coder_partition_d5_line_range(1).unwrap();
+        let (lo_12, _) = coder_partition_d5_line_range(12).unwrap();
+        let (lo_13, _) = coder_partition_d5_line_range(13).unwrap();
+        let (lo_32, _) = coder_partition_d5_line_range(32).unwrap();
+        assert!((split.narrow_band[0] - f64::from(lo_1)).abs() < 1.0e-12);
+        assert!((split.narrow_band[11] - f64::from(lo_12)).abs() < 1.0e-12);
+        assert!((split.wide_band[0] - f64::from(lo_13)).abs() < 1.0e-12);
+        assert!((split.wide_band[19] - f64::from(lo_32)).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_split_point_is_at_partition_thirteen() {
+        // Split point pin: narrow_band[11] reduces over partition 12's
+        // FFT-line range; wide_band[0] reduces over partition 13's
+        // FFT-line range. The two rows are adjacent in row-order Table
+        // D.5 — the width-column 0 → 1 transition lives between them.
+        let cb = |omega: u16| -> f64 { f64::from(omega) };
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let (lo_12, _) = coder_partition_d5_line_range(12).unwrap();
+        let (lo_13, _) = coder_partition_d5_line_range(13).unwrap();
+        assert!(
+            (split.narrow_band[11] - f64::from(lo_12)).abs() < 1.0e-12,
+            "narrow_band[11] (partition 12) should reduce to ωlow_12 = {lo_12}",
+        );
+        assert!(
+            (split.wide_band[0] - f64::from(lo_13)).abs() < 1.0e-12,
+            "wide_band[0] (partition 13) should reduce to ωlow_13 = {lo_13}",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_is_idempotent_for_pure_callback() {
+        // Pure callbacks produce the same column projection on
+        // back-to-back calls.
+        let cb = |omega: u16| -> f64 { f64::from(omega).cos() };
+        let a = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let b = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        for i in 0..12 {
+            assert!((a.narrow_band[i] - b.narrow_band[i]).abs() < 1.0e-12);
+        }
+        for j in 0..20 {
+            assert!((a.wide_band[j] - b.wide_band[j]).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_dip_in_narrow_only_affects_narrow() {
+        // Single-line dip in partition 6 (a strict-interior narrow
+        // partition): only narrow_band[5] drops. wide_band is
+        // untouched. Strict cross-band isolation, projection variant.
+        let baseline = 5.0_f64;
+        let dip = -25.0_f64;
+        let target_n: u16 = 6;
+        let (lo, hi) = coder_partition_d5_line_range(target_n).unwrap();
+        let interior = lo + (hi - lo) / 2;
+        assert!(interior > lo && interior < hi);
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(|omega| {
+            if omega == interior {
+                dip
+            } else {
+                baseline
+            }
+        });
+        let expected_index = (target_n as usize) - 1;
+        for (i, v) in split.narrow_band.iter().enumerate() {
+            let expected = if i == expected_index { dip } else { baseline };
+            assert!(
+                (v - expected).abs() < 1.0e-12,
+                "narrow band index {i}: projected {v} != expected {expected}",
+            );
+        }
+        for (j, v) in split.wide_band.iter().enumerate() {
+            assert!(
+                (v - baseline).abs() < 1.0e-12,
+                "wide band index {j}: projected {v} != baseline {baseline}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_dip_in_wide_only_affects_wide() {
+        // Single-line dip in partition 22 (a strict-interior wide
+        // partition): only wide_band[22 - 13] = wide_band[9] drops.
+        // narrow_band is untouched. Dual cross-band isolation.
+        let baseline = 5.0_f64;
+        let dip = -25.0_f64;
+        let target_n: u16 = 22;
+        let (lo, hi) = coder_partition_d5_line_range(target_n).unwrap();
+        let interior = lo + (hi - lo) / 2;
+        assert!(interior > lo && interior < hi);
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(|omega| {
+            if omega == interior {
+                dip
+            } else {
+                baseline
+            }
+        });
+        for (i, v) in split.narrow_band.iter().enumerate() {
+            assert!(
+                (v - baseline).abs() < 1.0e-12,
+                "narrow band index {i}: projected {v} != baseline {baseline}",
+            );
+        }
+        let expected_index = (target_n as usize) - 13;
+        for (j, v) in split.wide_band.iter().enumerate() {
+            let expected = if j == expected_index { dip } else { baseline };
+            assert!(
+                (v - expected).abs() < 1.0e-12,
+                "wide band index {j}: projected {v} != expected {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_split_yields_a_partition_of_step_59() {
+        // Composition pin: for every row-order callback, concatenating
+        // the projected narrow and wide subarrays equals step 59's
+        // row-order vector — i.e. the step 63 projection is a
+        // partition of step 59's output.
+        let cb = |omega: u16| -> f64 { (f64::from(omega) * 0.019).sin().abs() };
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let row_order = coder_partition_d5_ltg_min_row_order(cb);
+        let mut concat = [0.0_f64; 32];
+        concat[..12].copy_from_slice(&split.narrow_band);
+        concat[12..].copy_from_slice(&split.wide_band);
+        for i in 0..32 {
+            assert!(
+                (concat[i] - row_order[i]).abs() < 1.0e-12,
+                "concatenation index {i}: {} != step 59 row {}",
+                concat[i],
+                row_order[i],
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_db_row_order_by_width_independent_of_width_column() {
+        // Sanity: the projection is purely on the ltmin_db field —
+        // its values do not depend on the width column at all (the
+        // width column is implicit in the choice of subarray). Two
+        // hypothetical width-column orderings (had they applied)
+        // would still produce the same projected columns because the
+        // projection reads only ltmin_db and the underlying step 58
+        // / 59 reduction is width-column-blind. Verified here by
+        // checking equality against a non-trivial recomputation
+        // through the paired step 61 + manual prefix/suffix split,
+        // skipping step 62 entirely.
+        let cb = |omega: u16| -> f64 { (f64::from(omega) * 0.023).cos() * 4.0 - 1.0 };
+        let split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let paired = coder_partition_d5_reduction_row_order(cb);
+        for (i, paired_cell) in paired.iter().enumerate().take(12) {
+            assert!((split.narrow_band[i] - paired_cell.ltmin_db).abs() < 1.0e-12);
+        }
+        for (j, paired_cell) in paired.iter().enumerate().skip(12) {
+            let idx = j - 12;
+            assert!((split.wide_band[idx] - paired_cell.ltmin_db).abs() < 1.0e-12);
         }
     }
 }
