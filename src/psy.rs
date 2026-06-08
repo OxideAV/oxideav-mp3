@@ -2086,6 +2086,80 @@ pub fn first_partition_containing_line(omega: u16) -> Option<u16> {
         .map(|s| s.index)
 }
 
+/// Inclusive FFT-line iterator over Annex D Table D.5 partition `n` —
+/// yields every `omega ∈ [ωlow_n, ωhigh_n]` in ascending order.
+///
+/// Phase 2 step 51 (r250) exposed each partition's `(ωlow_n, ωhigh_n)`
+/// boundary pair via [`coder_partition_d5_line_range`]. Phase 2 step 53
+/// (r252) composed those boundaries with the `width_n` value into the
+/// [`CoderPartitionD5Span`] descriptor. Phase 2 step 54 (r253) lifted
+/// the membership inequality on that pair to the named predicate
+/// [`partition_n_contains_line`]; Phase 2 step 55 (r254) added the
+/// row-order iterator [`coder_partition_d5_spans`] over the recoverable
+/// descriptors; Phase 2 step 56 (r255) closed the inverse lookup with
+/// [`first_partition_containing_line`]. This step 57 accessor closes
+/// the per-partition FFT-line walk: given partition `n`, yield every
+/// in-range `omega` so the downstream Model 1 / Model 2 reduction can
+/// write
+///
+/// ```text
+///     for span in coder_partition_d5_spans() {
+///         let acc = coder_partition_d5_omega_iter(span.index)
+///             .expect("span.index ∈ 1..=32")
+///             .map(|omega| per_line_value(omega))
+///             .sum::<f64>();
+///         …
+///     }
+/// ```
+///
+/// matching the spec's per-partition sum-over-lines pattern (clause D.1
+/// Step 7's `Σ_{j ∈ partition}` form) without open-coding either the
+/// `ωlow_n..=ωhigh_n` range or the lookup at every reduction site.
+///
+/// Returns `Some(ωlow_n..=ωhigh_n)` (a [`core::ops::RangeInclusive`])
+/// for any `n ∈ 1..=32` — the same recoverable range as the descriptor
+/// itself — and **`None`** for any `n` outside that range. The two
+/// edge cases inherit from the descriptor:
+///
+/// * `n = 0` — partition 0's lower boundary `ωlow_0` is not in
+///   Table D.5; without a `ωlow_n`, the range is undefined. `None`.
+/// * `n = 33` — neither row 33's boundary nor its `width_n` cell
+///   exists in Table D.5. `None`.
+///
+/// **Boundary semantics.** The iterator is **inclusive on both ends**,
+/// matching the dual-role `ωlow_{n+1} / ωhigh_n` reading Phase 2
+/// step 50 (r249) pinned and the inclusive-on-both-ends membership
+/// predicate Phase 2 step 54 (r253) named. Two consecutive partitions
+/// `n` and `n + 1` therefore both emit the shared boundary line
+/// `ω = ωhigh_n = ωlow_{n+1}`; a caller that wants to bin every
+/// FFT line into exactly one partition (no double-counting) should
+/// use [`first_partition_containing_line`] (which deterministically
+/// assigns each shared boundary line to the *lower* partition).
+/// A caller that wants the spec's per-partition sum-over-lines (where
+/// the shared boundary line *does* contribute to both partitions'
+/// reductions per the Annex D Step 7 `Σ_{j ∈ partition}` reading) uses
+/// this iterator directly.
+///
+/// Implementation: `coder_partition_d5_line_range(n).map(|(lo, hi)|
+/// lo..=hi)` — a pure composition of the step-51 range accessor and
+/// `RangeInclusive::new`, with no arithmetic introduced. Complexity is
+/// `O(ωhigh_n − ωlow_n + 1)`; for the spec's mostly-16-wide partitions
+/// this is `O(16)` per partition, `O(513)` across the whole table.
+///
+/// Provenance: only the Phase 2 step 51 accessor
+/// [`coder_partition_d5_line_range`] and its underlying Table D.5
+/// transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table" are
+/// consulted; the inclusive-on-both-ends reading is the spec's,
+/// pinned by Phase 2 step 50 (r249) and step 54 (r253).
+#[inline]
+#[must_use]
+pub fn coder_partition_d5_omega_iter(n: u16) -> Option<core::ops::RangeInclusive<u16>> {
+    let (low, high) = coder_partition_d5_line_range(n)?;
+    Some(low..=high)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5006,6 +5080,224 @@ mod tests {
                 first_partition_containing_line(omega),
                 Some(expected),
                 "ω = {omega} should map to min partition; containing set = {containing:?}",
+            );
+        }
+    }
+
+    // Phase 2 step 57 (r256) — Table D.5 per-partition FFT-line
+    // iterator. The accessor `coder_partition_d5_omega_iter(n)` returns
+    // `Some(ωlow_n..=ωhigh_n)` for any `n ∈ 1..=32` and `None` for any
+    // n outside that range. The iterator is the per-partition omega
+    // walk the Annex D Step 7 partition reduction binds its sum across.
+
+    #[test]
+    fn coder_partition_d5_omega_iter_returns_none_for_partition_zero() {
+        // Partition 0's lower boundary ωlow_0 is not in Table D.5, so
+        // the descriptor returns None for n = 0; the iterator inherits
+        // this exactly.
+        assert!(coder_partition_d5_omega_iter(0).is_none());
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_returns_none_for_partition_thirty_three() {
+        // Row 33's boundary and its width_n cell are not in Table D.5,
+        // so the descriptor returns None for n = 33; the iterator
+        // inherits this exactly.
+        assert!(coder_partition_d5_omega_iter(33).is_none());
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_returns_none_for_far_out_of_range_indices() {
+        // Two values clearly outside the table's recoverable range —
+        // a clearly-large index and the u16 ceiling — both report None,
+        // matching the descriptor's None on n outside 1..=32.
+        assert!(coder_partition_d5_omega_iter(100).is_none());
+        assert!(coder_partition_d5_omega_iter(u16::MAX).is_none());
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_partition_one_starts_at_table_wide_lower_edge() {
+        // Partition 1 spans ωlow_1 = 1 .. ωhigh_1 = 17 (inclusive).
+        // The iterator yields exactly that inclusive range.
+        let iter = coder_partition_d5_omega_iter(1).expect("partition 1 is recoverable");
+        let lines: Vec<u16> = iter.collect();
+        // The first emitted line is the table-wide lower edge.
+        assert_eq!(lines.first(), Some(&1));
+        // The last emitted line is partition 1's ωhigh_1.
+        let high = coder_partition_d5_omega_high(1).expect("step 51 recovers ωhigh_1");
+        assert_eq!(lines.last(), Some(&high));
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_partition_thirty_two_ends_at_table_wide_upper_edge() {
+        // Partition 32 spans ωlow_32 .. ωhigh_32 = 513 (inclusive).
+        // The iterator yields exactly that inclusive range, and its
+        // last emitted line is the table-wide upper edge ω = 513.
+        let iter = coder_partition_d5_omega_iter(32).expect("partition 32 is recoverable");
+        let lines: Vec<u16> = iter.collect();
+        let low = coder_partition_d5_omega_low(32).expect("step 51 recovers ωlow_32");
+        assert_eq!(lines.first(), Some(&low));
+        assert_eq!(lines.last(), Some(&513));
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_matches_step_51_line_range_for_every_partition() {
+        // For every recoverable n ∈ 1..=32 the iterator's
+        // (first, last) endpoints must equal (ωlow_n, ωhigh_n) exactly,
+        // and the emitted-line count must equal ωhigh_n - ωlow_n + 1
+        // (inclusive-on-both-ends arithmetic). Pin both invariants
+        // against the step 51 line-range accessor directly.
+        for n in 1_u16..=32 {
+            let (low, high) =
+                coder_partition_d5_line_range(n).expect("step 51 recovers line range");
+            let lines: Vec<u16> = coder_partition_d5_omega_iter(n)
+                .expect("step 57 iterator is Some for n ∈ 1..=32")
+                .collect();
+            assert_eq!(
+                lines.first(),
+                Some(&low),
+                "partition {n}: first emitted line = ωlow_{n} = {low}",
+            );
+            assert_eq!(
+                lines.last(),
+                Some(&high),
+                "partition {n}: last emitted line = ωhigh_{n} = {high}",
+            );
+            let expected_count = usize::from(high - low + 1);
+            assert_eq!(
+                lines.len(),
+                expected_count,
+                "partition {n}: line count = ωhigh_{n} - ωlow_{n} + 1 = {expected_count}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_emits_ascending_lines_with_no_gaps() {
+        // Within each partition the iterator is a plain ascending walk
+        // from ωlow_n through ωhigh_n with stride 1 — no gaps, no
+        // duplicates, strictly increasing.
+        for n in 1_u16..=32 {
+            let lines: Vec<u16> = coder_partition_d5_omega_iter(n)
+                .expect("step 57 iterator is Some for n ∈ 1..=32")
+                .collect();
+            for window in lines.windows(2) {
+                assert_eq!(
+                    window[1],
+                    window[0] + 1,
+                    "partition {n}: consecutive lines must differ by 1, got {} then {}",
+                    window[0],
+                    window[1],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_every_emitted_line_passes_membership_predicate() {
+        // Pin agreement with the step 54 membership predicate:
+        // every line the iterator emits for partition n must satisfy
+        // `partition_n_contains_line(n, ω) = Some(true)`. The two
+        // accessors are duals — the iterator yields lines, the
+        // predicate tests lines — and they must agree on every
+        // (n, ω) pair the iterator produces.
+        for n in 1_u16..=32 {
+            for omega in coder_partition_d5_omega_iter(n).expect("recoverable n") {
+                assert_eq!(
+                    partition_n_contains_line(n, omega),
+                    Some(true),
+                    "iterator emitted ω = {omega} for partition {n}, but membership predicate disagrees",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_shared_boundary_line_is_in_both_partitions() {
+        // The inclusive-on-both-ends reading pinned by step 50 / step 54
+        // means every shared boundary line ω = ωhigh_n = ωlow_{n+1}
+        // appears in BOTH partition n's and partition (n+1)'s iterator.
+        // Pin this directly at every shared boundary in the table.
+        for n in 1_u16..=31 {
+            let boundary = coder_partition_d5_omega_high(n).expect("step 51 recovers ωhigh_n");
+            let n_lines: Vec<u16> = coder_partition_d5_omega_iter(n)
+                .expect("partition n is recoverable")
+                .collect();
+            let next_lines: Vec<u16> = coder_partition_d5_omega_iter(n + 1)
+                .expect("partition n+1 is recoverable")
+                .collect();
+            assert!(
+                n_lines.contains(&boundary),
+                "partition {n}: iterator should emit shared boundary ω = {boundary}",
+            );
+            assert!(
+                next_lines.contains(&boundary),
+                "partition {}: iterator should also emit shared boundary ω = {boundary}",
+                n + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_union_covers_table_wide_band() {
+        // Union of every partition's emitted lines (1..=32) covers the
+        // table-wide FFT-line band [1, 513] with no gaps. Boundary
+        // lines may be emitted twice (once per neighbouring partition
+        // under the inclusive-on-both-ends reading); the SET of emitted
+        // lines must equal the closed interval {1, 2, …, 513} exactly.
+        let mut seen = std::collections::BTreeSet::new();
+        for n in 1_u16..=32 {
+            for omega in coder_partition_d5_omega_iter(n).expect("recoverable n") {
+                seen.insert(omega);
+            }
+        }
+        let expected: std::collections::BTreeSet<u16> = (1_u16..=513).collect();
+        assert_eq!(seen, expected, "union of partition iterators ≠ [1, 513]");
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_total_line_count_with_boundary_double_counting() {
+        // With the inclusive-on-both-ends reading every interior
+        // shared boundary line (n ∈ 1..=31 with ωhigh_n = ωlow_{n+1})
+        // gets counted twice when summing partition lengths. Total
+        // emitted-line count across n ∈ 1..=32 must equal the band
+        // size (513) plus the 31 shared boundaries that are double-
+        // counted — i.e. 513 + 31 = 544.
+        let total: usize = (1_u16..=32)
+            .map(|n| {
+                coder_partition_d5_omega_iter(n)
+                    .expect("recoverable n")
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            total, 544,
+            "513 in-band lines + 31 shared boundaries double-counted = 544",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_omega_iter_supports_step_seven_per_partition_fold() {
+        // End-to-end smoke pin: the step 57 iterator composes naturally
+        // with `coder_partition_d5_spans` (step 55) into the spec's
+        // per-partition sum-over-lines pattern from clause D.1 Step 7.
+        // Use a trivial per-line value (the line index itself, as f64)
+        // and assert each partition's sum equals the arithmetic-series
+        // closed form sum_{ω=ωlow_n}^{ωhigh_n} ω = (ωlow_n + ωhigh_n)
+        // * (ωhigh_n - ωlow_n + 1) / 2. This pins the composition path
+        // the downstream Step 8 partition-threshold reduction will use.
+        for span in coder_partition_d5_spans() {
+            let sum: f64 = coder_partition_d5_omega_iter(span.index)
+                .expect("span.index ∈ 1..=32 is recoverable")
+                .map(f64::from)
+                .sum();
+            let n_terms = f64::from(span.omega_high - span.omega_low + 1);
+            let endpoints = f64::from(span.omega_low) + f64::from(span.omega_high);
+            let expected = endpoints * n_terms * 0.5;
+            assert!(
+                (sum - expected).abs() < 1.0e-9,
+                "partition {}: sum-over-ω = {sum}, expected closed-form {expected}",
+                span.index,
             );
         }
     }

@@ -8,6 +8,68 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Table D.5 per-partition FFT-line iterator (Phase 2
+  step 57). Phase 2 step 51 (r250) exposed each partition's
+  `(ωlow_n, ωhigh_n)` boundary pair via
+  `coder_partition_d5_line_range`. Phase 2 step 53 (r252) composed
+  those boundaries with `width_n` into the
+  `CoderPartitionD5Span` descriptor. Phase 2 step 54 (r253) lifted
+  the membership inequality on that pair to the named predicate
+  `partition_n_contains_line`; Phase 2 step 55 (r254) added the
+  row-order iterator `coder_partition_d5_spans`; Phase 2 step 56
+  (r255) closed the inverse lookup with
+  `first_partition_containing_line`. r256 closes the per-partition
+  FFT-line walk: a new free function
+  `coder_partition_d5_omega_iter(n) -> Option<RangeInclusive<u16>>`
+  yields every `omega ∈ [ωlow_n, ωhigh_n]` in ascending order for
+  any `n ∈ 1..=32`. The iterator is the foundational primitive the
+  downstream Model 1 / Model 2 per-partition reduction binds its
+  sum-over-lines against — Annex D Step 7's
+  `Σ_{j ∈ partition} 10^(LT[j]/10)` pattern composes directly:
+  `coder_partition_d5_omega_iter(span.index).unwrap().map(|ω|
+  per_line_value(ω)).sum()`. The iterator is inclusive on both ends,
+  matching the dual-role `ωlow_{n+1} / ωhigh_n` reading pinned by
+  step 50 and the inclusive-on-both-ends membership predicate named
+  by step 54: two consecutive partitions both emit the shared
+  boundary line `ω = ωhigh_n = ωlow_{n+1}`, matching the spec's
+  per-partition sum-over-lines reading where the shared boundary
+  *does* contribute to both partitions' reductions. A caller that
+  wants single-assignment binning (no double-counting) uses the
+  step 56 inverse accessor instead. Returns `None` for any `n`
+  outside `1..=32` — the same recoverable range as the underlying
+  descriptor. Implementation is one line —
+  `coder_partition_d5_line_range(n).map(|(lo, hi)| lo..=hi)` — a
+  pure composition of the step 51 line-range accessor and
+  `RangeInclusive::new`, with no arithmetic introduced. 12 new lib
+  unit tests pin: the out-of-band `None` branches at `n = 0`,
+  `n = 33`, `n = 100`, and `n = u16::MAX`; partition 1's iterator
+  starts at the table-wide lower edge `ω = 1`; partition 32's
+  iterator ends at the table-wide upper edge `ω = 513`;
+  per-partition endpoint and length agreement with step 51's
+  `coder_partition_d5_line_range` for every `n ∈ 1..=32`; the
+  ascending-stride-1 walk within each partition (no gaps, no
+  duplicates); per-line agreement with the step 54 membership
+  predicate `partition_n_contains_line(n, ω) = Some(true)` for
+  every iterator-emitted `ω`; the shared-boundary double-emission
+  property at every `n ∈ 1..=31` (both `n` and `n+1`'s iterators
+  contain `ωhigh_n`); the table-wide band coverage
+  `⋃ iter(n) = [1, 513]`; the total-line-count identity
+  `Σ_n |iter(n)| = 513 + 31 = 544` (band size + 31 double-counted
+  shared boundaries); and an end-to-end composition smoke pin
+  `coder_partition_d5_spans` ∘ `coder_partition_d5_omega_iter` ∘
+  `sum` matching the arithmetic-series closed form
+  `Σ_{ω=ωlow_n}^{ωhigh_n} ω = (ωlow_n + ωhigh_n) ·
+  (ωhigh_n − ωlow_n + 1) / 2` for every recoverable partition —
+  pinning the downstream Step 8 partition-threshold reduction's
+  composition path directly. Tests: 724 lib (was 712 baseline; +12
+  unit). Provenance: only the Phase 2 step 51 accessor
+  `coder_partition_d5_line_range` and its underlying Table D.5
+  transcription in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+  §"Table D.5 - Layer I and Layer II coder partition table" are
+  consulted; the inclusive-on-both-ends reading is the spec's,
+  pinned by Phase 2 step 50 (r249) and step 54 (r253).
+
 - psy: Annex D Table D.5 inverse line→partition lookup (Phase 2
   step 56). Phase 2 step 53 (r252) composed each partition's three
   Table D.5 columns into a `CoderPartitionD5Span` descriptor with the
