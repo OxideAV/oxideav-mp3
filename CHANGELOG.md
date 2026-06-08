@@ -8,6 +8,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 8 paired `(LTmin_n, width_n)`
+  row-order vector over Table D.5 (Phase 2 step 61). Phase 2 step
+  59 (r258) exposed the row-order LTmin vector
+  `[LTmin_1, …, LTmin_32]`; Phase 2 step 60 (r259) exposed the
+  row-order width vector `[width_1, …, width_32]`. The Layer I /
+  Layer II bit-allocation loop walks the 32 coder partitions in
+  row order and at every row consumes **both** columns paired —
+  the LTmin_n value drives the per-partition target threshold, the
+  width_n column flags whether the partition spans more than one
+  Layer I / Layer II coder partition row. A new free function
+  `coder_partition_d5_reduction_row_order<F: Fn(u16) -> f64>(
+  ltg_per_line) -> [CoderPartitionD5Reduction; 32]` zips the two
+  row-order columns at the same array index, producing the per-
+  frame paired input the bit-allocation loop reads in lockstep.
+  A new public struct `CoderPartitionD5Reduction { ltmin_db: f64,
+  width_n: u16 }` carries the per-row pair. No spec arithmetic is
+  introduced — only the per-row pairing of the two existing row-
+  order columns. The 0-based index convention matches steps 59 and
+  60 (`out[i]` holds `(LTmin_{i + 1}, width_{i + 1})`), partition 0
+  excluded. Width-column endpoints `(out[0].width_n = 0,
+  out[31].width_n = 1)`, transition `(out[11].width_n = 0,
+  out[12].width_n = 1)`, and full literal `[0×12, 1×20]` are
+  pinned in tests. Tests: 770 lib (was 757 baseline; +13 unit)
+  covering length pin (32), constant-callback fills every
+  ltmin_db cell with the constant, ltmin column matches step 59
+  for a non-trivial line-dependent callback, width column matches
+  step 60 across two callbacks (structural orthogonality), width
+  invariant across callbacks, width matches Table D.5 literal,
+  identity callback returns ωlow_n per row, negative-identity
+  callback returns -ωhigh_n per row, transition pair at array
+  index 12, endpoint pin at indices 0 and 31, idempotence for a
+  pure callback, single-dip on a strict-interior line affects only
+  the target partition's ltmin_db with widths untouched, and
+  strict-composition pairing with step 59 + step 60 across every
+  row. No external implementation consulted; only the Phase 2 step
+  59 row-order LTmin reducer `coder_partition_d5_ltg_min_row_order`
+  and the Phase 2 step 60 row-order width vector
+  `coder_partition_d5_width_row_order` (and through them the Phase
+  2 step 58 / 52 underlying accessors and the Table D.5
+  transcription in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) were
+  read.
+
 - psy: Annex D Model 1 §D.1 Step 8 row-order `width_n` vector over
   Table D.5 (Phase 2 step 60). Phase 2 step 59 (r258) broadcast the
   Phase 2 step 58 (r257) per-partition `LTg` minimum reducer

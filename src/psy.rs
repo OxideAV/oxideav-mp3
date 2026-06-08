@@ -2596,6 +2596,176 @@ pub fn coder_partition_d5_width_row_order() -> [u16; 32] {
     out
 }
 
+// =====================================================================
+// Annex D Model 1 — §D.1 Step 8 paired (LTmin_n, width_n) row-order
+// vector over Table D.5 (Phase 2 step 61 / r260).
+//
+// Spec context (clause D.1, ISO/IEC 11172-3:1993, informative annex):
+//
+//   Step 8 produces, per coder partition n ∈ 1..=32, a per-partition
+//   minimum global masking threshold LTmin_n (dB) and reads the
+//   partition's width column width_n (0 for n ∈ 1..=12; 1 for
+//   n ∈ 13..=32). The Layer I / Layer II bit-allocation loop walks the
+//   32 partitions in row order (the spec table's ascending-n
+//   presentation, pinned at iteration order by Phase 2 step 55 /
+//   r254's `coder_partition_d5_spans`) and at every row consumes
+//   **both** columns paired — the LTmin_n value drives the per-
+//   partition target threshold, the width_n column flags whether the
+//   partition spans more than one Layer I / Layer II coder partition
+//   row (width_n = 1) or carries a single boundary row (width_n = 0).
+//
+//   Phase 2 step 59 (r258) exposed the row-order LTmin vector
+//   `[LTmin_1, …, LTmin_32]`. Phase 2 step 60 (r259) exposed the row-
+//   order width vector `[width_1, …, width_32]`. The bit-allocation
+//   loop pairs the two at the call site as the per-row tuple
+//   `(LTmin_n, width_n)`.
+//
+// Composition rather than introduction: this step is a strict
+// composition of the Phase 2 step 59 row-order LTmin reducer
+// `coder_partition_d5_ltg_min_row_order` and the Phase 2 step 60
+// row-order width vector `coder_partition_d5_width_row_order`. It
+// pairs the two columns at the same array index without introducing
+// any spec arithmetic — the LTmin column closes over the caller's
+// `LTg(ω)` callback (the run-time-dependent half of the input pair)
+// and the width column is the static Table D.5 column. The output is
+// the per-frame paired input the Layer I / Layer II bit-allocation
+// loop consumes in lockstep.
+//
+// The output is a 32-element `[CoderPartitionD5Reduction; 32]` indexed
+// 0-based, with element `i` holding the `(LTmin_{i + 1}, width_{i + 1})`
+// pair (the spec's 1-based `n` in 0-based array form). This matches
+// the spec's row-order presentation of Table D.5 and the same index
+// convention pinned by steps 59 and 60. Partition 0 (the degenerate
+// single-line `width_n = 0` row carrying `ωlow_0` only) is excluded
+// from the vector — Phase 2 step 58 returns `None` for `n = 0`
+// because the reduction range is undefined without a `ωlow_n`
+// boundary in Table D.5. The downstream bit-allocation loop walks
+// partitions `1..=32` and does not consult partition 0, matching the
+// spec's coder-partition usage.
+//
+// Boundary semantics inherit from Phase 2 step 59 unchanged — the
+// `LTmin_n` reduction is inclusive on both ends so a sharp dip on a
+// shared boundary `ω = ωhigh_n = ωlow_{n+1}` enters both adjacent
+// partitions' `LTmin`. The width column has no boundary semantics
+// (it is a static per-row table value).
+// =====================================================================
+
+/// A single row of the Layer I / Layer II coder-partition bit-
+/// allocation input: the per-partition minimum global masking
+/// threshold `LTmin_n` (dB) paired with the partition's `width_n`
+/// column (0 for `n ∈ 1..=12`; 1 for `n ∈ 13..=32`) at the same row
+/// index in row-order Table D.5 presentation.
+///
+/// Produced by [`coder_partition_d5_reduction_row_order`] (Phase 2
+/// step 61 / r260).
+///
+/// **Field semantics.** `ltmin_db` carries the inclusive minimum of
+/// `LTg(ω)` (dB) over the partition's FFT-line range, as defined by
+/// Phase 2 step 58's per-partition reducer
+/// [`coder_partition_d5_ltg_min`]. `width_n` is the static Table D.5
+/// column value read by Phase 2 step 52's per-partition accessor
+/// [`coder_partition_d5_width`]. The two columns are orthogonal: the
+/// LTmin column closes over the caller's `LTg(ω)` callback (run-
+/// time-dependent), the width column is a pure constant of the
+/// table.
+#[derive(Clone, Copy, Debug)]
+pub struct CoderPartitionD5Reduction {
+    /// Per-partition minimum global masking threshold `LTmin_n` (dB),
+    /// as reduced by Phase 2 step 58's [`coder_partition_d5_ltg_min`]
+    /// applied to the caller's `LTg(ω)` callback over the partition's
+    /// FFT-line range.
+    pub ltmin_db: f64,
+    /// Partition's `width_n` column from Table D.5 — `0` for
+    /// `n ∈ 1..=12`, `1` for `n ∈ 13..=32`. The same value Phase 2
+    /// step 52's [`coder_partition_d5_width`] returns for the
+    /// partition.
+    pub width_n: u16,
+}
+
+/// §D.1 Step 8 paired row-order `[(LTmin_n, width_n), …]` vector for
+/// every Layer I / Layer II coder partition `n ∈ 1..=32`. Element
+/// `i` of the returned `[CoderPartitionD5Reduction; 32]` holds the
+/// `(LTmin_{i + 1}, width_{i + 1})` pair (the spec's 1-based `n` in
+/// 0-based array form):
+///
+/// ```text
+/// out[i].ltmin_db = min_{ω ∈ [ωlow_{i+1}, ωhigh_{i+1}]} LTg(ω)   dB
+/// out[i].width_n  = width_{i + 1}   (∈ {0, 1})
+/// ```
+///
+/// The vector is the per-frame paired input the Layer I / Layer II
+/// bit-allocation loop consumes — at every row the loop reads both
+/// columns together as the partition's "per-row brief" (target
+/// threshold + width flag).
+///
+/// **Index convention.** 0-based on the returned slice; element `i`
+/// holds `(LTmin_{i + 1}, width_{i + 1})`. The spec's 1-based partition
+/// index `n ∈ 1..=32` maps to array index `i = n - 1 ∈ 0..=31`.
+/// Partition 0 (the degenerate single-line `width_n = 0` row carrying
+/// `ωlow_0` only) is excluded from the vector for index consistency
+/// with Phase 2 steps 59 and 60. The downstream bit-allocation loop
+/// walks partitions `1..=32` and does not consult partition 0,
+/// matching the spec's coder-partition usage.
+///
+/// **Composition.** A pure index-aligned zip of Phase 2 step 59's
+/// row-order LTmin vector [`coder_partition_d5_ltg_min_row_order`]
+/// (closed over the caller's `LTg(ω)` callback) with Phase 2 step
+/// 60's row-order width vector [`coder_partition_d5_width_row_order`].
+/// No spec arithmetic is introduced — only the per-row pairing of
+/// the two existing row-order columns at the same array index, which
+/// is exactly the per-row input the Layer I / Layer II bit-
+/// allocation loop reads.
+///
+/// **Caller cost.** The `LTg(ω)` callback is invoked exactly as many
+/// times as Phase 2 step 59 invokes it (one call per FFT line in
+/// `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)` summed over the table);
+/// the width vector adds no callback invocations.
+///
+/// **Boundary semantics.** Inherits Phase 2 step 59's inclusive-on-
+/// both-ends reduction semantics unchanged for the LTmin column — a
+/// sharp dip on a shared boundary `ω = ωhigh_n = ωlow_{n+1}` enters
+/// **both** adjacent partitions' `LTmin`. The width column has no
+/// boundary semantics (it is a static per-row table value).
+///
+/// **Implementation.** Calls [`coder_partition_d5_ltg_min_row_order`]
+/// once (folding the caller's callback over every recoverable
+/// partition's FFT-line range) and [`coder_partition_d5_width_row_order`]
+/// once (the static width column), then zips the two into the paired
+/// output at the same array index. The zip is a strict-composition
+/// pairing — neither column influences the other's computation.
+///
+/// Provenance: only the Phase 2 step 59 row-order LTmin reducer
+/// [`coder_partition_d5_ltg_min_row_order`] and the Phase 2 step 60
+/// row-order width vector [`coder_partition_d5_width_row_order`]
+/// (and through them the Phase 2 step 58 per-partition reducer
+/// [`coder_partition_d5_ltg_min`], the Phase 2 step 52 per-partition
+/// width accessor [`coder_partition_d5_width`], and the underlying
+/// Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") are
+/// consulted. The paired-row-order reading is the spec's per Annex D
+/// Step 8 (informative Model 1 reduction) row-by-row presentation;
+/// no external implementation was read.
+#[must_use]
+pub fn coder_partition_d5_reduction_row_order<F>(ltg_per_line: F) -> [CoderPartitionD5Reduction; 32]
+where
+    F: Fn(u16) -> f64,
+{
+    let ltmin = coder_partition_d5_ltg_min_row_order(ltg_per_line);
+    let widths = coder_partition_d5_width_row_order();
+    let mut out = [CoderPartitionD5Reduction {
+        ltmin_db: f64::INFINITY,
+        width_n: 0,
+    }; 32];
+    for i in 0..32 {
+        out[i] = CoderPartitionD5Reduction {
+            ltmin_db: ltmin[i],
+            width_n: widths[i],
+        };
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6362,5 +6532,244 @@ mod tests {
             manual[(n - 1) as usize] = coder_partition_d5_width(n).unwrap();
         }
         assert_eq!(v, manual);
+    }
+
+    // ---------- Phase 2 step 61 / r260 — paired (LTmin, width) row-order vector ----------
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_returns_exactly_thirty_two_pairs() {
+        // The paired vector pins the same 32-element length as steps
+        // 59 and 60 — partition 0 is excluded, partitions 1..=32 are
+        // each represented exactly once.
+        let v = coder_partition_d5_reduction_row_order(|_| 0.0);
+        assert_eq!(v.len(), 32);
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_constant_ltg_fills_ltmin_with_constant() {
+        // For a constant LTg(ω) = c the per-partition min is c for
+        // every partition (Phase 2 step 58 inherits this). Verify the
+        // paired vector's ltmin_db column carries c at every row.
+        let c = -7.25_f64;
+        let v = coder_partition_d5_reduction_row_order(|_| c);
+        for (i, pair) in v.iter().enumerate() {
+            assert!(
+                (pair.ltmin_db - c).abs() < 1.0e-12,
+                "row {i}: ltmin_db {} != constant {c}",
+                pair.ltmin_db,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_ltmin_column_matches_step_59() {
+        // Strict-composition cross-check: the paired vector's
+        // ltmin_db column must equal Phase 2 step 59's row-order LTmin
+        // vector for the same callback (the paired accessor is a pure
+        // zip — neither column influences the other's computation).
+        // Use a non-trivial line-dependent callback to exercise the
+        // per-partition reduction.
+        let cb = |omega: u16| f64::from(omega).sin();
+        let paired = coder_partition_d5_reduction_row_order(cb);
+        let step59 = coder_partition_d5_ltg_min_row_order(cb);
+        for i in 0..32 {
+            assert!(
+                (paired[i].ltmin_db - step59[i]).abs() < 1.0e-12,
+                "row {i}: paired ltmin_db {} != step 59 {}",
+                paired[i].ltmin_db,
+                step59[i],
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_width_column_matches_step_60() {
+        // The paired vector's width_n column must equal Phase 2 step
+        // 60's row-order width vector independent of the callback
+        // (the width column is a static Table D.5 column — no run-
+        // time inputs). Verify under two different callbacks.
+        let widths = coder_partition_d5_width_row_order();
+        let a = coder_partition_d5_reduction_row_order(|_| 0.0);
+        let b = coder_partition_d5_reduction_row_order(f64::from);
+        for i in 0..32 {
+            assert_eq!(a[i].width_n, widths[i]);
+            assert_eq!(b[i].width_n, widths[i]);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_width_invariant_across_callbacks() {
+        // Structural orthogonality: the width column is fully
+        // determined by the static Table D.5 column and does not
+        // depend on the caller's `LTg(ω)`. Verify directly that two
+        // callbacks produce identical width columns.
+        let a = coder_partition_d5_reduction_row_order(|_| 0.0);
+        let b = coder_partition_d5_reduction_row_order(|omega| f64::from(omega) * 3.0 - 1.0);
+        for i in 0..32 {
+            assert_eq!(
+                a[i].width_n, b[i].width_n,
+                "row {i}: width column varied across callbacks ({} vs {})",
+                a[i].width_n, b[i].width_n,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_width_matches_full_table_literal() {
+        // Pin the width column of the paired vector against the
+        // verbatim Table D.5 literal — twelve zeros followed by
+        // twenty ones. Any future change to Table D.5's width_n
+        // column would surface here independently of step 60.
+        let v = coder_partition_d5_reduction_row_order(|_| 0.0);
+        let widths: [u16; 32] = core::array::from_fn(|i| v[i].width_n);
+        let expected: [u16; 32] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // partitions 1..=12
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 13..=32
+        ];
+        assert_eq!(widths, expected);
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_identity_ltg_returns_omega_low_per_row() {
+        // For LTg(ω) = ω the per-partition minimum lies at ωlow_n
+        // (the inclusive lower endpoint of the partition's FFT-line
+        // range). Verify the paired vector's ltmin_db column equals
+        // f64::from(ωlow_{i+1}) per row.
+        let v = coder_partition_d5_reduction_row_order(f64::from);
+        for n in 1_u16..=32 {
+            let (lo, _hi) = coder_partition_d5_line_range(n).unwrap();
+            let got = v[(n - 1) as usize].ltmin_db;
+            let expected = f64::from(lo);
+            assert!(
+                (got - expected).abs() < 1.0e-9,
+                "partition {n}: paired ltmin_db {got} != ωlow_n = {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_negative_identity_returns_omega_high_per_row() {
+        // For LTg(ω) = -ω the per-partition minimum is the *most
+        // negative* line, which is -ωhigh_n (inclusive upper
+        // endpoint). Verify the paired vector's ltmin_db column
+        // matches -ωhigh_{i+1} per row.
+        let v = coder_partition_d5_reduction_row_order(|omega| -f64::from(omega));
+        for n in 1_u16..=32 {
+            let (_lo, hi) = coder_partition_d5_line_range(n).unwrap();
+            let got = v[(n - 1) as usize].ltmin_db;
+            let expected = -f64::from(hi);
+            assert!(
+                (got - expected).abs() < 1.0e-9,
+                "partition {n}: paired ltmin_db {got} != -ωhigh_n = {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_transition_pair_at_index_twelve() {
+        // The width column transitions 0 → 1 between array indices 11
+        // and 12 (partitions 12 and 13). Pin the boundary in the
+        // paired vector: out[11].width_n = 0, out[12].width_n = 1.
+        let v = coder_partition_d5_reduction_row_order(|_| 0.0);
+        assert_eq!(v[11].width_n, 0, "row 11 (partition 12) width should be 0");
+        assert_eq!(v[12].width_n, 1, "row 12 (partition 13) width should be 1");
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_endpoints_match_table_d5_edges() {
+        // Table-wide endpoint pin: array index 0 holds partition 1,
+        // index 31 holds partition 32. width_n endpoints are 0 and 1
+        // respectively (Table D.5 transcription); ltmin_db carries
+        // the constant under a constant callback.
+        let v = coder_partition_d5_reduction_row_order(|_| -3.5);
+        assert_eq!(v[0].width_n, 0, "row 0 (partition 1) width should be 0");
+        assert_eq!(v[31].width_n, 1, "row 31 (partition 32) width should be 1");
+        assert!((v[0].ltmin_db - -3.5).abs() < 1.0e-12);
+        assert!((v[31].ltmin_db - -3.5).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_is_idempotent_for_pure_callback() {
+        // A pure callback closing over no mutable state produces the
+        // same paired vector on every call. Verify back-to-back
+        // invocations agree column-by-column.
+        let a = coder_partition_d5_reduction_row_order(|omega| f64::from(omega).cos());
+        let b = coder_partition_d5_reduction_row_order(|omega| f64::from(omega).cos());
+        for i in 0..32 {
+            assert!((a[i].ltmin_db - b[i].ltmin_db).abs() < 1.0e-12);
+            assert_eq!(a[i].width_n, b[i].width_n);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_single_dip_only_affects_target_partition() {
+        // A dip at a strict-interior line of partition n pulls only
+        // that partition's ltmin_db down (no neighbour shares the
+        // line, so no neighbour is affected). Verify by dipping a
+        // strict-interior line of partition 5 and checking only row 4
+        // (1-based n = 5 → 0-based index 4) drops while every other
+        // row stays at the constant baseline. Width column is
+        // untouched throughout.
+        let target_n: u16 = 5;
+        let (lo, hi) = coder_partition_d5_line_range(target_n).unwrap();
+        // Pick a strict-interior line; partition 5 spans more than
+        // one line so lo + 1 is interior and != hi for any plausible
+        // width_n configuration in Table D.5.
+        assert!(
+            lo + 1 < hi,
+            "partition {target_n} must have an interior line for the test"
+        );
+        let dip_line = lo + 1;
+        let baseline = 0.0;
+        let dip = -100.0;
+        let v =
+            coder_partition_d5_reduction_row_order(
+                |omega| {
+                    if omega == dip_line {
+                        dip
+                    } else {
+                        baseline
+                    }
+                },
+            );
+        for n in 1_u16..=32 {
+            let i = (n - 1) as usize;
+            let expected = if n == target_n { dip } else { baseline };
+            assert!(
+                (v[i].ltmin_db - expected).abs() < 1.0e-12,
+                "partition {n}: ltmin_db {} != expected {expected}",
+                v[i].ltmin_db,
+            );
+        }
+        // Width column unchanged by the dip.
+        let widths_dipped: [u16; 32] = core::array::from_fn(|i| v[i].width_n);
+        let widths_static = coder_partition_d5_width_row_order();
+        assert_eq!(widths_dipped, widths_static);
+    }
+
+    #[test]
+    fn coder_partition_d5_reduction_row_order_pairs_at_every_row_with_step_59_and_step_60() {
+        // Strict-composition pin: at every row the paired entry is
+        // exactly the index-aligned zip of step 59's LTmin vector
+        // with step 60's width vector. Walk every row and verify
+        // both columns individually agree with the underlying single-
+        // column accessors.
+        let cb = |omega: u16| (f64::from(omega) - 256.0) * 0.5;
+        let paired = coder_partition_d5_reduction_row_order(cb);
+        let ltmin = coder_partition_d5_ltg_min_row_order(cb);
+        let widths = coder_partition_d5_width_row_order();
+        for i in 0..32 {
+            assert!(
+                (paired[i].ltmin_db - ltmin[i]).abs() < 1.0e-12,
+                "row {i}: paired ltmin_db {} != step 59 {}",
+                paired[i].ltmin_db,
+                ltmin[i],
+            );
+            assert_eq!(
+                paired[i].width_n, widths[i],
+                "row {i}: paired width_n {} != step 60 {}",
+                paired[i].width_n, widths[i],
+            );
+        }
     }
 }

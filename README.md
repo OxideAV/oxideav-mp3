@@ -2373,6 +2373,96 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 61 (r260)** — Annex D Model 1 §D.1 Step 8 paired
+`(LTmin_n, width_n)` row-order vector over Table D.5. Phase 2
+step 59 (r258) exposed the row-order LTmin vector
+`[LTmin_1, …, LTmin_32]` the Layer I / Layer II bit-allocation
+loop reduces from `LTg(ω)`; Phase 2 step 60 (r259) exposed the
+row-order width vector `[width_1, …, width_32]` it pairs with
+LTmin at every row. r260 closes the per-row pairing: the bit-
+allocation loop walks the 32 coder partitions in row order and at
+every row consumes **both** columns paired as the partition's
+"per-row brief" (target threshold + width flag). The LTmin column
+closes over the caller's `LTg(ω)` callback (run-time-dependent);
+the width column is a static Table D.5 column.
+
+A new free function plus a new public struct:
+
+* `CoderPartitionD5Reduction { ltmin_db: f64, width_n: u16 }` — a
+  single row of the bit-allocation input. `ltmin_db` carries the
+  inclusive minimum of `LTg(ω)` (dB) over the partition's FFT-
+  line range; `width_n` is the static Table D.5 column value.
+* `coder_partition_d5_reduction_row_order<F: Fn(u16) -> f64>(
+  ltg_per_line) -> [CoderPartitionD5Reduction; 32]` — index-
+  aligned zip of Phase 2 step 59's row-order LTmin reducer
+  `coder_partition_d5_ltg_min_row_order` (closed over the
+  caller's `LTg(ω)` callback) with Phase 2 step 60's row-order
+  width vector `coder_partition_d5_width_row_order`. Element `i`
+  holds the `(LTmin_{i + 1}, width_{i + 1})` pair (the spec's
+  1-based `n` in 0-based array form).
+
+**Index convention.** 0-based on the returned slice; element
+`i` holds `(LTmin_{i + 1}, width_{i + 1})`. The spec's 1-based
+partition index `n ∈ 1..=32` maps to array index `i = n - 1 ∈
+0..=31`. Partition 0 (the degenerate single-line `width_n = 0`
+row carrying `ωlow_0` only) is excluded from the vector for
+index consistency with steps 59 and 60 — the downstream bit-
+allocation loop walks partitions `1..=32` and does not consult
+partition 0, matching the spec's coder-partition usage.
+
+**Composition rather than introduction.** A pure index-aligned
+zip of the two existing row-order columns. No spec arithmetic is
+introduced — only the per-row pairing at the same array index,
+which is exactly the per-row input the Layer I / Layer II bit-
+allocation loop reads in lockstep. The width column is fully
+determined by the static Table D.5 column (no run-time inputs)
+and so is invariant across callbacks; the LTmin column closes
+over the caller's `LTg(ω)`. Structural orthogonality keeps the
+two columns independent — neither influences the other's
+computation.
+
+**Caller cost.** The `LTg(ω)` callback is invoked exactly as
+many times as Phase 2 step 59 invokes it (one call per FFT line
+in `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)` summed over the table);
+the width vector adds no callback invocations.
+
+**Boundary semantics.** Inherit Phase 2 step 59's inclusive-on-
+both-ends reduction semantics unchanged for the LTmin column — a
+sharp dip on a shared boundary `ω = ωhigh_n = ωlow_{n+1}` enters
+**both** adjacent partitions' `LTmin`. The width column has no
+boundary semantics (it is a static per-row table value).
+
+Validated by 13 new lib unit tests in `psy::tests`. Length pin
+(32). Constant-callback fills every `ltmin_db` cell with the
+constant. LTmin column matches step 59 for a non-trivial line-
+dependent callback `LTg(ω) = sin(ω)`. Width column matches step
+60 across two different callbacks (structural orthogonality).
+Width invariant across callbacks. Width column matches the full
+verbatim Table D.5 literal `[0×12, 1×20]`. Identity callback
+`LTg(ω) = ω` returns `ωlow_n` per row. Negative-identity
+callback `LTg(ω) = -ω` returns `-ωhigh_n` per row. Transition
+pair pinned at array indices 11 and 12 (`width_n = 0` and `1`
+respectively). Endpoint pin at array indices 0 (partition 1,
+width 0) and 31 (partition 32, width 1). Idempotence for a pure
+callback `LTg(ω) = cos(ω)`. Single dip on a strict-interior line
+of partition 5 affects only that partition's `ltmin_db` with the
+width vector untouched. Strict-composition pairing at every row:
+both columns of the paired output agree with the underlying
+single-column accessors (`coder_partition_d5_ltg_min_row_order`
+and `coder_partition_d5_width_row_order`) under a non-trivial
+affine callback `LTg(ω) = (ω − 256) × 0.5`. Tests: 770 lib (was
+757 baseline; +13 unit). No external implementation consulted;
+only the Phase 2 step 59 row-order LTmin reducer
+`coder_partition_d5_ltg_min_row_order` and the Phase 2 step 60
+row-order width vector `coder_partition_d5_width_row_order` (and
+through them the Phase 2 step 58 per-partition reducer
+`coder_partition_d5_ltg_min`, the Phase 2 step 52 per-partition
+width accessor `coder_partition_d5_width`, and the underlying
+Table D.5 transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 - Layer I and Layer II coder partition table") were
+read.
+
 **Phase 2 step 60 (r259)** — Annex D Model 1 §D.1 Step 8 row-order
 `width_n` vector over Table D.5. Phase 2 step 59 (r258) broadcast
 the Phase 2 step 58 (r257) per-partition `LTg` minimum reducer
