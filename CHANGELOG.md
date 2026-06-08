@@ -8,6 +8,78 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 8 row-order LTmin vector over
+  Table D.5 (Phase 2 step 59). Phase 2 step 58 (r257) reduced the
+  per-FFT-line global masking threshold `LTg(ω)` over a single
+  coder partition `n ∈ 1..=32` by taking the minimum
+  `LTmin_n = min_{ω ∈ [ωlow_n, ωhigh_n]} LTg(ω)`. The Layer I /
+  Layer II bit-allocation loop consumes the full row-order vector
+  `[LTmin_1, LTmin_2, …, LTmin_32]` per frame, walking the 32
+  coder partitions in ascending-`n` order (the spec table's row
+  order, pinned at iteration order by Phase 2 step 55 / r254's
+  `coder_partition_d5_spans`). The Layer III outer-loop SNR-budget
+  analogue consumes the same per-partition vector. A new free
+  function
+  `coder_partition_d5_ltg_min_row_order<F: Fn(u16) -> f64>(
+  ltg_per_line) -> [f64; 32]` broadcasts the step 58 per-partition
+  reducer across the step 55 row-order iterator, returning a
+  32-element 0-based array where element `i` holds `LTmin_{i + 1}`
+  (the spec's 1-based partition index in 0-based array form).
+  Partition 0 (the degenerate single-line `width_n = 0` row
+  carrying `ωlow_0` only) is excluded — step 58 returns `None`
+  for `n = 0` because the reduction range is undefined without a
+  `ωlow_n` boundary in Table D.5; the downstream bit-allocation
+  loop walks partitions `1..=32` and does not consult partition 0,
+  matching the spec's coder-partition usage. Composition rather
+  than introduction: the accessor is a strict broadcast of step
+  58's single-partition reducer across the step 55 ascending-`n`
+  iterator — no new spec arithmetic is introduced, only the
+  per-partition fold expanded across all 32 recoverable rows.
+  Boundary semantics inherit from step 58 unchanged: a sharp dip
+  on a shared boundary `ω = ωhigh_n = ωlow_{n+1}` enters both
+  adjacent partitions' `LTmin` (the conservative-bit-allocation
+  reading the spec intends). A caller that wants single-assignment
+  binning uses the step 56 inverse accessor
+  `first_partition_containing_line` to bin per line before
+  folding. Complexity is `O(513)` per frame total — the sum of
+  every partition's inclusive line range — dominated by the
+  caller's `ltg_per_line` cost. 11 new lib unit tests pin: a
+  constant LTg ≡ C callback returns `[C; 32]` (every partition's
+  minimum over a flat dB curve is the constant); the 0-based-
+  array / 1-based-partition convention `out[0] = LTmin_1` (under
+  identity LTg the value equals ωlow_1 = 1, the table-wide lower
+  edge); strict-composition cross-check against a manual loop
+  calling the step 58 per-partition reducer for a non-trivial
+  callback `ω * 0.7 - 13`; the array length is exactly 32; every
+  cell is finite under a finite callback (no inf leak from the
+  `f64::INFINITY` seed); a single -100 dB dip at a partition's
+  interior middle line pulls only that partition's row down and
+  leaves every other partition at the baseline; shared-boundary
+  -50 dB dip at `ωhigh_5 = ωlow_6` pulls both adjacent partitions
+  to the dip value and leaves every other partition at the
+  baseline; end-to-end composition pin feeding the row-order
+  builder the Step 7 `global_masking_threshold_db` value at every
+  line (with a tonal masker at z = 5 Bark, SPL = 60 dB and a
+  synthetic `z(ω) = ω · 0.05` Bark stand-in until Step 1's
+  FFT-bin → Hz mapping lands) matched against the explicit per-
+  line fold; row-order vector is non-decreasing under the identity
+  callback (each `ωlow_n` grows strictly with `n` per the
+  Phase 2 step 50 boundary-monotonicity reading); table-wide
+  endpoint pin (`out[0] = ωlow_1`, `out[31] = ωlow_32`);
+  negative-identity `LTg(ω) = -ω` callback returns `-ωhigh_n` per
+  row (the highest line produces the most-negative reduction).
+  Tests: 745 lib (was 734 baseline; +11 unit). Provenance: only
+  the Phase 2 step 58 per-partition reducer
+  `coder_partition_d5_ltg_min` and the Phase 2 step 55 row-order
+  iterator `coder_partition_d5_spans` (and through them the Phase
+  2 step 44 Step 7 `global_masking_threshold_db` and the Table
+  D.5 transcription in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+  §"Table D.5 - Layer I and Layer II coder partition table") are
+  consulted; the row-order broadcast reading is the spec's per
+  Annex D Step 8 (informative Model 1 reduction); no external
+  implementation was read.
+
 - psy: Annex D Model 1 §D.1 Step 8 per-partition `LTg` minimum
   reduction (Phase 2 step 58). Phase 2 step 44 (r219) landed Step 7's
   per-FFT-line global masking threshold `LTg(i)` as

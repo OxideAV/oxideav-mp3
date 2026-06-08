@@ -2317,6 +2317,147 @@ where
     Some(range.map(ltg_per_line).fold(f64::INFINITY, f64::min))
 }
 
+// =====================================================================
+// Annex D Model 1 — §D.1 Step 8 row-order LTmin vector over Table D.5
+// (Phase 2 step 59 / r258).
+//
+// Spec context (clause D.1, ISO/IEC 11172-3:1993, informative annex):
+//
+//   Step 8 (Phase 2 step 58 / r257) reduces the per-FFT-line global
+//   masking threshold `LTg(ω)` (dB) over a single coder partition
+//   `n ∈ 1..=32` by taking the minimum
+//
+//       LTmin_n = min_{ω ∈ [ωlow_n, ωhigh_n]} LTg(ω)   dB
+//
+//   The Layer I / Layer II bit-allocation loop consumes the **full
+//   vector** `[LTmin_1, LTmin_2, …, LTmin_32]` per frame, walking the
+//   32 coder partitions in row order (the spec table's
+//   ascending-`n` presentation, pinned at row-order by Phase 2
+//   step 55 / r254's `coder_partition_d5_spans`). The Layer III
+//   outer-loop SNR-budget analogue consumes the same per-partition
+//   vector.
+//
+// Composition rather than introduction: this step is a strict
+// composition of the Phase 2 step 55 row-order partition iterator
+// `coder_partition_d5_spans` (which yields every recoverable
+// `n ∈ 1..=32` in ascending order) with the Phase 2 step 58
+// per-partition reducer `coder_partition_d5_ltg_min`. No new spec
+// arithmetic is introduced — only the broadcast of step 58's single-
+// partition reduction across all 32 recoverable partitions. The
+// `LTg(ω)` callback is the caller's, keeping this accessor pure
+// with respect to the masker selection pipeline (Steps 1-5), which
+// remain blocked on the PNG-only Table D.1 / D.2 / D.3 transcription
+// gap.
+//
+// The output is a 32-element `[f64; 32]` indexed 0-based, with
+// element `i` holding `LTmin_{i + 1}` (the spec's 1-based `n` in
+// 0-based array form). This matches the spec's row-order
+// presentation of Table D.5 (partition 0 is the degenerate
+// `width_n = 0` single-line row excluded from the reduction
+// targets — see Phase 2 step 58's `None`-on-`n = 0` clause) and is
+// the natural index the downstream Layer I / Layer II bit-allocation
+// loop walks against.
+//
+// Boundary semantics inherit from Phase 2 step 58 unchanged — the
+// reduction is inclusive on both ends, so a sharp dip on a shared
+// boundary `ω = ωhigh_n = ωlow_{n+1}` enters both adjacent
+// partitions' `LTmin`. A caller that wants single-assignment binning
+// uses the step 56 inverse accessor `first_partition_containing_line`
+// to bin each FFT line into exactly one partition before folding.
+// =====================================================================
+
+/// §D.1 Step 8 row-order minimum global masking threshold vector
+/// `[LTmin_1, LTmin_2, …, LTmin_32]` (dB) for every Layer I /
+/// Layer II coder partition `n ∈ 1..=32`. Element `i` of the
+/// returned `[f64; 32]` holds `LTmin_{i + 1}` (the spec's 1-based
+/// `n` in 0-based array form):
+///
+/// ```text
+/// LTmin_n = min_{ω ∈ [ωlow_n, ωhigh_n]} LTg(ω)   dB
+/// ```
+///
+/// The vector is the per-frame input the Layer I / Layer II bit-
+/// allocation loop consumes (Layer III's outer-loop SNR-budget
+/// analogue is the same per-partition vector). Each element is the
+/// most-conservative per-partition threshold — a single FFT line
+/// dipping below the partition's average threshold pulls the whole
+/// partition's `LTmin` down to that line's level (the encoder cannot
+/// afford to leak sub-threshold noise into the partition without
+/// becoming audible).
+///
+/// **Index convention.** 0-based on the returned slice;
+/// `out[i] = LTmin_{i + 1}`. The spec's 1-based partition index
+/// `n ∈ 1..=32` maps to array index `i = n - 1 ∈ 0..=31`. Partition
+/// 0 (the degenerate single-line `width_n = 0` row carrying `ωlow_0`
+/// only) is excluded from the vector — Phase 2 step 58 returns
+/// `None` for `n = 0` because the reduction range is undefined
+/// without a `ωlow_n` boundary in Table D.5. The downstream bit-
+/// allocation loop walks partitions `1..=32` and does not consult
+/// partition 0, matching the spec's coder-partition usage.
+///
+/// **Composition.** A pure broadcast of Phase 2 step 58's per-
+/// partition reducer [`coder_partition_d5_ltg_min`] across the
+/// Phase 2 step 55 row-order iterator [`coder_partition_d5_spans`].
+/// No spec arithmetic is introduced — only the broadcast of step
+/// 58's single-partition reduction across all 32 recoverable
+/// partitions, which is the row-order vector form the Layer I /
+/// Layer II bit-allocation loop consumes per frame. The `LTg(ω)`
+/// callback is the caller's, typically a closure closing over the
+/// static masker list + threshold-in-quiet curve — keeping this
+/// accessor pure with respect to the masker selection pipeline
+/// (Steps 1-5), which remain blocked on the PNG-only Table D.1 /
+/// D.2 / D.3 transcription gap. Once Steps 1-5 land the concrete
+/// `LTg(ω)` closure will be the one produced by Step 7's
+/// `global_masking_threshold_db` applied per line.
+///
+/// **Boundary semantics.** Inherits Phase 2 step 58's inclusive-on-
+/// both-ends reduction semantics unchanged: a sharp dip on a shared
+/// boundary `ω = ωhigh_n = ωlow_{n+1}` enters **both** adjacent
+/// partitions' `LTmin` (the conservative-bit-allocation reading the
+/// spec intends, where two adjacent partitions both see the shared
+/// boundary line). A caller that wants every FFT line to enter
+/// exactly one partition's reduction (single-assignment binning) uses
+/// [`first_partition_containing_line`] to bin per line before
+/// folding outside this accessor.
+///
+/// **Implementation.** A pure composition of
+/// [`coder_partition_d5_spans`] (Phase 2 step 55) and
+/// [`coder_partition_d5_ltg_min`] (Phase 2 step 58): for each
+/// recoverable span the function calls the step 58 reducer with
+/// the caller's `ltg_per_line` callback. The `.expect("…")` on the
+/// step 58 result is infallible by construction — every span
+/// emitted by [`coder_partition_d5_spans`] has `index ∈ 1..=32`,
+/// the exact range step 58 returns `Some(_)` over. Complexity is
+/// `O(513)` per frame total — `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`
+/// summed over the table — dominated by the caller's `ltg_per_line`
+/// cost.
+///
+/// Provenance: only the Phase 2 step 58 per-partition reducer
+/// [`coder_partition_d5_ltg_min`] and the Phase 2 step 55 row-order
+/// iterator [`coder_partition_d5_spans`] (and through them the
+/// underlying Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") are
+/// consulted. The row-order broadcast reading is the spec's per
+/// Annex D Step 8 (informative Model 1 reduction); no external
+/// implementation was read.
+#[must_use]
+pub fn coder_partition_d5_ltg_min_row_order<F>(ltg_per_line: F) -> [f64; 32]
+where
+    F: Fn(u16) -> f64,
+{
+    let mut out = [f64::INFINITY; 32];
+    for span in coder_partition_d5_spans() {
+        // `span.index ∈ 1..=32` by step 55 construction; the step 58
+        // reducer is `Some(_)` exactly over that range so the
+        // `.expect` is infallible.
+        let i = (span.index - 1) as usize;
+        out[i] = coder_partition_d5_ltg_min(span.index, &ltg_per_line)
+            .expect("n ∈ 1..=32 is recoverable by step 58 / Table D.5");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5664,6 +5805,266 @@ mod tests {
                 via_step58.is_finite(),
                 "partition {}: LTmin = {via_step58} is not finite",
                 span.index,
+            );
+        }
+    }
+
+    // ---------- Phase 2 step 59 / r258 — row-order LTmin vector ----------
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_constant_callback_fills_every_cell() {
+        // A constant LTg ≡ C callback must produce [C; 32]: every
+        // partition's minimum over a flat dB curve is the constant.
+        const C: f64 = -12.5;
+        let v = coder_partition_d5_ltg_min_row_order(|_| C);
+        assert_eq!(v.len(), 32);
+        for (i, x) in v.iter().enumerate() {
+            assert!(
+                (x - C).abs() < 1.0e-9,
+                "index {i} (partition {}): got {x}, expected {C}",
+                i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_index_zero_holds_partition_one() {
+        // Pin the 0-based-array / 1-based-partition convention:
+        // out[0] = LTmin_1 (partition 1's reduction, not partition 0's).
+        // Use an identity LTg(ω) = ω — partition 1's minimum is
+        // ωlow_1 (table-wide lower edge ω = 1) and partition 32's
+        // minimum is ωlow_32. Verify against the per-partition
+        // accessor for every row.
+        let v = coder_partition_d5_ltg_min_row_order(f64::from);
+        for (i, &got) in v.iter().enumerate() {
+            let n = (i + 1) as u16;
+            let expected =
+                coder_partition_d5_ltg_min(n, f64::from).expect("n ∈ 1..=32 is recoverable");
+            assert!(
+                (got - expected).abs() < 1.0e-9,
+                "index {i} (partition {n}): row-order vec = {got}, per-partition = {expected}",
+            );
+        }
+        // Spot-check: out[0] is partition 1's reduction, which is
+        // ωlow_1 = 1 for the identity callback (table-wide lower
+        // edge pinned at step 51).
+        let (lo_1, _hi_1) = coder_partition_d5_line_range(1).unwrap();
+        assert!(
+            (v[0] - f64::from(lo_1)).abs() < 1.0e-9,
+            "out[0] = {} should equal ωlow_1 = {lo_1} under identity LTg",
+            v[0],
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_matches_per_partition_for_arbitrary_callback() {
+        // Strict-composition pin: the row-order vector must agree
+        // element-by-element with a manual loop calling the step 58
+        // per-partition reducer for n ∈ 1..=32. Use a non-trivial
+        // callback to exercise the broadcast under realistic dB
+        // values.
+        let ltg = |omega: u16| f64::from(omega) * 0.7 - 13.0;
+        let v = coder_partition_d5_ltg_min_row_order(ltg);
+        for n in 1_u16..=32 {
+            let expected = coder_partition_d5_ltg_min(n, ltg).expect("n ∈ 1..=32 is recoverable");
+            let got = v[(n - 1) as usize];
+            assert!(
+                (got - expected).abs() < 1.0e-9,
+                "partition {n}: row-order = {got}, per-partition = {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_returns_exactly_thirty_two_elements() {
+        // The row-order vector covers partitions 1..=32 (Phase 2 step
+        // 58 returns None for n = 0 and n = 33); the array length is
+        // exactly 32.
+        let v = coder_partition_d5_ltg_min_row_order(|_| 0.0);
+        assert_eq!(v.len(), 32);
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_all_cells_finite_for_finite_callback() {
+        // The f64::INFINITY initialisation must be replaced in every
+        // cell — a finite LTg callback should produce 32 finite values
+        // (no inf leak from the seed).
+        let v = coder_partition_d5_ltg_min_row_order(|omega| -f64::from(omega));
+        for (i, x) in v.iter().enumerate() {
+            assert!(
+                x.is_finite(),
+                "index {i} (partition {}): got non-finite {x}",
+                i + 1,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_single_dip_only_affects_target_partition() {
+        // Single-assignment binning regression pin: a -100 dB dip at
+        // the *middle* line of partition `target` (not on a shared
+        // boundary) must pull down only the target partition's LTmin
+        // in the row-order vector and leave every other partition at
+        // the baseline.
+        const BASELINE: f64 = 5.0;
+        const DIP: f64 = -100.0;
+        // Use partition 5 (a typical mid-table partition); its line
+        // range is (ωlow_5, ωhigh_5) = (65, 80) from Table D.5.
+        let target: u16 = 5;
+        let (lo, hi) = coder_partition_d5_line_range(target).unwrap();
+        let middle = lo + (hi - lo) / 2;
+        // Ensure middle is interior (not on either inclusive end) so
+        // no shared-boundary spill into neighbouring partitions.
+        assert!(middle > lo && middle < hi, "middle line must be interior");
+        let v = coder_partition_d5_ltg_min_row_order(
+            |omega| if omega == middle { DIP } else { BASELINE },
+        );
+        for (i, &got) in v.iter().enumerate() {
+            let n = (i + 1) as u16;
+            let expected = if n == target { DIP } else { BASELINE };
+            assert!(
+                (got - expected).abs() < 1.0e-9,
+                "partition {n}: got {got}, expected {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_shared_boundary_dip_pulls_both_neighbours() {
+        // Shared-boundary semantics pin: a -50 dB dip placed exactly
+        // on a shared boundary line ωhigh_n = ωlow_{n+1} must pull
+        // both partitions n and n+1 to -50 dB in the row-order vector
+        // (the conservative-bit-allocation reading inherited from
+        // step 58). Use the boundary between partitions 5 and 6:
+        // ωhigh_5 = ωlow_6.
+        const BASELINE: f64 = 10.0;
+        const DIP: f64 = -50.0;
+        let target: u16 = 5;
+        let (_lo_n, hi_n) = coder_partition_d5_line_range(target).unwrap();
+        let (lo_n1, _hi_n1) = coder_partition_d5_line_range(target + 1).unwrap();
+        // The dual-role ωlow_{n+1} / ωhigh_n column means the shared
+        // boundary line is precisely hi_n = lo_n1.
+        assert_eq!(hi_n, lo_n1, "shared-boundary precondition");
+        let v = coder_partition_d5_ltg_min_row_order(
+            |omega| if omega == hi_n { DIP } else { BASELINE },
+        );
+        // Both adjacent partitions register the dip.
+        assert!(
+            (v[(target - 1) as usize] - DIP).abs() < 1.0e-9,
+            "partition {target}: got {}, expected {DIP}",
+            v[(target - 1) as usize],
+        );
+        assert!(
+            (v[target as usize] - DIP).abs() < 1.0e-9,
+            "partition {}: got {}, expected {DIP}",
+            target + 1,
+            v[target as usize],
+        );
+        // Non-adjacent partitions stay at baseline.
+        for (i, &got) in v.iter().enumerate() {
+            let n = (i + 1) as u16;
+            if n == target || n == target + 1 {
+                continue;
+            }
+            assert!(
+                (got - BASELINE).abs() < 1.0e-9,
+                "partition {n}: got {got}, expected baseline {BASELINE}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_composes_with_step_seven_global_threshold() {
+        // End-to-end composition pin: feed the row-order vector
+        // builder the Step 7 `global_masking_threshold_db` value at
+        // every FFT line (with one tonal masker at z = 5 Bark, SPL =
+        // 60 dB and a synthetic z(ω) = ω · 0.05 Bark stand-in until
+        // Step 1's FFT-bin → Hz table lands). Every cell of the
+        // row-order vector must agree with the explicit per-line
+        // fold via step 57's iterator.
+        let masker = Masker {
+            kind: MaskerKind::Tonal,
+            z_bark: 5.0,
+            spl_db: 60.0,
+        };
+        let maskers = [masker];
+        let z_of = |omega: u16| f64::from(omega) * 0.05;
+        let ltg = |omega: u16| {
+            let z_i = z_of(omega);
+            global_masking_threshold_db(&maskers, z_i, -5.0)
+        };
+        let v = coder_partition_d5_ltg_min_row_order(ltg);
+        for n in 1_u16..=32 {
+            let expected = coder_partition_d5_omega_iter(n)
+                .expect("n ∈ 1..=32 is recoverable")
+                .map(ltg)
+                .fold(f64::INFINITY, f64::min);
+            let got = v[(n - 1) as usize];
+            assert!(
+                (got - expected).abs() < 1.0e-9,
+                "partition {n}: row-order = {got}, explicit fold = {expected}",
+            );
+            assert!(
+                got.is_finite(),
+                "partition {n}: LTmin = {got} is not finite"
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_walks_partitions_in_ascending_order() {
+        // The row-order vector reflects ascending-`n` order: feed an
+        // identity callback and verify out[i] is monotonically non-
+        // decreasing across i ∈ 0..31 (every ωlow_n grows with n by
+        // the strictly-monotonic boundary pinned at step 50).
+        let v = coder_partition_d5_ltg_min_row_order(f64::from);
+        for w in v.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "row-order should be non-decreasing under identity LTg: {} > {}",
+                w[0],
+                w[1],
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_endpoints_match_table_d5_edges() {
+        // Pin the table-wide edges via the identity callback:
+        // out[0]  = ωlow_1  (partition 1, table-wide lower edge)
+        // out[31] = ωlow_32 (partition 32, the last recoverable
+        //                    partition's lower line)
+        // The minimum over an inclusive range under f64::from is the
+        // range's lower endpoint.
+        let v = coder_partition_d5_ltg_min_row_order(f64::from);
+        let (lo_1, _) = coder_partition_d5_line_range(1).unwrap();
+        let (lo_32, _) = coder_partition_d5_line_range(32).unwrap();
+        assert!(
+            (v[0] - f64::from(lo_1)).abs() < 1.0e-9,
+            "out[0] = {} should equal ωlow_1 = {lo_1}",
+            v[0],
+        );
+        assert!(
+            (v[31] - f64::from(lo_32)).abs() < 1.0e-9,
+            "out[31] = {} should equal ωlow_32 = {lo_32}",
+            v[31],
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltg_min_row_order_negative_identity_returns_omega_high_per_row() {
+        // Negative-identity LTg(ω) = -ω callback: each partition's
+        // minimum is the *most negative* line, which is -ωhigh_n
+        // (the inclusive upper endpoint). Verify per-row in the
+        // 0-based vector matches -ωhigh_{i+1}.
+        let v = coder_partition_d5_ltg_min_row_order(|omega| -f64::from(omega));
+        for n in 1_u16..=32 {
+            let (_lo, hi) = coder_partition_d5_line_range(n).unwrap();
+            let got = v[(n - 1) as usize];
+            let expected = -f64::from(hi);
+            assert!(
+                (got - expected).abs() < 1.0e-9,
+                "partition {n}: got {got}, expected -ωhigh_n = {expected}",
             );
         }
     }
