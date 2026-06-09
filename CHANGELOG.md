@@ -8,6 +8,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 8 width-gated `log2(LTmin_lin_n)`
+  column projection over Table D.5 (Phase 2 step 65). Phase 2 step
+  64 (r263) projected the width-gated paired `(LTmin_n, width_n)`
+  vector onto its linear-energy presentation, exposing two
+  strictly-positive per-band subarrays
+  (`narrow_band: [f64; 12]` for partitions `n ∈ 1..=12` with
+  `width_n = 0`; `wide_band: [f64; 20]` for partitions `n ∈ 13..=32`
+  with `width_n = 1`). Several Step 9 / Step 10 / outer-loop
+  consumers do not read the per-band linear-energy threshold
+  directly — they read its base-2 logarithm
+  `log2(10^(LTmin_n / 10))`, the natural per-band bit-budget proxy
+  in the Layer I/II bit-allocation loop (every factor-of-two change
+  in linear masking energy corresponds to exactly one unit on the
+  `log2` axis). The `log2` conversion is the standard `f64::log2`
+  primitive — it introduces no new spec arithmetic. A new free
+  function `coder_partition_d5_ltmin_log2_row_order_by_width<F:
+  Fn(u16) -> f64>(ltg_per_line) -> CoderPartitionD5LtminLog2ByWidth`
+  calls Phase 2 step 64's
+  `coder_partition_d5_ltmin_linear_row_order_by_width` once and
+  applies `cell.log2()` to each of the 12 + 20 cells, producing a
+  new struct `CoderPartitionD5LtminLog2ByWidth { narrow_band:
+  [f64; 12], wide_band: [f64; 20] }` whose entries are finite for
+  any callback returning finite dB at every FFT line (or
+  `+INFINITY` only under the degenerate condition steps 63/64
+  already document). The `LTg(ω)` callback is invoked exactly as
+  many times as Phase 2 step 64 invokes it (one call per FFT line
+  in `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`). Strict monotonicity
+  is preserved cell-wise (`log2` is strictly monotone on the
+  positive reals). Width invariant pinned structurally (implicit
+  in subarray choice). Identity with the dB column: every output
+  cell equals step 63's matching dB cell multiplied by
+  `log2(10) / 10 ≈ 0.33219` (a strictly-proportional rescaling).
+  Tests: 822 lib (was 810 baseline; +12 unit) covering subarray
+  lengths (12 / 20), zero-dB callback maps to zero (`log2(1) = 0`)
+  in every cell, finiteness for any finite-dB callback, cell-wise
+  equality with `log2(step64_linear)` under a non-trivial callback
+  (strict-projection cross-check), spot pin at uniform +3 dB
+  (cell ≈ 0.9966), odd-symmetry around zero under sign-flipped
+  callbacks (uniform +3 dB and −3 dB cells sum to zero per cell),
+  strict proportionality to step 63's dB column with constant
+  `log2(10) / 10`, strict monotonicity under a uniform −1 dB shift
+  (every cell shifts by the same constant `−log2(10)/10`),
+  idempotent for a pure callback, dip in narrow band only affects
+  narrow band (cross-block insulation), dip in wide band only
+  affects wide band (cross-block insulation), and partition-of-step
+  59 cross-check (narrow ++ wide log2 cells, scaled back to dB by
+  `10 · log10(2)`, equal step 59's row-order LTmin vector).
 - psy: Annex D Model 1 §D.1 Step 8 width-gated `LTmin_n` column
   projection over Table D.5 converted to linear energy
   (`10^(LTmin_n / 10)`) (Phase 2 step 64). Phase 2 step 63 (r262)

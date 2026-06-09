@@ -3292,6 +3292,189 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// Annex D Model 1 — §D.1 Step 8 width-gated `log2(LTmin_lin_n)` column
+// projection over Table D.5 (Phase 2 step 65 / r264).
+//
+// Step 8 (Phase 2 steps 58 / 59 / 60 / 61 / 62 / 63 / 64) produces, per
+// coder partition `n ∈ 1..=32`, the per-partition minimum global
+// masking threshold `LTmin_n` in two presentations — dB (step 63) and
+// linear energy `10^(LTmin_n / 10)` (step 64) — already split at the
+// single width-column 0 → 1 transition (between rows 12 and 13):
+//
+//   narrow_band[i] = 10^(LTmin_{i + 1}  / 10)   for i ∈ 0..=11  (width_n = 0)
+//   wide_band[j]   = 10^(LTmin_{j + 13} / 10)   for j ∈ 0..=19  (width_n = 1)
+//
+// Several Step 9 / Step 10 / outer-loop consumers do not read the
+// per-band linear-energy threshold directly — they read its base-2
+// logarithm `log2(10^(LTmin_n / 10))`. The base-2 log of a linear-
+// energy threshold is the natural per-band bit-budget proxy in the
+// Layer I/II bit-allocation loop: a linear-energy ratio expressed in
+// "bits" maps one factor of two in masking power to a single bit of
+// allocated dynamic range. The `log2` transformation is a strict
+// mathematical primitive — `f64::log2` — and introduces no new spec
+// arithmetic.
+//
+// Step 65 exposes that conversion as a free function returning a new
+// `CoderPartitionD5LtminLog2ByWidth` carrying the same row-order
+// subarray split (12 narrow + 20 wide) but with each cell holding
+// `log2(linear_n) = log2(10^(LTmin_n / 10)) = LTmin_n · log2(10) / 10`
+// instead of a linear-energy value. Like step 64, the function is a
+// pure projection of step 62's struct — it invokes the caller's
+// `LTg(ω)` callback exactly the same number of times as step 64 (and
+// through it steps 63 / 62 / 61 / 60 / 59 / 58) invokes it (one call
+// per FFT line in `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`), and applies
+// one `f64::log2` per output cell of step 64's linear projection.
+// ---------------------------------------------------------------------------
+
+/// Per-partition minimum global masking threshold `LTmin_n` over
+/// Table D.5 in **`log2` of linear energy** (`log2(10^(LTmin_n / 10))`),
+/// split by the `width_n` column.
+///
+/// Produced by [`coder_partition_d5_ltmin_log2_row_order_by_width`]
+/// (the `log2` projection of Phase 2 step 64's
+/// [`coder_partition_d5_ltmin_linear_row_order_by_width`]).
+///
+/// The two subarrays carry the partition's minimum global masking
+/// threshold per row of Table D.5, expressed as the base-2 logarithm
+/// of the linear-energy presentation. They preserve step 64's
+/// row-order indexing and the same split point (12) Table D.5's
+/// `width_n` column pins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoderPartitionD5LtminLog2ByWidth {
+    /// `log2(linear_n)` for the contiguous prefix of rows with
+    /// `width_n = 0` (partitions `n ∈ 1..=12`, the lower FFT-line
+    /// block). Twelve elements in row order; element `i` carries
+    /// `log2(10^(LTmin_{i + 1} / 10))`. Cells are finite when step 64's
+    /// matching cell is finite and strictly positive (always the case
+    /// for any callback returning a finite dB value at every FFT line
+    /// in the partition's range); `+INFINITY` only when step 64's
+    /// matching cell is `+INFINITY` (the degenerate all-`INFINITY`
+    /// callback).
+    pub narrow_band: [f64; 12],
+    /// `log2(linear_n)` for the contiguous suffix of rows with
+    /// `width_n = 1` (partitions `n ∈ 13..=32`, the upper FFT-line
+    /// block). Twenty elements in row order; element `j` carries
+    /// `log2(10^(LTmin_{j + 13} / 10))`. Same finiteness convention as
+    /// `narrow_band`.
+    pub wide_band: [f64; 20],
+}
+
+/// §D.1 Step 8 width-gated `LTmin_n` column projection over Table D.5
+/// converted to **`log2` of linear energy** (`log2(10^(LTmin_n / 10))`).
+/// Returns a [`CoderPartitionD5LtminLog2ByWidth`] holding:
+///
+/// ```text
+/// narrow_band[i] = log2(10^(LTmin_{i + 1}  / 10))   for i ∈ 0..=11  (width_n = 0)
+/// wide_band[j]   = log2(10^(LTmin_{j + 13} / 10))   for j ∈ 0..=19  (width_n = 1)
+/// ```
+///
+/// This is the base-2 logarithm presentation of Phase 2 step 64's
+/// width-gated per-band linear-energy column. The `log2` conversion is
+/// the natural per-band bit-budget proxy in the Layer I/II
+/// bit-allocation loop: every factor-of-two change in linear masking
+/// energy corresponds to exactly one unit on the `log2` axis, which is
+/// the unit Step 9's signal-to-mask ratio and the outer loop's per-band
+/// bit-demand summation both work in. It introduces no new spec
+/// arithmetic — `log2` is a pure `f64::log2` primitive.
+///
+/// **Index convention.** 0-based on each subarray independently.
+/// `narrow_band[i]` carries `log2(10^(LTmin_{i + 1}  / 10))`;
+/// `wide_band[j]`   carries `log2(10^(LTmin_{j + 13} / 10))`. The split
+/// point (12) is constant — preserved verbatim from Phase 2 step 64
+/// (and through it step 63 / 62 / 60).
+///
+/// **Composition.** A pure logarithmisation of Phase 2 step 64's
+/// [`coder_partition_d5_ltmin_linear_row_order_by_width`]. The `LTg(ω)`
+/// callback is invoked exactly as many times as step 64 invokes it
+/// (one call per FFT line in
+/// `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`); each output cell is
+/// `input_cell_linear.log2()`.
+///
+/// **Identity with the dB column.** `log2` of step 64's linear cell
+/// equals `LTmin_n · log2(10) / 10` — a strictly proportional rescaling
+/// of step 63's dB column by the constant `log2(10) / 10 ≈ 0.33219`.
+/// This makes the `log2` view equivalent in information content to
+/// the dB view (both preserve the same ordering and same per-band
+/// magnitudes up to a constant); the `log2` view is what consumers
+/// need when their downstream summation is in linear-energy bit units
+/// (a power-of-two quantisation step), and the dB view is what
+/// consumers need when their downstream summation is in dB
+/// (a power-of-ten quantisation step). Both are pure projections of
+/// step 62.
+///
+/// **Monotonicity.** `log2` is strictly monotone on the positive
+/// reals — `a < b ⇔ log2(a) < log2(b)` for `0 < a, b < ∞` — so the
+/// cell-wise ordering is preserved. A partition whose `LTmin_n` is
+/// strictly less than another partition's `LTmin_n` (in any of the
+/// dB, linear, or log2 presentations) will have a strictly smaller
+/// `log2` cell at the corresponding row index, and vice versa.
+///
+/// **Sign convention.** Unlike the linear-energy presentation
+/// (`> 0` always) and the dB presentation (sign unconstrained), the
+/// `log2` cells can be of either sign: `log2(x) < 0 ⇔ x < 1`, i.e.
+/// every cell whose linear-energy threshold is strictly less than
+/// unit energy (one in the integer pulse-code modulation grid) sits
+/// below zero on the `log2` axis. A `0` cell corresponds to unit
+/// linear energy (`10^0 = 1`), which corresponds to a `0 dB` LTmin.
+///
+/// **Width invariant.** The width column is implicit in the choice
+/// of subarray — every cell of the returned `narrow_band` corresponds
+/// to a partition with `width_n = 0`; every cell of the returned
+/// `wide_band` corresponds to a partition with `width_n = 1`. The
+/// invariant is structural — pinned at the same split point (12)
+/// Phase 2 step 64 pins.
+///
+/// **Boundary semantics.** Inherits Phase 2 step 64's (and through
+/// it step 63 / 62 / 61 / 58 / 59's) inclusive-on-both-ends `LTmin_n`
+/// reduction semantics unchanged. The logarithmisation has no
+/// boundary semantics of its own — it is a pure cell-wise
+/// transformation reading exactly one input cell per output cell.
+///
+/// **Implementation.** Calls
+/// [`coder_partition_d5_ltmin_linear_row_order_by_width`] once (folding
+/// the caller's callback over every recoverable partition's FFT-line
+/// range) and applies `f64::log2` to each cell of each subarray into
+/// the matching output subarray. The conversion is structurally
+/// pinned at the same index 12 the static width-column transition
+/// lives at — Phase 2 step 60's row-order width vector matches the
+/// pattern `[0; 12]` followed by `[1; 20]` exactly and Phase 2 step 64
+/// inherits the split point verbatim.
+///
+/// Provenance: only the Phase 2 step 64 width-gated linear-energy
+/// `LTmin_n` accessor [`coder_partition_d5_ltmin_linear_row_order_by_width`]
+/// (and through it the Phase 2 step 63 width-gated dB column accessor,
+/// the Phase 2 step 62 width-gated paired-vector accessor, the Phase
+/// 2 step 61 row-order paired vector, the Phase 2 step 59 / 60
+/// row-order LTmin and width vectors, the Phase 2 step 58
+/// per-partition reducer, the Phase 2 step 52 per-partition width
+/// accessor, and the underlying Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") is
+/// consulted. The `f64::log2` primitive is the in-tree standard
+/// library call; no external implementation was read.
+#[must_use]
+pub fn coder_partition_d5_ltmin_log2_row_order_by_width<F>(
+    ltg_per_line: F,
+) -> CoderPartitionD5LtminLog2ByWidth
+where
+    F: Fn(u16) -> f64,
+{
+    let lin = coder_partition_d5_ltmin_linear_row_order_by_width(ltg_per_line);
+    let mut narrow = [f64::INFINITY; 12];
+    let mut wide = [f64::INFINITY; 20];
+    for (i, &cell_lin) in lin.narrow_band.iter().enumerate() {
+        narrow[i] = cell_lin.log2();
+    }
+    for (j, &cell_lin) in lin.wide_band.iter().enumerate() {
+        wide[j] = cell_lin.log2();
+    }
+    CoderPartitionD5LtminLog2ByWidth {
+        narrow_band: narrow,
+        wide_band: wide,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8131,6 +8314,277 @@ mod tests {
         for (j, &row_db) in row_order.iter().enumerate().skip(12) {
             let idx = j - 12;
             let recovered_db = 10.0 * split.wide_band[idx].log10();
+            assert!(
+                (recovered_db - row_db).abs() < 1.0e-9,
+                "wide band index {idx}: recovered {recovered_db} dB != step 59 {row_db} dB",
+            );
+        }
+    }
+
+    // ---- Phase 2 step 65 / r264 — width-gated `log2(LTmin_lin_n)` column
+    // projection over Table D.5 (logarithmisation of step 64's per-band
+    // linear-energy column).
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_lengths_are_twelve_and_twenty() {
+        // Structural pin: 12 narrow + 20 wide cells, matching step 64.
+        let split = coder_partition_d5_ltmin_log2_row_order_by_width(|_| 0.0);
+        assert_eq!(split.narrow_band.len(), 12);
+        assert_eq!(split.wide_band.len(), 20);
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_zero_db_is_zero_log2() {
+        // 0 dB → linear 1.0 → log2(1.0) = 0.0 in every cell.
+        let split = coder_partition_d5_ltmin_log2_row_order_by_width(|_| 0.0);
+        for &v in &split.narrow_band {
+            assert!(v.abs() < 1.0e-12, "narrow cell {v} != 0.0");
+        }
+        for &v in &split.wide_band {
+            assert!(v.abs() < 1.0e-12, "wide cell {v} != 0.0");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_finite_for_finite_callback() {
+        // Every output cell is finite when the callback returns finite
+        // dB at every FFT line (step 64's positivity guarantees
+        // `log2(strictly_positive) ∈ ℝ`).
+        let cb = |omega: u16| -> f64 { -25.0 + f64::from(omega) * 0.07 };
+        let split = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        for &v in &split.narrow_band {
+            assert!(v.is_finite(), "narrow cell {v} is not finite");
+        }
+        for &v in &split.wide_band {
+            assert!(v.is_finite(), "wide cell {v} is not finite");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_matches_step64_log2() {
+        // Cell-wise relation: log2[i] = log2(linear[i]) exactly,
+        // reusing the same callback for both projections.
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.3 - 1.5 };
+        let log2 = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        let lin = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
+        for (i, (&l2, &li)) in log2
+            .narrow_band
+            .iter()
+            .zip(lin.narrow_band.iter())
+            .enumerate()
+        {
+            let expect = li.log2();
+            assert!(
+                (l2 - expect).abs() < 1.0e-12,
+                "narrow {i}: log2 {l2} != log2(lin {li}) = {expect}",
+            );
+        }
+        for (j, (&l2, &li)) in log2.wide_band.iter().zip(lin.wide_band.iter()).enumerate() {
+            let expect = li.log2();
+            assert!(
+                (l2 - expect).abs() < 1.0e-12,
+                "wide {j}: log2 {l2} != log2(lin {li}) = {expect}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_three_db_is_pin() {
+        // Spot pin: a uniform +3 dB callback produces `log2(10^0.3)` in
+        // every cell. log10(2) ≈ 0.30103, so log2(10^0.3) =
+        // 0.3 / log10(2) ≈ 0.9966.
+        let split = coder_partition_d5_ltmin_log2_row_order_by_width(|_| 3.0);
+        let expect = 3.0_f64 / 10.0 / 2.0_f64.log10();
+        for &v in &split.narrow_band {
+            assert!((v - expect).abs() < 1.0e-12, "narrow cell {v} != {expect}");
+        }
+        for &v in &split.wide_band {
+            assert!((v - expect).abs() < 1.0e-12, "wide cell {v} != {expect}");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_minus_three_db_is_sign_flipped() {
+        // log2 is odd-symmetric around log2(1.0) = 0: a uniform −3 dB
+        // callback produces a cell equal to the negative of the uniform
+        // +3 dB cell (both sit at `linear = 10^(±0.3) = 2.0^(±x)` where
+        // `x = 0.3 / log10(2)`).
+        let hi = coder_partition_d5_ltmin_log2_row_order_by_width(|_| 3.0);
+        let lo = coder_partition_d5_ltmin_log2_row_order_by_width(|_| -3.0);
+        for (i, (&h, &l)) in hi.narrow_band.iter().zip(lo.narrow_band.iter()).enumerate() {
+            assert!((h + l).abs() < 1.0e-12, "narrow {i}: hi {h} + lo {l} != 0");
+        }
+        for (j, (&h, &l)) in hi.wide_band.iter().zip(lo.wide_band.iter()).enumerate() {
+            assert!((h + l).abs() < 1.0e-12, "wide {j}: hi {h} + lo {l} != 0");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_is_proportional_to_step63_db() {
+        // Identity: every output cell = step 63's matching dB cell
+        // multiplied by `log2(10) / 10` (the dB → log2-linear constant).
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.42 + 1.7 };
+        let log2 = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        let db = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let k = 10.0_f64.log2() / 10.0;
+        for (i, (&l2, &d)) in log2
+            .narrow_band
+            .iter()
+            .zip(db.narrow_band.iter())
+            .enumerate()
+        {
+            let expect = d * k;
+            assert!(
+                (l2 - expect).abs() < 1.0e-12,
+                "narrow {i}: log2 {l2} != {d} dB × {k} = {expect}",
+            );
+        }
+        for (j, (&l2, &d)) in log2.wide_band.iter().zip(db.wide_band.iter()).enumerate() {
+            let expect = d * k;
+            assert!(
+                (l2 - expect).abs() < 1.0e-12,
+                "wide {j}: log2 {l2} != {d} dB × {k} = {expect}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_monotone_in_db_per_cell() {
+        // Strict monotonicity: a callback that everywhere returns
+        // (cb_a − 1.0) dB produces a log2 cell that is strictly smaller
+        // (in fact, shifted by exactly −log2(10)/10 ≈ −0.33219 from)
+        // the log2 cell of a callback returning cb_a dB. Because every
+        // partition's min is shifted by exactly −1 dB, the log2 shift
+        // is identical at every cell.
+        let cb_hi = |omega: u16| -> f64 { f64::from(omega) * 0.5 + 3.0 };
+        let cb_lo = |omega: u16| -> f64 { f64::from(omega) * 0.5 + 2.0 };
+        let hi = coder_partition_d5_ltmin_log2_row_order_by_width(cb_hi);
+        let lo = coder_partition_d5_ltmin_log2_row_order_by_width(cb_lo);
+        let shift = -10.0_f64.log2() / 10.0;
+        for (i, (&h, &l)) in hi.narrow_band.iter().zip(lo.narrow_band.iter()).enumerate() {
+            assert!(l < h, "narrow {i}: lo {l} not < hi {h}");
+            let diff = l - h;
+            assert!(
+                (diff - shift).abs() < 1.0e-12,
+                "narrow {i}: diff {diff} != {shift}",
+            );
+        }
+        for (j, (&h, &l)) in hi.wide_band.iter().zip(lo.wide_band.iter()).enumerate() {
+            assert!(l < h, "wide {j}: lo {l} not < hi {h}");
+            let diff = l - h;
+            assert!(
+                (diff - shift).abs() < 1.0e-12,
+                "wide {j}: diff {diff} != {shift}",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_is_idempotent_for_pure_callback() {
+        // Pure callback → same log2 projection on repeated invocation.
+        let cb = |omega: u16| -> f64 { f64::from(omega).cos() * 5.0 - 0.25 };
+        let a = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        let b = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        for i in 0..12 {
+            assert!((a.narrow_band[i] - b.narrow_band[i]).abs() < 1.0e-12);
+        }
+        for j in 0..20 {
+            assert!((a.wide_band[j] - b.wide_band[j]).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_dip_in_narrow_only_affects_narrow() {
+        // A −20 dB dip in a single FFT line that lives inside the
+        // narrow block (line ω = 50 lives in partition 3, narrow row
+        // index 2) lowers exactly one narrow-band cell relative to the
+        // baseline; wide-band cells are unchanged.
+        let baseline = coder_partition_d5_ltmin_log2_row_order_by_width(|_| 0.0);
+        let cb = |omega: u16| -> f64 {
+            if omega == 50 {
+                -20.0
+            } else {
+                0.0
+            }
+        };
+        let split = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        for j in 0..20 {
+            assert!(
+                (split.wide_band[j] - baseline.wide_band[j]).abs() < 1.0e-12,
+                "wide band cell {j} should be unaffected by a narrow-line dip",
+            );
+        }
+        let mut narrow_dipped = 0u32;
+        for i in 0..12 {
+            if (split.narrow_band[i] - baseline.narrow_band[i]).abs() > 1.0e-12 {
+                narrow_dipped += 1;
+                assert!(
+                    split.narrow_band[i] < baseline.narrow_band[i],
+                    "narrow band cell {i} should have dipped",
+                );
+            }
+        }
+        assert_eq!(
+            narrow_dipped, 1,
+            "exactly one narrow band cell should dip from a single-line callback",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_dip_in_wide_only_affects_wide() {
+        // A −20 dB dip in a single FFT line that lives inside the
+        // wide block (line ω = 300 lives in partition 18, wide row
+        // index 5) lowers exactly one wide-band cell relative to the
+        // baseline; narrow-band cells are unchanged.
+        let baseline = coder_partition_d5_ltmin_log2_row_order_by_width(|_| 0.0);
+        let cb = |omega: u16| -> f64 {
+            if omega == 300 {
+                -20.0
+            } else {
+                0.0
+            }
+        };
+        let split = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        for i in 0..12 {
+            assert!(
+                (split.narrow_band[i] - baseline.narrow_band[i]).abs() < 1.0e-12,
+                "narrow band cell {i} should be unaffected by a wide-line dip",
+            );
+        }
+        let mut wide_dipped = 0u32;
+        for j in 0..20 {
+            if (split.wide_band[j] - baseline.wide_band[j]).abs() > 1.0e-12 {
+                wide_dipped += 1;
+                assert!(
+                    split.wide_band[j] < baseline.wide_band[j],
+                    "wide band cell {j} should have dipped",
+                );
+            }
+        }
+        assert_eq!(
+            wide_dipped, 1,
+            "exactly one wide band cell should dip from a single-line callback",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_row_order_by_width_split_yields_a_partition_of_step59() {
+        // narrow_band ++ wide_band, when mapped back to dB
+        // (`10 · log10(2^cell) = cell · 10 · log10(2)`), equals
+        // step 59's row-order LTmin vector index-by-index.
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.04 - 1.0 };
+        let split = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        let row_order = coder_partition_d5_ltg_min_row_order(cb);
+        let k = 10.0 * 2.0_f64.log10();
+        for (i, &row_db) in row_order.iter().enumerate().take(12) {
+            let recovered_db = split.narrow_band[i] * k;
+            assert!(
+                (recovered_db - row_db).abs() < 1.0e-9,
+                "narrow band index {i}: recovered {recovered_db} dB != step 59 {row_db} dB",
+            );
+        }
+        for (j, &row_db) in row_order.iter().enumerate().skip(12) {
+            let idx = j - 12;
+            let recovered_db = split.wide_band[idx] * k;
             assert!(
                 (recovered_db - row_db).abs() < 1.0e-9,
                 "wide band index {idx}: recovered {recovered_db} dB != step 59 {row_db} dB",
