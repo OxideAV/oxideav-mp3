@@ -3475,6 +3475,136 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// Annex D Model 1 — §D.1 Step 8 width-gated wide-band signed bit-budget
+// reduction `Σ_{n=1..=32} width_n · log2(LTmin_lin_n)` over Table D.5
+// (Phase 2 step 66 / r265).
+//
+// Step 8 (Phase 2 steps 58 / 59 / 60 / 61 / 62 / 63 / 64 / 65)
+// produces, per coder partition `n ∈ 1..=32`, the per-partition
+// minimum global masking threshold `LTmin_n` already projected onto
+// the `log2`-of-linear-energy presentation `log2(10^(LTmin_n / 10))`
+// and split at the single width-column 0 → 1 transition (between
+// rows 12 and 13):
+//
+//   narrow_band[i] = log2(10^(LTmin_{i + 1}  / 10))   for i ∈ 0..=11  (width_n = 0)
+//   wide_band[j]   = log2(10^(LTmin_{j + 13} / 10))   for j ∈ 0..=19  (width_n = 1)
+//
+// Several Step 9 / Step 10 consumers do not read the per-band
+// `log2(LTmin_lin_n)` column cell-by-cell — they read its weighted
+// total `Σ_{n=1..=32} width_n · log2_n` where `width_n` is the row's
+// width column flag. Because `width_n = 0` for every narrow row and
+// `width_n = 1` for every wide row (a structural invariant of
+// Table D.5 verified by Phase 2 step 60 and inherited by step 65),
+// the weighted total collapses to the unweighted sum of step 65's
+// `wide_band` subarray — a 20-element strict reduction that
+// introduces no new spec arithmetic beyond `+`.
+//
+// Step 66 exposes that reduction as a free function returning a
+// single `f64`. Like step 65, the function is a pure projection of
+// step 62's struct — it invokes the caller's `LTg(ω)` callback
+// exactly the same number of times as step 65 (and through it steps
+// 64 / 63 / 62 / 61 / 60 / 59 / 58) invokes it (one call per FFT
+// line in `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`), and applies one
+// addition per wide-band output cell of step 65's `log2` projection.
+// ---------------------------------------------------------------------------
+
+/// §D.1 Step 8 width-gated wide-band signed bit-budget reduction
+/// `Σ_{n=1..=32} width_n · log2(LTmin_lin_n)` over Table D.5. Returns
+/// the scalar `f64` total:
+///
+/// ```text
+/// total = Σ_{n=1..=32} width_n · log2(10^(LTmin_n / 10))
+///       = Σ_{j=0..=19} wide_band[j]                  (since width_n = 0 for n ∈ 1..=12)
+/// ```
+///
+/// This is the wide-block signed bit-budget total of Phase 2 step
+/// 65's width-gated per-band `log2(LTmin_lin_n)` column. Because
+/// Table D.5's `width_n` column is `0` for every row in `1..=12`
+/// and `1` for every row in `13..=32` (Phase 2 step 60 verifies the
+/// shape and step 65 inherits the split point), the weighted total
+/// reduces algebraically to the unweighted sum of step 65's
+/// `wide_band` subarray. The reduction introduces no new spec
+/// arithmetic — it is pure addition over 20 cells.
+///
+/// **Composition.** A pure reduction of Phase 2 step 65's
+/// [`coder_partition_d5_ltmin_log2_row_order_by_width`]. The `LTg(ω)`
+/// callback is invoked exactly as many times as step 65 invokes it
+/// (one call per FFT line in
+/// `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`); the output total is
+/// `wide_band.iter().sum::<f64>()`.
+///
+/// **Sign semantics.** The "signed" qualifier reflects that
+/// `log2(linear)` is unbounded below as `linear → 0`. A partition
+/// whose `LTmin_n` is well below 0 dB linearises to a value strictly
+/// less than `1.0`, whose `log2` is strictly negative; conversely a
+/// partition whose `LTmin_n` exceeds 0 dB contributes a strictly
+/// positive cell. The total accumulates both signs without clipping.
+///
+/// **Width invariant.** The reduction reads only step 65's
+/// `wide_band` subarray (20 cells). Narrow-band cells contribute
+/// `0 · log2_n = 0` per the width column and are deliberately
+/// skipped — the reduction is structurally identical to
+/// `Σ_{n=1..=32} width_n · log2_n` but avoids 12 redundant
+/// multiplications by zero. The optimisation is pinned at the same
+/// split index (12) Phase 2 step 60's row-order width vector
+/// transitions at and Phase 2 step 65 inherits.
+///
+/// **Boundary semantics.** Inherits Phase 2 step 65's (and through
+/// it step 64 / 63 / 62 / 61 / 58 / 59's) inclusive-on-both-ends
+/// `LTmin_n` reduction semantics unchanged. The wide-band sum has no
+/// boundary semantics of its own — it is a pure cell-wise addition
+/// reading every cell of `wide_band` exactly once.
+///
+/// **Finiteness.** Finite when every wide cell of step 65 is finite
+/// (which holds whenever the callback returns a finite real for
+/// every FFT line in partitions `13..=32`). If any wide cell is
+/// `INFINITY` (a degenerate callback returning `INFINITY` for every
+/// FFT line in some wide partition's range, lifted through step 64's
+/// `10^x` linearisation and step 65's `log2`), the total is
+/// `INFINITY`. If any wide cell is `-INFINITY` (a callback returning
+/// `-INFINITY` for every FFT line in some wide partition's range,
+/// driving step 64's `10^x` to `0.0` whose `log2` is `-INFINITY`),
+/// the total is `-INFINITY`.
+///
+/// **Determinism.** A pure function of the callback: invoking the
+/// reduction twice with the same callback returns the same `f64`.
+///
+/// **Implementation.** Calls
+/// [`coder_partition_d5_ltmin_log2_row_order_by_width`] once
+/// (folding the caller's callback over every recoverable partition's
+/// FFT-line range) and sums the resulting `wide_band` subarray. The
+/// reduction is structurally pinned at the same index 12 the static
+/// width-column transition lives at — Phase 2 step 60's row-order
+/// width vector matches the pattern `[0; 12]` followed by `[1; 20]`
+/// exactly and Phase 2 step 65 inherits the split point verbatim.
+///
+/// Provenance: only the Phase 2 step 65 width-gated `log2(LTmin_lin_n)`
+/// column accessor [`coder_partition_d5_ltmin_log2_row_order_by_width`]
+/// (and through it the Phase 2 step 64 width-gated `LTmin_n` linear
+/// accessor, the Phase 2 step 63 width-gated `LTmin_n` dB accessor,
+/// the Phase 2 step 62 width-gated paired-vector accessor, the
+/// Phase 2 step 61 row-order paired vector, the Phase 2 step 59 / 60
+/// row-order LTmin and width vectors, the Phase 2 step 58
+/// per-partition reducer, the Phase 2 step 52 per-partition width
+/// accessor, and the underlying Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") is
+/// consulted. The reduction is plain `f64` addition; no external
+/// implementation was read.
+#[must_use]
+pub fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total<F>(ltg_per_line: F) -> f64
+where
+    F: Fn(u16) -> f64,
+{
+    let split = coder_partition_d5_ltmin_log2_row_order_by_width(ltg_per_line);
+    let mut total = 0.0_f64;
+    for &cell in &split.wide_band {
+        total += cell;
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8590,5 +8720,188 @@ mod tests {
                 "wide band index {idx}: recovered {recovered_db} dB != step 59 {row_db} dB",
             );
         }
+    }
+
+    // ---- Phase 2 step 66 / r265 — width-gated wide-band signed
+    // bit-budget reduction `Σ_n width_n · log2(LTmin_lin_n)` over
+    // Table D.5 (algebraic collapse of the weighted total onto the
+    // unweighted sum of step 65's `wide_band` subarray).
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_zero_db_is_zero() {
+        // 0 dB everywhere → linear 1.0 in every cell → log2(1.0) = 0
+        // in every wide cell → total sum = 0.0 exactly.
+        let total = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|_| 0.0);
+        assert!(total.abs() < 1.0e-12, "total {total} != 0.0");
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_finite_for_finite_callback() {
+        // Finite real callback → finite total (each of the 20 wide
+        // cells is finite, and the sum of 20 finite f64s is finite
+        // outside catastrophic-cancellation overflow which a tame
+        // bounded ramp cannot trigger).
+        let cb = |omega: u16| -> f64 { -30.0 + f64::from(omega) * 0.05 };
+        let total = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(cb);
+        assert!(total.is_finite(), "total {total} is not finite");
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_matches_wide_band_sum() {
+        // Algebraic identity: the reduction equals the unweighted sum
+        // of step 65's `wide_band` subarray (a 20-cell straight sum).
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.25 - 4.5 };
+        let total = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(cb);
+        let split = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        let expect: f64 = split.wide_band.iter().sum();
+        assert!(
+            (total - expect).abs() < 1.0e-12,
+            "total {total} != Σ wide_band {expect}",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_ignores_narrow_band_contributions()
+    {
+        // The reduction reads only `wide_band`. Verify by perturbing
+        // narrow callbacks (ω = 50 lives in partition 3, a narrow
+        // row) and confirming the total is unchanged from the
+        // baseline that returns 0 dB everywhere.
+        let baseline = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|_| 0.0);
+        let perturb_narrow = |omega: u16| -> f64 {
+            if omega == 50 || omega == 30 || omega == 100 {
+                -25.0
+            } else {
+                0.0
+            }
+        };
+        let perturbed = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(perturb_narrow);
+        assert!(
+            (perturbed - baseline).abs() < 1.0e-12,
+            "narrow-only perturbation changed total: baseline {baseline} → {perturbed}",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_three_db_is_pin() {
+        // Spot pin: a uniform +3 dB callback drives every wide cell
+        // to `log2(10^0.3) = 0.3 / log10(2)`. The total is exactly
+        // 20 × that value.
+        let total = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|_| 3.0);
+        let per_cell = 3.0_f64 / 10.0 / 2.0_f64.log10();
+        let expect = 20.0 * per_cell;
+        assert!(
+            (total - expect).abs() < 1.0e-12,
+            "total {total} != 20 × {per_cell} = {expect}",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_minus_three_db_is_sign_flipped() {
+        // log2-of-10^(x/10) is odd around 0 dB. The total at uniform
+        // −3 dB equals the additive inverse of the total at +3 dB
+        // (each of the 20 wide cells flips sign identically).
+        let hi = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|_| 3.0);
+        let lo = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|_| -3.0);
+        assert!(
+            (hi + lo).abs() < 1.0e-12,
+            "hi {hi} + lo {lo} != 0 (odd-symmetry broken)",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_uniform_db_scales_linearly() {
+        // Linearity in dB: the per-cell mapping `db → log2(10^(db/10))`
+        // is `db · log2(10) / 10`, a linear scaling. A uniform
+        // callback at `2 · k` dB produces exactly twice the total of
+        // a uniform callback at `k` dB.
+        let one = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|_| 5.0);
+        let two = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|_| 10.0);
+        assert!(
+            (two - 2.0 * one).abs() < 1.0e-12,
+            "uniform 10 dB total {two} != 2 × uniform 5 dB total {one}",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_is_idempotent_for_pure_callback() {
+        // Pure callback → identical total on repeated invocation.
+        let cb = |omega: u16| -> f64 { f64::from(omega).sin() * 4.0 + 0.7 };
+        let a = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(cb);
+        let b = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(cb);
+        assert!(
+            (a - b).abs() < 1.0e-12,
+            "non-deterministic total: {a} vs {b}"
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_matches_weighted_full_sum_over_row_order(
+    ) {
+        // Width-gating algebraic identity: the reduction equals the
+        // weighted sum `Σ_{n=1..=32} width_n · log2_n` taken over the
+        // full row-order log2 vector — narrow rows weighted by 0,
+        // wide rows weighted by 1. Reuse step 60's row-order width
+        // vector and step 65's row-order log2 columns (concatenated)
+        // and confirm equality with the direct reduction.
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.10 + 0.5 };
+        let total = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(cb);
+        let widths = coder_partition_d5_width_row_order();
+        let row_order_db = coder_partition_d5_ltg_min_row_order(cb);
+        let k = 10.0_f64.log2() / 10.0;
+        let mut weighted = 0.0_f64;
+        for (i, &db) in row_order_db.iter().enumerate() {
+            weighted += f64::from(widths[i]) * (db * k);
+        }
+        assert!(
+            (total - weighted).abs() < 1.0e-9,
+            "wide-band sum {total} != weighted full sum {weighted}",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_dip_in_wide_only_lowers_total() {
+        // A −20 dB dip in a single FFT line that lives inside the
+        // wide block (line ω = 300 lives in partition 18) lowers the
+        // total relative to the baseline. The dip drives exactly one
+        // wide cell strictly negative (the rest stay at 0), so the
+        // total drops by that cell's magnitude.
+        let baseline = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|_| 0.0);
+        let dipped = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|omega: u16| {
+            if omega == 300 {
+                -20.0
+            } else {
+                0.0
+            }
+        });
+        assert!(
+            dipped < baseline,
+            "dipped total {dipped} should be strictly below baseline {baseline}",
+        );
+        // Expected magnitude: one cell dropped to log2(10^(−20/10)) =
+        // −20 / 10 × log2(10) = −2 · log2(10).
+        let expected_drop = 2.0 * 10.0_f64.log2();
+        let actual_drop = baseline - dipped;
+        assert!(
+            (actual_drop - expected_drop).abs() < 1.0e-9,
+            "actual drop {actual_drop} != expected −2·log2(10) = {expected_drop}",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_proportional_to_step63_wide_sum() {
+        // Equivalence to step 63's wide-band dB sum scaled by the
+        // dB → log2-linear constant `log2(10) / 10`. This pins the
+        // reduction to the dB presentation without invoking step 65
+        // a second time.
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.13 - 1.1 };
+        let total = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(cb);
+        let db_split = coder_partition_d5_ltmin_db_row_order_by_width(cb);
+        let db_wide_sum: f64 = db_split.wide_band.iter().sum();
+        let k = 10.0_f64.log2() / 10.0;
+        let expect = db_wide_sum * k;
+        assert!(
+            (total - expect).abs() < 1.0e-9,
+            "total {total} != db wide sum {db_wide_sum} × {k} = {expect}",
+        );
     }
 }

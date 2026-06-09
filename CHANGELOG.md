@@ -8,6 +8,51 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 8 width-gated wide-band signed
+  bit-budget reduction `Σ_{n=1..=32} width_n · log2(LTmin_lin_n)`
+  over Table D.5 (Phase 2 step 66). Phase 2 step 65 (r264) projected
+  the width-gated per-band `LTmin_n` column onto its
+  `log2`-of-linear-energy presentation, exposing two per-band
+  subarrays carrying the per-row `log2(10^(LTmin_n / 10))` value
+  (`narrow_band: [f64; 12]` for `n ∈ 1..=12` with `width_n = 0`;
+  `wide_band: [f64; 20]` for `n ∈ 13..=32` with `width_n = 1`).
+  Several Step 9 / Step 10 consumers do not read the
+  `log2(LTmin_lin_n)` column cell-by-cell — they read its weighted
+  total `Σ_{n=1..=32} width_n · log2_n` where `width_n` is the row's
+  width column flag. Because `width_n = 0` for every narrow row and
+  `width_n = 1` for every wide row (a structural invariant of
+  Table D.5 verified by Phase 2 step 60 and inherited by step 65),
+  the weighted total collapses algebraically onto the unweighted
+  sum of step 65's `wide_band` subarray — a 20-element strict
+  reduction that introduces no new spec arithmetic beyond `+`. A
+  new free function
+  `coder_partition_d5_ltmin_log2_wide_band_bit_budget_total<F:
+  Fn(u16) -> f64>(ltg_per_line) -> f64` calls Phase 2 step 65's
+  `coder_partition_d5_ltmin_log2_row_order_by_width` once and sums
+  the resulting `wide_band` subarray. The `LTg(ω)` callback is
+  invoked exactly as many times as Phase 2 step 65 invokes it (one
+  call per FFT line in `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`).
+  Signed: a callback that drives wide partitions' `LTmin_n` below
+  0 dB produces a strictly negative contribution at the relevant
+  cells; a callback that drives `LTmin_n` above 0 dB produces a
+  strictly positive contribution. The reduction accumulates both
+  signs without clipping. Tests: 833 lib (was 822 baseline; +11
+  unit) covering zero-dB callback total = 0.0 exactly, finiteness
+  under a bounded finite-dB callback, equality with the unweighted
+  `wide_band` sum under a non-trivial callback (algebraic-identity
+  cross-check), narrow-row perturbations leave the total unchanged
+  (width-gated reduction reads only the wide block), uniform +3 dB
+  total pin (= 20 × `0.3 / log10(2)`), odd-symmetry around zero
+  under sign-flipped uniform callbacks, linearity-in-dB scaling
+  (uniform 10 dB total = 2 × uniform 5 dB total), idempotence for
+  pure callbacks, equality with the explicit weighted full-row-order
+  sum `Σ_{n=1..=32} width_n · log2_n` reconstructed from Phase 2
+  step 60's row-order width vector and Phase 2 step 59's row-order
+  LTmin dB vector (rescaled by `log2(10) / 10`), single-wide-line
+  −20 dB dip lowers the total by exactly `2 · log2(10)` relative to
+  the baseline (per-cell drop sanity check), and proportionality
+  to Phase 2 step 63's dB wide-block sum by the dB →
+  `log2`-of-linear constant `log2(10) / 10`.
 - psy: Annex D Model 1 §D.1 Step 8 width-gated `log2(LTmin_lin_n)`
   column projection over Table D.5 (Phase 2 step 65). Phase 2 step
   64 (r263) projected the width-gated paired `(LTmin_n, width_n)`
