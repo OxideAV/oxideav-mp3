@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex C §C.1.5.2.7 "Bit allocation" next-higher-entry quantization
+  promotion (Phase 2 step 74). Phase 2 step 73 (r272) selected the
+  minimal-MNR subband — the one "that has the greatest benefit"; this step
+  performs the loop's next verbatim action, "The accuracy of the
+  quantization of the subband with the minimal MNR is increased by using
+  the next higher entry in the relevant table B.2, Layer II Possible
+  Quantization per subband" (printed p.71, verbatim). New public struct
+  `BitAllocPromotion { subband, entry, advanced }` and free function
+  `bit_allocation_promote_entry(subband, prev_entry, entry_count) ->
+  BitAllocPromotion`: advances the selected subband's Table B.2 column
+  entry index by one when a next-higher entry exists
+  (`prev_entry + 1 < entry_count` → `entry = prev_entry + 1`,
+  `advanced = true`), otherwise holds the prior entry and reports
+  `advanced = false` (top-entry saturation, single-entry columns, and
+  `entry_count == 0` all yield no advance). The Table B.2 column length is
+  caller-injected (the table is behind the same numeric-table
+  transcription gap as Tables C.5 / D.1 / D.2, the dependency-injection
+  pattern the surrounding Phase 2 steps use); the B.2 entry *values* are
+  not consulted — only the column index is advanced. No spec arithmetic is
+  introduced beyond the `prev_entry + 1` increment and the bound
+  comparison. Tests: 909 lib (was 900 baseline; +9 unit) covering
+  mid-column advance, bottom-entry advance, top-entry saturation,
+  single-entry and zero-entry columns never advancing, subband-index
+  pass-through, penultimate-then-top walk, a one-per-call climb to the top
+  entry, and determinism. Only the §C.1.5.2.7 "increased by using the next
+  higher entry in the relevant table B.2" loop step (ISO/IEC 11172-3:1993
+  Annex C, printed p.71) and the Phase 2 step 73
+  `coder_partition_d5_min_mnr` selection it consumes are read; no external
+  implementation was consulted.
 - psy: Annex C §C.1.5.2.7 "Bit allocation" minimal-MNR subband selection
   (Phase 2 step 73). Phase 2 step 72 (r271) landed the per-partition
   `MNR_n = SNR_n − SMR_n` row-order vector; this step performs the first

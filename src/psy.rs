@@ -4627,6 +4627,112 @@ pub fn coder_partition_d5_min_mnr(mnr: &[CoderPartitionD5Mnr; 32]) -> CoderParti
     }
 }
 
+/// The outcome of the §C.1.5.2.7 "increase the accuracy of the
+/// quantization of the subband with the minimal MNR" loop action — the
+/// per-subband allocation-entry advance produced by
+/// [`bit_allocation_promote_entry`] (Phase 2 step 74 / r273).
+///
+/// The §C.1.5.2.7 iteration, after step 73 selects the subband "that has
+/// the greatest benefit" (the minimal-MNR partition), increases that
+/// subband's quantization accuracy "by using the next higher entry in
+/// the relevant table B.2, *Layer II Possible Quantization per
+/// subband*". This struct reports the post-advance allocation-table
+/// entry index for the selected subband and whether the advance was
+/// actually applied.
+///
+/// **Field semantics.** `subband` echoes the 0-based subband index the
+/// advance targeted (the array index of the selected partition);
+/// `entry` is the resulting Table B.2 column entry index after the
+/// promotion (`prev_entry + 1` on a successful advance, otherwise
+/// `prev_entry` unchanged); `advanced` is `true` iff a next-higher entry
+/// existed and was selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitAllocPromotion {
+    /// 0-based subband index whose Table B.2 entry the loop tried to
+    /// advance — the array slot of the §C.1.5.2.7 minimal-MNR subband.
+    pub subband: u16,
+    /// The subband's resulting Table B.2 *Layer II Possible Quantization
+    /// per subband* column entry index after this loop action: one
+    /// higher than the prior entry on a successful advance, or the prior
+    /// entry unchanged when the subband was already at its top entry.
+    pub entry: u16,
+    /// `true` iff a next-higher entry was available and selected; `false`
+    /// when the subband already held the highest entry of its B.2 column
+    /// (`entry_count - 1`), so no finer quantization could be assigned.
+    pub advanced: bool,
+}
+
+/// §C.1.5.2.7 "The accuracy of the quantization of the subband with the
+/// minimal MNR is increased by using the next higher entry in the
+/// relevant table B.2" — the second action of every Layer I / Layer II
+/// bit-allocation iteration.
+///
+/// Phase 2 step 73 ([`coder_partition_d5_min_mnr`]) selected the subband
+/// "that has the greatest benefit" — the minimal-MNR partition. This
+/// step performs the loop's next verbatim action: it advances that
+/// subband's quantization accuracy to the **next-higher entry** of its
+/// Table B.2 *Layer II Possible Quantization per subband* column, so the
+/// following loop step can recompute the subband's MNR at the finer
+/// quantization.
+///
+/// **Parameters.** `subband` is the 0-based index of the selected
+/// subband (the array slot of the step-73 minimal-MNR partition, i.e.
+/// `CoderPartitionD5MinMnr::partition_n - 1`); `prev_entry` is that
+/// subband's current Table B.2 column entry index before this action;
+/// `entry_count` is the number of entries in that subband's B.2 column
+/// (the count of possible quantizations the column permits). The B.2
+/// column lengths are caller-supplied: Table B.2 lives behind the same
+/// numeric-table transcription gap as Tables C.5 / D.1 / D.2, so the
+/// per-subband entry count is injected, the dependency-injection pattern
+/// the surrounding Phase 2 steps use.
+///
+/// **Advance rule.** When `prev_entry + 1 < entry_count` a next-higher
+/// entry exists, so `entry = prev_entry + 1` and `advanced = true`. When
+/// `prev_entry` is already the top entry (`prev_entry + 1 >= entry_count`)
+/// no finer quantization can be assigned, so `entry = prev_entry`
+/// unchanged and `advanced = false` — the loop must then leave this
+/// subband and reselect (a later §C.1.5.2.7 step). An `entry_count` of
+/// zero (a subband with no possible quantization) likewise yields no
+/// advance with `entry = prev_entry`.
+///
+/// **No spec arithmetic beyond the increment.** The only computation is
+/// the `prev_entry + 1` index step and the bound comparison against
+/// `entry_count`; the B.2 entry *values* (step counts / bit costs) are
+/// not consulted here — only the column's entry index is advanced.
+///
+/// **Determinism.** A pure function of its three arguments.
+///
+/// Provenance: only the §C.1.5.2.7 "The accuracy of the quantization of
+/// the subband with the minimal MNR is increased by using the next
+/// higher entry in the relevant table B.2" loop step transcribed from
+/// ISO/IEC 11172-3:1993 Annex C §C.1.5.2.7 "Bit allocation" (printed
+/// p.71) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`, and the
+/// Phase 2 step 73 [`coder_partition_d5_min_mnr`] selection it consumes,
+/// are read. The Table B.2 column length is caller-injected (the table
+/// is behind the numeric-table transcription gap); no external
+/// implementation was consulted.
+#[must_use]
+pub fn bit_allocation_promote_entry(
+    subband: u16,
+    prev_entry: u16,
+    entry_count: u16,
+) -> BitAllocPromotion {
+    let next = prev_entry.saturating_add(1);
+    if next < entry_count {
+        BitAllocPromotion {
+            subband,
+            entry: next,
+            advanced: true,
+        }
+    } else {
+        BitAllocPromotion {
+            subband,
+            entry: prev_entry,
+            advanced: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10995,5 +11101,110 @@ mod tests {
             .map(|(i, _)| i as u16 + 1)
             .unwrap();
         assert_eq!(coder_partition_d5_min_mnr(&mnr).partition_n, expected);
+    }
+
+    // ---- Phase 2 step 74: §C.1.5.2.7 next-higher-entry promotion -----
+
+    #[test]
+    fn promote_entry_advances_to_next_higher() {
+        // A subband mid-column advances by exactly one entry index.
+        let got = bit_allocation_promote_entry(3, 2, 16);
+        assert_eq!(
+            got,
+            BitAllocPromotion {
+                subband: 3,
+                entry: 3,
+                advanced: true,
+            }
+        );
+    }
+
+    #[test]
+    fn promote_entry_from_bottom_entry() {
+        // Entry 0 (coarsest) advances to entry 1 when the column has room.
+        let got = bit_allocation_promote_entry(0, 0, 4);
+        assert_eq!(got.entry, 1);
+        assert!(got.advanced);
+    }
+
+    #[test]
+    fn promote_entry_saturates_at_top_entry() {
+        // Already at the highest entry (entry_count - 1): no advance, entry
+        // held unchanged, advanced = false.
+        let got = bit_allocation_promote_entry(7, 15, 16);
+        assert_eq!(
+            got,
+            BitAllocPromotion {
+                subband: 7,
+                entry: 15,
+                advanced: false,
+            }
+        );
+    }
+
+    #[test]
+    fn promote_entry_single_entry_column_never_advances() {
+        // A column with exactly one entry can never be promoted.
+        let got = bit_allocation_promote_entry(11, 0, 1);
+        assert_eq!(got.entry, 0);
+        assert!(!got.advanced);
+    }
+
+    #[test]
+    fn promote_entry_zero_entry_count_never_advances() {
+        // A subband with no possible quantization (entry_count = 0) holds
+        // its prior entry and reports no advance.
+        let got = bit_allocation_promote_entry(20, 0, 0);
+        assert_eq!(got.entry, 0);
+        assert!(!got.advanced);
+    }
+
+    #[test]
+    fn promote_entry_echoes_subband_index() {
+        // The targeted subband index is carried through verbatim in both
+        // the advancing and the saturated cases.
+        assert_eq!(bit_allocation_promote_entry(29, 0, 8).subband, 29);
+        assert_eq!(bit_allocation_promote_entry(29, 7, 8).subband, 29);
+    }
+
+    #[test]
+    fn promote_entry_last_room_advances_then_next_saturates() {
+        // From the penultimate entry the advance lands on the top entry and
+        // succeeds; a second call from there saturates.
+        let first = bit_allocation_promote_entry(5, 14, 16);
+        assert_eq!(first.entry, 15);
+        assert!(first.advanced);
+        let second = bit_allocation_promote_entry(5, first.entry, 16);
+        assert_eq!(second.entry, 15);
+        assert!(!second.advanced);
+    }
+
+    #[test]
+    fn promote_entry_repeated_walk_climbs_one_per_call() {
+        // Iterating the action over a fresh column climbs entry indices one
+        // at a time up to (entry_count - 1), then stops.
+        let entry_count = 6u16;
+        let mut entry = 0u16;
+        let mut steps = 0u16;
+        loop {
+            let p = bit_allocation_promote_entry(2, entry, entry_count);
+            if !p.advanced {
+                break;
+            }
+            assert_eq!(p.entry, entry + 1);
+            entry = p.entry;
+            steps += 1;
+        }
+        assert_eq!(entry, entry_count - 1);
+        assert_eq!(steps, entry_count - 1);
+    }
+
+    #[test]
+    fn promote_entry_is_deterministic() {
+        // A pure function: same arguments yield identical results.
+        assert_eq!(
+            bit_allocation_promote_entry(4, 9, 27),
+            bit_allocation_promote_entry(4, 9, 27)
+        );
     }
 }
