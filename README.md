@@ -2373,6 +2373,47 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 68 (r267)** — Annex D Model 1 §D.1 Step 8 width-
+gated paired `(narrow_total, wide_total)` signed bit-budget
+reduction over Table D.5 with a **single** step-65 invocation.
+Phase 2 step 66 (r265) exposed the wide-band weighted total
+`Σ_{n=1..=32} width_n · log2(LTmin_lin_n)` (collapsing onto the
+unweighted sum of step 65's `wide_band` subarray); Phase 2 step
+67 (r266) exposed the complementary narrow-band total
+`Σ_{n=1..=32} (1 − width_n) · log2(LTmin_lin_n)` (collapsing onto
+`Σ narrow_band`). The two reductions partition the full row-order
+`Σ_n log2_n` exactly. Several Step 9 / Step 10 consumers read
+**both** totals together, and calling step 66 + step 67
+back-to-back invokes the caller's `LTg(ω)` callback **twice** over
+the full `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)` FFT-line range,
+because each total independently re-derives step 65's split
+struct — doubling the per-line work for a non-trivial callback. The
+new free function `coder_partition_d5_ltmin_log2_paired_bit_budget_totals<F:
+Fn(u16) -> f64>(ltg_per_line) -> (f64, f64)` fuses the two: it
+calls Phase 2 step 65's
+`coder_partition_d5_ltmin_log2_row_order_by_width` **once**, then
+sums the `narrow_band` (12 cells) and `wide_band` (20 cells)
+subarrays of the single returned struct independently, returning
+`(narrow_total, wide_total)` — narrow first, matching step 65's
+field order. The callback fan-out is exactly half the back-to-back
+step 67 + step 66 pairing (one FFT-line pass instead of two), while
+the two scalars are bit-identical to the standalone step 67 / step
+66 results. No new spec arithmetic beyond `+`. Pairing identity:
+`narrow_total + wide_total` recovers the unweighted full row-order
+`Σ_n log2_n` exactly. Tests: +6 unit covering zero-dB pair
+`(0.0, 0.0)`, bit-identity with standalone steps 67 / 66, callback
+fan-out exactly one step-65 pass (= half the back-to-back standalone
+count, verified by a `Cell`-counting callback), `narrow + wide`
+recovering the full row-order sum, block independence (a wide-only
+omega-400 perturbation moves only `wide_total`; a narrow-only
+omega-100 perturbation only `narrow_total`), and idempotence for a
+pure callback. No external implementation consulted; only the Phase
+2 step 65 width-gated `log2(LTmin_lin_n)` column accessor (and
+through it the cascade down to the Table D.5 transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+§"Table D.5 — Layer I and Layer II coder partition table") is read;
+the reduction is plain `f64` addition.
+
 **Phase 2 step 65 (r264)** — Annex D Model 1 §D.1 Step 8 width-
 gated `log2(LTmin_lin_n)` column projection over Table D.5. Phase
 2 step 64 (r263) projected the width-gated paired

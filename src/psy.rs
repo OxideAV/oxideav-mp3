@@ -3756,6 +3756,152 @@ where
     total
 }
 
+// ---------------------------------------------------------------------------
+// Annex D Model 1 — §D.1 Step 8 width-gated paired `(narrow_total,
+// wide_total)` signed bit-budget reduction over Table D.5 with a single
+// step-65 invocation (Phase 2 step 68 / r267).
+//
+// Phase 2 step 66 (r265) exposed the wide-band weighted total
+// `Σ_n width_n · log2_n` (collapsing onto `Σ wide_band`) and Phase 2
+// step 67 (r266) exposed the complementary narrow-band weighted total
+// `Σ_n (1 − width_n) · log2_n` (collapsing onto `Σ narrow_band`). The
+// two reductions partition the full row-order `Σ_n log2_n` exactly.
+//
+// Several Step 9 / Step 10 consumers read *both* totals together — the
+// narrow-block companion and the wide-block companion of the same
+// width-gated `log2(LTmin_lin_n)` column. Calling step 66 and step 67
+// back-to-back invokes the caller's `LTg(ω)` callback *twice* over the
+// full `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)` FFT-line range, because
+// each total independently re-derives step 65's split struct. For an
+// FFT-line callback whose evaluation is non-trivial (the realistic
+// Step 8 case, where `LTg(ω)` is itself a per-line global-masking
+// reduction), that doubles the per-line work for no algebraic gain.
+//
+// Step 68 fuses the two reductions: it invokes step 65 *once*, then
+// sums the `narrow_band` and `wide_band` subarrays of the single
+// returned struct independently, returning the pair
+// `(narrow_total, wide_total)`. The callback fan-out is exactly half
+// of the back-to-back step 67 + step 66 pairing — one pass over the
+// FFT-line range instead of two — while the two scalars are
+// bit-identical to the standalone step 67 / step 66 results because
+// each is the same cell-wise sum over the same subarray. No new spec
+// arithmetic is introduced beyond `+`.
+// ---------------------------------------------------------------------------
+
+/// §D.1 Step 8 width-gated paired `(narrow_total, wide_total)` signed
+/// bit-budget reduction over Table D.5, computed with a single step-65
+/// invocation. Returns the tuple `(narrow_total, wide_total)`:
+///
+/// ```text
+/// narrow_total = Σ_{n=1..=32} (1 − width_n) · log2(10^(LTmin_n / 10))
+///              = Σ_{i=0..=11} narrow_band[i]      (since width_n = 1 for n ∈ 13..=32)
+/// wide_total   = Σ_{n=1..=32}      width_n  · log2(10^(LTmin_n / 10))
+///              = Σ_{j=0..=19} wide_band[j]        (since width_n = 0 for n ∈ 1..=12)
+/// ```
+///
+/// This is the fused presentation of Phase 2 step 67's narrow-band
+/// complementary total
+/// ([`coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total`]) and
+/// Phase 2 step 66's wide-band total
+/// ([`coder_partition_d5_ltmin_log2_wide_band_bit_budget_total`]). The
+/// two scalars are bit-identical to the standalone step 67 / step 66
+/// results — each is the same cell-wise sum over the same subarray of
+/// step 65's split struct — but they are produced from a **single**
+/// call to [`coder_partition_d5_ltmin_log2_row_order_by_width`] rather
+/// than two.
+///
+/// **Tuple order.** The pair is `(narrow_total, wide_total)` — narrow
+/// first, matching the partition order of step 65's struct
+/// (`narrow_band` field declared before `wide_band`) and the
+/// `(1 − width_n)` / `width_n` companion order. The first element is
+/// step 67's value; the second is step 66's value.
+///
+/// **Callback fan-out.** The `LTg(ω)` callback is invoked exactly the
+/// same number of times step 65 invokes it (one call per FFT line in
+/// `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`) — **half** the fan-out of
+/// calling [`coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total`]
+/// and [`coder_partition_d5_ltmin_log2_wide_band_bit_budget_total`]
+/// back-to-back, which would re-walk the FFT-line range twice. For a
+/// non-trivial per-line callback this halves the per-line work.
+///
+/// **Pairing identity.** By the disjointness of step 65's
+/// `narrow_band` / `wide_band` fields, `narrow_total + wide_total`
+/// equals the unweighted full row-order `Σ_n log2_n` exactly — the
+/// pair partitions the row-order signed bit-budget budget without
+/// losing the width-column split (the same identity Phase 2 step 67
+/// documents against the step 66 / 67 pair, now produced in one pass).
+///
+/// **Sign semantics.** Each total inherits step 66 / 67's "signed"
+/// qualifier: `log2(linear)` is unbounded below as `linear → 0`, so a
+/// partition below 0 dB contributes a strictly negative cell and one
+/// above 0 dB a strictly positive cell. Both totals accumulate both
+/// signs without clipping.
+///
+/// **Width invariant.** `narrow_total` reads only step 65's
+/// `narrow_band` subarray (12 cells, all `width_n = 0`); `wide_total`
+/// reads only the `wide_band` subarray (20 cells, all `width_n = 1`).
+/// The split is structurally pinned at index 12 — Phase 2 step 60's
+/// row-order width vector matches `[0; 12]` followed by `[1; 20]`
+/// exactly and Phase 2 step 65 inherits the split point verbatim. The
+/// fused accessor reads the two subarrays of the single struct without
+/// re-deriving the split.
+///
+/// **Boundary semantics.** Inherits Phase 2 step 65's (and through it
+/// step 64 / 63 / 62 / 61 / 58 / 59's) inclusive-on-both-ends
+/// `LTmin_n` reduction semantics unchanged. Neither sum has boundary
+/// semantics of its own — each is a pure cell-wise addition reading
+/// every cell of its subarray exactly once.
+///
+/// **Finiteness.** `narrow_total` is finite when every narrow cell of
+/// step 65 is finite; `wide_total` when every wide cell is finite. A
+/// degenerate callback driving any cell to `±INFINITY` (per step
+/// 64's `10^x` / step 65's `log2` lift) propagates that infinity into
+/// the corresponding total independently — an infinity in the narrow
+/// block does not contaminate `wide_total` and vice versa.
+///
+/// **Determinism.** A pure function of the callback: invoking the
+/// fused reduction twice with the same callback returns the same pair.
+///
+/// **Implementation.** Calls
+/// [`coder_partition_d5_ltmin_log2_row_order_by_width`] **once**
+/// (folding the caller's callback over every recoverable partition's
+/// FFT-line range) and sums the `narrow_band` and `wide_band`
+/// subarrays of the single returned struct independently. The
+/// reduction is structurally pinned at the same index 12 the static
+/// width-column transition lives at — Phase 2 step 60's row-order
+/// width vector matches the pattern `[0; 12]` followed by `[1; 20]`
+/// exactly and Phase 2 step 65 inherits the split point verbatim.
+///
+/// Provenance: only the Phase 2 step 65 width-gated `log2(LTmin_lin_n)`
+/// column accessor [`coder_partition_d5_ltmin_log2_row_order_by_width`]
+/// (and through it the Phase 2 step 64 width-gated `LTmin_n` linear
+/// accessor, the Phase 2 step 63 width-gated `LTmin_n` dB accessor,
+/// the Phase 2 step 62 width-gated paired-vector accessor, the
+/// Phase 2 step 61 row-order paired vector, the Phase 2 step 59 / 60
+/// row-order LTmin and width vectors, the Phase 2 step 58
+/// per-partition reducer, the Phase 2 step 52 per-partition width
+/// accessor, and the underlying Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") is
+/// consulted. The reduction is plain `f64` addition; no external
+/// implementation was read.
+#[must_use]
+pub fn coder_partition_d5_ltmin_log2_paired_bit_budget_totals<F>(ltg_per_line: F) -> (f64, f64)
+where
+    F: Fn(u16) -> f64,
+{
+    let split = coder_partition_d5_ltmin_log2_row_order_by_width(ltg_per_line);
+    let mut narrow_total = 0.0_f64;
+    for &cell in &split.narrow_band {
+        narrow_total += cell;
+    }
+    let mut wide_total = 0.0_f64;
+    for &cell in &split.wide_band {
+        wide_total += cell;
+    }
+    (narrow_total, wide_total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9264,5 +9410,150 @@ mod tests {
             (narrow + wide - full).abs() < 1.0e-12,
             "narrow {narrow} + wide {wide} != full row-order sum {full}",
         );
+    }
+
+    // -- Phase 2 step 68 (r267): fused paired (narrow_total, wide_total) ----
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_paired_totals_zero_db_is_zero_pair() {
+        // 0 dB → linear 1.0 → log2 0.0 in every cell, so both totals
+        // are exactly 0.0.
+        let (narrow, wide) = coder_partition_d5_ltmin_log2_paired_bit_budget_totals(|_| 0.0);
+        assert_eq!(narrow, 0.0);
+        assert_eq!(wide, 0.0);
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_paired_totals_match_standalone_steps_67_and_66() {
+        // The fused pair is bit-identical to the standalone step 67
+        // (narrow) and step 66 (wide) results for the same callback.
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.13 - 5.5 };
+        let (narrow, wide) = coder_partition_d5_ltmin_log2_paired_bit_budget_totals(cb);
+        let narrow_std = coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total(cb);
+        let wide_std = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(cb);
+        assert_eq!(narrow, narrow_std);
+        assert_eq!(wide, wide_std);
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_paired_totals_invoke_callback_exactly_once_over_range() {
+        // Callback fan-out is half the back-to-back step 67 + step 66
+        // pairing: the fused accessor walks the FFT-line range once,
+        // so its call count equals a single step-65 invocation, which
+        // is exactly half the count of calling narrow + wide
+        // standalone.
+        use core::cell::Cell;
+        let fused_calls = Cell::new(0usize);
+        let _ = coder_partition_d5_ltmin_log2_paired_bit_budget_totals(|omega: u16| {
+            fused_calls.set(fused_calls.get() + 1);
+            f64::from(omega) * 0.01
+        });
+
+        let split_calls = Cell::new(0usize);
+        let _ = coder_partition_d5_ltmin_log2_row_order_by_width(|omega: u16| {
+            split_calls.set(split_calls.get() + 1);
+            f64::from(omega) * 0.01
+        });
+
+        // The two standalone reductions are counted with separate
+        // counters (each closure moves into exactly one call); their
+        // sum is the back-to-back fan-out.
+        let narrow_calls = Cell::new(0usize);
+        let _ = coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total(|omega: u16| {
+            narrow_calls.set(narrow_calls.get() + 1);
+            f64::from(omega) * 0.01
+        });
+        let wide_calls = Cell::new(0usize);
+        let _ = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|omega: u16| {
+            wide_calls.set(wide_calls.get() + 1);
+            f64::from(omega) * 0.01
+        });
+        let standalone_total = narrow_calls.get() + wide_calls.get();
+
+        assert_eq!(
+            fused_calls.get(),
+            split_calls.get(),
+            "fused accessor must invoke the callback exactly as many times as one step-65 pass",
+        );
+        assert_eq!(
+            standalone_total,
+            2 * fused_calls.get(),
+            "back-to-back step 67 + step 66 must double the fused fan-out",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_paired_totals_sum_recovers_full_row_order() {
+        // Pairing identity through the fused accessor: narrow + wide
+        // equals the unweighted full row-order sum exactly.
+        let cb = |omega: u16| -> f64 { f64::from(omega) * 0.07 - 2.3 };
+        let (narrow, wide) = coder_partition_d5_ltmin_log2_paired_bit_budget_totals(cb);
+        let split = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
+        let full: f64 = split.narrow_band.iter().sum::<f64>() + split.wide_band.iter().sum::<f64>();
+        assert!(
+            (narrow + wide - full).abs() < 1.0e-12,
+            "narrow {narrow} + wide {wide} != full row-order sum {full}",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_paired_totals_blocks_are_independent() {
+        // A perturbation confined to wide partitions (13..=32) moves
+        // only `wide_total`; `narrow_total` is unchanged, and vice
+        // versa. Confirms the two sums read disjoint subarrays.
+        let baseline = coder_partition_d5_ltmin_log2_paired_bit_budget_totals(|_| 0.0);
+
+        // `LTmin_n` is the inclusive *minimum* of `LTg(ω)` over the
+        // partition's FFT-line range, so a perturbation only moves a
+        // total when it drops a line *below* the baseline 0.0 — raising
+        // a line above 0.0 leaves the min (and the total) unchanged.
+        //
+        // Wide partitions are 13..=32, spanning FFT lines in
+        // `[209, 513]` (row 13's `[193, 209]` through row 32's
+        // `[497, 513]`). omega = 400 is interior to a wide partition.
+        let wide_perturbed =
+            coder_partition_d5_ltmin_log2_paired_bit_budget_totals(|omega: u16| {
+                if omega == 400 {
+                    -4.0
+                } else {
+                    0.0
+                }
+            });
+        assert_eq!(
+            wide_perturbed.0, baseline.0,
+            "narrow_total must be unaffected by a wide-only perturbation",
+        );
+        assert!(
+            wide_perturbed.1 != baseline.1,
+            "wide_total must move under a wide-only perturbation",
+        );
+
+        // Narrow partitions are 1..=12, spanning FFT lines in
+        // `[1, 193]`. omega = 100 is interior to partition 7
+        // (`[97, 113]`, width 0).
+        let narrow_perturbed =
+            coder_partition_d5_ltmin_log2_paired_bit_budget_totals(|omega: u16| {
+                if omega == 100 {
+                    -4.0
+                } else {
+                    0.0
+                }
+            });
+        assert!(
+            narrow_perturbed.0 != baseline.0,
+            "narrow_total must move under a narrow-only perturbation",
+        );
+        assert_eq!(
+            narrow_perturbed.1, baseline.1,
+            "wide_total must be unaffected by a narrow-only perturbation",
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_ltmin_log2_paired_totals_is_idempotent_for_pure_callback() {
+        let cb = |omega: u16| -> f64 { (f64::from(omega) * 0.001).sin() };
+        let a = coder_partition_d5_ltmin_log2_paired_bit_budget_totals(cb);
+        let b = coder_partition_d5_ltmin_log2_paired_bit_budget_totals(cb);
+        assert_eq!(a, b);
     }
 }

@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 8 width-gated paired
+  `(narrow_total, wide_total)` signed bit-budget reduction over
+  Table D.5 with a single step-65 invocation (Phase 2 step 68).
+  Phase 2 step 66 (r265) exposed the wide-band weighted total
+  `Σ_{n=1..=32} width_n · log2(LTmin_lin_n)` (collapsing onto
+  `Σ wide_band`) and Phase 2 step 67 (r266) the complementary
+  narrow-band total `Σ_{n=1..=32} (1 − width_n) · log2(LTmin_lin_n)`
+  (collapsing onto `Σ narrow_band`); the two partition the full
+  row-order `Σ_n log2_n` exactly. Several Step 9 / Step 10 consumers
+  read *both* totals together, and calling step 66 + step 67
+  back-to-back invokes the caller's `LTg(ω)` callback **twice** over
+  the full `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)` FFT-line range,
+  because each total independently re-derives step 65's split
+  struct. A new free function
+  `coder_partition_d5_ltmin_log2_paired_bit_budget_totals<F:
+  Fn(u16) -> f64>(ltg_per_line) -> (f64, f64)` fuses the two: it
+  calls Phase 2 step 65's
+  `coder_partition_d5_ltmin_log2_row_order_by_width` **once**, then
+  sums the `narrow_band` and `wide_band` subarrays of the single
+  returned struct independently, returning `(narrow_total,
+  wide_total)`. The callback fan-out is exactly half the
+  back-to-back step 67 + step 66 pairing — one pass over the
+  FFT-line range instead of two — while the two scalars are
+  bit-identical to the standalone step 67 / step 66 results. No new
+  spec arithmetic is introduced beyond `+`. Tests: +6 unit covering
+  zero-dB pair `(0.0, 0.0)`, bit-identity with standalone steps 67 /
+  66, callback fan-out exactly one step-65 pass (= half the
+  back-to-back standalone count), `narrow + wide` recovering the
+  full row-order sum, block independence (a wide-only perturbation
+  moves only `wide_total`, a narrow-only perturbation only
+  `narrow_total`), and idempotence for a pure callback.
 - psy: Annex D Model 1 §D.1 Step 8 width-gated wide-band signed
   bit-budget reduction `Σ_{n=1..=32} width_n · log2(LTmin_lin_n)`
   over Table D.5 (Phase 2 step 66). Phase 2 step 65 (r264) projected
