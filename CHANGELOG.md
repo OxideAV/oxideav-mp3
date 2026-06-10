@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 1 "FFT Analysis" Hann-windowed
+  power-density spectrum (Phase 2 step 77). New public primitives
+  `model1_hann_window(i, n)` (verbatim `h(i) = sqrt(8/3)·0,5·{1 −
+  cos[2·π·i/N]}`, `None` outside `0 <= i <= N−1`),
+  `model1_power_density_spectrum(s)` (verbatim `X(k) = 10·log10
+  |(1/N)·Σ h(l)·s(l)·e^(−j·k·l·2π/N)|² dB` over the inclusive
+  half-spectrum `k = 0…N/2`; only the spec transform lengths 512 /
+  1 024 accepted — `MODEL1_FFT_LEN_LAYER1` / `MODEL1_FFT_LEN_LAYER2`;
+  513 output lines for the 1 024-sample block matching the Table D.5
+  1-based ω ∈ 1..=513 convention via `k = ω − 1`), and
+  `model1_normalize_to_96db_spl(&mut x)` (verbatim "maximum value
+  corresponds to 96 dB" reference shift, `MODEL1_SPL_REFERENCE_DB`;
+  returns the applied offset, `None` when no finite maximum exists).
+  The DFT kernel is a private radix-2 in-place FFT cross-checked in
+  tests against a direct evaluation of the spec formula; pure-tone /
+  DC anchors (`10·log10(1/6)` peak, ±1 Hann sidelines exactly
+  `10·log10 4` down, `X(0) = 10·log10(2/3)` for `s ≡ 1`) and window
+  unit-power (`Σ h(i)² = N`) are pinned. +12 unit tests (942 lib).
 - psy: Annex C §C.1.5.2.7 "Bit allocation" step-4 budget update +
   iterate/terminate test (Phase 2 step 76). Steps 73–75 selected the
   minimal-MNR subband, promoted its Table B.2 entry, and recomputed its

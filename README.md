@@ -2373,6 +2373,46 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 77 (r276)** — Annex D Model 1 §D.1 **Step 1 "FFT
+Analysis"**: the Hann-windowed power-density spectrum that Steps 2–9
+consume — the first of the long-standing "Steps 1–3" lacks items.
+Three public primitives in `psy`: `model1_hann_window(i, n)`
+implements the verbatim window formula `h(i) = sqrt(8/3) · 0,5 ·
+{1 − cos[2·π·i/N]}` for `0 <= i <= N−1` (`None` outside the domain;
+the `sqrt(8/3)` prefactor makes the window unit-power, `Σ h(i)² = N`);
+`model1_power_density_spectrum(s)` evaluates the verbatim
+`X(k) = 10·log10 |(1/N)·Σ h(l)·s(l)·e^(−j·k·l·2π/N)|² dB` over the
+spec's inclusive half-spectrum `k = 0…N/2` (so 513 lines for the
+1 024-sample block — exactly the 1-based ω ∈ 1..=513 Table D.5
+convention via `k = ω − 1` — and 257 for Layer I's 512), accepting
+only the two spec transform lengths (`MODEL1_FFT_LEN_LAYER1 = 512`,
+`MODEL1_FFT_LEN_LAYER2 = 1024`; Layer III adapts the 1 024 variant)
+and returning `None` for any other length; and
+`model1_normalize_to_96db_spl(&mut x)` applies the verbatim "maximum
+value corresponds to 96 dB" reference shift
+(`MODEL1_SPL_REFERENCE_DB = 96.0`) in place, returning the applied
+offset, or `None` (slice untouched) when no finite maximum exists
+(empty / all-silent `−∞` spectrum). The DFT kernel is a private
+split-re/im radix-2 in-place FFT (pure standard mathematics, nothing
+codec-specific). Silence maps to `−∞` dB lines verbatim (no invented
+floor); the Step 1 PCM window-placement rules (256-sample subband
+filter delay compensation, ±64-sample Hann/frame alignment) remain
+caller responsibilities. 12 new unit tests: window domain rejections
++ `h(0) = 0` / `h(N/2) = sqrt(8/3)` endpoints, symmetry +
+unit-power (`Σh² = N` within 1e−6), non-spec-length rejection,
+inclusive half-spectrum lengths (257/513), the DC anchor
+`X(0) = 10·log10(2/3)` for `s ≡ 1`, pure-tone anchors (peak
+`10·log10(1/6)`, ±1 Hann sidelines exactly `10·log10 4 ≈ 6,02 dB`
+down, no leakage beyond ±1), a radix-2 vs direct-DFT cross-check on
+deterministic broadband blocks at both lengths (≤ 1e−8 dB), silent
+block → all `−∞`, normalization max-pin + delta preservation +
+identity-at-reference + refusal cases, and an end-to-end
+window→FFT→normalize pipeline pinning the tonal peak at exactly
+96 dB. Tests: 942 lib (was 930; +12 unit). No external
+implementation consulted; only the §D.1 Step 1 prose/formulas
+(printed p.110) read directly from
+`docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`.
+
 **Phase 2 step 76 (r275)** — Annex C §C.1.5.2.7 "Bit allocation"
 **step-4 budget update + iterate/terminate test** — the fourth and
 final action of every Layer II bit-allocation iteration, plus the loop's
@@ -3981,11 +4021,12 @@ convention (row 0 carries ω = 1), and the top-of-table pin
 (row 32 carries ω = 513 = 1 + 32·16, matching the
 1024-sample FFT's 1..=513 one-based half-spectrum) — it
 still lacks
-Model 1 Steps 1–3 (1024-sample FFT + SPL conversion +
-tonality classifier — surrounding Steps still need the FFT
-primitive + a tonality classifier; that's a `core`-level
-numerical primitive that is independent of the Annex D
-tables), the rest of
+Model 1 Step 2 SPL determination (`Lsb(n)` from the step-77
+spectrum's per-subband maximum line / alternative `Xspl(n)`
+power sum, plus the `20·log10(scf_max·32768) − 10`
+scalefactor term) and the Step 4 tonality classifier
+(local-maximum labelling + tonal/non-tonal listing over the
+step-77 `X(k)` lines), the rest of
 Annex D Model 2 (calculation-partition
 table D.3 — PNG-only — the general PM2 spreading-function
 `tmpy` line that is typeset as image in the PDF and is not

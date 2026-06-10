@@ -5039,6 +5039,221 @@ pub fn bit_allocation_should_iterate(adb: u32, max_possible_increase: u32) -> bo
     adb >= max_possible_increase
 }
 
+/// §D.1 Step 1 FFT transform length for **Layer I** — 512 samples.
+///
+/// Annex D Model 1 Step 1 "FFT Analysis" (printed p.110) technical
+/// data: "transform length — Layer I: 512 samples". Frequency
+/// resolution is `sampling_frequency / 512`.
+pub const MODEL1_FFT_LEN_LAYER1: usize = 512;
+
+/// §D.1 Step 1 FFT transform length for **Layer II** — 1 024 samples.
+///
+/// Annex D Model 1 Step 1 "FFT Analysis" (printed p.110) technical
+/// data: "transform length — Layer II: 1 024 samples". Frequency
+/// resolution is `sampling_frequency / 1024`. The D.1 preamble notes
+/// "the model can be adapted to Layer III"; the Layer III adaptation
+/// keeps this 1 024-sample length (its half-spectrum lines `k ∈
+/// 0..=512` are exactly the 1-based ω ∈ 1..=513 lines that the Table
+/// D.5 coder-partition accessors above consume).
+pub const MODEL1_FFT_LEN_LAYER2: usize = 1024;
+
+/// §D.1 Step 1 sound-pressure-level reference — 96 dB.
+///
+/// Verbatim (printed p.110): "A normalization to the reference level
+/// of 96 dB SPL (Sound Pressure Level) has to be done in such a way
+/// that the maximum value corresponds to 96 dB."
+pub const MODEL1_SPL_REFERENCE_DB: f64 = 96.0;
+
+/// §D.1 Step 1 Hann window coefficient `h(i)` (Phase 2 step 77 /
+/// r276).
+///
+/// Verbatim formula (printed p.110):
+///
+/// ```text
+/// h(i) = sqrt(8/3) * 0,5 * {1 - cos[2 * π * (i)/N]}      0 <= i <= N-1
+/// ```
+///
+/// Returns `None` for `n == 0` or any `i` outside the spec's
+/// `0 <= i <= N-1` domain; no clamping or periodic extension is
+/// invented. The `sqrt(8/3)` prefactor makes the window
+/// **unit-power**: `Σ h(i)² = N` exactly in exact arithmetic (the
+/// `0,5²·(1-cos)²` expansion averages to `3/8` over a full period and
+/// `8/3 · 3/8 = 1`), so windowing does not bias the power-density
+/// estimate of [`model1_power_density_spectrum`].
+///
+/// **Determinism.** Pure function of `(i, n)`.
+///
+/// Provenance: only the Step 1 "Hann window, h(i)" formula line
+/// transcribed above from ISO/IEC 11172-3:1993 Annex D §D.1 Step 1
+/// "FFT Analysis" (printed p.110) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read; no external
+/// implementation was consulted.
+#[must_use]
+pub fn model1_hann_window(i: usize, n: usize) -> Option<f64> {
+    if n == 0 || i >= n {
+        return None;
+    }
+    let sqrt_8_3 = (8.0_f64 / 3.0).sqrt();
+    let angle = 2.0 * core::f64::consts::PI * (i as f64) / (n as f64);
+    Some(sqrt_8_3 * 0.5 * (1.0 - angle.cos()))
+}
+
+/// In-place iterative radix-2 decimation-in-time FFT over split
+/// real/imaginary slices. Private helper for
+/// [`model1_power_density_spectrum`]; `re.len()` must be a power of
+/// two and equal `im.len()` (callers guarantee it — the public entry
+/// point only accepts the two spec transform lengths 512 / 1 024).
+/// Standard-mathematics Cooley-Tukey butterflies; nothing here is
+/// codec-specific.
+fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    debug_assert!(n.is_power_of_two());
+    debug_assert_eq!(n, im.len());
+    // Bit-reversal permutation.
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    // Butterfly passes.
+    let mut len = 2usize;
+    while len <= n {
+        let half = len / 2;
+        let ang = -2.0 * core::f64::consts::PI / (len as f64);
+        let (step_re, step_im) = (ang.cos(), ang.sin());
+        let mut base = 0usize;
+        while base < n {
+            let (mut w_re, mut w_im) = (1.0_f64, 0.0_f64);
+            for k in 0..half {
+                let (u_re, u_im) = (re[base + k], im[base + k]);
+                let (t_re, t_im) = (re[base + k + half], im[base + k + half]);
+                let (v_re, v_im) = (t_re * w_re - t_im * w_im, t_re * w_im + t_im * w_re);
+                re[base + k] = u_re + v_re;
+                im[base + k] = u_im + v_im;
+                re[base + k + half] = u_re - v_re;
+                im[base + k + half] = u_im - v_im;
+                let next_re = w_re * step_re - w_im * step_im;
+                w_im = w_re * step_im + w_im * step_re;
+                w_re = next_re;
+            }
+            base += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// §D.1 Step 1 power-density spectrum `X(k)` of one analysis block
+/// (Phase 2 step 77 / r276).
+///
+/// Verbatim formula (printed p.110):
+///
+/// ```text
+/// X(k) = 10 * log10 | (1/N) Σ_{l=0}^{N-1} h(l) * s(l) * e^(-j*k*l*2*π/N) |²  dB
+///                                                            k = 0...N/2,
+/// ```
+///
+/// where `s(l)` is the input signal and `h(l)` the
+/// [`model1_hann_window`] coefficient. The masking threshold "is
+/// derived from an estimate of the power density spectrum that is
+/// calculated by a 512-point FFT for Layer I, or by a 1 024-point FFT
+/// for Layer II" (Layer III adapts the 1 024-point variant); any
+/// other input length returns `None` verbatim — no padding or
+/// truncation is invented. The output carries the spec's `k = 0...N/2`
+/// inclusive half-spectrum: `N/2 + 1` lines (513 for the 1 024-sample
+/// block — matching the 1-based ω ∈ 1..=513 Table D.5 convention via
+/// `k = ω - 1`).
+///
+/// An all-zero (silent) block yields `10·log10(0) = -∞` dB lines;
+/// `f64::NEG_INFINITY` is returned unmodified (the spec expresses the
+/// spectrum in dB with no floor; [`model1_normalize_to_96db_spl`]
+/// refuses to normalize a spectrum with no finite maximum).
+///
+/// The Step 1 PCM **window-placement** rules (the 256-sample analysis
+/// subband-filter delay compensation and the ±64-sample Hann/frame
+/// alignment shifts) are caller responsibilities: this primitive
+/// transforms exactly the block it is handed.
+///
+/// **Determinism.** Pure function of the input block; the in-place
+/// radix-2 FFT introduces only standard floating-point rounding
+/// (cross-checked against a direct DFT evaluation in the tests).
+///
+/// Provenance: only the Step 1 "power density spectrum X(k)" formula,
+/// the "windowed by a Hann window" sentence, the transform-length
+/// technical-data lines, and the `k = 0...N/2` index range transcribed
+/// from ISO/IEC 11172-3:1993 Annex D §D.1 Step 1 "FFT Analysis"
+/// (printed p.110) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`
+/// are read; no external implementation was consulted.
+#[must_use]
+pub fn model1_power_density_spectrum(s: &[f64]) -> Option<Vec<f64>> {
+    let n = s.len();
+    if n != MODEL1_FFT_LEN_LAYER1 && n != MODEL1_FFT_LEN_LAYER2 {
+        return None;
+    }
+    let mut re: Vec<f64> = s
+        .iter()
+        .enumerate()
+        .map(|(l, &sample)| {
+            // `l < n` always holds here, so the window accessor cannot
+            // return `None`.
+            model1_hann_window(l, n).unwrap_or(0.0) * sample
+        })
+        .collect();
+    let mut im = vec![0.0_f64; n];
+    fft_in_place(&mut re, &mut im);
+    let inv_n = 1.0 / (n as f64);
+    Some(
+        (0..=n / 2)
+            .map(|k| {
+                let r = re[k] * inv_n;
+                let i = im[k] * inv_n;
+                10.0 * (r * r + i * i).log10()
+            })
+            .collect(),
+    )
+}
+
+/// §D.1 Step 1 normalization of a dB spectrum to the 96 dB SPL
+/// reference (Phase 2 step 77 / r276).
+///
+/// Verbatim (printed p.110): "A normalization to the reference level
+/// of 96 dB SPL (Sound Pressure Level) has to be done in such a way
+/// that the maximum value corresponds to 96 dB."
+///
+/// Adds the constant offset `96 − max(x)` dB to every line in place
+/// and returns the applied offset. The maximum is taken over all
+/// supplied lines; relative line-to-line differences are preserved
+/// exactly (a single shared addend). Returns `None` — leaving the
+/// slice untouched — when no finite maximum exists (empty slice, or
+/// an all-`-∞` silent-block spectrum), since no finite offset can
+/// place a non-finite maximum at 96 dB.
+///
+/// **Determinism.** Pure in-place affine shift.
+///
+/// Provenance: only the Step 1 normalization sentence quoted above
+/// from ISO/IEC 11172-3:1993 Annex D §D.1 Step 1 "FFT Analysis"
+/// (printed p.110) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`
+/// is read; no external implementation was consulted.
+#[must_use]
+pub fn model1_normalize_to_96db_spl(x: &mut [f64]) -> Option<f64> {
+    let max = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !max.is_finite() {
+        return None;
+    }
+    let offset = MODEL1_SPL_REFERENCE_DB - max;
+    for line in x.iter_mut() {
+        *line += offset;
+    }
+    Some(offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11827,5 +12042,206 @@ mod tests {
         assert!(!bit_allocation_should_iterate(got.adb, 50));
         // A cheaper next increase (20 bits) would still fit.
         assert!(bit_allocation_should_iterate(got.adb, 20));
+    }
+
+    // ----- Phase 2 step 77: §D.1 Step 1 FFT analysis -----
+
+    /// Deterministic pseudo-random sample stream for FFT cross-checks
+    /// (simple LCG; no external randomness).
+    fn lcg_samples(len: usize, mut state: u64) -> Vec<f64> {
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                // Map the top 32 bits to (-1, 1).
+                ((state >> 32) as f64 / 2147483648.0) - 1.0
+            })
+            .collect()
+    }
+
+    /// Direct (naive) evaluation of the Step 1 power-density formula —
+    /// independent of the radix-2 FFT under test.
+    fn direct_power_density(s: &[f64]) -> Vec<f64> {
+        let n = s.len();
+        let inv_n = 1.0 / n as f64;
+        (0..=n / 2)
+            .map(|k| {
+                let mut re = 0.0_f64;
+                let mut im = 0.0_f64;
+                for (l, &sample) in s.iter().enumerate() {
+                    let w = model1_hann_window(l, n).unwrap() * sample;
+                    let ang = -2.0 * core::f64::consts::PI * (k as f64) * (l as f64) / (n as f64);
+                    re += w * ang.cos();
+                    im += w * ang.sin();
+                }
+                let (r, i) = (re * inv_n, im * inv_n);
+                10.0 * (r * r + i * i).log10()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hann_window_domain_and_endpoints() {
+        // Out-of-domain rejections: n = 0 and i >= n.
+        assert_eq!(model1_hann_window(0, 0), None);
+        assert_eq!(model1_hann_window(1024, 1024), None);
+        assert_eq!(model1_hann_window(usize::MAX, 1024), None);
+        // h(0) = sqrt(8/3)·0,5·(1 − cos 0) = 0.
+        assert_eq!(model1_hann_window(0, 1024), Some(0.0));
+        // Midpoint h(N/2): cos(π) = −1 ⇒ h = sqrt(8/3).
+        let mid = model1_hann_window(512, 1024).unwrap();
+        assert!((mid - (8.0_f64 / 3.0).sqrt()).abs() < 1e-15);
+    }
+
+    #[test]
+    fn hann_window_symmetry_and_unit_power() {
+        let n = MODEL1_FFT_LEN_LAYER2;
+        // h(i) = h(N − i) for 1 <= i <= N−1 (cos is even around 0/2π).
+        for i in 1..n {
+            let a = model1_hann_window(i, n).unwrap();
+            let b = model1_hann_window(n - i, n).unwrap();
+            assert!((a - b).abs() < 1e-12, "asymmetry at i={i}");
+        }
+        // Unit power: Σ h(i)² = N (the sqrt(8/3) prefactor's purpose).
+        let power: f64 = (0..n)
+            .map(|i| {
+                let h = model1_hann_window(i, n).unwrap();
+                h * h
+            })
+            .sum();
+        assert!((power - n as f64).abs() < 1e-6, "Σh² = {power}");
+    }
+
+    #[test]
+    fn power_density_rejects_non_spec_lengths() {
+        assert!(model1_power_density_spectrum(&[]).is_none());
+        assert!(model1_power_density_spectrum(&[0.0; 100]).is_none());
+        assert!(model1_power_density_spectrum(&[0.0; 576]).is_none());
+        assert!(model1_power_density_spectrum(&[0.0; 2048]).is_none());
+    }
+
+    #[test]
+    fn power_density_output_is_inclusive_half_spectrum() {
+        // k = 0...N/2 ⇒ N/2 + 1 lines: 257 (Layer I) / 513 (Layer II).
+        let x1 = model1_power_density_spectrum(&vec![0.5; MODEL1_FFT_LEN_LAYER1]).unwrap();
+        assert_eq!(x1.len(), MODEL1_FFT_LEN_LAYER1 / 2 + 1);
+        let x2 = model1_power_density_spectrum(&vec![0.5; MODEL1_FFT_LEN_LAYER2]).unwrap();
+        assert_eq!(x2.len(), MODEL1_FFT_LEN_LAYER2 / 2 + 1);
+    }
+
+    #[test]
+    fn power_density_dc_anchor() {
+        // Constant signal s(l) = 1: only the DC coefficient survives.
+        // (1/N)·Σ h(l) = sqrt(8/3)·0,5 (the cos term sums to zero over a
+        // full period) ⇒ power = (8/3)·0,25 = 2/3 ⇒ 10·log10(2/3) dB.
+        let n = MODEL1_FFT_LEN_LAYER2;
+        let x = model1_power_density_spectrum(&vec![1.0; n]).unwrap();
+        let expect_dc = 10.0 * (2.0_f64 / 3.0).log10();
+        assert!((x[0] - expect_dc).abs() < 1e-9, "X(0) = {}", x[0]);
+        // Every non-adjacent line is numerically negligible.
+        for (k, &line) in x.iter().enumerate().skip(2) {
+            assert!(line < -250.0, "leak at k={k}: {line} dB");
+        }
+    }
+
+    #[test]
+    fn power_density_pure_tone_anchors() {
+        // Unit-amplitude sine at exact bin k0: the Hann-windowed DFT
+        // concentrates power on k0 and k0±1.
+        //   |X(k0)|   = sqrt(8/3)/4  ⇒ power = 1/6
+        //   |X(k0±1)| = sqrt(8/3)/8  ⇒ power = 1/24  (−10·log10 4 dB)
+        let n = MODEL1_FFT_LEN_LAYER2;
+        let k0 = 100usize;
+        let s: Vec<f64> = (0..n)
+            .map(|l| (2.0 * core::f64::consts::PI * (k0 as f64) * (l as f64) / (n as f64)).sin())
+            .collect();
+        let x = model1_power_density_spectrum(&s).unwrap();
+        let peak_expect = 10.0 * (1.0_f64 / 6.0).log10();
+        let side_expect = 10.0 * (1.0_f64 / 24.0).log10();
+        assert!((x[k0] - peak_expect).abs() < 1e-9, "X(k0) = {}", x[k0]);
+        assert!((x[k0 - 1] - side_expect).abs() < 1e-9);
+        assert!((x[k0 + 1] - side_expect).abs() < 1e-9);
+        // Hann leakage stops after ±1: everything else is negligible.
+        for (k, &line) in x.iter().enumerate() {
+            if k + 2 <= k0 || k >= k0 + 2 {
+                assert!(line < -250.0, "leak at k={k}: {line} dB");
+            }
+        }
+        // The ±1 lines sit exactly 10·log10(4) ≈ 6,02 dB below the peak.
+        assert!(((x[k0] - x[k0 + 1]) - 10.0 * 4.0_f64.log10()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn power_density_matches_direct_dft_evaluation() {
+        // Cross-check the radix-2 FFT against an independent direct
+        // evaluation of the verbatim Step 1 formula on a deterministic
+        // broadband block (both transform lengths).
+        for &n in &[MODEL1_FFT_LEN_LAYER1, MODEL1_FFT_LEN_LAYER2] {
+            let s = lcg_samples(n, 0x0D15_EA5E_u64);
+            let fast = model1_power_density_spectrum(&s).unwrap();
+            let slow = direct_power_density(&s);
+            assert_eq!(fast.len(), slow.len());
+            for (k, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-8, "n={n} k={k}: fft {a} vs dft {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn power_density_silent_block_is_negative_infinity() {
+        let x = model1_power_density_spectrum(&vec![0.0; MODEL1_FFT_LEN_LAYER2]).unwrap();
+        assert!(x.iter().all(|&v| v == f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn normalize_pins_maximum_to_96db_and_preserves_deltas() {
+        let mut x = vec![-30.0, -7.5, 12.25, 3.0, f64::NEG_INFINITY];
+        let offset = model1_normalize_to_96db_spl(&mut x).unwrap();
+        assert_eq!(offset, MODEL1_SPL_REFERENCE_DB - 12.25);
+        let max = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!(max, MODEL1_SPL_REFERENCE_DB);
+        // Relative differences preserved (single shared addend).
+        assert_eq!(x[2] - x[0], 12.25 - (-30.0));
+        assert_eq!(x[2] - x[1], 12.25 - (-7.5));
+        // −∞ stays −∞ (an affine shift cannot lift true silence).
+        assert_eq!(x[4], f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn normalize_already_at_reference_is_identity() {
+        let mut x = vec![96.0, 50.0, -10.0];
+        let offset = model1_normalize_to_96db_spl(&mut x).unwrap();
+        assert_eq!(offset, 0.0);
+        assert_eq!(x, vec![96.0, 50.0, -10.0]);
+    }
+
+    #[test]
+    fn normalize_refuses_spectra_without_finite_maximum() {
+        let mut empty: Vec<f64> = vec![];
+        assert_eq!(model1_normalize_to_96db_spl(&mut empty), None);
+        let mut silent = vec![f64::NEG_INFINITY; 5];
+        assert_eq!(model1_normalize_to_96db_spl(&mut silent), None);
+        // Slice untouched on refusal.
+        assert!(silent.iter().all(|&v| v == f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn step1_pipeline_tone_normalizes_to_reference() {
+        // End-to-end Step 1: window+FFT a pure tone, then normalize —
+        // the tonal peak line lands exactly at 96 dB SPL.
+        let n = MODEL1_FFT_LEN_LAYER2;
+        let k0 = 64usize;
+        let s: Vec<f64> = (0..n)
+            .map(|l| {
+                0.25 * (2.0 * core::f64::consts::PI * (k0 as f64) * (l as f64) / (n as f64)).sin()
+            })
+            .collect();
+        let mut x = model1_power_density_spectrum(&s).unwrap();
+        let offset = model1_normalize_to_96db_spl(&mut x).unwrap();
+        assert!(offset.is_finite());
+        assert_eq!(x[k0], MODEL1_SPL_REFERENCE_DB);
+        // The ±1 Hann sidelines keep their −6,02 dB relation post-shift.
+        assert!(((x[k0] - x[k0 + 1]) - 10.0 * 4.0_f64.log10()).abs() < 1e-9);
     }
 }
