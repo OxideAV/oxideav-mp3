@@ -2373,6 +2373,50 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 69 (r268)** — Annex D Model 1 §D.1 **Step 9**
+width-gated signal-to-mask-ratio over Table D.5. The Step 9 formula
+(ISO/IEC 11172-3:1993 Annex D, printed p.115) is
+`SMR_sb(n) = Lsb(n) − LTmin(n)` dB, computed for every subband `n` —
+the per-band input the Layer I / Layer II bit-allocation loop seeds
+its mask-to-noise iteration from. This step had been carried as
+"docs-blocked on the §D.1 SMR formula"; r268 verified the formula is
+directly derivable from the staged spec PDF
+(`docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`, §D.1 Step 9 printed
+p.115 + Step 8 `LTmin(n) = MIN[LTg(i)]` printed p.114), closing the
+gap without any new commission. The `LTmin_n` operand comes from the
+Phase 2 step 58–63 chain (one step-63 invocation of
+`coder_partition_d5_ltmin_db_row_order_by_width`); the `Lsb(n)`
+operand is the §D.1 Step 2 sound pressure level
+(`MAX[X(k), 20·log10(scf_max(n)·32768) − 10]` dB, printed p.110),
+supplied as a caller callback because Steps 1–2 (FFT + SPL) remain
+behind the PNG-only Tables D.1 / D.2 transcription gap — the same
+dependency-injection pattern steps 58–68 use for `LTg(ω)`. New free
+function `coder_partition_d5_smr_db_row_order_by_width<L: Fn(u16) ->
+f64, F: Fn(u16) -> f64>(lsb_per_partition, ltg_per_line) ->
+CoderPartitionD5SmrByWidth { narrow_band: [f64; 12], wide_band:
+[f64; 20] }` — the only new spec arithmetic is the Step 9
+subtraction itself, one `Lsb(n) − LTmin_n` per row, presented in the
+step 63 width-gated split (narrow partitions 1..=12, wide 13..=32).
+`lsb_per_partition` is invoked exactly once per partition `n ∈
+1..=32` in ascending row order; `ltg_per_line` fan-out is exactly
+one step-63 pass. Signs preserved without clipping (positive =
+audible content needing bits; negative = fully masked). Tests: 859
+lib (was 851 baseline; +8 unit) covering zero-callback all-zero
+cells, uniform pin (96 − 20 = 76.0 exact), cell-wise equality with
+the independently reconstructed `lsb(n) − step63` difference under
+non-trivial callbacks, partition-index mapping (`Lsb(n) = n`, flat
+threshold → `narrow[i] = i + 1`, `wide[j] = j + 13`), sign
+semantics in both directions, dual callback fan-out (Lsb exactly
+`[1..=32]` ascending; LTg equal to a directly-counted step-63
+pass), a −30 dB interior-line LTg dip (ω = 300, partition located
+via the step 56 inverse lookup) raising exactly one wide cell's SMR
+by +30 dB with all 31 other cells unchanged, and idempotence for
+pure callbacks. No external implementation consulted; only the
+staged ISO/IEC 11172-3:1993 spec PDF (§D.1 Steps 2 / 8 / 9, printed
+pp.110/114/115) and the Phase 2 step 63 width-gated dB accessor
+(and through it the cascade down to the Table D.5 transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) are read.
+
 **Phase 2 step 68 (r267)** — Annex D Model 1 §D.1 Step 8 width-
 gated paired `(narrow_total, wide_total)` signed bit-budget
 reduction over Table D.5 with a **single** step-65 invocation.

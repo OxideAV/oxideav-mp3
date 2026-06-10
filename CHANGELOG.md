@@ -8,6 +8,43 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 9 width-gated signal-to-mask-ratio
+  `SMR_n = Lsb(n) − LTmin_n` (dB) over Table D.5 (Phase 2 step 69).
+  The Step 9 formula (ISO/IEC 11172-3:1993 Annex D, printed p.115)
+  computes the signal-to-mask ratio for every subband `n` — the
+  per-band input the Layer I / Layer II bit-allocation loop seeds
+  its mask-to-noise iteration from. Previously carried as
+  "docs-blocked on the §D.1 SMR formula"; verified directly
+  derivable from the staged spec PDF
+  (`docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`, §D.1 Step 9
+  printed p.115 + Step 8 printed p.114), closing the gap. New free
+  function `coder_partition_d5_smr_db_row_order_by_width<L:
+  Fn(u16) -> f64, F: Fn(u16) -> f64>(lsb_per_partition,
+  ltg_per_line) -> CoderPartitionD5SmrByWidth { narrow_band:
+  [f64; 12], wide_band: [f64; 20] }`. The `LTmin_n` operand comes
+  from one Phase 2 step 63 invocation
+  (`coder_partition_d5_ltmin_db_row_order_by_width`); the `Lsb(n)`
+  operand (§D.1 Step 2 sound pressure level, printed p.110) enters
+  as a caller-supplied per-partition callback because Steps 1–2
+  (FFT + SPL) remain behind the PNG-only Tables D.1 / D.2
+  transcription gap — the same dependency-injection pattern steps
+  58–68 use for `LTg(ω)`. The only new spec arithmetic is the
+  Step 9 subtraction itself, one `Lsb(n) − LTmin_n` per row,
+  presented in the step 63 width-gated split (narrow partitions
+  1..=12, wide 13..=32). `lsb_per_partition` is invoked exactly
+  once per partition `n ∈ 1..=32` in ascending row order;
+  `ltg_per_line` fan-out is exactly one step-63 pass. Signs
+  preserved without clipping (positive = audible content needing
+  bits; negative = fully masked). Tests: +8 unit covering
+  zero-callback all-zero cells, uniform pin (96 − 20 = 76.0
+  exact), cell-wise equality with the independently reconstructed
+  `lsb(n) − step63` difference, partition-index mapping
+  (`Lsb(n) = n`, flat threshold → `narrow[i] = i + 1`,
+  `wide[j] = j + 13`), sign semantics in both directions, dual
+  callback fan-out (Lsb exactly `[1..=32]` ascending; LTg equal to
+  a directly-counted step-63 pass), a −30 dB interior-line LTg dip
+  (ω = 300) raising exactly one wide cell's SMR by +30 dB with all
+  31 other cells unchanged, and idempotence for pure callbacks.
 - psy: Annex D Model 1 §D.1 Step 8 width-gated paired
   `(narrow_total, wide_total)` signed bit-budget reduction over
   Table D.5 with a single step-65 invocation (Phase 2 step 68).
