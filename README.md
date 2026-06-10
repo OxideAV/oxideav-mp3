@@ -2373,6 +2373,44 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 73 (r272)** — Annex C §C.1.5.2.7 "Bit allocation"
+**minimal-MNR subband selection** — the first action of every Layer I /
+Layer II bit-allocation iteration. Phase 2 step 72 (r271) landed the
+per-partition `MNR_n = SNR_n − SMR_n` row-order vector; this step
+performs the loop's opening move, "Determination of the minimal MNR of
+all subbands" (printed p.71, verbatim), reducing the 32-row vector to
+the single subband "that has the greatest benefit", which the loop then
+promotes to the next-higher quantization-accuracy entry. New public
+struct `CoderPartitionD5MinMnr { partition_n: u16, mnr_db: f64,
+smr_db: f64, width_n: u16 }` and free function
+`coder_partition_d5_min_mnr(mnr: &[CoderPartitionD5Mnr; 32]) ->
+CoderPartitionD5MinMnr`: a row-order argmin scan over step 72's
+`coder_partition_d5_mnr_row_order` output, returning the winning
+partition's 1-based index `n ∈ 1..=32` alongside its `mnr_db` /
+`smr_db` / `width_n` columns carried through verbatim. Ties resolve to
+the lowest partition index — the spec selects "the" subband (singular),
+so a deterministic tie-break is required and the row-order scan keeps
+the first occurrence, matching the order in which the §C.1.5.2.7 loop
+walks Table D.5. `NaN` rows are skipped (a `NaN` `mnr_db` never compares
+`<` the running minimum, so an all-`NaN` vector retains the `n = 1`
+seed). No spec arithmetic is introduced beyond the `<` comparisons of
+the scan. Tests: 900 lib (was 891 baseline; +9 unit) covering the
+unique-minimum selection under a −30 dB interior-line LTg dip (with
+verbatim winning-row echo), low/high partition-index minima
+(`SNR(n) = n` → `n = 1`; `SNR(n) = 100 − n` → `n = 32`), the
+lowest-index tie-break on an all-equal MNR vector, width/SMR-column
+pass-through of the winner in a `width_n = 1` partition, negative-MNR
+selection (signal needing more bits than current quantization gives),
+`NaN`-row skipping, idempotence, and a brute-force argmin cross-check.
+Steps 1–2 (FFT/SPL) and Tables D.1 / D.2 / C.5 stay numeric-table-
+blocked (#1262/#1538); only the §C.1.5.2.7 "Determination of the minimal
+MNR of all subbands" loop step (ISO/IEC 11172-3:1993 Annex C, printed
+p.71, in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`) and the Phase 2
+step 72 `coder_partition_d5_mnr_row_order` vector it consumes (and
+through it the Table D.5 transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) were read. No
+external implementation was consulted.
+
 **Phase 2 step 72 (r271)** — Annex C §C.1.5.2.7 "Bit allocation"
 per-partition **mask-to-noise ratio `MNR_n = SNR_n − SMR_n`** row-order
 vector over Table D.5. Phase 2 step 71 (r270) exposed the §D.1 Step 9

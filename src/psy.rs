@@ -4532,6 +4532,101 @@ where
     out
 }
 
+/// The §C.1.5.2.7 "subband with the minimal MNR" — the single coder
+/// partition the bit-allocation loop selects at the head of each
+/// iteration to receive the next-higher quantization-accuracy entry.
+///
+/// Produced by [`coder_partition_d5_min_mnr`] (Phase 2 step 73 / r272).
+/// The per-iteration successor of Phase 2 step 72's
+/// [`CoderPartitionD5Mnr`] vector: where step 72 computes the row-order
+/// `MNR_n = SNR_n − SMR_n` column, this step performs the loop's very
+/// first iteration action — "Determination of the minimal MNR of all
+/// subbands" (verbatim, printed p.71) — reducing the 32-row vector to
+/// the one partition "that has the greatest benefit".
+///
+/// **Field semantics.** `partition_n` is the spec's 1-based partition
+/// index `n ∈ 1..=32` of the selected subband (the array index plus
+/// one); `mnr_db`, `smr_db`, and `width_n` are that partition's
+/// [`CoderPartitionD5Mnr`] columns carried through verbatim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoderPartitionD5MinMnr {
+    /// 1-based partition index `n ∈ 1..=32` of the subband holding the
+    /// minimal `MNR_n` — the "subband with the minimal MNR" the
+    /// §C.1.5.2.7 loop increases the quantization accuracy of next.
+    /// Maps to array index `partition_n - 1` on the step-72 vector.
+    pub partition_n: u16,
+    /// The selected partition's mask-to-noise ratio `MNR_n` (dB) — the
+    /// minimum over all 32 subbands. Carried verbatim from the step-72
+    /// [`CoderPartitionD5Mnr::mnr_db`] cell.
+    pub mnr_db: f64,
+    /// The selected partition's §D.1 Step 9 signal-to-mask ratio
+    /// `SMR_n` (dB), carried verbatim from
+    /// [`CoderPartitionD5Mnr::smr_db`].
+    pub smr_db: f64,
+    /// The selected partition's `width_n` Table D.5 column flag,
+    /// carried verbatim from [`CoderPartitionD5Mnr::width_n`].
+    pub width_n: u16,
+}
+
+/// §C.1.5.2.7 "Determination of the minimal MNR of all subbands" — the
+/// argmin selection at the head of every Layer I / Layer II
+/// bit-allocation iteration.
+///
+/// Given the Phase 2 step 72 row-order MNR vector
+/// (`[CoderPartitionD5Mnr; 32]`), returns the single
+/// [`CoderPartitionD5MinMnr`] for the subband with the **smallest**
+/// `mnr_db` — the partition "that has the greatest benefit", which the
+/// loop then promotes to the next-higher quantization-accuracy entry.
+/// This is the first iteration action of the iterative allocation
+/// procedure, performed once per loop pass after the step-72
+/// `MNR = SNR − SMR` initialisation.
+///
+/// **Selection rule.** A row-order scan over `n ∈ 1..=32` keeping the
+/// running minimum; the first (lowest-index) partition achieving the
+/// minimum wins. The spec selects "the subband with the minimal MNR"
+/// (singular), so a deterministic tie-break is required — equal-MNR
+/// subbands resolve to the lowest partition index, the order in which
+/// the §C.1.5.2.7 loop walks Table D.5.
+///
+/// **Index convention.** `partition_n` is 1-based (`n ∈ 1..=32`),
+/// matching the spec; it equals `i + 1` for the winning array index
+/// `i ∈ 0..=31` of the step-72 vector.
+///
+/// **Column pass-through.** `mnr_db`, `smr_db`, and `width_n` are
+/// copied verbatim from the selected [`CoderPartitionD5Mnr`] row; no
+/// arithmetic is performed beyond the `<` comparisons of the scan.
+///
+/// **NaN handling.** A `NaN` `mnr_db` never compares `<` the running
+/// minimum, so it is skipped; an all-`NaN` vector therefore retains the
+/// `n = 1` seed. (Step 72's `MNR = SNR − SMR` produces `NaN` only when a
+/// caller injects a `NaN` `SNR_n`/`SMR_n`; well-formed inputs are
+/// finite.)
+///
+/// **Determinism.** A pure function of the input vector: the same
+/// `[CoderPartitionD5Mnr; 32]` always yields the same selection.
+///
+/// Provenance: only the §C.1.5.2.7 "Determination of the minimal MNR of
+/// all subbands" loop step transcribed from ISO/IEC 11172-3:1993 Annex
+/// C §C.1.5.2.7 "Bit allocation" (printed p.71) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` and the Phase 2 step 72
+/// [`coder_partition_d5_mnr_row_order`] vector it consumes are read; no
+/// external implementation was consulted.
+#[must_use]
+pub fn coder_partition_d5_min_mnr(mnr: &[CoderPartitionD5Mnr; 32]) -> CoderPartitionD5MinMnr {
+    let mut best = 0usize;
+    for (i, row) in mnr.iter().enumerate().skip(1) {
+        if row.mnr_db < mnr[best].mnr_db {
+            best = i;
+        }
+    }
+    CoderPartitionD5MinMnr {
+        partition_n: (best + 1) as u16,
+        mnr_db: mnr[best].mnr_db,
+        smr_db: mnr[best].smr_db,
+        width_n: mnr[best].width_n,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10774,5 +10869,131 @@ mod tests {
         let a = coder_partition_d5_mnr_row_order(snr, lsb, ltg);
         let b = coder_partition_d5_mnr_row_order(snr, lsb, ltg);
         assert_eq!(a, b);
+    }
+
+    // ----- Phase 2 step 73 (r272): §C.1.5.2.7 minimal-MNR selection -----
+
+    #[test]
+    fn coder_partition_d5_min_mnr_selects_unique_minimum() {
+        // A −30 dB LTg dip at ω = 300 raises one partition's SMR by +30 dB,
+        // making its MNR = SNR − SMR the unique smallest (most negative).
+        // §C.1.5.2.7: the loop selects "the subband with the minimal MNR".
+        let n = first_partition_containing_line(300).expect("ω = 300 is in-table");
+        let mnr = coder_partition_d5_mnr_row_order(
+            |_| 20.0,
+            |_| 50.0,
+            |omega: u16| if omega == 300 { -30.0 } else { 0.0 },
+        );
+        let sel = coder_partition_d5_min_mnr(&mnr);
+        assert_eq!(sel.partition_n, n);
+        // The selection echoes the winning step-72 row verbatim.
+        assert_eq!(sel.mnr_db, mnr[(n - 1) as usize].mnr_db);
+        assert_eq!(sel.smr_db, mnr[(n - 1) as usize].smr_db);
+        assert_eq!(sel.width_n, mnr[(n - 1) as usize].width_n);
+        // The dipped partition's MNR is genuinely below the flat rest.
+        assert!(sel.mnr_db < mnr[0].mnr_db);
+    }
+
+    #[test]
+    fn coder_partition_d5_min_mnr_partition_index_mapping() {
+        // SNR(n) = n with flat SMR makes MNR strictly ascending in n, so
+        // partition n = 1 (array index 0) holds the unique minimum.
+        let mnr = coder_partition_d5_mnr_row_order(f64::from, |_| 0.0, |_| 0.0);
+        let sel = coder_partition_d5_min_mnr(&mnr);
+        assert_eq!(sel.partition_n, 1);
+        assert_eq!(sel.mnr_db, 1.0); // SNR(1) − 0 = 1
+    }
+
+    #[test]
+    fn coder_partition_d5_min_mnr_high_index_minimum() {
+        // SNR(n) = 100 − n makes MNR strictly descending in n, so the
+        // last partition n = 32 (array index 31) holds the minimum.
+        let mnr = coder_partition_d5_mnr_row_order(|n| 100.0 - f64::from(n), |_| 0.0, |_| 0.0);
+        let sel = coder_partition_d5_min_mnr(&mnr);
+        assert_eq!(sel.partition_n, 32);
+        assert_eq!(sel.mnr_db, 68.0); // 100 − 32 = 68
+    }
+
+    #[test]
+    fn coder_partition_d5_min_mnr_ties_resolve_to_lowest_index() {
+        // All-equal MNR: the spec selects "the" subband, so the
+        // deterministic tie-break is the lowest partition index — the
+        // row-order scan keeps the first occurrence.
+        let mnr = coder_partition_d5_mnr_row_order(|_| 7.0, |_| 7.0, |_| 0.0);
+        // smr_db is 7 − 0 = 7 (uniform), mnr_db is 7 − 7 = 0 (uniform).
+        assert!(mnr.iter().all(|r| r.mnr_db == 0.0));
+        let sel = coder_partition_d5_min_mnr(&mnr);
+        assert_eq!(sel.partition_n, 1);
+        assert_eq!(sel.mnr_db, 0.0);
+    }
+
+    #[test]
+    fn coder_partition_d5_min_mnr_carries_width_and_smr_of_winner() {
+        // Pick an interior partition in the wide band (width_n = 1) as the
+        // unique minimum and confirm both pass-through columns.
+        let n = first_partition_containing_line(300).expect("ω = 300 is in-table");
+        assert!(n >= 13, "ω = 300 falls in a width_n = 1 partition");
+        let mnr = coder_partition_d5_mnr_row_order(
+            |_| 0.0,
+            |_| 40.0,
+            |omega: u16| if omega == 300 { -30.0 } else { 0.0 },
+        );
+        let sel = coder_partition_d5_min_mnr(&mnr);
+        assert_eq!(sel.partition_n, n);
+        assert_eq!(sel.width_n, 1);
+        assert_eq!(sel.smr_db, mnr[(n - 1) as usize].smr_db);
+    }
+
+    #[test]
+    fn coder_partition_d5_min_mnr_negative_minimum_is_selected() {
+        // A negative MNR (signal needs more bits than current quantization
+        // provides) is a valid — and the most urgent — selection.
+        let mut mnr = coder_partition_d5_mnr_row_order(|_| 10.0, |_| 0.0, |_| 0.0);
+        // All rows currently mnr_db = 10; depress partition n = 20.
+        mnr[19].mnr_db = -5.0;
+        let sel = coder_partition_d5_min_mnr(&mnr);
+        assert_eq!(sel.partition_n, 20);
+        assert_eq!(sel.mnr_db, -5.0);
+    }
+
+    #[test]
+    fn coder_partition_d5_min_mnr_nan_rows_are_skipped() {
+        // A NaN MNR never compares `<` the running minimum, so it is
+        // skipped; the finite minimum still wins.
+        let mut mnr = coder_partition_d5_mnr_row_order(|_| 10.0, |_| 0.0, |_| 0.0);
+        mnr[5].mnr_db = f64::NAN;
+        mnr[18].mnr_db = 2.0;
+        let sel = coder_partition_d5_min_mnr(&mnr);
+        assert_eq!(sel.partition_n, 19);
+        assert_eq!(sel.mnr_db, 2.0);
+    }
+
+    #[test]
+    fn coder_partition_d5_min_mnr_is_idempotent() {
+        let snr = |n: u16| -> f64 { (f64::from(n) * 1.7).sin() * 10.0 + 30.0 };
+        let lsb = |n: u16| -> f64 { f64::from(n) * 0.5 + 30.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.002).cos() * 8.0 };
+        let mnr = coder_partition_d5_mnr_row_order(snr, lsb, ltg);
+        assert_eq!(
+            coder_partition_d5_min_mnr(&mnr),
+            coder_partition_d5_min_mnr(&mnr)
+        );
+    }
+
+    #[test]
+    fn coder_partition_d5_min_mnr_matches_brute_force_argmin() {
+        // Cross-check the row-order scan against an independent argmin over
+        // the same 32-row vector for an arbitrary non-degenerate input.
+        let snr = |n: u16| -> f64 { (f64::from(n) * 2.3).cos() * 13.0 + 25.0 };
+        let lsb = |n: u16| -> f64 { f64::from(n) * 0.37 + 28.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.0017).sin() * 6.0 };
+        let mnr = coder_partition_d5_mnr_row_order(snr, lsb, ltg);
+        let expected = mnr
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.mnr_db.partial_cmp(&b.1.mnr_db).unwrap())
+            .map(|(i, _)| i as u16 + 1)
+            .unwrap();
+        assert_eq!(coder_partition_d5_min_mnr(&mnr).partition_n, expected);
     }
 }

@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex C §C.1.5.2.7 "Bit allocation" minimal-MNR subband selection
+  (Phase 2 step 73). Phase 2 step 72 (r271) landed the per-partition
+  `MNR_n = SNR_n − SMR_n` row-order vector; this step performs the first
+  action of every bit-allocation iteration loop — "Determination of the
+  minimal MNR of all subbands" (printed p.71, verbatim) — reducing the
+  32-row vector to the single subband "that has the greatest benefit",
+  which the loop then promotes to the next-higher quantization-accuracy
+  entry. New public struct
+  `CoderPartitionD5MinMnr { partition_n, mnr_db, smr_db, width_n }` and
+  free function
+  `coder_partition_d5_min_mnr(&[CoderPartitionD5Mnr; 32]) ->
+  CoderPartitionD5MinMnr`: a row-order argmin scan over the step-72
+  vector, carrying the winning partition's `mnr_db` / `smr_db` /
+  `width_n` columns through verbatim and returning its 1-based partition
+  index `n ∈ 1..=32`. Ties resolve to the lowest partition index (the
+  spec selects "the" subband, so a deterministic tie-break is required —
+  the row-order scan keeps the first occurrence), and `NaN` rows are
+  skipped (never compare `<` the running minimum). No spec arithmetic is
+  introduced beyond the `<` comparisons of the scan. Tests: 900 lib (was
+  891 baseline; +9 unit) covering unique-minimum selection under a
+  −30 dB interior-line LTg dip, low/high partition-index minima,
+  lowest-index tie-break, width/SMR column pass-through of the winner,
+  negative-minimum selection, `NaN`-row skipping, idempotence, and a
+  brute-force argmin cross-check. Only the §C.1.5.2.7 "Determination of
+  the minimal MNR of all subbands" loop step (ISO/IEC 11172-3:1993 Annex
+  C, printed p.71) and the Phase 2 step 72
+  `coder_partition_d5_mnr_row_order` vector it consumes are read; no
+  external implementation was consulted.
 - psy: Annex C §C.1.5.2.7 "Bit allocation" per-partition mask-to-noise
   ratio `MNR_n = SNR_n − SMR_n` row-order vector over Table D.5 (Phase 2
   step 72). Phase 2 step 71 (r270) exposed the §D.1 Step 9 paired
