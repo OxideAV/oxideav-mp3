@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex C §C.1.5.2.7 "Bit allocation" step-4 budget update +
+  iterate/terminate test (Phase 2 step 76). Steps 73–75 selected the
+  minimal-MNR subband, promoted its Table B.2 entry, and recomputed its
+  MNR; this step closes the iteration with the loop's fourth verbatim
+  action — "bspl is updated according to the additional number of bits
+  required. If a non-zero number of bits is assigned to a subband for the
+  first time, bsel has to be updated, and bscf has to be updated according
+  to the number of scalefactors required for this subband" — and the
+  recompute `adb = cb − (bhdr + bcrc + bbal + bsel + bscf + bspl + banc)`
+  (printed p.74, verbatim), saturating at zero. New public structs
+  `BitAllocBudget { bspl, bsel, bscf, first_time, adb }` and
+  `BitAllocOverhead { cb, bhdr, bcrc, bbal, banc }` and free functions
+  `bit_allocation_budget_update(prev, extra_sample_bits, first_time,
+  sel_bits, scf_bits, overhead) -> BitAllocBudget` and
+  `bit_allocation_should_iterate(adb, max_possible_increase) -> bool`,
+  the latter the verbatim termination predicate "The iterative procedure
+  is repeated as long as adb is not less than any possible increase of
+  bspl, bsel and bscf within one loop" (`adb >= max_possible_increase`).
+  Per-entry sample-bit / scalefactor-bit costs (Tables B.2 / B.4) and the
+  fixed overhead terms are caller-injected (behind the numeric-table
+  transcription gap), the dependency-injection pattern the surrounding
+  Phase 2 steps use. Tests: 930 lib (was 918 baseline; +12 unit). Only
+  ISO/IEC 11172-3:1993 Annex C §C.1.5.2.7 (printed p.74) was read; no
+  external implementation was consulted.
 - psy: Annex C §C.1.5.2.7 "Bit allocation" recompute-new-MNR loop action
   (Phase 2 step 75). Phase 2 step 74 (r273) advanced the minimal-MNR
   subband's Table B.2 entry to the next-higher quantization accuracy; this

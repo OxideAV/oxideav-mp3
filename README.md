@@ -2373,6 +2373,50 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 76 (r275)** — Annex C §C.1.5.2.7 "Bit allocation"
+**step-4 budget update + iterate/terminate test** — the fourth and
+final action of every Layer II bit-allocation iteration, plus the loop's
+continuation predicate. Steps 73–75 selected the minimal-MNR subband,
+promoted its Table B.2 entry, and recomputed its MNR; this step closes
+the iteration by folding the promotion's bit cost into the running
+budget and recomputing the available-data-bits `adb`, then deciding
+whether to loop again. New public structs `BitAllocBudget { bspl, bsel,
+bscf, first_time, adb }` (the loop-mutated `bspl` / `bsel` / `bscf`
+accumulators + derived `adb`) and `BitAllocOverhead { cb, bhdr, bcrc,
+bbal, banc }` (the fixed per-frame `adb`-formula terms), and free
+functions `bit_allocation_budget_update(prev, extra_sample_bits,
+first_time, sel_bits, scf_bits, overhead) -> BitAllocBudget` and
+`bit_allocation_should_iterate(adb, max_possible_increase) -> bool`. The
+update applies the verbatim §C.1.5.2.7 rule "bspl is updated according
+to the additional number of bits required. If a non-zero number of bits
+is assigned to a subband for the first time, bsel has to be updated, and
+bscf has to be updated according to the number of scalefactors required
+for this subband" (`bspl += extra_sample_bits`; on a `first_time`
+promotion also `bsel += sel_bits`, `bscf += scf_bits`), then recomputes
+`adb = cb − (bhdr + bcrc + bbal + bsel + bscf + bspl + banc)` (saturating
+at zero). The predicate is the verbatim termination sentence "The
+iterative procedure is repeated as long as adb is not less than any
+possible increase of bspl, bsel and bscf within one loop" — `adb >=
+max_possible_increase`. The per-entry sample-bit / scalefactor-bit costs
+(Tables B.2 / B.4) and the fixed overhead terms are caller-injected (the
+tables are behind the numeric-table transcription gap), the
+dependency-injection pattern the surrounding Phase 2 steps use; no spec
+arithmetic is introduced beyond the accumulator additions, the `adb`
+subtraction, and the `>=` comparison. Tests: 930 lib (was 918 baseline;
++12 unit) covering the non-first-time bspl-only growth with bsel/bscf
+carried through, first-time growth of all three accumulators, the
+verbatim `adb` formula (both first-time and not), adb saturation on
+overcommit, zero-extra-bits accumulator idempotence, determinism, a
+three-iteration threading chain with monotone-shrinking adb, the
+not-less-than boundary (`adb == increase` continues), termination below
+the increase, the zero-increase trivial-continue case, and an
+end-to-end budget-then-iterate exhaustion. Only the §C.1.5.2.7 "bspl is
+updated … Then adb is calculated again" loop step, its `adb` formula,
+and the "repeated as long as adb is not less than any possible increase"
+termination sentence (ISO/IEC 11172-3:1993 Annex C §C.1.5.2.7, printed
+p.74, in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`) were read. No
+external implementation was consulted.
+
 **Phase 2 step 73 (r272)** — Annex C §C.1.5.2.7 "Bit allocation"
 **minimal-MNR subband selection** — the first action of every Layer I /
 Layer II bit-allocation iteration. Phase 2 step 72 (r271) landed the

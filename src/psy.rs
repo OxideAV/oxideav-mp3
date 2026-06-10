@@ -4839,6 +4839,206 @@ where
     }
 }
 
+/// The running bit-budget accumulators of the §C.1.5.2.7 Layer II
+/// bit-allocation loop — the `bspl` / `bsel` / `bscf` totals and the
+/// derived available-data-bits `adb` after the §C.1.5.2.7 step-4 update
+/// produced by [`bit_allocation_budget_update`] (Phase 2 step 76 / r275).
+///
+/// The §C.1.5.2.7 iteration's fourth action reads, verbatim: "bspl is
+/// updated according to the additional number of bits required. If a
+/// non-zero number of bits is assigned to a subband for the first time,
+/// bsel has to be updated, and bscf has to be updated according to the
+/// number of scalefactors required for this subband. Then adb is
+/// calculated again using the formula:
+/// `adb = cb - (bhdr + bcrc + bbal + bsel + bscf + bspl + banc)`."
+/// This struct carries the three loop-mutated accumulators plus the
+/// recomputed `adb` after one such update.
+///
+/// **Field semantics.** `bspl` is the running total of bits assigned to
+/// the subband **samples** after adding this iteration's additional
+/// sample bits; `bsel` is the running total of bits for the
+/// scalefactor-selection information (scfsi); `bscf` is the running total
+/// of bits for the transmitted **scalefactors**; `first_time` is `true`
+/// iff this iteration assigned a non-zero number of bits to the selected
+/// subband for the first time (the condition under which `bsel` and
+/// `bscf` are grown); `adb` is the recomputed available-data-bits left
+/// for samples and scalefactors after the §C.1.5.2.7 `adb` formula.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitAllocBudget {
+    /// Running total of bits assigned to the subband **samples** (`bspl`)
+    /// after this iteration's additional sample bits were added.
+    pub bspl: u32,
+    /// Running total of bits for the scalefactor-**selection** information
+    /// (`bsel`, the scfsi field) after this iteration's update. Grown only
+    /// when a non-zero number of bits is assigned to the subband for the
+    /// first time.
+    pub bsel: u32,
+    /// Running total of bits for the transmitted **scalefactors**
+    /// (`bscf`) after this iteration's update. Grown only when a non-zero
+    /// number of bits is assigned to the subband for the first time.
+    pub bscf: u32,
+    /// `true` iff this iteration assigned a non-zero number of bits to the
+    /// selected subband for the **first time** — the §C.1.5.2.7 condition
+    /// under which `bsel` and `bscf` are updated.
+    pub first_time: bool,
+    /// Recomputed available-data-bits `adb = cb - (bhdr + bcrc + bbal +
+    /// bsel + bscf + bspl + banc)` after this iteration's accumulator
+    /// update. Saturates at zero (never negative) — the §C.1.5.2.7
+    /// termination test compares it against the next possible increase.
+    pub adb: u32,
+}
+
+/// The fixed per-frame overhead bit counts of the §C.1.5.2.7 `adb`
+/// formula — the terms subtracted from the total available bits `cb`
+/// that do **not** change across the bit-allocation loop's iterations.
+///
+/// These are the `bhdr` (header), `bcrc` (CRC checkword), `bbal` (bit
+/// allocation field), `banc` (ancillary data) terms of
+/// `adb = cb - (bhdr + bcrc + bbal + bsel + bscf + bspl + banc)`. They
+/// are caller-supplied because their values depend on the frame's
+/// configuration (header is 32 bits, CRC is 16 bits only when used, the
+/// bit-allocation field width follows Table B.2 per the chosen layout,
+/// and ancillary data is application-defined) rather than on any single
+/// numeric table behind the transcription gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitAllocOverhead {
+    /// Total available bits for the frame (`cb`).
+    pub cb: u32,
+    /// Header bits (`bhdr`, 32 for a Layer II frame).
+    pub bhdr: u32,
+    /// CRC-checkword bits (`bcrc`, 16 when CRC protection is used, else
+    /// 0).
+    pub bcrc: u32,
+    /// Bit-allocation-field bits (`bbal`).
+    pub bbal: u32,
+    /// Ancillary-data bits (`banc`).
+    pub banc: u32,
+}
+
+/// §C.1.5.2.7 step 4 — "bspl is updated according to the additional
+/// number of bits required … Then adb is calculated again" — the fourth
+/// and final action of every Layer II bit-allocation iteration.
+///
+/// Phase 2 step 73 selected the minimal-MNR subband, step 74
+/// ([`bit_allocation_promote_entry`]) advanced its Table B.2 entry, and
+/// step 75 ([`bit_allocation_recompute_mnr`]) recomputed its MNR. This
+/// step closes the iteration by folding the promotion's bit cost into the
+/// running budget and recomputing the available-data-bits `adb`.
+///
+/// **Parameters.** `prev` is the running budget before this iteration
+/// (`bspl` / `bsel` / `bscf` accumulators; its `first_time` / `adb`
+/// fields are ignored on input); `extra_sample_bits` is the additional
+/// number of bits the promotion requires for this subband's samples (the
+/// difference between the Table B.4 sample-bit cost at the new and old
+/// Table B.2 entries — caller-supplied because Table B.4 is behind the
+/// numeric-table transcription gap); `first_time` is `true` iff this
+/// promotion assigned a non-zero number of bits to the subband for the
+/// **first time** (i.e. the subband moved off its zero-bit entry);
+/// `sel_bits` and `scf_bits` are the bits this subband then contributes
+/// to `bsel` (scfsi) and `bscf` (scalefactors) respectively — added only
+/// on a `first_time` promotion; `overhead` carries the fixed `cb` / `bhdr`
+/// / `bcrc` / `bbal` / `banc` terms of the `adb` formula.
+///
+/// **Update rule (verbatim §C.1.5.2.7).**
+/// `bspl += extra_sample_bits`; and when `first_time` is set,
+/// `bsel += sel_bits` and `bscf += scf_bits`. Then
+/// `adb = cb - (bhdr + bcrc + bbal + bsel + bscf + bspl + banc)`,
+/// saturating at zero. When `first_time` is `false` the `bsel` / `bscf`
+/// totals are carried through unchanged (the subband already held a
+/// non-zero allocation, so its scalefactor / selection bits are already
+/// in the running totals).
+///
+/// **No spec arithmetic beyond the additions and the formula.** The
+/// per-entry sample-bit and scalefactor-bit costs are caller-injected
+/// (Tables B.2 / B.4 are behind the numeric-table transcription gap); the
+/// only computation here is the accumulator additions and the verbatim
+/// `adb` subtraction.
+///
+/// **Determinism.** A pure function of its arguments.
+///
+/// Provenance: only the §C.1.5.2.7 "bspl is updated … Then adb is
+/// calculated again" loop step and its `adb = cb - (bhdr + bcrc + bbal +
+/// bsel + bscf + bspl + banc)` formula transcribed from
+/// ISO/IEC 11172-3:1993 Annex C §C.1.5.2.7 "Bit allocation" (printed
+/// p.74) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`, and the
+/// Phase 2 step 74 [`bit_allocation_promote_entry`] result it follows,
+/// are read. The Table B.2 / B.4 per-entry bit costs are caller-injected
+/// (behind the numeric-table transcription gap); no external
+/// implementation was consulted.
+#[must_use]
+pub fn bit_allocation_budget_update(
+    prev: BitAllocBudget,
+    extra_sample_bits: u32,
+    first_time: bool,
+    sel_bits: u32,
+    scf_bits: u32,
+    overhead: BitAllocOverhead,
+) -> BitAllocBudget {
+    let bspl = prev.bspl.saturating_add(extra_sample_bits);
+    let (bsel, bscf) = if first_time {
+        (
+            prev.bsel.saturating_add(sel_bits),
+            prev.bscf.saturating_add(scf_bits),
+        )
+    } else {
+        (prev.bsel, prev.bscf)
+    };
+    let used = overhead
+        .bhdr
+        .saturating_add(overhead.bcrc)
+        .saturating_add(overhead.bbal)
+        .saturating_add(bsel)
+        .saturating_add(bscf)
+        .saturating_add(bspl)
+        .saturating_add(overhead.banc);
+    let adb = overhead.cb.saturating_sub(used);
+    BitAllocBudget {
+        bspl,
+        bsel,
+        bscf,
+        first_time,
+        adb,
+    }
+}
+
+/// §C.1.5.2.7 loop-continuation test — "The iterative procedure is
+/// repeated as long as adb is not less than any possible increase of
+/// bspl, bsel and bscf within one loop." (Phase 2 step 76 / r275.)
+///
+/// After the step-4 [`bit_allocation_budget_update`] recomputes `adb`,
+/// the loop re-runs (step 73 reselects the minimal-MNR subband, step 74
+/// promotes it, …) only while the remaining `adb` can still pay for the
+/// **largest possible** single-iteration increase of the three loop
+/// accumulators. `max_possible_increase` is that worst-case one-loop bit
+/// cost — the maximum over all subbands of the additional `bspl` bits a
+/// next-entry promotion would cost, plus the `bsel` + `bscf` bits a
+/// first-time allocation of that subband would add (caller-supplied; the
+/// per-entry costs live behind the Tables B.2 / B.4 transcription gap).
+///
+/// Returns `true` iff `adb >= max_possible_increase` — i.e. the loop
+/// should iterate again. When the largest possible increase no longer
+/// fits the remaining `adb`, the iteration terminates (`false`). A
+/// `max_possible_increase` of zero (no subband can be promoted further —
+/// every subband is at its top Table B.2 entry) returns `true` only while
+/// `adb >= 0`, which `u32` always satisfies; callers detect the
+/// no-promotable-subband terminal condition from step 74's
+/// [`BitAllocPromotion::advanced`] flag, not from this predicate.
+///
+/// **Determinism.** A pure comparison of its two arguments.
+///
+/// Provenance: only the §C.1.5.2.7 "The iterative procedure is repeated
+/// as long as adb is not less than any possible increase of bspl, bsel
+/// and bscf within one loop" termination sentence transcribed from
+/// ISO/IEC 11172-3:1993 Annex C §C.1.5.2.7 "Bit allocation" (printed
+/// p.74) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read. The
+/// worst-case one-loop increase is caller-supplied (its per-entry bit
+/// costs are behind the numeric-table transcription gap); no external
+/// implementation was consulted.
+#[must_use]
+pub fn bit_allocation_should_iterate(adb: u32, max_possible_increase: u32) -> bool {
+    adb >= max_possible_increase
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11429,5 +11629,203 @@ mod tests {
         let promotion = bit_allocation_promote_entry(0, 0, 4);
         let got = bit_allocation_recompute_mnr(promotion, -12.0, |_| 8.0);
         assert_eq!(got.mnr_db, 8.0 + 12.0);
+    }
+
+    // --- Phase 2 step 76 (r275): §C.1.5.2.7 step-4 budget update + ------
+    // --- iterate/terminate test --------------------------------------
+
+    fn overhead_fixture() -> BitAllocOverhead {
+        // A representative Layer II overhead: 32-bit header, no CRC, a
+        // 64-bit allocation field, no ancillary data, 1000-bit frame.
+        BitAllocOverhead {
+            cb: 1000,
+            bhdr: 32,
+            bcrc: 0,
+            bbal: 64,
+            banc: 0,
+        }
+    }
+
+    #[test]
+    fn budget_update_adds_sample_bits_to_bspl() {
+        // A non-first-time promotion only grows bspl; bsel/bscf are
+        // carried through unchanged.
+        let prev = BitAllocBudget {
+            bspl: 100,
+            bsel: 8,
+            bscf: 36,
+            first_time: false,
+            adb: 0,
+        };
+        let got = bit_allocation_budget_update(prev, 40, false, 999, 999, overhead_fixture());
+        assert_eq!(got.bspl, 140);
+        assert_eq!(got.bsel, 8); // unchanged: not a first-time allocation
+        assert_eq!(got.bscf, 36); // unchanged
+        assert!(!got.first_time);
+    }
+
+    #[test]
+    fn budget_update_first_time_grows_bsel_and_bscf() {
+        // A first-time allocation grows all three accumulators.
+        let prev = BitAllocBudget {
+            bspl: 0,
+            bsel: 0,
+            bscf: 0,
+            first_time: false,
+            adb: 0,
+        };
+        let got = bit_allocation_budget_update(prev, 30, true, 2, 18, overhead_fixture());
+        assert_eq!(got.bspl, 30);
+        assert_eq!(got.bsel, 2);
+        assert_eq!(got.bscf, 18);
+        assert!(got.first_time);
+    }
+
+    #[test]
+    fn budget_update_recomputes_adb_per_spec_formula() {
+        // adb = cb - (bhdr + bcrc + bbal + bsel + bscf + bspl + banc).
+        let prev = BitAllocBudget {
+            bspl: 50,
+            bsel: 4,
+            bscf: 20,
+            first_time: false,
+            adb: 0,
+        };
+        let oh = overhead_fixture();
+        let got = bit_allocation_budget_update(prev, 10, false, 0, 0, oh);
+        // bspl=60, bsel=4, bscf=20; used = 32+0+64+4+20+60+0 = 180.
+        let expect = oh.cb - (oh.bhdr + oh.bcrc + oh.bbal + 4 + 20 + 60 + oh.banc);
+        assert_eq!(got.adb, expect);
+        assert_eq!(got.adb, 1000 - 180);
+    }
+
+    #[test]
+    fn budget_update_first_time_adb_includes_new_sel_scf() {
+        // On a first-time promotion the recomputed adb reflects the freshly
+        // added bsel and bscf, not just bspl.
+        let prev = BitAllocBudget {
+            bspl: 0,
+            bsel: 0,
+            bscf: 0,
+            first_time: false,
+            adb: 0,
+        };
+        let oh = overhead_fixture();
+        let got = bit_allocation_budget_update(prev, 30, true, 2, 18, oh);
+        // used = 32 + 0 + 64 + 2 + 18 + 30 + 0 = 146.
+        assert_eq!(got.adb, 1000 - 146);
+    }
+
+    #[test]
+    fn budget_update_adb_saturates_at_zero_on_overcommit() {
+        // When the running totals exceed cb, adb floors at zero rather than
+        // wrapping (u32 saturation).
+        let prev = BitAllocBudget {
+            bspl: 900,
+            bsel: 8,
+            bscf: 36,
+            first_time: false,
+            adb: 0,
+        };
+        let got = bit_allocation_budget_update(prev, 200, false, 0, 0, overhead_fixture());
+        assert_eq!(got.adb, 0);
+    }
+
+    #[test]
+    fn budget_update_zero_extra_bits_is_idempotent_on_accumulators() {
+        // A no-op promotion (saturated step-74) adds zero bits; the
+        // accumulators are unchanged and adb is recomputed from them.
+        let prev = BitAllocBudget {
+            bspl: 120,
+            bsel: 8,
+            bscf: 36,
+            first_time: false,
+            adb: 0,
+        };
+        let got = bit_allocation_budget_update(prev, 0, false, 5, 5, overhead_fixture());
+        assert_eq!((got.bspl, got.bsel, got.bscf), (120, 8, 36));
+    }
+
+    #[test]
+    fn budget_update_is_deterministic() {
+        let prev = BitAllocBudget {
+            bspl: 10,
+            bsel: 2,
+            bscf: 6,
+            first_time: false,
+            adb: 0,
+        };
+        let oh = overhead_fixture();
+        assert_eq!(
+            bit_allocation_budget_update(prev, 7, true, 2, 12, oh),
+            bit_allocation_budget_update(prev, 7, true, 2, 12, oh)
+        );
+    }
+
+    #[test]
+    fn budget_update_threads_across_iterations() {
+        // Chain three iterations: the budget accumulates and adb shrinks
+        // monotonically as bits are spent.
+        let oh = overhead_fixture();
+        let mut b = BitAllocBudget {
+            bspl: 0,
+            bsel: 0,
+            bscf: 0,
+            first_time: false,
+            adb: oh.cb,
+        };
+        let mut prev_adb = oh.cb;
+        for _ in 0..3 {
+            b = bit_allocation_budget_update(b, 50, true, 2, 18, oh);
+            assert!(b.adb < prev_adb, "adb must shrink as bits are spent");
+            prev_adb = b.adb;
+        }
+        // After three first-time allocations: bspl=150, bsel=6, bscf=54.
+        assert_eq!((b.bspl, b.bsel, b.bscf), (150, 6, 54));
+    }
+
+    #[test]
+    fn should_iterate_true_while_adb_covers_largest_increase() {
+        // adb >= max increase ⇒ loop continues.
+        assert!(bit_allocation_should_iterate(100, 40));
+        assert!(bit_allocation_should_iterate(40, 40)); // not-less-than ⇒ boundary continues
+    }
+
+    #[test]
+    fn should_iterate_false_when_adb_below_largest_increase() {
+        // adb < max increase ⇒ loop terminates.
+        assert!(!bit_allocation_should_iterate(39, 40));
+        assert!(!bit_allocation_should_iterate(0, 1));
+    }
+
+    #[test]
+    fn should_iterate_zero_increase_always_continues() {
+        // A zero worst-case increase (no promotable subband) trivially
+        // satisfies the >= test; the terminal condition is detected from
+        // step 74's `advanced` flag instead.
+        assert!(bit_allocation_should_iterate(0, 0));
+        assert!(bit_allocation_should_iterate(500, 0));
+    }
+
+    #[test]
+    fn budget_then_iterate_terminates_when_budget_exhausted() {
+        // End-to-end: a step-4 update that drives adb below the next
+        // possible increase makes should_iterate report termination.
+        let oh = overhead_fixture();
+        let prev = BitAllocBudget {
+            bspl: 800,
+            bsel: 8,
+            bscf: 36,
+            first_time: false,
+            adb: 0,
+        };
+        // used so far before this add = 32+64+8+36+800 = 940; adb = 60.
+        let got = bit_allocation_budget_update(prev, 30, false, 0, 0, oh);
+        // bspl=830 ⇒ used=970 ⇒ adb=30.
+        assert_eq!(got.adb, 30);
+        // Next possible increase needs 50 bits ⇒ cannot continue.
+        assert!(!bit_allocation_should_iterate(got.adb, 50));
+        // A cheaper next increase (20 bits) would still fit.
+        assert!(bit_allocation_should_iterate(got.adb, 20));
     }
 }
