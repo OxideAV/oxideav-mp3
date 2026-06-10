@@ -4354,6 +4354,184 @@ where
     out
 }
 
+// =====================================================================
+// Annex C §C.1.5.2.7 "Bit allocation" — per-partition mask-to-noise
+// ratio `MNR_n = SNR_n − SMR_n` row-order vector over Table D.5
+// (Phase 2 step 72 / r271).
+//
+// Spec context (ISO/IEC 11172-3:1993 Annex C §C.1.5.2.7 "Bit
+// allocation", printed p.73):
+//
+//   "The allocation procedure is an iterative procedure where, in each
+//    iteration step the number of levels of the subband that has the
+//    greatest benefit is increased. First the mask-to-noise ratio
+//    'MNR' for each subband is calculated by subtracting from the
+//    signal-to-noise-ratio 'SNR' the signal-to-mask-ratio 'SMR':
+//        MNR = SNR − SMR
+//    The signal-to-noise-ratio can be found in table C.5 'Layer II
+//    Signal-to-Noise Ratios'. The signal-to-mask-ratio is the output
+//    of the psychoacoustic model."
+//
+// Phase 2 step 71 (r270) exposed the §D.1 Step 9 paired `(SMR_n,
+// width_n)` row-order vector — the "output of the psychoacoustic
+// model" the §C.1.5.2.7 procedure consumes. This step takes the very
+// first arithmetic of the bit-allocation iterative loop — the
+// per-subband `MNR_n = SNR_n − SMR_n` initialisation, computed once
+// per partition before the iterative level-bumping begins — and
+// presents it as a row-order vector seeded directly off the step-71
+// paired SMR vector.
+//
+// The `SNR_n` term is the Table C.5 "Layer II Signal-to-Noise Ratios"
+// column, supplied per partition through a caller callback (exactly
+// the dependency-injection pattern Phase 2 steps 58–71 use for the
+// §D.1 Step 2 `Lsb(n)` term). Table C.5 lives behind the same
+// numeric-table transcription gap as Tables D.1 / D.2, so the
+// quantization-step-count → SNR mapping is injected, not transcribed.
+//
+// No spec arithmetic is introduced beyond the verbatim `SNR − SMR`
+// subtraction above; the SMR column is bit-identical to step 71's and
+// the `width_n` column passes through unchanged.
+// =====================================================================
+
+/// A single row of the Layer I / Layer II bit-allocation iterative
+/// procedure in §C.1.5.2.7 initial form: the per-partition mask-to-
+/// noise ratio `MNR_n = SNR_n − SMR_n` (dB) paired with the
+/// partition's `width_n` column at the same row index in row-order
+/// Table D.5 presentation.
+///
+/// Produced by [`coder_partition_d5_mnr_row_order`] (Phase 2 step 72 /
+/// r271). The per-iteration successor of Phase 2 step 71's
+/// [`CoderPartitionD5Smr`] (which carries the bare §D.1 Step 9 `SMR_n`
+/// column): the §C.1.5.2.7 loop subtracts the supplied `SNR_n` from
+/// each `SMR_n` to obtain the `MNR_n` it then minimises over.
+///
+/// **Field semantics.** `mnr_db` carries the §C.1.5.2.7 mask-to-noise
+/// ratio `MNR_n = SNR_n − SMR_n` (dB), where `SMR_n` is the Phase 2
+/// step 71 psychoacoustic-model output and `SNR_n` is the caller-
+/// supplied Table C.5 value for the partition. The `smr_db` column is
+/// preserved verbatim from step 71 (the loop re-uses it across
+/// iterations), and `width_n` is the static Table D.5 column.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoderPartitionD5Mnr {
+    /// Per-partition mask-to-noise ratio `MNR_n = SNR_n − SMR_n` (dB),
+    /// per the §C.1.5.2.7 verbatim definition. A **larger** `MNR_n`
+    /// means more margin above the masking threshold; the iterative
+    /// procedure minimises the total by bumping the subband with the
+    /// **smallest** `MNR_n` first ("the subband that has the greatest
+    /// benefit"). No clipping.
+    pub mnr_db: f64,
+    /// The §D.1 Step 9 signal-to-mask ratio `SMR_n` (dB) preserved
+    /// verbatim from Phase 2 step 71's
+    /// [`CoderPartitionD5Smr::smr_db`] — the psychoacoustic-model
+    /// output the loop re-reads each iteration.
+    pub smr_db: f64,
+    /// Partition's `width_n` column from Table D.5 — `0` for
+    /// `n ∈ 1..=12`, `1` for `n ∈ 13..=32`. Identical to Phase 2
+    /// step 71's [`CoderPartitionD5Smr::width_n`].
+    pub width_n: u16,
+}
+
+/// §C.1.5.2.7 mask-to-noise-ratio row-order
+/// `[(MNR_n, SMR_n, width_n), …]` vector for every Layer I / Layer II
+/// coder partition `n ∈ 1..=32`. Element `i` of the returned
+/// `[CoderPartitionD5Mnr; 32]` holds the partition `n = i + 1` triple
+/// (the spec's 1-based `n` in 0-based array form):
+///
+/// ```text
+/// out[i].mnr_db  = SNR_{i + 1} − SMR_{i + 1}   dB
+/// out[i].smr_db  = SMR_{i + 1}                 dB
+/// out[i].width_n = width_{i + 1}   (∈ {0, 1})
+/// ```
+///
+/// This is the very first arithmetic of the §C.1.5.2.7 bit-allocation
+/// iterative procedure — the per-subband `MNR` initialisation computed
+/// once before the loop's level-bumping begins. The iterative loop
+/// then repeatedly "determines the minimal MNR of all subbands" and
+/// increases the quantization accuracy of that subband; this primitive
+/// supplies the loop's row-order starting `MNR_n` (and re-presents the
+/// `SMR_n` it derives from, since the loop re-uses `SMR_n` whenever a
+/// subband's `SNR_n` advances to the next quantization-table entry).
+/// It is the per-iteration successor of Phase 2 step 71's paired
+/// §D.1 Step 9 `(SMR_n, width_n)` vector
+/// [`coder_partition_d5_smr_row_order`].
+///
+/// **Index convention.** 0-based on the returned slice; element `i`
+/// holds the partition-`(i + 1)` triple. The spec's 1-based partition
+/// index `n ∈ 1..=32` maps to array index `i = n - 1 ∈ 0..=31`.
+///
+/// **Callbacks.** `snr_per_partition` is the Table C.5 "Layer II
+/// Signal-to-Noise Ratios" value `SNR_n` (dB) for the partition's
+/// current quantization-table entry, supplied per partition — Table
+/// C.5 lives behind the same numeric-table transcription gap as
+/// Tables D.1 / D.2, so the value is injected, the same dependency-
+/// injection pattern Phase 2 steps 58–71 use for the §D.1 Step 2
+/// `Lsb(n)` term. `lsb_per_partition` and `ltg_per_line` are forwarded
+/// unchanged to Phase 2 step 71's
+/// [`coder_partition_d5_smr_row_order`] to obtain the `SMR_n` /
+/// `width_n` columns.
+///
+/// **Composition.** `out[i].smr_db` / `out[i].width_n` come verbatim
+/// from Phase 2 step 71's paired SMR vector (closed over
+/// `lsb_per_partition` / `ltg_per_line`); `out[i].mnr_db` is the single
+/// §C.1.5.2.7 subtraction `snr_per_partition(i + 1) − smr_db`. No spec
+/// arithmetic is introduced beyond that verbatim subtraction.
+///
+/// **Caller cost.** `snr_per_partition` is invoked exactly once per
+/// partition `n ∈ 1..=32` in ascending row order; `lsb_per_partition`
+/// and `ltg_per_line` are invoked exactly as many times as Phase 2
+/// step 71 (= one step-70 pass).
+///
+/// **SMR-column identity with step 71.** `out[i].smr_db` equals Phase
+/// 2 step 71's [`coder_partition_d5_smr_row_order`] `smr_db` cell-for-
+/// cell, and `out[i].width_n` its `width_n` cell-for-cell.
+///
+/// **Sign semantics.** Per the §C.1.5.2.7 definition `MNR = SNR − SMR`:
+/// a subband with a high `SMR_n` (audible signal needing protection)
+/// and a low `SNR_n` (coarse current quantization) yields a small —
+/// possibly negative — `MNR_n`, marking it as the subband "that has the
+/// greatest benefit" from a finer quantization step. No clipping.
+///
+/// **Determinism.** A pure function of the three callbacks: invoking
+/// twice with the same pure callbacks returns identical cells.
+///
+/// Provenance: only the Phase 2 step 71 paired SMR vector
+/// [`coder_partition_d5_smr_row_order`] (and through it the §D.1
+/// Step 9 formula and the Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) and the
+/// §C.1.5.2.7 verbatim `MNR = SNR − SMR` definition transcribed from
+/// ISO/IEC 11172-3:1993 Annex C §C.1.5.2.7 "Bit allocation" printed
+/// p.73 in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` are consulted.
+/// The Table C.5 `SNR_n` term is caller-injected (the table is behind
+/// the numeric-table transcription gap); no external implementation
+/// was read.
+#[must_use]
+pub fn coder_partition_d5_mnr_row_order<S, L, F>(
+    snr_per_partition: S,
+    lsb_per_partition: L,
+    ltg_per_line: F,
+) -> [CoderPartitionD5Mnr; 32]
+where
+    S: Fn(u16) -> f64,
+    L: Fn(u16) -> f64,
+    F: Fn(u16) -> f64,
+{
+    let smr = coder_partition_d5_smr_row_order(lsb_per_partition, ltg_per_line);
+    let mut out = [CoderPartitionD5Mnr {
+        mnr_db: 0.0,
+        smr_db: 0.0,
+        width_n: 0,
+    }; 32];
+    for (i, row) in smr.iter().enumerate() {
+        let n = (i + 1) as u16;
+        out[i] = CoderPartitionD5Mnr {
+            mnr_db: snr_per_partition(n) - row.smr_db,
+            smr_db: row.smr_db,
+            width_n: row.width_n,
+        };
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10449,6 +10627,152 @@ mod tests {
         let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.002).cos() * 8.0 };
         let a = coder_partition_d5_smr_row_order(lsb, ltg);
         let b = coder_partition_d5_smr_row_order(lsb, ltg);
+        assert_eq!(a, b);
+    }
+
+    // ---- Phase 2 step 72 / r271 — §C.1.5.2.7 "Bit allocation"
+    // per-partition mask-to-noise ratio `MNR_n = SNR_n − SMR_n`
+    // row-order vector over Table D.5 (printed p.73). The per-iteration
+    // successor of step 71's paired `(SMR_n, width_n)` vector.
+    #[test]
+    fn coder_partition_d5_mnr_returns_exactly_thirty_two_rows() {
+        let v = coder_partition_d5_mnr_row_order(|_| 0.0, |_| 0.0, |_| 0.0);
+        assert_eq!(v.len(), 32);
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_zero_callbacks_yield_zero_everywhere() {
+        // SNR(n) = 0, SMR_n = 0 − 0 = 0 → MNR_n = 0 − 0 = 0 in every
+        // row; width is the static table value.
+        let v = coder_partition_d5_mnr_row_order(|_| 0.0, |_| 0.0, |_| 0.0);
+        assert!(v.iter().all(|r| r.mnr_db == 0.0 && r.smr_db == 0.0));
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_uniform_pin() {
+        // SNR(n) = 30, Lsb(n) = 96, LTg(ω) = 20 → SMR_n = 76.0,
+        // MNR_n = 30 − 76 = −46.0 dB exactly per row.
+        let v = coder_partition_d5_mnr_row_order(|_| 30.0, |_| 96.0, |_| 20.0);
+        assert!(v.iter().all(|r| r.smr_db == 76.0 && r.mnr_db == -46.0));
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_is_snr_minus_smr_cell_wise() {
+        // The verbatim §C.1.5.2.7 definition MNR = SNR − SMR holds at
+        // every row against the step-71 SMR column directly.
+        let snr = |n: u16| -> f64 { f64::from(n) * 1.5 + 12.0 };
+        let lsb = |n: u16| -> f64 { f64::from(n) * 1.75 + 40.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.01).sin() * 12.0 + 30.0 };
+        let mnr = coder_partition_d5_mnr_row_order(snr, lsb, ltg);
+        let smr = coder_partition_d5_smr_row_order(lsb, ltg);
+        for i in 0..32 {
+            let n = i as u16 + 1;
+            assert_eq!(mnr[i].smr_db, smr[i].smr_db, "smr_db[{i}]");
+            assert!(
+                (mnr[i].mnr_db - (snr(n) - smr[i].smr_db)).abs() < 1.0e-12,
+                "mnr_db[{i}]",
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_smr_and_width_columns_pass_through_step71() {
+        // The smr_db / width_n columns are bit-identical to step 71's
+        // paired SMR vector under non-trivial callbacks, regardless of
+        // the SNR callback.
+        let lsb = |n: u16| -> f64 { f64::from(n) * 2.25 + 17.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.007).cos() * 9.0 + 41.0 };
+        let step71 = coder_partition_d5_smr_row_order(lsb, ltg);
+        let mnr = coder_partition_d5_mnr_row_order(|n| f64::from(n) * 3.1, lsb, ltg);
+        for i in 0..32 {
+            assert_eq!(mnr[i].smr_db, step71[i].smr_db, "smr_db[{i}]");
+            assert_eq!(mnr[i].width_n, step71[i].width_n, "width_n[{i}]");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_width_column_is_twelve_zeros_then_twenty_ones() {
+        // Table D.5 literal width pattern survives unchanged.
+        let v = coder_partition_d5_mnr_row_order(|_| 0.0, |_| 0.0, |_| 0.0);
+        for r in &v[..12] {
+            assert_eq!(r.width_n, 0);
+        }
+        for r in &v[12..] {
+            assert_eq!(r.width_n, 1);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_partition_index_mapping() {
+        // SNR(n) = n, Lsb(n) = 0, LTg = 0 → SMR_n = 0 →
+        // MNR_n = n − 0 = n = i + 1.
+        let v = coder_partition_d5_mnr_row_order(f64::from, |_| 0.0, |_| 0.0);
+        for (i, r) in v.iter().enumerate() {
+            assert_eq!(r.mnr_db, (i + 1) as f64, "mnr_db[{i}]");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_minimum_marks_greatest_benefit_subband() {
+        // §C.1.5.2.7: the loop bumps "the subband that has the greatest
+        // benefit" = the minimal MNR. With a flat SNR a single raised
+        // SMR partition becomes the unique minimum-MNR row.
+        let n = first_partition_containing_line(300).expect("ω = 300 is in-table");
+        // A −30 dB LTg dip at line ω = 300 lowers that partition's
+        // LTmin, raising its SMR by +30 dB; with a flat SNR that raises
+        // its MNR-deficit, so MNR = SNR − SMR is at its smallest there.
+        let v = coder_partition_d5_mnr_row_order(
+            |_| 20.0,
+            |_| 50.0,
+            |omega: u16| if omega == 300 { -30.0 } else { 0.0 },
+        );
+        // The dipped (raised-SMR) partition has the smallest (most
+        // negative) MNR — it is the unique argmin.
+        let argmin = v
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.mnr_db.partial_cmp(&b.1.mnr_db).unwrap())
+            .map(|(i, _)| i as u16 + 1)
+            .unwrap();
+        assert_eq!(argmin, n);
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_snr_fanout_once_per_partition_ascending() {
+        // SNR(n) invoked once per partition n ∈ 1..=32 ascending.
+        use core::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let _ = coder_partition_d5_mnr_row_order(
+            |n: u16| {
+                seen.borrow_mut().push(n);
+                0.0
+            },
+            |_| 0.0,
+            |_| 0.0,
+        );
+        let expected: Vec<u16> = (1..=32).collect();
+        assert_eq!(*seen.borrow(), expected);
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_sign_semantics() {
+        // High SMR + low SNR → small/negative MNR (needs bits);
+        // low SMR + high SNR → large positive MNR (already protected).
+        let needs = coder_partition_d5_mnr_row_order(|_| 5.0, |_| 60.0, |_| 25.0);
+        assert!(needs.iter().all(|r| r.smr_db == 35.0 && r.mnr_db == -30.0));
+        let protected = coder_partition_d5_mnr_row_order(|_| 80.0, |_| 10.0, |_| 25.0);
+        assert!(protected
+            .iter()
+            .all(|r| r.smr_db == -15.0 && r.mnr_db == 95.0));
+    }
+
+    #[test]
+    fn coder_partition_d5_mnr_is_idempotent_for_pure_callbacks() {
+        let snr = |n: u16| -> f64 { f64::from(n) * 0.9 + 11.0 };
+        let lsb = |n: u16| -> f64 { f64::from(n) * 0.5 + 30.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.002).cos() * 8.0 };
+        let a = coder_partition_d5_mnr_row_order(snr, lsb, ltg);
+        let b = coder_partition_d5_mnr_row_order(snr, lsb, ltg);
         assert_eq!(a, b);
     }
 }

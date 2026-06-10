@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex C §C.1.5.2.7 "Bit allocation" per-partition mask-to-noise
+  ratio `MNR_n = SNR_n − SMR_n` row-order vector over Table D.5 (Phase 2
+  step 72). Phase 2 step 71 (r270) exposed the §D.1 Step 9 paired
+  `(SMR_n, width_n)` vector — "the output of the psychoacoustic model"
+  the §C.1.5.2.7 bit-allocation loop consumes. This step lands the very
+  first arithmetic of that iterative procedure: the per-subband `MNR`
+  initialisation `MNR = SNR − SMR` (printed p.73, verbatim), computed
+  once per partition before the loop's level-bumping begins. New public
+  struct `CoderPartitionD5Mnr { mnr_db, smr_db, width_n }` and free
+  function `coder_partition_d5_mnr_row_order<S, L, F>(snr_per_partition,
+  lsb_per_partition, ltg_per_line) -> [CoderPartitionD5Mnr; 32]`: a pure
+  per-row subtraction of a caller-supplied `SNR_n` from Phase 2 step
+  71's `coder_partition_d5_smr_row_order` SMR column, carrying the
+  `smr_db` and `width_n` columns through verbatim. The `SNR_n` term is
+  the Table C.5 "Layer II Signal-to-Noise Ratios" column — behind the
+  same numeric-table transcription gap as Tables D.1 / D.2 — so it is
+  caller-injected, the same dependency-injection pattern Phase 2 steps
+  58–71 use for the §D.1 Step 2 `Lsb(n)` term. No spec arithmetic is
+  introduced beyond the verbatim `SNR − SMR` subtraction; the `smr_db`
+  column is bit-identical to step 71's and the `width_n` column to step
+  60's (`[0×12, 1×20]`). Tests: 891 lib (was 880 baseline; +11 unit)
+  covering the 32-row length, zero-callback all-zero MNR, uniform pin
+  (30 − 76 = −46.0 exact), cell-wise `MNR = SNR − SMR` against the
+  step-71 SMR column, SMR/width column pass-through from step 71, the
+  `[0×12, 1×20]` width literal, partition-index mapping
+  (`SNR(n) = n`, flat SMR → `mnr_db[i] = i + 1`), the §C.1.5.2.7
+  "subband with the greatest benefit" = unique minimum-MNR argmin under
+  a −30 dB interior-line LTg dip, SNR fan-out once-per-partition
+  ascending, sign semantics in both directions (needs-bits vs already-
+  protected), and idempotence for pure callbacks. No external
+  implementation consulted; only the staged ISO/IEC 11172-3:1993 spec
+  PDF (Annex C §C.1.5.2.7, printed p.73; §D.1 Step 9, printed p.115)
+  and the Phase 2 step 71 row-order accessor (and through it the Table
+  D.5 transcription in
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) are read.
 - psy: Annex D Model 1 §D.1 Step 9 paired `(SMR_n, width_n)` row-order
   vector over Table D.5 (Phase 2 step 71). Phase 2 step 70 (r269)
   exposed the bare row-order signal-to-mask-ratio vector
