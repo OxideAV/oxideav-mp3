@@ -5254,6 +5254,176 @@ pub fn model1_normalize_to_96db_spl(x: &mut [f64]) -> Option<f64> {
     Some(offset)
 }
 
+/// §D.1 Step 2 full-scale factor — 32 768.
+///
+/// The verbatim `Lsb(n)` formula's scalefactor term multiplies
+/// `scf_max(n)` by `32 768` before taking `20·log` (printed p.110).
+pub const MODEL1_STEP2_FULL_SCALE: f64 = 32768.0;
+
+/// §D.1 Step 2 peak-to-RMS correction — 10 dB.
+///
+/// Verbatim (printed p.110): "The '-10 dB' term corrects for the
+/// difference between peak and RMS level."
+pub const MODEL1_STEP2_PEAK_RMS_CORRECTION_DB: f64 = 10.0;
+
+/// §D.1 Step 2 scalefactor SPL term `20·log(scf_max(n)·32 768) − 10`
+/// dB (Phase 2 step 78 / r276).
+///
+/// The second argument of the verbatim Step 2 maximum (printed
+/// p.110):
+///
+/// ```text
+/// Lsb(n) = MAX[ X(k), 20*log(scf_max(n)*32 768)-10 ]  dB
+///               X(k) in subband n
+/// ```
+///
+/// "The expression scf_max(n) is in Layer I the scalefactor, and in
+/// Layer II the maximum of the three scalefactors of subband n within
+/// a frame." The caller supplies that per-subband maximum scalefactor
+/// value; this primitive evaluates only the formula term. The log is
+/// the dB-convention base-10 logarithm. No domain clamping is
+/// invented: a non-positive `scf_max` propagates the IEEE `log10`
+/// result (`-∞` at zero, NaN below) — spec scalefactors are positive.
+///
+/// **Determinism.** Pure function of `scf_max`.
+///
+/// Provenance: only the Step 2 `Lsb(n)` formula and the scf_max /
+/// "-10 dB" explanatory sentences transcribed from ISO/IEC
+/// 11172-3:1993 Annex D §D.1 Step 2 "Determination of the sound
+/// pressure level" (printed p.110) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` are read; no
+/// external implementation was consulted.
+#[must_use]
+pub fn model1_step2_scf_term_db(scf_max: f64) -> f64 {
+    20.0 * (scf_max * MODEL1_STEP2_FULL_SCALE).log10() - MODEL1_STEP2_PEAK_RMS_CORRECTION_DB
+}
+
+/// §D.1 Step 2 sound pressure level `Lsb(n)` (Phase 2 step 78 /
+/// r276).
+///
+/// The verbatim outer maximum (printed p.110):
+///
+/// ```text
+/// Lsb(n) = MAX[ X(k), 20*log(scf_max(n)*32 768)-10 ]  dB
+/// ```
+///
+/// `x_subband_db` is the caller-determined spectral argument — either
+/// "the sound pressure level of the spectral line with index k of the
+/// FFT with the maximum amplitude in the frequency range corresponding
+/// to subband n" ([`model1_step2_subband_max_line_db`]) or, for the
+/// spec's alternative method ("offers a potential for better encoder
+/// performance, but this technique has not been subjected to a formal
+/// audio quality test", printed p.110–111), the alternative
+/// sound-pressure level `Xspl(n)` ([`model1_step2_subband_xspl_db`]).
+/// Both methods share this identical outer MAX with the
+/// [`model1_step2_scf_term_db`] scalefactor term.
+///
+/// **Determinism.** Pure two-argument maximum.
+///
+/// Provenance: only the two Step 2 `Lsb(n)` formula lines (primary
+/// and alternative method) transcribed from ISO/IEC 11172-3:1993
+/// Annex D §D.1 Step 2 (printed p.110–111) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` are read; no
+/// external implementation was consulted.
+#[must_use]
+pub fn model1_step2_lsb_db(x_subband_db: f64, scf_max: f64) -> f64 {
+    x_subband_db.max(model1_step2_scf_term_db(scf_max))
+}
+
+/// §D.1 Step 2 alternative sound pressure level `Xspl` over a set of
+/// spectral lines (Phase 2 step 78 / r276).
+///
+/// Verbatim (printed p.111):
+///
+/// ```text
+/// Xspl(n) = 10*log10( Σ_k 10^(X(k)/10) ) dB        k in subband n
+/// ```
+///
+/// The caller selects the lines ("k in subband n" — see
+/// [`model1_step2_subband_xspl_db`] for the Table D.5-driven subband
+/// selection); this primitive evaluates the dB-domain power sum over
+/// exactly the lines it is handed. `-∞` dB (silent) lines contribute
+/// zero linear power; an empty (or all-silent) selection yields
+/// `10·log10(0) = -∞` dB.
+///
+/// **Determinism.** Pure fold over the input slice.
+///
+/// Provenance: only the Step 2 alternative-method `Xspl(n)` formula
+/// transcribed from ISO/IEC 11172-3:1993 Annex D §D.1 Step 2 (printed
+/// p.111) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read;
+/// no external implementation was consulted.
+#[must_use]
+pub fn model1_step2_xspl_db(lines_db: &[f64]) -> f64 {
+    let linear_sum: f64 = lines_db.iter().map(|&db| 10.0_f64.powf(db / 10.0)).sum();
+    10.0 * linear_sum.log10()
+}
+
+/// §D.1 Step 2 maximum spectral line of subband `n` over the Table
+/// D.5 line span (Phase 2 step 78 / r276).
+///
+/// Selects "the spectral line … of the FFT with the maximum amplitude
+/// in the frequency range corresponding to subband n" (printed p.110)
+/// from a step-77 [`model1_power_density_spectrum`] half-spectrum.
+/// The "frequency range corresponding to subband n" is read from
+/// Table D.5: partition `n ∈ 1..=32` spans the inclusive 1-based FFT
+/// lines `[ωlow_n, ωhigh_n]` ([`coder_partition_d5_line_range`]),
+/// mapped onto the spectrum vector via `k = ω − 1`. Adjacent spans
+/// share their boundary cell (the table's dual-role `ωlow_{n+1} /
+/// ωhigh_n` column) — harmless under a maximum. Returns `None` for
+/// `n` outside `1..=32` or when `x` is not the 513-line (1 024-sample
+/// FFT) half-spectrum the D.5 ω-indexing addresses; no alternative
+/// line mapping is invented.
+///
+/// **Determinism.** Pure table lookup + slice maximum.
+///
+/// Provenance: the Step 2 maximum-amplitude sentence (printed p.110)
+/// in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` plus the Table
+/// D.5 spans already transcribed in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`; no
+/// external implementation was consulted.
+#[must_use]
+pub fn model1_step2_subband_max_line_db(x: &[f64], n: u16) -> Option<f64> {
+    if x.len() != MODEL1_FFT_LEN_LAYER2 / 2 + 1 {
+        return None;
+    }
+    let (low, high) = coder_partition_d5_line_range(n)?;
+    Some(
+        x[(low as usize - 1)..=(high as usize - 1)]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max),
+    )
+}
+
+/// §D.1 Step 2 alternative sound pressure level `Xspl(n)` of subband
+/// `n` over the Table D.5 line span (Phase 2 step 78 / r276).
+///
+/// Composes [`model1_step2_xspl_db`] with the same Table D.5 "k in
+/// subband n" line selection as [`model1_step2_subband_max_line_db`]:
+/// partition `n ∈ 1..=32`'s inclusive 1-based span `[ωlow_n, ωhigh_n]`
+/// mapped via `k = ω − 1` onto a 513-line step-77 half-spectrum
+/// (`None` otherwise). The dual-role boundary cell shared by adjacent
+/// spans is part of both subbands' sums, exactly as the D.5 column
+/// prints it; no exclusive re-partitioning is invented.
+///
+/// **Determinism.** Pure table lookup + dB-domain power sum.
+///
+/// Provenance: the Step 2 alternative-method `Xspl(n)` formula
+/// (printed p.111) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`
+/// plus the Table D.5 spans already transcribed in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`; no
+/// external implementation was consulted.
+#[must_use]
+pub fn model1_step2_subband_xspl_db(x: &[f64], n: u16) -> Option<f64> {
+    if x.len() != MODEL1_FFT_LEN_LAYER2 / 2 + 1 {
+        return None;
+    }
+    let (low, high) = coder_partition_d5_line_range(n)?;
+    Some(model1_step2_xspl_db(
+        &x[(low as usize - 1)..=(high as usize - 1)],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12243,5 +12413,136 @@ mod tests {
         assert_eq!(x[k0], MODEL1_SPL_REFERENCE_DB);
         // The ±1 Hann sidelines keep their −6,02 dB relation post-shift.
         assert!(((x[k0] - x[k0 + 1]) - 10.0 * 4.0_f64.log10()).abs() < 1e-9);
+    }
+
+    // ----- Phase 2 step 78: §D.1 Step 2 sound pressure level -----
+
+    #[test]
+    fn step2_scf_term_anchors() {
+        // scf_max = 1: 20·log10(32 768) − 10 = 20·15·log10(2) − 10.
+        let unit = model1_step2_scf_term_db(1.0);
+        let expect = 20.0 * 32768.0_f64.log10() - 10.0;
+        assert!((unit - expect).abs() < 1e-12);
+        assert!((unit - 80.30899869919435).abs() < 1e-9);
+        // scf_max = 1/32 768 makes the log term vanish: exactly −10 dB.
+        let tiny = model1_step2_scf_term_db(1.0 / 32768.0);
+        assert!((tiny - (-MODEL1_STEP2_PEAK_RMS_CORRECTION_DB)).abs() < 1e-12);
+        // Doubling scf_max adds 20·log10(2) ≈ 6,0206 dB.
+        let doubled = model1_step2_scf_term_db(2.0);
+        assert!(((doubled - unit) - 20.0 * 2.0_f64.log10()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn step2_lsb_is_outer_maximum() {
+        let scf_term = model1_step2_scf_term_db(0.5);
+        // Spectral argument dominates…
+        assert_eq!(model1_step2_lsb_db(scf_term + 5.0, 0.5), scf_term + 5.0);
+        // …or the scalefactor term dominates…
+        assert_eq!(model1_step2_lsb_db(scf_term - 5.0, 0.5), scf_term);
+        // …and a silent subband falls back to the scf term entirely.
+        assert_eq!(model1_step2_lsb_db(f64::NEG_INFINITY, 0.5), scf_term);
+    }
+
+    #[test]
+    fn step2_xspl_power_sum_anchors() {
+        // A single line is returned unchanged.
+        assert!((model1_step2_xspl_db(&[-7.5]) - (-7.5)).abs() < 1e-12);
+        // Two equal-power lines: +10·log10(2) ≈ +3,0103 dB.
+        let two = model1_step2_xspl_db(&[20.0, 20.0]);
+        assert!(((two - 20.0) - 10.0 * 2.0_f64.log10()).abs() < 1e-12);
+        // −∞ (silent) lines contribute zero linear power.
+        let with_silence = model1_step2_xspl_db(&[20.0, f64::NEG_INFINITY]);
+        assert!((with_silence - 20.0).abs() < 1e-12);
+        // Empty / all-silent selections collapse to −∞.
+        assert_eq!(model1_step2_xspl_db(&[]), f64::NEG_INFINITY);
+        assert_eq!(
+            model1_step2_xspl_db(&[f64::NEG_INFINITY; 4]),
+            f64::NEG_INFINITY
+        );
+    }
+
+    #[test]
+    fn step2_subband_accessors_reject_bad_inputs() {
+        let x = vec![0.0; MODEL1_FFT_LEN_LAYER2 / 2 + 1];
+        // Partition index outside 1..=32.
+        assert!(model1_step2_subband_max_line_db(&x, 0).is_none());
+        assert!(model1_step2_subband_max_line_db(&x, 33).is_none());
+        assert!(model1_step2_subband_xspl_db(&x, 0).is_none());
+        assert!(model1_step2_subband_xspl_db(&x, 33).is_none());
+        // Not the 513-line 1 024-sample half-spectrum.
+        let short = vec![0.0; MODEL1_FFT_LEN_LAYER1 / 2 + 1];
+        assert!(model1_step2_subband_max_line_db(&short, 1).is_none());
+        assert!(model1_step2_subband_xspl_db(&short, 1).is_none());
+    }
+
+    #[test]
+    fn step2_subband_max_finds_planted_line_via_d5_span() {
+        // Plant a single loud line inside every partition's exclusive
+        // interior and confirm the D.5-driven max recovers it.
+        for n in 1..=32u16 {
+            let (low, high) = coder_partition_d5_line_range(n).unwrap();
+            let mut x = vec![-300.0; MODEL1_FFT_LEN_LAYER2 / 2 + 1];
+            // Interior line (not a shared boundary cell).
+            let k = (low as usize - 1) + (high as usize - low as usize) / 2;
+            x[k] = -3.25;
+            assert_eq!(model1_step2_subband_max_line_db(&x, n), Some(-3.25));
+        }
+    }
+
+    #[test]
+    fn step2_subband_spans_share_boundary_cells() {
+        // The D.5 dual-role ωlow_{n+1}/ωhigh_n cell belongs to both
+        // adjacent subbands: a loud boundary line is seen by both maxima.
+        let n = 7u16;
+        let (_, high) = coder_partition_d5_line_range(n).unwrap();
+        let mut x = vec![-300.0; MODEL1_FFT_LEN_LAYER2 / 2 + 1];
+        x[high as usize - 1] = 1.5;
+        assert_eq!(model1_step2_subband_max_line_db(&x, n), Some(1.5));
+        assert_eq!(model1_step2_subband_max_line_db(&x, n + 1), Some(1.5));
+    }
+
+    #[test]
+    fn step2_xspl_dominates_max_line_on_broadband_spectrum() {
+        // Xspl(n) sums power over the whole span, so it is never below
+        // the span's single maximum line — checked on a real step-77
+        // spectrum across every partition.
+        let s = lcg_samples(MODEL1_FFT_LEN_LAYER2, 0xFEED_F00D_u64);
+        let x = model1_power_density_spectrum(&s).unwrap();
+        for n in 1..=32u16 {
+            let max_line = model1_step2_subband_max_line_db(&x, n).unwrap();
+            let xspl = model1_step2_subband_xspl_db(&x, n).unwrap();
+            assert!(
+                xspl >= max_line - 1e-12,
+                "n={n}: Xspl {xspl} < max line {max_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn step2_lsb_end_to_end_from_step1_spectrum() {
+        // Full Step 1 → Step 2 chain: tone at bin 100 (inside partition
+        // 7 per the D.5 16-line stride), normalized to 96 dB, then Lsb.
+        let n_fft = MODEL1_FFT_LEN_LAYER2;
+        let k0 = 100usize;
+        let s: Vec<f64> = (0..n_fft)
+            .map(|l| {
+                (2.0 * core::f64::consts::PI * (k0 as f64) * (l as f64) / (n_fft as f64)).sin()
+            })
+            .collect();
+        let mut x = model1_power_density_spectrum(&s).unwrap();
+        model1_normalize_to_96db_spl(&mut x).unwrap();
+        // Line k = 100 is ω = 101 ∈ [97, 113] = partition 7's span.
+        let part = first_partition_containing_line(101).unwrap();
+        assert_eq!(part, 7);
+        let max_line = model1_step2_subband_max_line_db(&x, part).unwrap();
+        assert_eq!(max_line, MODEL1_SPL_REFERENCE_DB);
+        // A small scalefactor leaves the spectral argument dominant…
+        let lsb = model1_step2_lsb_db(max_line, 1.0 / 32768.0);
+        assert_eq!(lsb, MODEL1_SPL_REFERENCE_DB);
+        // …a full-scale scalefactor pushes Lsb to the scf term instead
+        // (96 < 20·log10(32 768·10) − 10 would be false; use a huge one).
+        let huge_scf_term = model1_step2_scf_term_db(100.0);
+        assert!(huge_scf_term > MODEL1_SPL_REFERENCE_DB);
+        assert_eq!(model1_step2_lsb_db(max_line, 100.0), huge_scf_term);
     }
 }

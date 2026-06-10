@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 2 "Determination of the sound
+  pressure level" (Phase 2 step 78). New public primitives
+  `model1_step2_scf_term_db(scf_max)` (verbatim `20·log(scf_max·32 768)
+  − 10` dB; `MODEL1_STEP2_FULL_SCALE` / `MODEL1_STEP2_PEAK_RMS_CORRECTION_DB`
+  constants), `model1_step2_lsb_db(x_subband_db, scf_max)` (the verbatim
+  outer `Lsb(n) = MAX[X(k), scf-term]` shared by both Step 2 methods),
+  `model1_step2_xspl_db(lines)` (verbatim alternative-method
+  `Xspl(n) = 10·log10(Σ 10^(X(k)/10))` dB power sum), and the Table
+  D.5-driven subband selectors `model1_step2_subband_max_line_db(x, n)` /
+  `model1_step2_subband_xspl_db(x, n)` mapping partition `n ∈ 1..=32`'s
+  inclusive 1-based `[ωlow_n, ωhigh_n]` span onto a 513-line step-77
+  half-spectrum via `k = ω − 1` (`None` for out-of-range `n` or any
+  other spectrum length). Together with step 77 this produces the
+  `lsb_per_partition` values that the step-70/71 SMR vectors consume.
+  +8 unit tests (950 lib).
 - psy: Annex D Model 1 §D.1 Step 1 "FFT Analysis" Hann-windowed
   power-density spectrum (Phase 2 step 77). New public primitives
   `model1_hann_window(i, n)` (verbatim `h(i) = sqrt(8/3)·0,5·{1 −

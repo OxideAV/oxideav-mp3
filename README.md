@@ -2373,6 +2373,48 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 78 (r276)** — Annex D Model 1 §D.1 **Step 2
+"Determination of the sound pressure level"**: `Lsb(n)` from the
+step-77 spectrum — the second of the "Steps 1–3" lacks items (and,
+with step 77, the producer for the `lsb_per_partition` callback that
+the step-70/71 SMR row-order vectors have consumed caller-injected
+until now). Five public primitives in `psy`:
+`model1_step2_scf_term_db(scf_max)` evaluates the verbatim
+scalefactor term `20·log(scf_max(n)·32 768) − 10` dB
+(`MODEL1_STEP2_FULL_SCALE = 32768.0`,
+`MODEL1_STEP2_PEAK_RMS_CORRECTION_DB = 10.0` — "the '-10 dB' term
+corrects for the difference between peak and RMS level"; `scf_max`
+is caller-supplied per the verbatim Layer I scalefactor / Layer II
+max-of-three rule); `model1_step2_lsb_db(x_subband_db, scf_max)` is
+the verbatim outer `Lsb(n) = MAX[X(k), scf-term]` shared by both
+Step 2 methods; `model1_step2_xspl_db(lines)` is the verbatim
+alternative-method power sum `Xspl(n) = 10·log10(Σ 10^(X(k)/10))` dB
+over caller-selected lines (`−∞` lines contribute zero; empty
+selection → `−∞`); and the two Table D.5-driven subband selectors
+`model1_step2_subband_max_line_db(x, n)` ("the spectral line … with
+the maximum amplitude in the frequency range corresponding to
+subband n") and `model1_step2_subband_xspl_db(x, n)`, which read
+partition `n ∈ 1..=32`'s inclusive 1-based span `[ωlow_n, ωhigh_n]`
+via the step-50 accessors and map it onto a 513-line step-77
+half-spectrum through `k = ω − 1` (`None` for out-of-range `n` or
+any other spectrum length; adjacent spans share their dual-role
+boundary cell exactly as the D.5 column prints it). 8 new unit
+tests: scf-term anchors (scf 1 → `20·log10 32768 − 10 ≈ 80,309`,
+scf `1/32768` → exactly −10, doubling adds `20·log10 2`), outer-MAX
+dominance both ways + silent-subband fallback, Xspl single-line
+identity / equal-pair `+3,0103 dB` / silence-transparency /
+empty-`−∞` anchors, subband-accessor rejections (n = 0 / 33, 257-line
+spectrum), planted-interior-line recovery across all 32 D.5 spans,
+shared-boundary-cell visibility from both adjacent subbands,
+`Xspl ≥ max-line` across every partition of a real broadband step-77
+spectrum, and an end-to-end Step 1 → normalize → Step 2 chain
+(tone at line ω = 101 → partition 7, `Lsb = 96 dB` against a small
+scalefactor, scf-term dominance against a huge one). Tests: 950 lib
+(was 942; +8 unit). No external implementation consulted; only the
+§D.1 Step 2 prose/formulas (printed p.110–111) read directly from
+`docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` plus the in-repo Table
+D.5 transcription.
+
 **Phase 2 step 77 (r276)** — Annex D Model 1 §D.1 **Step 1 "FFT
 Analysis"**: the Hann-windowed power-density spectrum that Steps 2–9
 consume — the first of the long-standing "Steps 1–3" lacks items.
@@ -4021,11 +4063,10 @@ convention (row 0 carries ω = 1), and the top-of-table pin
 (row 32 carries ω = 513 = 1 + 32·16, matching the
 1024-sample FFT's 1..=513 one-based half-spectrum) — it
 still lacks
-Model 1 Step 2 SPL determination (`Lsb(n)` from the step-77
-spectrum's per-subband maximum line / alternative `Xspl(n)`
-power sum, plus the `20·log10(scf_max·32768) − 10`
-scalefactor term) and the Step 4 tonality classifier
-(local-maximum labelling + tonal/non-tonal listing over the
+the Model 1 Step 4 tonality classifier (local-maximum
+labelling, the `X(k) − X(k+j) >= 7 dB` tonal-component
+listing with its layer/frequency-dependent `j` ranges, and
+the per-critical-band non-tonal residue power over the
 step-77 `X(k)` lines), the rest of
 Annex D Model 2 (calculation-partition
 table D.3 — PNG-only — the general PM2 spreading-function
