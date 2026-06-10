@@ -2373,6 +2373,44 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 70 (r269)** — Annex D Model 1 §D.1 Step 9 **row-order**
+signal-to-mask-ratio vector over Table D.5. Phase 2 step 69 (r268)
+landed the Step 9 subtraction `SMR_n = Lsb(n) − LTmin_n` dB
+(ISO/IEC 11172-3:1993 Annex D, printed p.115) in the width-gated
+split presentation (12 narrow + 20 wide subarrays); the Layer I /
+Layer II bit-allocation loop, however, walks the 32 coder partitions
+of Table D.5 **in row order**, pairing each partition's `SMR_n` with
+the same row's `width_n` flag (Phase 2 step 60's `[u16; 32]`) and
+`LTmin_n` value (Phase 2 step 59's `[f64; 32]`) at the same array
+index. New free function `coder_partition_d5_smr_db_row_order<L:
+Fn(u16) -> f64, F: Fn(u16) -> f64>(lsb_per_partition, ltg_per_line)
+-> [f64; 32]` supplies that missing row-order presentation: element
+`i` carries `SMR_{i + 1}`, the `LTmin_n` operand comes from one
+Phase 2 step 59 pass (`coder_partition_d5_ltg_min_row_order`), and
+the `Lsb(n)` operand stays the steps-58–69 caller-callback injection
+(§D.1 Steps 1–2 remain behind the PNG-only Tables D.1 / D.2
+transcription gap). No new spec arithmetic beyond the step 69
+subtraction. Because step 63's by-width `LTmin_n` cells are
+index-preserving copies of the step 59 row-order vector (via the
+step 61 / 62 chain), the output is **bit-identical** to step 69's
+split read back in row order (`out[0..12] == narrow_band`,
+`out[12..32] == wide_band`) — pinned by an exact-`==` test under
+non-trivial callbacks. Tests: 868 lib (was 859 baseline; +9 unit)
+covering zero-callback all-zero rows, uniform pin (96 − 20 = 76.0
+exact), cell-wise equality with the independently reconstructed
+`lsb(n) − step59` difference, partition-index mapping (`Lsb(n) = n`,
+flat threshold → `out[i] = i + 1`), sign semantics in both
+directions, dual callback fan-out (Lsb exactly `[1..=32]` ascending;
+LTg equal to a directly-counted step-59 pass), the step 69
+bit-identity, a −30 dB interior-line LTg dip (ω = 300, partition via
+the step 56 inverse lookup) raising exactly one row's SMR by +30 dB
+with all 31 other rows unchanged, and idempotence for pure
+callbacks. No external implementation consulted; only the staged
+ISO/IEC 11172-3:1993 spec PDF (§D.1 Steps 2 / 8 / 9, printed
+pp.110/114/115) and the Phase 2 step 59 row-order reducer (and
+through it the cascade down to the Table D.5 transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) are read.
+
 **Phase 2 step 69 (r268)** — Annex D Model 1 §D.1 **Step 9**
 width-gated signal-to-mask-ratio over Table D.5. The Step 9 formula
 (ISO/IEC 11172-3:1993 Annex D, printed p.115) is

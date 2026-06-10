@@ -4064,6 +4064,129 @@ where
     }
 }
 
+// =====================================================================
+// Annex D Model 1 — §D.1 Step 9 row-order signal-to-mask-ratio vector
+// over Table D.5 (Phase 2 step 70 / r269).
+//
+// Spec context (clause D.1, ISO/IEC 11172-3:1993, informative annex,
+// printed p.115 — "Step 9: Calculation of the signal-to-mask-ratio"):
+//
+//   SMR_sb(n) = Lsb(n) − LTmin(n)   dB     computed for every
+//   subband n.
+//
+// Phase 2 step 69 (r268) landed the Step 9 subtraction in the
+// width-gated split presentation (12 narrow + 20 wide subarrays).
+// The Layer I / Layer II bit-allocation loop, however, walks the 32
+// coder partitions of Table D.5 **in row order**, pairing each
+// partition's `SMR_n` with the same row's `width_n` flag (Phase 2
+// step 60's `[u16; 32]` vector) and `LTmin_n` value (Phase 2 step
+// 59's `[f64; 32]` vector) at the same array index — the same
+// row-order vector form steps 59 / 60 / 61 expose for the Step 8
+// columns. This step supplies the missing row-order presentation of
+// the Step 9 output: a single `[f64; 32]` with element `i` carrying
+// `SMR_{i + 1}`.
+//
+// Composition rather than introduction: the `LTmin_n` operand comes
+// from one Phase 2 step 59 pass
+// (`coder_partition_d5_ltg_min_row_order`); the Step 9 subtraction
+// `Lsb(n) − LTmin_n` per row is the same arithmetic step 69
+// introduced — no new spec arithmetic appears here. Because Phase 2
+// step 63's by-width `LTmin_n` cells are index-preserving copies of
+// the step 59 row-order vector (via the step 61 / 62 chain), the
+// returned vector is bit-identical to step 69's split read back in
+// row order: `out[0..12] == narrow_band`, `out[12..32] == wide_band`.
+// =====================================================================
+
+/// §D.1 Step 9 row-order signal-to-mask-ratio vector
+/// `[SMR_1, SMR_2, …, SMR_32]` (dB) over Table D.5
+/// (ISO/IEC 11172-3:1993 Annex D, printed p.115):
+///
+/// ```text
+/// out[i] = SMR_{i + 1} = Lsb(i + 1) − LTmin_{i + 1}   dB
+///                                          for i ∈ 0..=31
+/// ```
+///
+/// The row-order vector is the per-frame form the Layer I / Layer II
+/// bit-allocation loop consumes: it pairs `out[i]` with the same
+/// row's `width_{i + 1}` flag ([`coder_partition_d5_width_row_order`],
+/// Phase 2 step 60) and `LTmin_{i + 1}` value
+/// ([`coder_partition_d5_ltg_min_row_order`], Phase 2 step 59) at the
+/// same array index, then iterates bit assignment on the partition
+/// with the worst mask-to-noise ratio seeded from this SMR vector.
+///
+/// `Lsb(n)` is the §D.1 Step 2 sound pressure level of partition `n`
+/// (printed p.110: `Lsb(n) = MAX[X(k), 20·log10(scf_max(n)·32768) −
+/// 10]` dB), supplied by the caller as the `lsb_per_partition`
+/// callback — Steps 1–2 (FFT analysis + SPL determination) remain
+/// behind the PNG-only Tables D.1 / D.2 transcription gap, the same
+/// dependency-injection pattern Phase 2 steps 58–69 use for
+/// `LTg(ω)`. `LTmin_n` is the §D.1 Step 8 minimum masking threshold
+/// (printed p.114: `LTmin(n) = MIN[LTg(i)]` over the partition's FFT
+/// lines), derived here from the caller's `ltg_per_line` callback
+/// through the Phase 2 step 59 row-order reducer.
+///
+/// **Index convention.** `lsb_per_partition` receives the spec's
+/// 1-based partition index `n ∈ 1..=32`, invoked exactly once per
+/// partition in ascending row order (`1, 2, …, 32`). The returned
+/// slice is 0-based: `out[i]` carries `SMR_{i + 1}`. Partition 0
+/// (the degenerate single-line `width_n = 0` row) is excluded,
+/// matching the step 58–69 chain's recoverable range.
+///
+/// **Composition.** Calls Phase 2 step 59's
+/// [`coder_partition_d5_ltg_min_row_order`] once (folding
+/// `ltg_per_line` over every recoverable partition's FFT-line range —
+/// the callback fan-out is exactly one step-59 pass, one call per FFT
+/// line in `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`), then applies the
+/// Step 9 subtraction `Lsb(n) − LTmin_n` per row. No new spec
+/// arithmetic beyond the step 69 subtraction is introduced.
+///
+/// **Bit-identity with the step 69 split.** Phase 2 step 63's
+/// by-width `LTmin_n` cells are index-preserving copies of the step
+/// 59 row-order vector (through the step 61 / 62 chain), so this
+/// vector equals Phase 2 step 69's
+/// [`coder_partition_d5_smr_db_row_order_by_width`] output read back
+/// in row order bit-for-bit: `out[i] == narrow_band[i]` for
+/// `i ∈ 0..=11` and `out[j + 12] == wide_band[j]` for `j ∈ 0..=19`.
+///
+/// **Sign semantics.** Positive cells mark partitions whose signal
+/// exceeds the masking threshold (the bit-allocation loop must spend
+/// bits there); negative cells mark fully-masked partitions. No
+/// clipping.
+///
+/// **Boundary semantics.** Inherits Phase 2 step 59's (and through it
+/// step 58's) inclusive-on-both-ends `LTmin_n` reduction semantics
+/// unchanged: a sharp `LTg` dip on a shared boundary line enters both
+/// adjacent partitions' `LTmin` and hence raises both partitions'
+/// SMR. The Step 9 subtraction itself has no boundary semantics — it
+/// is a pure per-row operation.
+///
+/// **Determinism.** A pure function of the two callbacks: invoking
+/// twice with the same pure callbacks returns identical cells.
+///
+/// Provenance: the Step 9 formula `SMR_sb(n) = Lsb(n) − LTmin(n)` dB
+/// is transcribed from ISO/IEC 11172-3:1993 Annex D §D.1 Step 9
+/// (printed p.115, `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`);
+/// the `LTmin_n` operand comes from the Phase 2 step 59 row-order
+/// reducer [`coder_partition_d5_ltg_min_row_order`] (and through it
+/// the cascade down to the Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 — Layer I and Layer II coder partition table"). No
+/// external implementation was read.
+#[must_use]
+pub fn coder_partition_d5_smr_db_row_order<L, F>(lsb_per_partition: L, ltg_per_line: F) -> [f64; 32]
+where
+    L: Fn(u16) -> f64,
+    F: Fn(u16) -> f64,
+{
+    let ltmin = coder_partition_d5_ltg_min_row_order(ltg_per_line);
+    let mut out = [0.0_f64; 32];
+    for (i, &ltmin_db) in ltmin.iter().enumerate() {
+        // Row i carries partition n = i + 1 (spec 1-based).
+        out[i] = lsb_per_partition(i as u16 + 1) - ltmin_db;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9861,5 +9984,140 @@ mod tests {
         let b = coder_partition_d5_smr_db_row_order_by_width(lsb, ltg);
         assert_eq!(a.narrow_band, b.narrow_band);
         assert_eq!(a.wide_band, b.wide_band);
+    }
+
+    // ---- Phase 2 step 70 / r269 — §D.1 Step 9 row-order
+    // signal-to-mask-ratio vector `[SMR_1 … SMR_32]` (dB) over
+    // Table D.5 (printed p.115).
+    #[test]
+    fn coder_partition_d5_smr_row_order_zero_callbacks_yield_zero_everywhere() {
+        // Lsb(n) = 0 dB and LTg(ω) = 0 dB → LTmin_n = 0 in every
+        // partition → SMR_n = 0 − 0 = 0.0 exactly in all 32 rows.
+        let smr = coder_partition_d5_smr_db_row_order(|_| 0.0, |_| 0.0);
+        assert!(smr.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_row_order_uniform_pin() {
+        // Lsb(n) = 96 dB everywhere, LTg(ω) = 20 dB everywhere →
+        // LTmin_n = 20 → SMR_n = 96 − 20 = 76.0 dB exactly per row.
+        let smr = coder_partition_d5_smr_db_row_order(|_| 96.0, |_| 20.0);
+        assert!(smr.iter().all(|&v| v == 76.0));
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_row_order_matches_step59_difference_cell_wise() {
+        // Strict-composition cross-check: every row equals
+        // `lsb(n) − step59_ltmin[n − 1]` reconstructed independently
+        // under non-trivial callbacks on both inputs.
+        let lsb = |n: u16| -> f64 { f64::from(n) * 1.75 + 40.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.01).sin() * 12.0 + 30.0 };
+        let smr = coder_partition_d5_smr_db_row_order(lsb, ltg);
+        let ltmin = coder_partition_d5_ltg_min_row_order(ltg);
+        for i in 0..32 {
+            let expect = lsb(i as u16 + 1) - ltmin[i];
+            assert!(
+                (smr[i] - expect).abs() < 1.0e-12,
+                "out[{i}] = {} != {expect}",
+                smr[i],
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_row_order_partition_index_mapping() {
+        // Lsb(n) = n with a flat 0-dB threshold pins the row →
+        // partition mapping: out[i] = SMR_{i + 1} = i + 1.
+        let smr = coder_partition_d5_smr_db_row_order(f64::from, |_| 0.0);
+        for (i, &v) in smr.iter().enumerate() {
+            assert_eq!(v, (i + 1) as f64, "out[{i}]");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_row_order_sign_semantics() {
+        // Lsb below the threshold → strictly negative SMR (fully
+        // masked); above → strictly positive (audible content).
+        let masked = coder_partition_d5_smr_db_row_order(|_| 10.0, |_| 25.0);
+        assert!(masked.iter().all(|&v| v == -15.0));
+        let audible = coder_partition_d5_smr_db_row_order(|_| 60.0, |_| 25.0);
+        assert!(audible.iter().all(|&v| v == 35.0));
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_row_order_lsb_fanout_once_per_partition_ascending() {
+        // The Lsb(n) callback is invoked exactly once per partition
+        // n ∈ 1..=32 in ascending row order; the LTg(ω) callback
+        // fan-out equals exactly one step-59 pass (one call per FFT
+        // line in Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)).
+        use core::cell::{Cell, RefCell};
+        let seen = RefCell::new(Vec::new());
+        let ltg_calls = Cell::new(0_u32);
+        let _ = coder_partition_d5_smr_db_row_order(
+            |n: u16| {
+                seen.borrow_mut().push(n);
+                0.0
+            },
+            |_omega: u16| {
+                ltg_calls.set(ltg_calls.get() + 1);
+                0.0
+            },
+        );
+        let expected: Vec<u16> = (1..=32).collect();
+        assert_eq!(*seen.borrow(), expected, "Lsb fan-out / order");
+        // One step-59 pass: count it independently.
+        let direct = Cell::new(0_u32);
+        let _ = coder_partition_d5_ltg_min_row_order(|_omega: u16| {
+            direct.set(direct.get() + 1);
+            0.0
+        });
+        assert_eq!(ltg_calls.get(), direct.get(), "LTg fan-out");
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_row_order_bit_identical_to_step69_split() {
+        // Step 63's by-width LTmin cells are index-preserving copies
+        // of the step 59 row-order vector, so the row-order SMR must
+        // equal the step 69 split read back in row order bit-for-bit
+        // under non-trivial callbacks: out[0..12] == narrow_band,
+        // out[12..32] == wide_band (exact ==, not approximate).
+        let lsb = |n: u16| -> f64 { f64::from(n) * 2.25 + 17.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.007).cos() * 9.0 + 41.0 };
+        let row = coder_partition_d5_smr_db_row_order(lsb, ltg);
+        let split = coder_partition_d5_smr_db_row_order_by_width(lsb, ltg);
+        assert_eq!(&row[..12], &split.narrow_band[..], "narrow block");
+        assert_eq!(&row[12..], &split.wide_band[..], "wide block");
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_row_order_ltg_dip_raises_exactly_one_interior_partition() {
+        // A −30 dB LTg dip at the interior line ω = 300 (not a shared
+        // 16k + 1 boundary) lowers exactly one partition's LTmin by
+        // 30 dB, raising that row's SMR by exactly +30 dB; all other
+        // rows are unchanged. The affected partition is found via the
+        // step 56 inverse lookup.
+        let n = first_partition_containing_line(300).expect("ω = 300 is in-table");
+        let baseline = coder_partition_d5_smr_db_row_order(|_| 50.0, |_| 0.0);
+        let dipped = coder_partition_d5_smr_db_row_order(
+            |_| 50.0,
+            |omega: u16| if omega == 300 { -30.0 } else { 0.0 },
+        );
+        for i in 0..32 {
+            let expect = if i as u16 + 1 == n {
+                baseline[i] + 30.0
+            } else {
+                baseline[i]
+            };
+            assert_eq!(dipped[i], expect, "out[{i}]");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_row_order_is_idempotent_for_pure_callbacks() {
+        let lsb = |n: u16| -> f64 { f64::from(n) * 0.5 + 30.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.002).cos() * 8.0 };
+        let a = coder_partition_d5_smr_db_row_order(lsb, ltg);
+        let b = coder_partition_d5_smr_db_row_order(lsb, ltg);
+        assert_eq!(a, b);
     }
 }
