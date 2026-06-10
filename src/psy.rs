@@ -5424,6 +5424,501 @@ pub fn model1_step2_subband_xspl_db(x: &[f64], n: u16) -> Option<f64> {
     ))
 }
 
+// =====================================================================
+// Annex D Model 1 — §D.1 Step 4 "Finding of tonal and non-tonal
+// components" (Phase 2 step 79 / r277).
+//
+// Step 4 classifies the step-77 SPL spectrum `X(k)` into discrete
+// tonal maskers (sinusoid-like local maxima) and one non-tonal
+// (noise) masker per critical band. The spec text (printed
+// p.111–112) defines three operations:
+//
+//   (a) Labelling of local maxima —
+//       "A spectral line X(k) is labelled as a local maximum if
+//        X(k) > X(k-1) and X(k) >= X(k+1)"
+//
+//   (b) Listing of tonal components and calculation of the sound
+//       pressure level — "A local maximum is put in the list of
+//       tonal components if X(k) - X(k+j) >= 7 dB", with the offset
+//       set j chosen by layer and `k` range (transcribed verbatim in
+//       `model1_step4_tonal_check_offsets`). A listed component
+//       carries the index k, the SPL
+//       `X_tm(k) = 10·log10(10^(X(k-1)/10) + 10^(X(k)/10) +
+//       10^(X(k+1)/10))` dB, and the tonal flag. "Next, all spectral
+//       lines within the examined frequency range are set to -∞ dB."
+//
+//   (c) Listing of non-tonal components and calculation of the
+//       power — "Within each critical band, the power of the
+//       spectral lines (remaining after the tonal components have
+//       been zeroed) are summed to form the sound pressure level of
+//       the new non-tonal component X_nm(k) corresponding to that
+//       critical band", listed at the "index number k of the
+//       spectral line nearest to the geometric mean of the critical
+//       band" with the non-tonal flag. The critical bands are the
+//       Tables D.2a–f boundaries already transcribed above.
+//
+// Reading notes (documented choices, all from the spec text alone):
+//
+// * Operation (a) labels the local maxima of the spectrum *before*
+//   any zeroing (it is a separate, earlier operation in the spec's
+//   enumerated list), so this implementation evaluates every (a)/(b)
+//   decision — including the 7 dB examinations and the three-line
+//   SPL sums — against a snapshot of the input spectrum, and applies
+//   the "set to -∞ dB" zeroing only as the feed into operation (c).
+//   Sequential within-pass zeroing would manufacture order-dependent
+//   maxima that operation (a) never labelled. Two genuine tonal
+//   components close enough to share examined ranges both list here;
+//   §D.1 Step 5(b)'s 0,5-Bark decimation is the spec's dedup stage.
+// * The multi-valued `j` condition is read as "for every j in the
+//   set" — a single passing offset cannot discriminate a sinusoid
+//   from noise, and the spec prints the set as a single condition
+//   over the whole list.
+// * "All spectral lines within the examined frequency range" is the
+//   contiguous run `k − j_max ..= k + j_max` (the df window around
+//   the maximum whose half-width the j set encodes), which includes
+//   the component's own three SPL lines.
+// * The spec prints per-sampling-rate `df` values in Hz but a single
+//   layer-wide `j` table in line units; the `j` table is the
+//   operative listing rule ("where j is chosen according to") and is
+//   what this implementation transcribes.
+// * The critical-band line spans for operation (c) follow the
+//   crate's established Tables D.2 reading (`band_of_fft_line`):
+//   each row is the inclusive *top* of its band (the docs file
+//   glosses `index F&CB` as "the top FFT line of this band"), so
+//   band `no` spans raw lines `(top(no−1), top(no)]` with band 0
+//   starting at line 1 (DC line 0 is in no band). Raw-line tops are
+//   recovered from each row's exact `frequency [Hz]` column via
+//   `k = round(f · N / Fs)` — the D.2 frequencies are exact
+//   line-center multiples of `Fs/N`, whereas the `index F&CB` column
+//   indexes the *subsampled* Table D.1 domain and cannot address the
+//   full-resolution spectrum that Step 4(c) sums.
+// * "Nearest to the geometric mean of the critical band" is
+//   evaluated over the band's own line span: `round(sqrt(k_first ·
+//   k_last))` (frequency is proportional to line index, so this is
+//   the frequency-domain geometric mean of the band's first/last
+//   line centers, and it always lands inside the summed span).
+// =====================================================================
+
+/// §D.1 Step 4(b) tonal-component SPL margin — 7 dB.
+///
+/// Verbatim (printed p.112): "A local maximum is put in the list of
+/// tonal components if X(k) - X(k+j) >= 7 dB".
+pub const MODEL1_STEP4_TONAL_DELTA_DB: f64 = 7.0;
+
+/// §D.1 Step 4(b) examined-neighbour offsets, shared first range
+/// (`2 < k < 63`, both layers): `j = -2, +2`.
+const MODEL1_STEP4_J_NEAR: [i32; 2] = [-2, 2];
+
+/// §D.1 Step 4(b) offsets, shared second range (`63 <= k < 127`,
+/// both layers): `j = -3, -2, +2, +3`.
+const MODEL1_STEP4_J_MID: [i32; 4] = [-3, -2, 2, 3];
+
+/// §D.1 Step 4(b) offsets, third range (`127 <= k <= 250` Layer I /
+/// `127 <= k < 255` Layer II): `j = -6, …, -2, +2, …, +6`.
+const MODEL1_STEP4_J_FAR: [i32; 10] = [-6, -5, -4, -3, -2, 2, 3, 4, 5, 6];
+
+/// §D.1 Step 4(b) offsets, Layer II top range (`255 <= k <= 500`):
+/// `j = -12, …, -2, +2, …, +12`.
+const MODEL1_STEP4_J_TOP_LAYER2: [i32; 22] = [
+    -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+];
+
+/// §D.1 Step 4(b) examined-neighbour offset set `j` for a candidate
+/// local maximum at spectral line `k` (Phase 2 step 79 / r277).
+///
+/// Verbatim (printed p.112), "where j is chosen according to":
+///
+/// ```text
+/// Layer I:
+///   j = -2, +2                          for   2 <  k <  63
+///   j = -3, -2, +2, +3                  for  63 <= k < 127
+///   j = -6, …, -2, +2, …, +6            for 127 <= k <= 250
+///
+/// Layer II:
+///   j = -2, +2                          for   2 <  k <  63
+///   j = -3, -2, +2, +3                  for  63 <= k < 127
+///   j = -6, …, -2, +2, …, +6            for 127 <= k < 255
+///   j = -12, …, -2, +2, …, +12          for 255 <= k <= 500
+/// ```
+///
+/// Returns `None` for any `k` outside the listed ranges (`k <= 2`,
+/// `k > 250` Layer I, `k > 500` Layer II) — the spec defines no
+/// examination there, so no line outside the table can be listed as
+/// tonal — and `None` for Layer III (the D.1 preamble adapts the
+/// Layer II 1 024-point model to Layer III; a Layer III caller passes
+/// `LayerII` explicitly, mirroring [`critical_band_boundaries`]).
+///
+/// **Determinism.** Pure range dispatch onto `'static` tables.
+///
+/// Provenance: only the Step 4(b) `j` listing transcribed above from
+/// ISO/IEC 11172-3:1993 Annex D §D.1 Step 4 (printed p.112) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read; no external
+/// implementation was consulted.
+#[must_use]
+pub fn model1_step4_tonal_check_offsets(
+    layer: crate::frame::Layer,
+    k: usize,
+) -> Option<&'static [i32]> {
+    use crate::frame::Layer;
+    match layer {
+        Layer::LayerI => match k {
+            3..=62 => Some(&MODEL1_STEP4_J_NEAR),
+            63..=126 => Some(&MODEL1_STEP4_J_MID),
+            127..=250 => Some(&MODEL1_STEP4_J_FAR),
+            _ => None,
+        },
+        Layer::LayerII => match k {
+            3..=62 => Some(&MODEL1_STEP4_J_NEAR),
+            63..=126 => Some(&MODEL1_STEP4_J_MID),
+            127..=254 => Some(&MODEL1_STEP4_J_FAR),
+            255..=500 => Some(&MODEL1_STEP4_J_TOP_LAYER2),
+            _ => None,
+        },
+        Layer::LayerIII => None,
+    }
+}
+
+/// §D.1 Step 4(a) local-maximum label for spectral line `k` (Phase 2
+/// step 79 / r277).
+///
+/// Verbatim (printed p.112): "A spectral line X(k) is labelled as a
+/// local maximum if X(k) > X(k-1) and X(k) >= X(k+1)" — strict
+/// against the lower neighbour, non-strict against the upper.
+/// Returns `None` when either neighbour does not exist (`k == 0` or
+/// `k + 1 >= x.len()`); the spec formula is undefined there and no
+/// boundary extension is invented.
+///
+/// **Determinism.** Pure two-comparison predicate.
+///
+/// Provenance: only the Step 4(a) labelling rule quoted above from
+/// ISO/IEC 11172-3:1993 Annex D §D.1 Step 4 (printed p.112) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read; no external
+/// implementation was consulted.
+#[inline]
+#[must_use]
+pub fn model1_step4_is_local_maximum(x: &[f64], k: usize) -> Option<bool> {
+    if k == 0 || k + 1 >= x.len() {
+        return None;
+    }
+    Some(x[k] > x[k - 1] && x[k] >= x[k + 1])
+}
+
+/// §D.1 Step 4(b) tonality test for spectral line `k` (Phase 2 step
+/// 79 / r277).
+///
+/// `Some(true)` iff line `k` is a Step 4(a) local maximum **and**
+/// `X(k) − X(k+j) >= 7 dB` holds for *every* `j` in the
+/// [`model1_step4_tonal_check_offsets`] set for `(layer, k)` (the
+/// multi-valued condition is read conjunctively — a single passing
+/// offset cannot discriminate a sinusoid from noise). Returns `None`
+/// when the spec defines no examination at `k` (no `j` set — see the
+/// offsets accessor) or when any examined line `k + j` falls outside
+/// the supplied spectrum; both spec transform lengths keep every
+/// listed `k` range fully in bounds, so `None` from the bounds check
+/// only arises on truncated input.
+///
+/// `-∞` dB (silent / already-zeroed) lines behave per IEEE
+/// arithmetic: a `-∞` line is never a local maximum (`-∞ > -∞` is
+/// false) and `-∞ − -∞ = NaN` fails the `>= 7` comparison.
+///
+/// **Determinism.** Pure predicate over the slice.
+///
+/// Provenance: only the Step 4(a)/(b) rules quoted in
+/// [`model1_step4_is_local_maximum`] / the offsets accessor from
+/// ISO/IEC 11172-3:1993 Annex D §D.1 Step 4 (printed p.112) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` are read; no
+/// external implementation was consulted.
+#[must_use]
+pub fn model1_step4_is_tonal(x: &[f64], layer: crate::frame::Layer, k: usize) -> Option<bool> {
+    let offsets = model1_step4_tonal_check_offsets(layer, k)?;
+    let local_max = model1_step4_is_local_maximum(x, k)?;
+    // `j_max` is the largest |j| (the sets are symmetric); every
+    // examined line must exist.
+    let j_max = offsets.last().copied().unwrap_or(0) as usize;
+    if k < j_max || k + j_max >= x.len() {
+        return None;
+    }
+    Some(
+        local_max
+            && offsets.iter().all(|&j| {
+                let neighbour = (k as i64 + i64::from(j)) as usize;
+                x[k] - x[neighbour] >= MODEL1_STEP4_TONAL_DELTA_DB
+            }),
+    )
+}
+
+/// §D.1 Step 4(b) tonal-component sound pressure level `X_tm(k)`
+/// (Phase 2 step 79 / r277).
+///
+/// Verbatim (printed p.112): a listed tonal component carries
+///
+/// ```text
+/// X_tm(k) = 10 * log10( 10^(X(k-1)/10) + 10^(X(k)/10) + 10^(X(k+1)/10) )  dB
+/// ```
+///
+/// — the dB-domain power sum of the maximum and its two immediate
+/// neighbours (the sinusoid's Hann-window leakage lines). Returns
+/// `None` when either neighbour does not exist. Implemented as
+/// [`model1_step2_xspl_db`] over the three-line window (it is the
+/// same power-sum formula).
+///
+/// **Determinism.** Pure three-term dB-domain sum.
+///
+/// Provenance: only the Step 4(b) `X_tm(k)` formula quoted above from
+/// ISO/IEC 11172-3:1993 Annex D §D.1 Step 4 (printed p.112) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read; no external
+/// implementation was consulted.
+#[inline]
+#[must_use]
+pub fn model1_step4_tonal_spl_db(x: &[f64], k: usize) -> Option<f64> {
+    if k == 0 || k + 1 >= x.len() {
+        return None;
+    }
+    Some(model1_step2_xspl_db(&x[k - 1..=k + 1]))
+}
+
+/// One §D.1 Step 4 masking component: the listed parameters are the
+/// spectral-line index `k`, the sound pressure level, and the
+/// tonal / non-tonal flag (verbatim the three list entries of
+/// operations (b) and (c), printed p.112).
+///
+/// `k` is the 0-based step-77 spectrum index (the spec's FFT bin
+/// `k = 0…N/2`). For tonal components it is the local-maximum line;
+/// for non-tonal components it is "the spectral line nearest to the
+/// geometric mean of the critical band". The Bark-coordinate mapping
+/// (`z(k)` via Tables D.1) that Steps 5–7's [`Masker`] carrier needs
+/// remains blocked on the PNG-only Tables D.1 transcription, so this
+/// carrier stays in the line-index domain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Model1Step4Component {
+    /// 0-based spectral-line index `k` of the component.
+    pub k: u16,
+    /// Sound pressure level of the component in dB (`X_tm(k)` for
+    /// tonal, `X_nm(k)` for non-tonal).
+    pub spl_db: f64,
+    /// Tonal / non-tonal flag.
+    pub kind: MaskerKind,
+}
+
+/// §D.1 Step 4(a)+(b) tonal-component extraction (Phase 2 step 79 /
+/// r277).
+///
+/// Scans the spectrum in increasing `k` over the spec's examined
+/// ranges, lists every line that passes [`model1_step4_is_tonal`] as
+/// a [`Model1Step4Component`] with its [`model1_step4_tonal_spl_db`]
+/// SPL and the tonal flag, and then applies the verbatim "Next, all
+/// spectral lines within the examined frequency range are set to
+/// -∞ dB" zeroing to `x` — the contiguous run `k − j_max ..= k +
+/// j_max` around each listed maximum — leaving `x` as the residual
+/// spectrum that operation (c) ([`model1_step4_non_tonal_components`])
+/// sums.
+///
+/// All (a)/(b) decisions (local-maximum labels, 7 dB examinations,
+/// three-line SPL sums) are evaluated against a snapshot of the input
+/// spectrum: operation (a) labels the maxima of the spectrum before
+/// any zeroing, so within-pass zeroing must not manufacture or
+/// destroy candidates (see the module-level reading notes). Returns
+/// `None` unless `x` is exactly the layer's step-77 half-spectrum
+/// (257 lines for Layer I's 512-point FFT, 513 for Layer II's
+/// 1 024-point; Layer III → `None`, pass `LayerII` per the D.1
+/// preamble's adaptation).
+///
+/// **Determinism.** Pure function of the input block (plus the
+/// in-place residue write-back).
+///
+/// Provenance: only the §D.1 Step 4 operations (a)/(b) text (printed
+/// p.112) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read;
+/// no external implementation was consulted.
+#[must_use]
+pub fn model1_step4_extract_tonal(
+    x: &mut [f64],
+    layer: crate::frame::Layer,
+) -> Option<Vec<Model1Step4Component>> {
+    use crate::frame::Layer;
+    let expected = match layer {
+        Layer::LayerI => MODEL1_FFT_LEN_LAYER1 / 2 + 1,
+        Layer::LayerII => MODEL1_FFT_LEN_LAYER2 / 2 + 1,
+        Layer::LayerIII => return None,
+    };
+    if x.len() != expected {
+        return None;
+    }
+    let snapshot = x.to_vec();
+    let mut components = Vec::new();
+    for k in 3..x.len() - 1 {
+        let Some(offsets) = model1_step4_tonal_check_offsets(layer, k) else {
+            continue;
+        };
+        if model1_step4_is_tonal(&snapshot, layer, k) != Some(true) {
+            continue;
+        }
+        // The neighbours exist for every examined k, so the SPL
+        // accessor cannot return `None` here.
+        let spl_db = model1_step4_tonal_spl_db(&snapshot, k)?;
+        components.push(Model1Step4Component {
+            k: k as u16,
+            spl_db,
+            kind: MaskerKind::Tonal,
+        });
+        let j_max = offsets.last().copied().unwrap_or(0) as usize;
+        for line in &mut x[k - j_max..=k + j_max] {
+            *line = f64::NEG_INFINITY;
+        }
+    }
+    Some(components)
+}
+
+/// Raw-spectral-line span of one §D.1 Step 4(c) critical band: band
+/// `no` covers the inclusive 0-based step-77 lines `k_first ..=
+/// k_last`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Model1Step4BandSpan {
+    /// Critical-band number (the Tables D.2 `no` column).
+    pub no: u16,
+    /// First 0-based spectral line of the band (inclusive).
+    pub k_first: u16,
+    /// Last 0-based spectral line of the band (inclusive; the band's
+    /// top boundary line per the Tables D.2 `frequency [Hz]` column).
+    pub k_last: u16,
+}
+
+/// §D.1 Step 4(c) critical-band spans in raw step-77 line units
+/// (Phase 2 step 79 / r277).
+///
+/// Maps the Tables D.2a–f boundary rows for `(layer, fs)` onto the
+/// full-resolution spectrum: each row's exact `frequency [Hz]` column
+/// is converted to its 0-based line index via `k = round(f · N / Fs)`
+/// (`N` = 512 Layer I / 1 024 Layer II; the D.2 frequencies are exact
+/// line-center multiples of `Fs/N`), each row is the inclusive top of
+/// its band per the crate's established Tables D.2 reading
+/// ([`band_of_fft_line`]), band 0 starts at line 1, and DC line 0
+/// belongs to no band. The row `index F&CB` column is *not* used
+/// here: it indexes the subsampled Table D.1 domain, which cannot
+/// address the full-resolution lines that Step 4(c) sums. Returns
+/// `None` exactly when [`critical_band_boundaries`] does (Layer III).
+///
+/// **Determinism.** Pure table transformation.
+///
+/// Provenance: the Tables D.2a–f rows already transcribed in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` plus the
+/// §D.1 Step 4(c) prose (printed p.112) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`; no external
+/// implementation was consulted.
+#[must_use]
+pub fn model1_step4_band_line_spans(
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+) -> Option<Vec<Model1Step4BandSpan>> {
+    use crate::frame::Layer;
+    let boundaries = critical_band_boundaries(layer, fs)?;
+    let fft_len = match layer {
+        Layer::LayerI => MODEL1_FFT_LEN_LAYER1,
+        Layer::LayerII => MODEL1_FFT_LEN_LAYER2,
+        // `critical_band_boundaries` already returned `None`.
+        Layer::LayerIII => return None,
+    };
+    let fs_hz = f64::from(fs.as_hz());
+    let mut prev_top = 0u16;
+    Some(
+        boundaries
+            .iter()
+            .map(|b| {
+                let top = (b.frequency_hz * (fft_len as f64) / fs_hz).round() as u16;
+                let span = Model1Step4BandSpan {
+                    no: b.no,
+                    k_first: prev_top + 1,
+                    k_last: top,
+                };
+                prev_top = top;
+                span
+            })
+            .collect(),
+    )
+}
+
+/// §D.1 Step 4(c) non-tonal components from the tonal-zeroed residual
+/// spectrum (Phase 2 step 79 / r277).
+///
+/// For each [`model1_step4_band_line_spans`] critical band the power
+/// of the residual lines is summed in the dB domain (the same
+/// [`model1_step2_xspl_db`] power sum — verbatim "the power of the
+/// spectral lines (remaining after the tonal components have been
+/// zeroed) are summed to form the sound pressure level of the new
+/// non-tonal component"), listed at the "index number k of the
+/// spectral line nearest to the geometric mean of the critical band"
+/// — evaluated over the band's own line span as
+/// `round(sqrt(k_first · k_last))`, which is the frequency-domain
+/// geometric mean of the band's first/last line centers (frequency ∝
+/// line index) and always lands inside the summed span — with the
+/// non-tonal flag. A band whose lines were all zeroed by Step 4(b)
+/// yields a `-∞` dB component verbatim (zero linear power; Step 5(a)
+/// screens it out against LTq). Returns `None` unless `x` is exactly
+/// the layer's step-77 half-spectrum length (Layer III → `None`).
+///
+/// **Determinism.** Pure per-band fold.
+///
+/// Provenance: only the §D.1 Step 4(c) prose (printed p.112) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` plus the in-repo
+/// Tables D.2 transcription are read; no external implementation was
+/// consulted.
+#[must_use]
+pub fn model1_step4_non_tonal_components(
+    x: &[f64],
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+) -> Option<Vec<Model1Step4Component>> {
+    use crate::frame::Layer;
+    let expected = match layer {
+        Layer::LayerI => MODEL1_FFT_LEN_LAYER1 / 2 + 1,
+        Layer::LayerII => MODEL1_FFT_LEN_LAYER2 / 2 + 1,
+        Layer::LayerIII => return None,
+    };
+    if x.len() != expected {
+        return None;
+    }
+    let spans = model1_step4_band_line_spans(layer, fs)?;
+    Some(
+        spans
+            .iter()
+            .map(|s| {
+                let spl_db = model1_step2_xspl_db(&x[s.k_first as usize..=s.k_last as usize]);
+                let gm = (f64::from(s.k_first) * f64::from(s.k_last)).sqrt().round() as u16;
+                Model1Step4Component {
+                    k: gm,
+                    spl_db,
+                    kind: MaskerKind::NonTonal,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// §D.1 Step 4 end-to-end classification: tonal list + non-tonal list
+/// (Phase 2 step 79 / r277).
+///
+/// Composes the three Step 4 operations on a copy of the input
+/// spectrum: [`model1_step4_extract_tonal`] lists the tonal
+/// components and zeroes their examined ranges in the copy, then
+/// [`model1_step4_non_tonal_components`] sums the residue per
+/// critical band. Returns `(tonal, non_tonal)`, or `None` under the
+/// same `(layer, fs, length)` validation as the two stages.
+///
+/// **Determinism.** Pure function of the input spectrum.
+///
+/// Provenance: composition of the Step 4 primitives above; no
+/// additional spec material and no external implementation consulted.
+#[must_use]
+pub fn model1_step4_components(
+    x: &[f64],
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+) -> Option<(Vec<Model1Step4Component>, Vec<Model1Step4Component>)> {
+    let mut residue = x.to_vec();
+    let tonal = model1_step4_extract_tonal(&mut residue, layer)?;
+    let non_tonal = model1_step4_non_tonal_components(&residue, layer, fs)?;
+    Some((tonal, non_tonal))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12544,5 +13039,385 @@ mod tests {
         let huge_scf_term = model1_step2_scf_term_db(100.0);
         assert!(huge_scf_term > MODEL1_SPL_REFERENCE_DB);
         assert_eq!(model1_step2_lsb_db(max_line, 100.0), huge_scf_term);
+    }
+
+    // ---- Phase 2 step 79 / r277 — §D.1 Step 4 tonal / non-tonal
+    //      classification.
+
+    /// Flat spectrum at `level` dB with the Layer II half-spectrum
+    /// length (513 lines).
+    fn flat_spectrum_l2(level: f64) -> Vec<f64> {
+        vec![level; MODEL1_FFT_LEN_LAYER2 / 2 + 1]
+    }
+
+    #[test]
+    fn step4_offsets_layer1_ranges() {
+        use crate::frame::Layer;
+        // Below the first examined range (k <= 2) — no j set.
+        assert!(model1_step4_tonal_check_offsets(Layer::LayerI, 0).is_none());
+        assert!(model1_step4_tonal_check_offsets(Layer::LayerI, 2).is_none());
+        // 2 < k < 63: j = -2, +2.
+        assert_eq!(
+            model1_step4_tonal_check_offsets(Layer::LayerI, 3),
+            Some(&[-2, 2][..])
+        );
+        assert_eq!(
+            model1_step4_tonal_check_offsets(Layer::LayerI, 62),
+            Some(&[-2, 2][..])
+        );
+        // 63 <= k < 127: j = -3, -2, +2, +3.
+        assert_eq!(
+            model1_step4_tonal_check_offsets(Layer::LayerI, 63),
+            Some(&[-3, -2, 2, 3][..])
+        );
+        assert_eq!(
+            model1_step4_tonal_check_offsets(Layer::LayerI, 126),
+            Some(&[-3, -2, 2, 3][..])
+        );
+        // 127 <= k <= 250: j = -6..-2, +2..+6 (10 offsets, no ±1, no 0).
+        let far = model1_step4_tonal_check_offsets(Layer::LayerI, 127).unwrap();
+        assert_eq!(far.len(), 10);
+        assert!(!far.contains(&-1) && !far.contains(&0) && !far.contains(&1));
+        assert_eq!(far.first(), Some(&-6));
+        assert_eq!(far.last(), Some(&6));
+        assert_eq!(
+            model1_step4_tonal_check_offsets(Layer::LayerI, 250),
+            Some(far)
+        );
+        // Layer I's table ends at k = 250 inclusive.
+        assert!(model1_step4_tonal_check_offsets(Layer::LayerI, 251).is_none());
+    }
+
+    #[test]
+    fn step4_offsets_layer2_ranges() {
+        use crate::frame::Layer;
+        // The first three ranges match Layer I…
+        assert_eq!(
+            model1_step4_tonal_check_offsets(Layer::LayerII, 3),
+            model1_step4_tonal_check_offsets(Layer::LayerI, 3)
+        );
+        assert_eq!(
+            model1_step4_tonal_check_offsets(Layer::LayerII, 126),
+            model1_step4_tonal_check_offsets(Layer::LayerI, 126)
+        );
+        // …but the third range is right-open at 255 for Layer II.
+        assert_eq!(
+            model1_step4_tonal_check_offsets(Layer::LayerII, 254).map(<[i32]>::len),
+            Some(10)
+        );
+        // 255 <= k <= 500: j = -12..-2, +2..+12 (22 offsets).
+        let top = model1_step4_tonal_check_offsets(Layer::LayerII, 255).unwrap();
+        assert_eq!(top.len(), 22);
+        assert_eq!(top.first(), Some(&-12));
+        assert_eq!(top.last(), Some(&12));
+        assert!(!top.contains(&-1) && !top.contains(&0) && !top.contains(&1));
+        assert_eq!(
+            model1_step4_tonal_check_offsets(Layer::LayerII, 500),
+            Some(top)
+        );
+        assert!(model1_step4_tonal_check_offsets(Layer::LayerII, 501).is_none());
+        // Annex D defines the j table for Layers I/II only.
+        assert!(model1_step4_tonal_check_offsets(Layer::LayerIII, 100).is_none());
+    }
+
+    #[test]
+    fn step4_local_maximum_strict_low_nonstrict_high() {
+        // X(k) > X(k-1) is strict; X(k) >= X(k+1) is non-strict: a
+        // plateau's *first* line is the labelled maximum.
+        let x = [0.0, 2.0, 2.0, 1.0, 1.0];
+        assert_eq!(model1_step4_is_local_maximum(&x, 1), Some(true)); // 2 > 0, 2 >= 2
+        assert_eq!(model1_step4_is_local_maximum(&x, 2), Some(false)); // 2 > 2 fails
+        assert_eq!(model1_step4_is_local_maximum(&x, 3), Some(false)); // 1 > 2 fails
+                                                                       // Edges have no neighbour — the spec formula is undefined.
+        assert!(model1_step4_is_local_maximum(&x, 0).is_none());
+        assert!(model1_step4_is_local_maximum(&x, 4).is_none());
+    }
+
+    #[test]
+    fn step4_is_tonal_seven_db_margin_inclusive() {
+        use crate::frame::Layer;
+        // k = 20 sits in the first range (j = ±2). A 7.0 dB margin
+        // passes (>= is inclusive); 6.9 dB fails.
+        let mut x = flat_spectrum_l2(0.0);
+        x[20] = 7.0;
+        assert_eq!(model1_step4_is_tonal(&x, Layer::LayerII, 20), Some(true));
+        x[18] = 0.1; // X(20) - X(18) = 6.9 < 7
+        assert_eq!(model1_step4_is_tonal(&x, Layer::LayerII, 20), Some(false));
+    }
+
+    #[test]
+    fn step4_is_tonal_requires_every_offset() {
+        use crate::frame::Layer;
+        // k = 300 is in the Layer II top range (j up to ±12). One
+        // near-level line at k + 12 defeats the whole conjunction.
+        let mut x = flat_spectrum_l2(-10.0);
+        x[300] = 50.0;
+        x[312] = 44.0; // 50 - 44 = 6 < 7
+        assert_eq!(model1_step4_is_tonal(&x, Layer::LayerII, 300), Some(false));
+        x[312] = -10.0;
+        assert_eq!(model1_step4_is_tonal(&x, Layer::LayerII, 300), Some(true));
+    }
+
+    #[test]
+    fn step4_is_tonal_none_outside_examined_ranges() {
+        use crate::frame::Layer;
+        let x = flat_spectrum_l2(0.0);
+        assert!(model1_step4_is_tonal(&x, Layer::LayerII, 2).is_none());
+        assert!(model1_step4_is_tonal(&x, Layer::LayerII, 501).is_none());
+        assert!(model1_step4_is_tonal(&x, Layer::LayerI, 251).is_none());
+        assert!(model1_step4_is_tonal(&x, Layer::LayerIII, 100).is_none());
+    }
+
+    #[test]
+    fn step4_tonal_spl_three_line_power_sum() {
+        // Three equal lines at L dB sum to L + 10·log10(3), and the
+        // formula is exactly the Step 2 Xspl power sum over the
+        // three-line window.
+        let x = [f64::NEG_INFINITY, 40.0, 40.0, 40.0, f64::NEG_INFINITY];
+        let spl = model1_step4_tonal_spl_db(&x, 2).unwrap();
+        assert!((spl - (40.0 + 10.0 * 3.0_f64.log10())).abs() < 1e-12);
+        assert_eq!(spl, model1_step2_xspl_db(&x[1..=3]));
+        // Neighbourless edges are undefined.
+        assert!(model1_step4_tonal_spl_db(&x, 0).is_none());
+        assert!(model1_step4_tonal_spl_db(&x, 4).is_none());
+    }
+
+    #[test]
+    fn step4_extract_tonal_lists_and_zeroes_examined_range() {
+        use crate::frame::Layer;
+        // One sinusoid-like peak at k = 100 (mid range, j_max = 3)
+        // over a -20 dB floor, with ±1 leakage lines at 10 dB.
+        let mut x = flat_spectrum_l2(-20.0);
+        x[100] = 30.0;
+        x[99] = 10.0;
+        x[101] = 10.0;
+        let tonal = model1_step4_extract_tonal(&mut x, Layer::LayerII).unwrap();
+        assert_eq!(tonal.len(), 1);
+        assert_eq!(tonal[0].k, 100);
+        assert_eq!(tonal[0].kind, MaskerKind::Tonal);
+        let expected_spl = 10.0 * (10.0_f64.powf(3.0) + 2.0 * 10.0_f64.powf(1.0)).log10();
+        assert!((tonal[0].spl_db - expected_spl).abs() < 1e-12);
+        // The examined range k ± 3 is zeroed to -∞; the floor outside
+        // is untouched.
+        for (line, &v) in x.iter().enumerate().take(103 + 1).skip(97) {
+            assert_eq!(v, f64::NEG_INFINITY, "line {line} must be -∞");
+        }
+        assert_eq!(x[96], -20.0);
+        assert_eq!(x[104], -20.0);
+    }
+
+    #[test]
+    fn step4_extract_tonal_decisions_use_the_original_spectrum() {
+        use crate::frame::Layer;
+        // Operation (a) labels maxima before any zeroing. The blocker
+        // line at k = 102 (inside the k = 100 peak's examined range)
+        // keeps k = 105 non-tonal: 25 - 20 = 5 < 7 dB. A sequential
+        // in-pass zeroing would have erased the blocker first and
+        // wrongly listed k = 105.
+        let mut x = flat_spectrum_l2(-20.0);
+        x[100] = 30.0;
+        x[102] = 20.0;
+        x[105] = 25.0;
+        let tonal = model1_step4_extract_tonal(&mut x, Layer::LayerII).unwrap();
+        assert_eq!(tonal.len(), 1);
+        assert_eq!(tonal[0].k, 100);
+    }
+
+    #[test]
+    fn step4_extract_tonal_rejects_wrong_length_and_layer3() {
+        use crate::frame::Layer;
+        let mut short = vec![0.0; MODEL1_FFT_LEN_LAYER1 / 2 + 1];
+        assert!(model1_step4_extract_tonal(&mut short, Layer::LayerII).is_none());
+        assert!(model1_step4_extract_tonal(&mut short, Layer::LayerI).is_some());
+        let mut long = flat_spectrum_l2(0.0);
+        assert!(model1_step4_extract_tonal(&mut long, Layer::LayerI).is_none());
+        assert!(model1_step4_extract_tonal(&mut long, Layer::LayerIII).is_none());
+    }
+
+    #[test]
+    fn step4_band_line_spans_tile_contiguously_from_line_1() {
+        use crate::frame::Layer;
+        // For every (layer, fs) table: band 0 starts at line 1, spans
+        // tile with no gaps or overlaps, and the top band ends at the
+        // table's last boundary line (frequency / line-spacing).
+        let cases = [
+            (Layer::LayerI, AnnexDSamplingRate::Hz32000, 240u16),
+            (Layer::LayerI, AnnexDSamplingRate::Hz44100, 232),
+            (Layer::LayerI, AnnexDSamplingRate::Hz48000, 216),
+            (Layer::LayerII, AnnexDSamplingRate::Hz32000, 480),
+            (Layer::LayerII, AnnexDSamplingRate::Hz44100, 464),
+            (Layer::LayerII, AnnexDSamplingRate::Hz48000, 432),
+        ];
+        for (layer, fs, last_top) in cases {
+            let spans = model1_step4_band_line_spans(layer, fs).unwrap();
+            let table = critical_band_boundaries(layer, fs).unwrap();
+            assert_eq!(spans.len(), table.len());
+            assert_eq!(spans[0].k_first, 1, "{layer:?}/{fs:?}");
+            let mut prev_last = 0u16;
+            for s in &spans {
+                assert_eq!(s.k_first, prev_last + 1, "{layer:?}/{fs:?} band {}", s.no);
+                assert!(s.k_last >= s.k_first, "{layer:?}/{fs:?} band {}", s.no);
+                prev_last = s.k_last;
+            }
+            assert_eq!(prev_last, last_top, "{layer:?}/{fs:?} top line");
+        }
+        assert!(
+            model1_step4_band_line_spans(Layer::LayerIII, AnnexDSamplingRate::Hz44100).is_none()
+        );
+    }
+
+    #[test]
+    fn step4_band_line_spans_d2d_anchor_rows() {
+        use crate::frame::Layer;
+        // D.2d (Layer II, 32 kHz; line spacing 31,25 Hz): band 0 tops
+        // at 31,25 Hz = line 1, band 1 at 93,75 Hz = line 3, band 2 at
+        // 187,5 Hz = line 6; band 22 tops at 9 250 Hz = line 296, so
+        // band 23 (top 11 500 Hz = line 368) spans 297..=368 and band
+        // 24 (top 15 000 Hz = line 480) spans 369..=480.
+        let spans =
+            model1_step4_band_line_spans(Layer::LayerII, AnnexDSamplingRate::Hz32000).unwrap();
+        assert_eq!((spans[0].k_first, spans[0].k_last), (1, 1));
+        assert_eq!((spans[1].k_first, spans[1].k_last), (2, 3));
+        assert_eq!((spans[2].k_first, spans[2].k_last), (4, 6));
+        assert_eq!((spans[23].k_first, spans[23].k_last), (297, 368));
+        assert_eq!((spans[24].k_first, spans[24].k_last), (369, 480));
+    }
+
+    #[test]
+    fn step4_non_tonal_flat_spectrum_per_band_power() {
+        use crate::frame::Layer;
+        // On a flat 0 dB residue every band's non-tonal SPL is
+        // 10·log10(width) and the listed line is round(sqrt(first·last)),
+        // inside the band.
+        let x = flat_spectrum_l2(0.0);
+        let spans =
+            model1_step4_band_line_spans(Layer::LayerII, AnnexDSamplingRate::Hz32000).unwrap();
+        let nt = model1_step4_non_tonal_components(&x, Layer::LayerII, AnnexDSamplingRate::Hz32000)
+            .unwrap();
+        assert_eq!(nt.len(), spans.len());
+        for (c, s) in nt.iter().zip(&spans) {
+            assert_eq!(c.kind, MaskerKind::NonTonal);
+            let width = f64::from(s.k_last - s.k_first + 1);
+            assert!(
+                (c.spl_db - 10.0 * width.log10()).abs() < 1e-12,
+                "band {}: spl {} vs width {}",
+                s.no,
+                c.spl_db,
+                width
+            );
+            let gm = (f64::from(s.k_first) * f64::from(s.k_last)).sqrt().round() as u16;
+            assert_eq!(c.k, gm);
+            assert!(c.k >= s.k_first && c.k <= s.k_last, "band {}", s.no);
+        }
+        // Anchor the geometric-mean line of the widest D.2d band:
+        // round(sqrt(369·480)) = round(420,86) = 421.
+        assert_eq!(nt[24].k, 421);
+    }
+
+    #[test]
+    fn step4_non_tonal_geometric_mean_inside_span_all_tables() {
+        use crate::frame::Layer;
+        for layer in [Layer::LayerI, Layer::LayerII] {
+            let len = match layer {
+                Layer::LayerI => MODEL1_FFT_LEN_LAYER1 / 2 + 1,
+                _ => MODEL1_FFT_LEN_LAYER2 / 2 + 1,
+            };
+            let x = vec![-30.0; len];
+            for fs in [
+                AnnexDSamplingRate::Hz32000,
+                AnnexDSamplingRate::Hz44100,
+                AnnexDSamplingRate::Hz48000,
+            ] {
+                let spans = model1_step4_band_line_spans(layer, fs).unwrap();
+                let nt = model1_step4_non_tonal_components(&x, layer, fs).unwrap();
+                for (c, s) in nt.iter().zip(&spans) {
+                    assert!(
+                        c.k >= s.k_first && c.k <= s.k_last,
+                        "{layer:?}/{fs:?} band {}: line {} outside [{}, {}]",
+                        s.no,
+                        c.k,
+                        s.k_first,
+                        s.k_last
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn step4_components_end_to_end_peak_plus_floor() {
+        use crate::frame::Layer;
+        // Peak at k = 100 over a -30 dB floor (Layer II, 44,1 kHz).
+        // The tonal list carries the peak; the band containing it
+        // (D.2e band 19 spans lines 91..=104) loses the zeroed peak
+        // energy from its non-tonal sum.
+        let mut x = flat_spectrum_l2(-30.0);
+        x[100] = 40.0;
+        x[99] = 20.0;
+        x[101] = 20.0;
+        let (tonal, non_tonal) =
+            model1_step4_components(&x, Layer::LayerII, AnnexDSamplingRate::Hz44100).unwrap();
+        assert_eq!(tonal.len(), 1);
+        assert_eq!(tonal[0].k, 100);
+        // 27 critical bands per Table D.2e.
+        assert_eq!(non_tonal.len(), CRITICAL_BANDS_D2E.len());
+        // The unzeroed spectrum would put the peak's power into the
+        // band's non-tonal sum; the residue must come in lower.
+        let unzeroed =
+            model1_step4_non_tonal_components(&x, Layer::LayerII, AnnexDSamplingRate::Hz44100)
+                .unwrap();
+        let spans =
+            model1_step4_band_line_spans(Layer::LayerII, AnnexDSamplingRate::Hz44100).unwrap();
+        let band = spans
+            .iter()
+            .position(|s| s.k_first <= 100 && 100 <= s.k_last)
+            .unwrap();
+        assert_eq!(spans[band].no, 19);
+        assert!(non_tonal[band].spl_db < unzeroed[band].spl_db - 30.0);
+        // Bands away from the peak are untouched by the zeroing.
+        assert_eq!(non_tonal[5].spl_db, unzeroed[5].spl_db);
+    }
+
+    #[test]
+    fn step4_components_from_step1_spectrum_detects_pure_tone() {
+        use crate::frame::Layer;
+        // Full Step 1 → normalize → Step 4 chain: a pure sine at bin
+        // 100 yields exactly one above-floor tonal component at
+        // k = 100 whose three-line SPL exceeds the 96 dB peak line by
+        // the two ±1 Hann sidelines (each exactly 6,02 dB down:
+        // +10·log10(1,5) ≈ 1,76 dB).
+        let n_fft = MODEL1_FFT_LEN_LAYER2;
+        let s: Vec<f64> = (0..n_fft)
+            .map(|l| (2.0 * core::f64::consts::PI * 100.0 * (l as f64) / (n_fft as f64)).sin())
+            .collect();
+        let mut x = model1_power_density_spectrum(&s).unwrap();
+        model1_normalize_to_96db_spl(&mut x).unwrap();
+        let (tonal, non_tonal) =
+            model1_step4_components(&x, Layer::LayerII, AnnexDSamplingRate::Hz44100).unwrap();
+        let loud: Vec<_> = tonal.iter().filter(|c| c.spl_db > 0.0).collect();
+        assert_eq!(loud.len(), 1);
+        assert_eq!(loud[0].k, 100);
+        let expected = MODEL1_SPL_REFERENCE_DB + 10.0 * 1.5_f64.log10();
+        assert!((loud[0].spl_db - expected).abs() < 1e-6);
+        assert_eq!(non_tonal.len(), CRITICAL_BANDS_D2E.len());
+        // Every non-tonal component is at/below the numerical noise
+        // floor — the tone's energy left the residue with the zeroing.
+        for c in &non_tonal {
+            assert!(c.spl_db < 0.0, "band line {}: {}", c.k, c.spl_db);
+        }
+    }
+
+    #[test]
+    fn step4_components_silent_spectrum_yields_no_tonal_and_silent_bands() {
+        use crate::frame::Layer;
+        let x = flat_spectrum_l2(f64::NEG_INFINITY);
+        let (tonal, non_tonal) =
+            model1_step4_components(&x, Layer::LayerII, AnnexDSamplingRate::Hz48000).unwrap();
+        assert!(tonal.is_empty());
+        assert_eq!(non_tonal.len(), CRITICAL_BANDS_D2F.len());
+        for c in &non_tonal {
+            assert_eq!(c.spl_db, f64::NEG_INFINITY);
+            assert_eq!(c.kind, MaskerKind::NonTonal);
+        }
     }
 }

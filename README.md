@@ -2373,6 +2373,73 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 79 (r277)** — Annex D Model 1 §D.1 **Step 4 "Finding
+of tonal and non-tonal components"**: the tonality classifier that
+turns the step-77/78 SPL spectrum into the discrete masker lists that
+Steps 5–7 (landed r229/r219) consume. Eight public items in `psy`:
+`model1_step4_is_local_maximum(x, k)` is the verbatim operation (a)
+label (`X(k) > X(k-1) and X(k) >= X(k+1)` — strict low side,
+non-strict high side; `None` at neighbourless edges);
+`model1_step4_tonal_check_offsets(layer, k)` transcribes the verbatim
+layer/k-range `j` table (`j = ±2` for `2 < k < 63`, `±2, ±3` for
+`63 <= k < 127`, `±2…±6` for `127 <= k <= 250` Layer I / `< 255`
+Layer II, `±2…±12` for `255 <= k <= 500` Layer II; `None` outside the
+listed ranges and for Layer III — the D.1 preamble adapts the Layer II
+1 024-point model, so Layer III callers pass `LayerII` exactly as with
+`critical_band_boundaries`); `model1_step4_is_tonal(x, layer, k)`
+applies the operation (b) `X(k) − X(k+j) >= 7 dB` test
+(`MODEL1_STEP4_TONAL_DELTA_DB`) conjunctively over the whole offset
+set; `model1_step4_tonal_spl_db(x, k)` is the verbatim three-line
+power sum `X_tm(k) = 10·log10(10^(X(k−1)/10) + 10^(X(k)/10) +
+10^(X(k+1)/10))`; `model1_step4_extract_tonal(&mut x, layer)` scans
+the examined ranges in ascending `k`, lists each passing line as a
+`Model1Step4Component` (index `k`, SPL, tonal flag — the spec's three
+listed parameters), and applies the verbatim "all spectral lines
+within the examined frequency range are set to -∞ dB" zeroing over
+`k ± j_max` (all decisions evaluate against the pre-zeroing spectrum:
+operation (a) labels the maxima *before* any zeroing, so in-pass
+zeroing must not manufacture candidates — close tonal pairs both list
+and Step 5(b)'s 0,5-Bark decimation dedups them);
+`model1_step4_band_line_spans(layer, fs)` maps the Tables D.2a–f
+boundary rows onto raw step-77 line spans (`Model1Step4BandSpan`) via
+`k = round(f·N/Fs)` from each row's exact `frequency [Hz]` column
+(the `index F&CB` column addresses the subsampled Table D.1 domain
+and cannot index the full-resolution spectrum operation (c) sums;
+rows are inclusive band *tops* per the established
+`band_of_fft_line` reading, band 0 starts at line 1, DC is in no
+band); `model1_step4_non_tonal_components(x, layer, fs)` forms the
+operation (c) per-critical-band residue power (the step-78 `Xspl`
+power sum) listed at the geometric-mean line
+`round(sqrt(k_first·k_last))` with the non-tonal flag (an all-zeroed
+band yields a `-∞` dB component verbatim — Step 5(a) screens it
+against LTq); and `model1_step4_components(x, layer, fs)` composes
+the three operations end-to-end into `(tonal, non_tonal)` lists. The
+remaining bridge to Steps 5–7's Bark-domain `Masker` carrier is the
+line-index → `z(k)` mapping through Tables D.1a–f, which are still
+PNG-only renders. 17 new unit tests: both layers' `j`-range
+boundaries (including the 254/255 Layer II split and the ±1/0
+exclusions), strict/non-strict local-maximum sides + edge rejections,
+inclusive 7,0 dB margin vs 6,9 dB failure, single-offset veto in the
+±12 top range, out-of-range `None`s, the three-line SPL identity with
+step-78 `Xspl`, extraction listing + exact `k ± 3` zeroing with
+untouched floor, a snapshot-vs-sequential discriminating case (a
+blocker line inside an earlier peak's zeroed range must still veto a
+later candidate), length/Layer III rejections, contiguous-tiling +
+top-line anchors for all six (layer, Fs) span tables (240/232/216
+Layer I, 480/464/432 Layer II), D.2d anchor rows (1/3/6, 297..368,
+369..480), flat-spectrum per-band `10·log10(width)` non-tonal power +
+geometric-mean placement (band 24 → line 421), geometric-mean-inside-
+span across all tables, an end-to-end peak-plus-floor run (D.2e band
+19 loses the zeroed peak energy, far bands bit-identical), a Step 1 →
+normalize → Step 4 pure-tone chain (single above-floor tonal at
+`96 + 10·log10(1,5) ≈ 97,76 dB`, all-residue bands below 0 dB), and
+the silent-spectrum case (no tonal, all `-∞` non-tonal). Tests: 967
+lib (was 950; +17 unit). No external implementation consulted; only
+the §D.1 Step 4 prose (printed p.111–112) read directly from
+`docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` plus the in-repo Tables
+D.2 transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`.
+
 **Phase 2 step 78 (r276)** — Annex D Model 1 §D.1 **Step 2
 "Determination of the sound pressure level"**: `Lsb(n)` from the
 step-77 spectrum — the second of the "Steps 1–3" lacks items (and,
@@ -4063,11 +4130,13 @@ convention (row 0 carries ω = 1), and the top-of-table pin
 (row 32 carries ω = 513 = 1 + 32·16, matching the
 1024-sample FFT's 1..=513 one-based half-spectrum) — it
 still lacks
-the Model 1 Step 4 tonality classifier (local-maximum
-labelling, the `X(k) − X(k+j) >= 7 dB` tonal-component
-listing with its layer/frequency-dependent `j` ranges, and
-the per-critical-band non-tonal residue power over the
-step-77 `X(k)` lines), the rest of
+the Model 1 Step 4 → Step 5/6 Bark bridge (the
+line-index → `z(k)` mapping that lifts the step-79
+`Model1Step4Component` lists into the Bark-domain `Masker`
+carrier; it needs the per-line crit-band-rate column of
+Tables D.1a–f, which are PNG-only renders in
+`docs/audio/mp3/annex-d-renders/` awaiting transcription),
+the rest of
 Annex D Model 2 (calculation-partition
 table D.3 — PNG-only — the general PM2 spreading-function
 `tmpy` line that is typeset as image in the PDF and is not

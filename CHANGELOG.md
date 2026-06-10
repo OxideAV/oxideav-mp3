@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 1 §D.1 Step 4 "Finding of tonal and non-tonal
+  components" (Phase 2 step 79). New public primitives:
+  `model1_step4_is_local_maximum(x, k)` (verbatim operation (a)
+  `X(k) > X(k-1) and X(k) >= X(k+1)`; `None` at neighbourless edges),
+  `model1_step4_tonal_check_offsets(layer, k)` (the verbatim
+  layer/k-range `j` table: `±2` for `2<k<63`, `±2..±3` for
+  `63<=k<127`, `±2..±6` for `127<=k<=250` Layer I / `<255` Layer II,
+  `±2..±12` for `255<=k<=500` Layer II; `None` outside),
+  `model1_step4_is_tonal(x, layer, k)` (conjunctive
+  `X(k) − X(k+j) >= 7 dB` over the whole set —
+  `MODEL1_STEP4_TONAL_DELTA_DB`), `model1_step4_tonal_spl_db(x, k)`
+  (verbatim three-line power sum `X_tm(k)`),
+  `model1_step4_extract_tonal(&mut x, layer)` (operation (b) listing
+  + the "set to −∞ dB" zeroing of each examined `k ± j_max` range,
+  decisions evaluated against the pre-zeroing spectrum),
+  `model1_step4_band_line_spans(layer, fs)` (Tables D.2a–f boundaries
+  mapped to raw step-77 line spans via `k = round(f·N/Fs)`; carrier
+  `Model1Step4BandSpan`), `model1_step4_non_tonal_components(x,
+  layer, fs)` (operation (c) per-critical-band residue power at the
+  geometric-mean line `round(sqrt(k_first·k_last))`), and the
+  end-to-end `model1_step4_components(x, layer, fs)` returning the
+  `(tonal, non_tonal)` `Model1Step4Component` lists (index `k`, SPL,
+  tonal/non-tonal flag — the spec's three listed parameters). +17
+  unit tests (967 lib) including a Step 1 → normalize → Step 4
+  pure-tone chain.
 - psy: Annex D Model 1 §D.1 Step 2 "Determination of the sound
   pressure level" (Phase 2 step 78). New public primitives
   `model1_step2_scf_term_db(scf_max)` (verbatim `20·log(scf_max·32 768)
