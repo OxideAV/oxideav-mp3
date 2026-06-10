@@ -4187,6 +4187,173 @@ where
     out
 }
 
+// =====================================================================
+// Annex D Model 1 — §D.1 Step 9 paired `(SMR_n, width_n)` row-order
+// vector over Table D.5 (Phase 2 step 71 / r270).
+//
+// Spec context (ISO/IEC 11172-3:1993 Annex D §D.1 Step 9, printed
+// p.115; Table D.5 — Layer I and Layer II coder partition table):
+//
+//   Phase 2 step 70 (r269) exposed the bare row-order signal-to-mask-
+//   ratio vector `[SMR_1, …, SMR_32]` (dB). The Layer I / Layer II
+//   bit-allocation loop walks the 32 coder partitions in row order and
+//   at every row consumes **both** the partition's SMR value (the
+//   per-partition signal-to-mask ratio that seeds its mask-to-noise
+//   iteration) **and** its `width_n` column flag (whether the
+//   partition spans one or more than one Layer I / Layer II coder
+//   partition row, driving single-line vs multi-line per-partition
+//   bit targeting). The two columns are read paired, in lockstep, the
+//   same way the §D.1 Step 8 paired `(LTmin_n, width_n)` vector (Phase
+//   2 step 61 / r260) is read.
+//
+// This step is the SMR analogue of step 61: a pure index-aligned zip
+// of step 70's row-order SMR vector
+// (`coder_partition_d5_smr_db_row_order`, closed over the caller's two
+// callbacks) with step 60's static row-order width vector
+// (`coder_partition_d5_width_row_order`). No spec arithmetic is
+// introduced beyond the step 70 subtraction already present in the SMR
+// column — only the per-row pairing of the two existing row-order
+// columns at the same array index, which is exactly the per-row input
+// the bit-allocation loop reads.
+// =====================================================================
+
+/// A single row of the Layer I / Layer II coder-partition bit-
+/// allocation input in §D.1 Step 9 form: the per-partition signal-to-
+/// mask ratio `SMR_n` (dB) paired with the partition's `width_n`
+/// column (0 for `n ∈ 1..=12`; 1 for `n ∈ 13..=32`) at the same row
+/// index in row-order Table D.5 presentation.
+///
+/// Produced by [`coder_partition_d5_smr_row_order`] (Phase 2 step 71 /
+/// r270). The SMR analogue of Phase 2 step 61's
+/// [`CoderPartitionD5Reduction`] (which pairs the §D.1 Step 8
+/// `LTmin_n` column with `width_n`).
+///
+/// **Field semantics.** `smr_db` carries the §D.1 Step 9 signal-to-
+/// mask ratio `SMR_n = Lsb(n) − LTmin_n` (dB), as computed by Phase 2
+/// step 70's [`coder_partition_d5_smr_db_row_order`] from the caller's
+/// two callbacks. `width_n` is the static Table D.5 column value read
+/// by Phase 2 step 52's per-partition accessor
+/// [`coder_partition_d5_width`]. The two columns are orthogonal: the
+/// SMR column closes over the caller's `Lsb(n)` and `LTg(ω)` callbacks
+/// (run-time-dependent), the width column is a pure constant of the
+/// table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoderPartitionD5Smr {
+    /// Per-partition signal-to-mask ratio `SMR_n = Lsb(n) − LTmin_n`
+    /// (dB), as computed by Phase 2 step 70's
+    /// [`coder_partition_d5_smr_db_row_order`]. Positive = audible
+    /// content needing bits; negative = fully masked. No clipping.
+    pub smr_db: f64,
+    /// Partition's `width_n` column from Table D.5 — `0` for
+    /// `n ∈ 1..=12`, `1` for `n ∈ 13..=32`. The same value Phase 2
+    /// step 52's [`coder_partition_d5_width`] returns for the
+    /// partition.
+    pub width_n: u16,
+}
+
+/// §D.1 Step 9 paired row-order `[(SMR_n, width_n), …]` vector for
+/// every Layer I / Layer II coder partition `n ∈ 1..=32`. Element `i`
+/// of the returned `[CoderPartitionD5Smr; 32]` holds the
+/// `(SMR_{i + 1}, width_{i + 1})` pair (the spec's 1-based `n` in
+/// 0-based array form):
+///
+/// ```text
+/// out[i].smr_db  = Lsb(i + 1) − LTmin_{i + 1}   dB
+/// out[i].width_n = width_{i + 1}   (∈ {0, 1})
+/// ```
+///
+/// The vector is the per-frame paired input the Layer I / Layer II
+/// bit-allocation loop consumes — at every row the loop reads both
+/// columns together as the partition's "per-row brief" (signal-to-mask
+/// ratio + width flag), then iterates bit assignment on the partition
+/// with the worst mask-to-noise ratio. It is the §D.1 Step 9 analogue
+/// of Phase 2 step 61's paired §D.1 Step 8
+/// `(LTmin_n, width_n)` vector [`coder_partition_d5_reduction_row_order`].
+///
+/// **Index convention.** 0-based on the returned slice; element `i`
+/// holds `(SMR_{i + 1}, width_{i + 1})`. The spec's 1-based partition
+/// index `n ∈ 1..=32` maps to array index `i = n - 1 ∈ 0..=31`.
+/// Partition 0 (the degenerate single-line `width_n = 0` row) is
+/// excluded, matching the step 58–70 chain's recoverable range.
+///
+/// **Callbacks.** `lsb_per_partition` is the §D.1 Step 2 sound
+/// pressure level `Lsb(n)` (printed p.110), supplied per partition —
+/// Steps 1–2 (FFT analysis + SPL determination) remain behind the
+/// PNG-only Tables D.1 / D.2 transcription gap, the same dependency-
+/// injection pattern Phase 2 steps 58–70 use. `ltg_per_line` is the
+/// §D.1 Step 7 per-FFT-line global masking threshold `LTg(ω)`, reduced
+/// to each partition's `LTmin_n` through the Phase 2 step 59 row-order
+/// reducer.
+///
+/// **Composition.** A pure index-aligned zip of Phase 2 step 70's
+/// row-order SMR vector [`coder_partition_d5_smr_db_row_order`] (closed
+/// over both caller callbacks) with Phase 2 step 60's row-order width
+/// vector [`coder_partition_d5_width_row_order`]. No spec arithmetic is
+/// introduced beyond the step 70 subtraction already in the SMR column
+/// — only the per-row pairing of the two existing row-order columns at
+/// the same array index.
+///
+/// **Caller cost.** `lsb_per_partition` is invoked exactly once per
+/// partition `n ∈ 1..=32` in ascending row order; the `ltg_per_line`
+/// callback is invoked exactly as many times as Phase 2 step 70 (= one
+/// step-59 pass, one call per FFT line in
+/// `Σ_{n=1..=32} (ωhigh_n − ωlow_n + 1)`). The width vector adds no
+/// callback invocations.
+///
+/// **Bit-identity with step 70.** The `smr_db` column equals Phase 2
+/// step 70's [`coder_partition_d5_smr_db_row_order`] output cell-for-
+/// cell (`out[i].smr_db == step70[i]`), and the `width_n` column equals
+/// Phase 2 step 60's [`coder_partition_d5_width_row_order`] cell-for-
+/// cell.
+///
+/// **Boundary / sign semantics.** Inherits Phase 2 step 70's unchanged:
+/// a sharp `LTg` dip on a shared boundary line raises both adjacent
+/// partitions' SMR; positive cells mark partitions whose signal exceeds
+/// the masking threshold, negative cells fully-masked partitions, no
+/// clipping. The width column has no boundary semantics (it is a static
+/// per-row table value).
+///
+/// **Determinism.** A pure function of the two callbacks: invoking
+/// twice with the same pure callbacks returns identical cells.
+///
+/// Provenance: only the Phase 2 step 70 row-order SMR vector
+/// [`coder_partition_d5_smr_db_row_order`] and the Phase 2 step 60
+/// row-order width vector [`coder_partition_d5_width_row_order`] (and
+/// through them the §D.1 Step 9 formula transcribed from
+/// ISO/IEC 11172-3:1993 Annex D §D.1 Step 9 printed p.115 in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`, the Phase 2 step 52
+/// per-partition width accessor [`coder_partition_d5_width`], and the
+/// Table D.5 transcription in
+/// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+/// §"Table D.5 - Layer I and Layer II coder partition table") are
+/// consulted. The
+/// paired-row-order reading is the spec's per Annex D §D.1 Step 9
+/// (informative Model 1) row-by-row presentation; no external
+/// implementation was read.
+#[must_use]
+pub fn coder_partition_d5_smr_row_order<L, F>(
+    lsb_per_partition: L,
+    ltg_per_line: F,
+) -> [CoderPartitionD5Smr; 32]
+where
+    L: Fn(u16) -> f64,
+    F: Fn(u16) -> f64,
+{
+    let smr = coder_partition_d5_smr_db_row_order(lsb_per_partition, ltg_per_line);
+    let widths = coder_partition_d5_width_row_order();
+    let mut out = [CoderPartitionD5Smr {
+        smr_db: 0.0,
+        width_n: 0,
+    }; 32];
+    for i in 0..32 {
+        out[i] = CoderPartitionD5Smr {
+            smr_db: smr[i],
+            width_n: widths[i],
+        };
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10118,6 +10285,170 @@ mod tests {
         let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.002).cos() * 8.0 };
         let a = coder_partition_d5_smr_db_row_order(lsb, ltg);
         let b = coder_partition_d5_smr_db_row_order(lsb, ltg);
+        assert_eq!(a, b);
+    }
+
+    // ---- Phase 2 step 71 / r270 — §D.1 Step 9 paired
+    // `(SMR_n, width_n)` row-order vector over Table D.5 (printed
+    // p.115). The SMR analogue of step 61's paired
+    // `(LTmin_n, width_n)` vector.
+    #[test]
+    fn coder_partition_d5_smr_pair_returns_exactly_thirty_two_pairs() {
+        let v = coder_partition_d5_smr_row_order(|_| 0.0, |_| 0.0);
+        assert_eq!(v.len(), 32);
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_zero_callbacks_yield_zero_smr_everywhere() {
+        // Lsb(n) = 0 dB and LTg(ω) = 0 dB → SMR_n = 0 − 0 = 0.0 in
+        // every row; the width column is the static table value.
+        let v = coder_partition_d5_smr_row_order(|_| 0.0, |_| 0.0);
+        assert!(v.iter().all(|r| r.smr_db == 0.0));
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_uniform_pin() {
+        // Lsb(n) = 96, LTg(ω) = 20 → SMR_n = 76.0 dB exactly per row.
+        let v = coder_partition_d5_smr_row_order(|_| 96.0, |_| 20.0);
+        assert!(v.iter().all(|r| r.smr_db == 76.0));
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_smr_column_matches_step70_cell_wise() {
+        // Strict-composition cross-check: the smr_db column equals the
+        // step-70 bare row-order SMR vector cell-for-cell under
+        // non-trivial callbacks (exact ==, not approximate — pure
+        // re-presentation, no arithmetic introduced).
+        let lsb = |n: u16| -> f64 { f64::from(n) * 1.75 + 40.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.01).sin() * 12.0 + 30.0 };
+        let v = coder_partition_d5_smr_row_order(lsb, ltg);
+        let smr = coder_partition_d5_smr_db_row_order(lsb, ltg);
+        for i in 0..32 {
+            assert_eq!(v[i].smr_db, smr[i], "smr_db[{i}]");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_width_column_matches_step60() {
+        // The width column equals the step-60 static row-order width
+        // vector cell-for-cell, regardless of the callbacks.
+        let widths = coder_partition_d5_width_row_order();
+        let a = coder_partition_d5_smr_row_order(|_| 0.0, |_| 0.0);
+        let b = coder_partition_d5_smr_row_order(f64::from, |omega| f64::from(omega) * 0.3);
+        for i in 0..32 {
+            assert_eq!(a[i].width_n, widths[i], "a.width_n[{i}]");
+            assert_eq!(b[i].width_n, widths[i], "b.width_n[{i}]");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_width_column_is_twelve_zeros_then_twenty_ones() {
+        // Table D.5 literal: width_n = 0 for n ∈ 1..=12 (array indices
+        // 0..=11), width_n = 1 for n ∈ 13..=32 (array indices 12..=31).
+        let v = coder_partition_d5_smr_row_order(|_| 0.0, |_| 0.0);
+        for r in &v[..12] {
+            assert_eq!(r.width_n, 0);
+        }
+        for r in &v[12..] {
+            assert_eq!(r.width_n, 1);
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_partition_index_mapping() {
+        // Lsb(n) = n with a flat 0-dB threshold pins the row →
+        // partition mapping: out[i].smr_db = SMR_{i + 1} = i + 1.
+        let v = coder_partition_d5_smr_row_order(f64::from, |_| 0.0);
+        for (i, r) in v.iter().enumerate() {
+            assert_eq!(r.smr_db, (i + 1) as f64, "smr_db[{i}]");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_sign_semantics() {
+        // Lsb below threshold → strictly negative SMR (fully masked);
+        // above → strictly positive (audible). Width unaffected.
+        let masked = coder_partition_d5_smr_row_order(|_| 10.0, |_| 25.0);
+        assert!(masked.iter().all(|r| r.smr_db == -15.0));
+        let audible = coder_partition_d5_smr_row_order(|_| 60.0, |_| 25.0);
+        assert!(audible.iter().all(|r| r.smr_db == 35.0));
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_matches_paired_step61_pattern() {
+        // The pairing pattern is identical to step 61's
+        // (LTmin_n, width_n) vector: same width column at every row,
+        // and the smr_db column is `lsb(n) − step61.ltmin_db` per row.
+        let lsb = |n: u16| -> f64 { f64::from(n) * 2.25 + 17.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.007).cos() * 9.0 + 41.0 };
+        let smr_pair = coder_partition_d5_smr_row_order(lsb, ltg);
+        let ltmin_pair = coder_partition_d5_reduction_row_order(ltg);
+        for i in 0..32 {
+            assert_eq!(smr_pair[i].width_n, ltmin_pair[i].width_n, "width_n[{i}]");
+            let expect = lsb(i as u16 + 1) - ltmin_pair[i].ltmin_db;
+            assert!(
+                (smr_pair[i].smr_db - expect).abs() < 1.0e-12,
+                "smr_db[{i}] = {} != {expect}",
+                smr_pair[i].smr_db,
+            );
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_lsb_fanout_once_per_partition_ascending() {
+        // Lsb(n) invoked once per partition n ∈ 1..=32 ascending; the
+        // LTg(ω) fan-out equals exactly one step-59 pass.
+        use core::cell::{Cell, RefCell};
+        let seen = RefCell::new(Vec::new());
+        let ltg_calls = Cell::new(0_u32);
+        let _ = coder_partition_d5_smr_row_order(
+            |n: u16| {
+                seen.borrow_mut().push(n);
+                0.0
+            },
+            |_omega: u16| {
+                ltg_calls.set(ltg_calls.get() + 1);
+                0.0
+            },
+        );
+        let expected: Vec<u16> = (1..=32).collect();
+        assert_eq!(*seen.borrow(), expected, "Lsb fan-out / order");
+        let direct = Cell::new(0_u32);
+        let _ = coder_partition_d5_ltg_min_row_order(|_omega: u16| {
+            direct.set(direct.get() + 1);
+            0.0
+        });
+        assert_eq!(ltg_calls.get(), direct.get(), "LTg fan-out");
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_ltg_dip_raises_exactly_one_interior_partition() {
+        // A −30 dB LTg dip at interior line ω = 300 raises exactly one
+        // partition's smr_db by +30 dB; widths and all other rows are
+        // unchanged.
+        let n = first_partition_containing_line(300).expect("ω = 300 is in-table");
+        let baseline = coder_partition_d5_smr_row_order(|_| 50.0, |_| 0.0);
+        let dipped = coder_partition_d5_smr_row_order(
+            |_| 50.0,
+            |omega: u16| if omega == 300 { -30.0 } else { 0.0 },
+        );
+        for i in 0..32 {
+            let expect = if i as u16 + 1 == n {
+                baseline[i].smr_db + 30.0
+            } else {
+                baseline[i].smr_db
+            };
+            assert_eq!(dipped[i].smr_db, expect, "smr_db[{i}]");
+            assert_eq!(dipped[i].width_n, baseline[i].width_n, "width_n[{i}]");
+        }
+    }
+
+    #[test]
+    fn coder_partition_d5_smr_pair_is_idempotent_for_pure_callbacks() {
+        let lsb = |n: u16| -> f64 { f64::from(n) * 0.5 + 30.0 };
+        let ltg = |omega: u16| -> f64 { (f64::from(omega) * 0.002).cos() * 8.0 };
+        let a = coder_partition_d5_smr_row_order(lsb, ltg);
+        let b = coder_partition_d5_smr_row_order(lsb, ltg);
         assert_eq!(a, b);
     }
 }

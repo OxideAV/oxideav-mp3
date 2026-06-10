@@ -2373,6 +2373,46 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 71 (r270)** — Annex D Model 1 §D.1 Step 9 **paired
+`(SMR_n, width_n)` row-order** vector over Table D.5. Phase 2 step 70
+(r269) exposed the bare row-order signal-to-mask-ratio vector
+`[SMR_1 … SMR_32]` (dB); the Layer I / Layer II bit-allocation loop,
+however, reads each partition's `SMR_n` **paired with** its `width_n`
+column flag in lockstep at every row (the SMR value seeds the
+partition's mask-to-noise iteration; the `width_n` flag drives
+single-line vs multi-line per-partition bit targeting) — exactly the
+way the §D.1 Step 8 paired `(LTmin_n, width_n)` vector (Phase 2 step
+61) is read. New public struct `CoderPartitionD5Smr { smr_db: f64,
+width_n: u16 }` and free function `coder_partition_d5_smr_row_order<L:
+Fn(u16) -> f64, F: Fn(u16) -> f64>(lsb_per_partition, ltg_per_line) ->
+[CoderPartitionD5Smr; 32]` supply that paired presentation: a pure
+index-aligned zip of step 70's row-order SMR vector
+(`coder_partition_d5_smr_db_row_order`) with step 60's static
+row-order width vector (`coder_partition_d5_width_row_order`). No spec
+arithmetic is introduced beyond the step 70 subtraction already in the
+SMR column — only the per-row pairing of the two existing columns at
+the same array index. The `smr_db` column is bit-identical to step
+70's output and the `width_n` column to step 60's
+(`[0×12, 1×20]`); `Lsb(n)` stays the steps-58–70 caller-callback
+injection (§D.1 Steps 1–2 remain behind the PNG-only Tables D.1 / D.2
+transcription gap). Tests: 880 lib (was 868 baseline; +12 unit)
+covering the 32-pair length, zero-callback all-zero SMR, uniform pin
+(96 − 20 = 76.0 exact), cell-wise SMR equality with step 70, width
+equality with step 60 across two callbacks, the `[0×12, 1×20]` width
+literal, partition-index mapping (`Lsb(n) = n`, flat threshold →
+`smr_db[i] = i + 1`), sign semantics in both directions, the step-61
+paired-pattern cross-check (matching `width_n` and
+`lsb(n) − step61.ltmin_db` per row), Lsb fan-out once-per-partition
+ascending with LTg fan-out equal to one step-59 pass, a −30 dB
+interior-line LTg dip (ω = 300, partition via the step 56 inverse
+lookup) raising exactly one row's SMR by +30 dB with widths and all 31
+other rows unchanged, and idempotence for pure callbacks. No external
+implementation consulted; only the staged ISO/IEC 11172-3:1993 spec
+PDF (§D.1 Step 9, printed p.115) and the Phase 2 step 70 / step 60
+row-order accessors (and through them the cascade down to the Table
+D.5 transcription in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) are read.
+
 **Phase 2 step 70 (r269)** — Annex D Model 1 §D.1 Step 9 **row-order**
 signal-to-mask-ratio vector over Table D.5. Phase 2 step 69 (r268)
 landed the Step 9 subtraction `SMR_n = Lsb(n) − LTmin_n` dB
