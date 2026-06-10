@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex C §C.1.5.2.7 "Bit allocation" recompute-new-MNR loop action
+  (Phase 2 step 75). Phase 2 step 74 (r273) advanced the minimal-MNR
+  subband's Table B.2 entry to the next-higher quantization accuracy; this
+  step performs the loop's next verbatim action, "The new MNR of this
+  subband is calculated" (printed p.71, verbatim), recomputing the
+  promoted subband's mask-to-noise ratio with the §C.1.5.2.7 definition
+  `MNR = SNR − SMR`. The `SNR_n` is the Table C.5 *Layer II
+  Signal-to-Noise Ratios* value for the **advanced** entry; the `SMR_n` is
+  the unchanged psychoacoustic-model output the loop re-reads each
+  iteration, so the new `MNR_n` rises (for a monotone Table C.5 column),
+  removing the subband from its "greatest benefit" position. New public
+  struct `CoderPartitionD5RecomputedMnr { subband, entry, mnr_db, smr_db }`
+  and free function `bit_allocation_recompute_mnr(promotion, smr_db,
+  snr_for_entry) -> CoderPartitionD5RecomputedMnr`: takes the step-74
+  `BitAllocPromotion`, the selected subband's carried-through `SMR_n`, and
+  a callback returning the Table C.5 `SNR_n` for the promotion's
+  post-advance entry, and returns the single verbatim subtraction
+  `snr_for_entry(promotion.entry) − smr_db`. The Table C.5 `SNR_n` is
+  caller-injected (Table C.5 is behind the same numeric-table
+  transcription gap as Tables B.2 / D.1 / D.2, the dependency-injection
+  pattern the surrounding Phase 2 steps use); no spec arithmetic is
+  introduced beyond the `SNR − SMR` subtraction. A saturated step-74
+  promotion (top entry, no advance) recomputes at the held entry — an
+  idempotent re-evaluation. Tests: 918 lib (was 909 baseline; +9 unit)
+  covering the advanced-entry MNR, SMR pass-through, subband/entry echo,
+  monotone-column MNR rise, saturated-promotion hold, single SNR-callback
+  invocation for the post-promotion entry only, cell-wise identity with
+  the step-72 `MNR = SNR − SMR` definition, negative-SMR lift, and
+  determinism. Only the §C.1.5.2.7 "The new MNR of this subband is
+  calculated" loop step and `MNR = SNR − SMR` definition (ISO/IEC
+  11172-3:1993 Annex C, printed p.71) and the Phase 2 step 74
+  `bit_allocation_promote_entry` result it consumes are read; no external
+  implementation was consulted.
 - psy: Annex C §C.1.5.2.7 "Bit allocation" next-higher-entry quantization
   promotion (Phase 2 step 74). Phase 2 step 73 (r272) selected the
   minimal-MNR subband — the one "that has the greatest benefit"; this step

@@ -4733,6 +4733,112 @@ pub fn bit_allocation_promote_entry(
     }
 }
 
+/// The outcome of the §C.1.5.2.7 "The new MNR of this subband is
+/// calculated" loop action — the post-promotion mask-to-noise ratio of
+/// the subband whose quantization accuracy was just increased, produced
+/// by [`bit_allocation_recompute_mnr`] (Phase 2 step 75 / r274).
+///
+/// The §C.1.5.2.7 iteration, after step 73 selects the minimal-MNR
+/// subband and step 74 advances its Table B.2 entry to the next-higher
+/// quantization accuracy, recomputes that subband's MNR with the verbatim
+/// definition `MNR = SNR − SMR`. The finer quantization carries a larger
+/// `SNR_n` (its Table C.5 *Layer II Signal-to-Noise Ratios* value for the
+/// advanced entry), while the `SMR_n` — the psychoacoustic-model output —
+/// is unchanged; the new `MNR_n` is therefore larger than the prior one,
+/// removing this subband from the "greatest benefit" position so a later
+/// iteration can reselect.
+///
+/// **Field semantics.** `subband` echoes the 0-based subband index whose
+/// MNR was recomputed; `entry` is the Table B.2 column entry index the
+/// recomputed `SNR_n` corresponds to (the post-promotion entry from
+/// step 74); `mnr_db` is the recomputed `MNR_n = SNR_n − SMR_n` (dB);
+/// `smr_db` is the carried-through psychoacoustic-model `SMR_n` (dB).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoderPartitionD5RecomputedMnr {
+    /// 0-based subband index whose `MNR_n` was recomputed after the
+    /// step-74 next-higher-entry promotion — the array slot of the
+    /// §C.1.5.2.7 minimal-MNR subband.
+    pub subband: u16,
+    /// The Table B.2 *Layer II Possible Quantization per subband* column
+    /// entry index the recomputed `SNR_n` corresponds to: the post-
+    /// promotion entry reported by step 74's [`BitAllocPromotion::entry`].
+    pub entry: u16,
+    /// The recomputed mask-to-noise ratio `MNR_n = SNR_n − SMR_n` (dB)
+    /// after the promotion, where `SNR_n` is the Table C.5 value for the
+    /// advanced entry and `SMR_n` is the unchanged psychoacoustic-model
+    /// output. Larger than the pre-promotion `MNR_n` for a monotone
+    /// Table C.5 column (finer quantization ⇒ higher `SNR_n`). No
+    /// clipping.
+    pub mnr_db: f64,
+    /// The §D.1 Step 9 signal-to-mask ratio `SMR_n` (dB) carried verbatim
+    /// from the selected subband — the psychoacoustic-model output the
+    /// loop re-uses unchanged across iterations.
+    pub smr_db: f64,
+}
+
+/// §C.1.5.2.7 "The new MNR of this subband is calculated" — the third
+/// action of every Layer I / Layer II bit-allocation iteration.
+///
+/// Phase 2 step 73 ([`coder_partition_d5_min_mnr`]) selected the subband
+/// "that has the greatest benefit"; Phase 2 step 74
+/// ([`bit_allocation_promote_entry`]) advanced that subband's Table B.2
+/// entry to the next-higher quantization accuracy. This step performs the
+/// loop's next verbatim action: it recomputes the subband's mask-to-noise
+/// ratio at the finer quantization using the §C.1.5.2.7 definition
+/// `MNR = SNR − SMR`. The `SNR_n` is the Table C.5 *Layer II
+/// Signal-to-Noise Ratios* value for the **advanced** entry; the `SMR_n`
+/// is unchanged from the selected subband (the psychoacoustic-model
+/// output the loop re-reads each iteration). The result removes the
+/// subband from its minimal-MNR position so a subsequent iteration's
+/// step-73 selection can move on.
+///
+/// **Parameters.** `promotion` is the step-74
+/// [`BitAllocPromotion`] for the selected subband (supplying its 0-based
+/// `subband` index and the post-promotion `entry`); `smr_db` is that
+/// subband's §D.1 Step 9 `SMR_n` (dB), carried verbatim from the step-73
+/// [`CoderPartitionD5MinMnr::smr_db`] selection (the loop re-uses the
+/// psychoacoustic-model output unchanged); `snr_for_entry` returns the
+/// Table C.5 `SNR_n` (dB) for the promotion's post-advance entry. Table
+/// C.5 lives behind the same numeric-table transcription gap as Tables
+/// B.2 / D.1 / D.2, so the `SNR_n` value is injected — the dependency-
+/// injection pattern the surrounding Phase 2 steps use.
+///
+/// **Recompute rule.** `mnr_db = snr_for_entry(promotion.entry) − smr_db`,
+/// the single verbatim §C.1.5.2.7 subtraction. The `entry` carried in the
+/// result is `promotion.entry` (so a saturated step-74 promotion that did
+/// not advance recomputes the MNR at the held entry — an idempotent re-
+/// evaluation, since the `SNR_n` for the unchanged entry is the same).
+/// No spec arithmetic is introduced beyond the `SNR − SMR` subtraction.
+///
+/// **Determinism.** A pure function of its arguments and the injected
+/// `SNR_n` callback.
+///
+/// Provenance: only the §C.1.5.2.7 "The new MNR of this subband is
+/// calculated" loop step transcribed from ISO/IEC 11172-3:1993 Annex C
+/// §C.1.5.2.7 "Bit allocation" (printed p.71) in
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`, the verbatim
+/// `MNR = SNR − SMR` definition from the same clause, and the Phase 2
+/// step 74 [`bit_allocation_promote_entry`] result it consumes are read.
+/// The Table C.5 `SNR_n` term is caller-injected (the table is behind the
+/// numeric-table transcription gap); no external implementation was
+/// consulted.
+#[must_use]
+pub fn bit_allocation_recompute_mnr<S>(
+    promotion: BitAllocPromotion,
+    smr_db: f64,
+    snr_for_entry: S,
+) -> CoderPartitionD5RecomputedMnr
+where
+    S: Fn(u16) -> f64,
+{
+    CoderPartitionD5RecomputedMnr {
+        subband: promotion.subband,
+        entry: promotion.entry,
+        mnr_db: snr_for_entry(promotion.entry) - smr_db,
+        smr_db,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11206,5 +11312,122 @@ mod tests {
             bit_allocation_promote_entry(4, 9, 27),
             bit_allocation_promote_entry(4, 9, 27)
         );
+    }
+
+    // ---- Phase 2 step 75: §C.1.5.2.7 "new MNR is calculated" ----------
+
+    #[test]
+    fn recompute_mnr_is_snr_for_advanced_entry_minus_smr() {
+        // After step 74 advances entry 2 -> 3, the new MNR uses the
+        // Table C.5 SNR for entry 3 minus the unchanged SMR.
+        let promotion = bit_allocation_promote_entry(3, 2, 16);
+        assert!(promotion.advanced);
+        assert_eq!(promotion.entry, 3);
+        // SNR table modelled as a monotone column: SNR(entry) grows.
+        let snr = |entry: u16| 6.0 * f64::from(entry);
+        let got = bit_allocation_recompute_mnr(promotion, 10.0, snr);
+        assert_eq!(
+            got,
+            CoderPartitionD5RecomputedMnr {
+                subband: 3,
+                entry: 3,
+                mnr_db: 6.0 * 3.0 - 10.0,
+                smr_db: 10.0,
+            }
+        );
+    }
+
+    #[test]
+    fn recompute_mnr_carries_smr_through_verbatim() {
+        // The SMR field echoes the supplied psychoacoustic-model output
+        // unchanged regardless of the SNR column.
+        let promotion = bit_allocation_promote_entry(7, 0, 4);
+        let got = bit_allocation_recompute_mnr(promotion, -3.5, |_| 42.0);
+        assert_eq!(got.smr_db, -3.5);
+        assert_eq!(got.mnr_db, 42.0 - (-3.5));
+    }
+
+    #[test]
+    fn recompute_mnr_echoes_subband_and_post_promotion_entry() {
+        // subband / entry fields mirror the step-74 promotion exactly.
+        let promotion = bit_allocation_promote_entry(29, 5, 8);
+        let got = bit_allocation_recompute_mnr(promotion, 0.0, f64::from);
+        assert_eq!(got.subband, 29);
+        assert_eq!(got.entry, promotion.entry);
+    }
+
+    #[test]
+    fn recompute_mnr_raises_mnr_for_monotone_snr_column() {
+        // The finer quantization (higher entry) yields a strictly larger
+        // MNR than the pre-promotion entry for a monotone SNR column —
+        // exactly why the loop drops this subband from "greatest benefit".
+        let smr = 20.0;
+        let snr = |entry: u16| 4.0 * f64::from(entry);
+        let prev_entry = 2u16;
+        let prev_mnr = snr(prev_entry) - smr;
+        let promotion = bit_allocation_promote_entry(1, prev_entry, 10);
+        let got = bit_allocation_recompute_mnr(promotion, smr, snr);
+        assert!(got.mnr_db > prev_mnr);
+    }
+
+    #[test]
+    fn recompute_mnr_on_saturated_promotion_holds_entry() {
+        // A step-74 promotion that could not advance (top entry) recomputes
+        // the MNR at the held entry: an idempotent re-evaluation since the
+        // SNR for the unchanged entry is identical.
+        let promotion = bit_allocation_promote_entry(4, 15, 16);
+        assert!(!promotion.advanced);
+        let snr = |entry: u16| 5.0 * f64::from(entry);
+        let got = bit_allocation_recompute_mnr(promotion, 1.0, snr);
+        assert_eq!(got.entry, 15);
+        assert_eq!(got.mnr_db, 5.0 * 15.0 - 1.0);
+    }
+
+    #[test]
+    fn recompute_mnr_invokes_snr_callback_for_the_post_entry_only() {
+        // The SNR callback is consulted exactly once, for the post-promotion
+        // entry index.
+        use core::cell::Cell;
+        let calls = Cell::new(0u32);
+        let seen = Cell::new(u16::MAX);
+        let promotion = bit_allocation_promote_entry(2, 3, 9);
+        let _ = bit_allocation_recompute_mnr(promotion, 0.0, |e| {
+            calls.set(calls.get() + 1);
+            seen.set(e);
+            0.0
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(seen.get(), promotion.entry);
+    }
+
+    #[test]
+    fn recompute_mnr_matches_step72_definition_cell_wise() {
+        // The recomputed MNR uses the identical MNR = SNR - SMR definition
+        // as the step-72 initialisation, just with the advanced entry's SNR.
+        let smr = 33.3;
+        let snr = |entry: u16| 100.0 - 7.0 * f64::from(entry);
+        let promotion = bit_allocation_promote_entry(6, 1, 12);
+        let got = bit_allocation_recompute_mnr(promotion, smr, snr);
+        assert!((got.mnr_db - (snr(promotion.entry) - smr)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn recompute_mnr_is_deterministic() {
+        // A pure function of its arguments and the (pure) SNR callback.
+        let promotion = bit_allocation_promote_entry(8, 4, 20);
+        let snr = |e: u16| 2.5 * f64::from(e) + 1.0;
+        assert_eq!(
+            bit_allocation_recompute_mnr(promotion, 9.0, snr),
+            bit_allocation_recompute_mnr(promotion, 9.0, snr)
+        );
+    }
+
+    #[test]
+    fn recompute_mnr_negative_smr_increases_mnr() {
+        // A negative SMR (mask below 0 dB reference) lifts the MNR by its
+        // magnitude, consistent with MNR = SNR - SMR.
+        let promotion = bit_allocation_promote_entry(0, 0, 4);
+        let got = bit_allocation_recompute_mnr(promotion, -12.0, |_| 8.0);
+        assert_eq!(got.mnr_db, 8.0 + 12.0);
     }
 }
