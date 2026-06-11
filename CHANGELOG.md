@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 2 Tables D.3a–c (calculation partition table)
+  + Tables D.4a–c (absolute threshold table) transcribed in full
+  (Phase 2 step 82) from the staged
+  `docs/audio/mp3/annex-d-renders/Table-D.3*.png` / `Table-D.4*.png`
+  renders. D.3a/b/c: 49/57/58 partitions × (ωlow, ωhigh, bval,
+  minval, TMN), contiguous over FFT lines 1…513; D.4a/b/c: 132/130/126
+  line-range absthr rows over lines 1…480 / 1…464 / 1…428. New public
+  surface: `Model2PartitionEntry`, `MODEL2_PARTITION_D3A…D3C`,
+  `model2_partition_table(fs)`, `model2_bval(fs)` (feeds the step-81
+  step-f) reductions), `model2_partition_index_for_line`,
+  `Model2AbsThrEntry`, `MODEL2_ABSTHR_D4A…D4C`,
+  `model2_absthr_table(fs)`, `model2_absthr_for_line`. Printed-spec
+  quirks kept verbatim and pinned by tests: the D.4a `57 | 57` row
+  (line 58 uncovered), the D.4c 4-line `329 | 332` group, and the
+  D.4↔D.1 (Layer II) cross-table print differences — D.4a 51,03 vs
+  51,04 at 15 kHz, and the systematic 44,1 kHz divergence (14 shared
+  lines 0,01 dB lower in D.4b; 69,13 dB plateau vs D.1e's 68,00 dB).
+  +9 unit tests (998 lib), including the D.4↔D.1 shared-line
+  agreement check and a `bval`-vs-D.1-Bark consistency guard.
 - psy: Annex D Model 2 §D.2.3 base spreading function + §D.2.4
   step f) convolution/renormalization + step g) tonality index
   (Phase 2 step 81) — the first base-Model-2 increment, unblocked by

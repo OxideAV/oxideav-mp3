@@ -2373,6 +2373,47 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 82 (r280)** — Annex D Model 2 **Tables D.3a–c**
+(calculation partition table) + **Tables D.4a–c** (absolute threshold
+table), transcribed in full from the staged renders
+`docs/audio/mp3/annex-d-renders/Table-D.3*.png` / `Table-D.4*.png`
+(printed pp.133–138) — the Model 2 table material the step-81
+reductions were parameterized for. D.3a/b/c carry 49 / 57 / 58
+partitions × (ωlow, ωhigh, bval, minval, TMN) with exact contiguous
+coverage of FFT lines 1…513 (the docs extracts file's "63 partitions
+at 32 kHz" prose is an erratum — the printed D.3a ends at Index 49
+with ωhigh = 513); D.4a/b/c carry 132 / 130 / 126 line-range rows
+covering lines 1…480 / 1…464 / 1…428. Public surface:
+`Model2PartitionEntry`, `MODEL2_PARTITION_D3A…D3C`,
+`model2_partition_table(fs)` (no Layer dimension — the Model 2 tables
+are rate-only), `model2_bval(fs)` (feeds `model2_step_f_spread` /
+`model2_step_f_rnorm` directly), `model2_partition_index_for_line`,
+`Model2AbsThrEntry`, `MODEL2_ABSTHR_D4A…D4C`, `model2_absthr_table(fs)`
+and `model2_absthr_for_line`. Printed-spec quirks kept verbatim and
+pinned by tests: D.4a's `57 | 57` row followed by `59 | 60` (line 58
+uncovered — its 0,55 dB equals Table D.1d's LTq at line 58, so the
+cell is almost certainly a misprint for 58); D.4c's lone 4-line group
+`329 | 332` inside the 8-line tail. Transcription is cross-validated
+against the r278 Layer II Tables D.1 on the shared 1024-point FFT
+line grid: every shared line agrees at 32 / 48 kHz except D.4a's last
+row (51,03 vs 51,04), while at 44,1 kHz the printed D.4b
+systematically diverges from the printed D.1e — 14 shared lines print
+exactly 0,01 dB lower and the saturation plateau prints 69,13 dB vs
+D.1e's 68,00 dB (sample cells of both sides re-verified at 300–400 %
+zoom; the full 26-entry exception list is pinned). 9 new unit tests:
+D.3 lengths + contiguous 1…513 coverage, column well-formedness
+(strict `bval` ascent, printed `minval` value set, non-decreasing
+TMN), spot rows, `bval`-vs-D.1-Bark consistency, `model2_bval`
+extraction, partition lookup bounds, D.4 lengths/coverage with the
+printed quirks, absthr lookup incl. the line-58 gap, and the D.4↔D.1
+cross-table agreement. Tests: 998 lib (was 989; +9 unit). Next Model
+2 steps: h) required SNR per partition (`minval`/`TMN` now in-tree),
+i)–l) power ratio / energy threshold / line spread /
+absolute-threshold floor (D.4 now in-tree), then b)–e) FFT-side
+inputs. No external implementation consulted; only the six staged
+D.3/D.4 renders, the D.1e render (cross-check), and the extracts file
+were read.
+
 **Phase 2 step 81 (r279)** — Annex D Model 2 **§D.2.3 "The spreading
 function"** + **§D.2.4 step f)** convolution / renormalization +
 **step g)** tonality index — the first base-Model-2 increment (the
@@ -4221,19 +4262,13 @@ convention (row 0 carries ω = 1), and the top-of-table pin
 (row 32 carries ω = 513 = 1 + 32·16, matching the
 1024-sample FFT's 1..=513 one-based half-spectrum) — it
 still lacks
-the Model 1 Step 4 → Step 5/6 Bark bridge (the
-line-index → `z(k)` mapping that lifts the step-79
-`Model1Step4Component` lists into the Bark-domain `Masker`
-carrier; it needs the per-line crit-band-rate column of
-Tables D.1a–f, which are PNG-only renders in
-`docs/audio/mp3/annex-d-renders/` awaiting transcription),
 the rest of
-Annex D Model 2 (calculation-partition
-table D.3 — PNG-only — the general PM2 spreading-function
-`tmpy` line that is typeset as image in the PDF and is not
-text-extractable, the Model 2 absolute-threshold tables
-D.4a–c, and the partition energy / threshold-spreading
-matrix that consumes the new Layer III primitives),
+Annex D Model 2 (steps h)–l) — required SNR per partition,
+power ratio, energy threshold, line spread and the
+absolute-threshold floor, all of whose table inputs
+(`minval` / `TMN` from Tables D.3a–c and `absthr` from
+Tables D.4a–c) are now transcribed in-tree — plus the
+steps b)–e) FFT-side inputs),
 intensity-stereo encode (§2.4.3.4.9.3), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's

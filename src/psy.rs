@@ -1649,9 +1649,9 @@ pub fn model2_sprdngf(i_bark: f64, j_bark: f64) -> f64 {
 /// unpredictability, step e) it yields `ct_b`.
 ///
 /// `bval` carries the median Bark value of each calculation
-/// partition (the `bval` column of Tables D.3a–c; the full tables
-/// remain a PNG-render transcription gap, so the column is
-/// caller-injected like the other Annex D numeric tables). Returns
+/// partition (the `bval` column of Tables D.3a–c — transcribed in
+/// [`MODEL2_PARTITION_D3A`]–[`MODEL2_PARTITION_D3C`]; [`model2_bval`]
+/// extracts the column for this function). Returns
 /// `None` when the two slices disagree in length; the output has one
 /// entry per partition, in slice order.
 #[must_use]
@@ -7230,6 +7230,802 @@ pub fn model1_step5_components(
         })
         .collect();
     Some(decimate_tonal_within_half_bark(&screened))
+}
+
+// =====================================================================
+// Annex D Model 2 — Tables D.3a–c "Calculation partition table" and
+// Tables D.4a–c "Absolute threshold table" (Phase 2 step 82 / r280).
+//
+// Spec context (ISO/IEC 11172-3:1993 Annex D clause D.2; tables
+// printed pp.133–138 / PDF pp.139–144). Transcribed verbatim from the
+// staged page renders
+// `docs/audio/mp3/annex-d-renders/Table-D.3{a,b,c}-calc-partition-*.png`
+// and `Table-D.4{a,b,c}-absolute-threshold-*.png` (the docs extracts
+// file marks these renders as the authoritative reading; its prose
+// "32 kHz has 63 partitions" note is an erratum — the printed D.3a
+// ends at Index 49 with ωhigh = 513, i.e. full coverage of the
+// 1024-point-FFT half-spectrum, and likewise D.3b at 57 / D.3c at 58).
+//
+// Tables D.3 (one per sampling rate, common to all Layers) define the
+// Model 2 *calculation partitions*: for each 1-based partition Index,
+// the first / last 1-based FFT line (ωlow / ωhigh), the partition's
+// median Bark value `bval` (the spreading-function coordinate used by
+// the §D.2.4 step f) convolution above), the minimum
+// masking-spread value `minval` [dB] and the tone-masking-noise
+// offset `TMN` [dB] (both consumed by later §D.2.4 steps).
+//
+// Tables D.4 (one per sampling rate) tabulate the Model 2 absolute
+// threshold (threshold in quiet) per FFT-line *range* — columns
+// `index [line] lower / higher` and `absthr [dB]`, with the printed
+// page note: "A value of 0 dB represents a level in the absolute
+// threshold calculation of 96 dB below the energy of a sine wave of
+// amplitude +-32 760."
+//
+// Printed-table quirks kept verbatim (each pinned by a unit test):
+//   - D.4a prints the row pair `57 | 57` followed by `59 | 60`: FFT
+//     line 58 is not covered by any printed row. The row's absthr
+//     (0,55 dB) equals Table D.1d's LTq at *line 58* (1 812,50 Hz),
+//     so the `higher = 57` cell is almost certainly a misprint for
+//     58, but the transcription keeps the printed value and
+//     [`model2_absthr_for_line`] returns `None` for line 58 at
+//     32 kHz.
+//   - D.4c prints a single 4-line group `329 | 332` inside the
+//     otherwise-8-line tail region (…, `321 | 328`, `329 | 332`,
+//     `333 | 340`, …); coverage stays contiguous but the tail rows
+//     after it sit 4 lines off the Table D.1f 8-line grid.
+//   - D.4a's last row (`473 | 480`) prints `51,03` dB where Tables
+//     D.1a/D.1d print `51,04` at the same 15 000 Hz line — a
+//     rounding inconsistency in the printed spec (same shape as the
+//     documented D.1/D.2 0,001-Bark print differences); both verbatim
+//     prints are kept.
+//
+// Redundancy used as a transcription cross-check (pinned by a unit
+// test): wherever a D.4 row's `higher` line is also tabulated by the
+// Layer II Table D.1 at the same sampling rate (D.1d/e/f share the
+// 1024-point FFT line grid), the row's `absthr` equals that row's
+// `Absolute Thresh.` column. Exceptions, all printed-spec
+// inconsistencies pinned by the test: the D.4a 51,03 / 51,04 print
+// difference above, plus a systematic 44,1 kHz divergence — 14
+// shared lines print exactly 0,01 dB lower in D.4b than in D.1e
+// (both sides re-verified on the renders, e.g. lines 51..=52 print
+// -1,37 in D.4b vs -1,38 in D.1e row 50), and D.4b's top-of-band
+// saturation plateau prints 69,13 dB where D.1e (and D.4c / D.1f)
+// clamp at 68,00 dB.
+//
+// Provenance: only the six staged PNG renders named above (and the
+// docs extracts file for column semantics); no external
+// implementation was consulted.
+// =====================================================================
+
+/// One row of Annex D Table D.3 (calculation partition table). The
+/// 1-based `Index` column is implicit (slice position + 1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Model2PartitionEntry {
+    /// `ωlow` column — first 1-based FFT line of the partition.
+    pub wlow: u16,
+    /// `ωhigh` column — last 1-based FFT line of the partition.
+    pub whigh: u16,
+    /// `bval` column — median Bark value of the partition (the
+    /// spreading-function coordinate of [`model2_step_f_spread`]).
+    pub bval: f64,
+    /// `minval` column — minimum masking-spread value in dB.
+    pub minval_db: f64,
+    /// `TMN` column — tone-masking-noise offset in dB.
+    pub tmn_db: f64,
+}
+
+impl Model2PartitionEntry {
+    /// Construct a table row at compile time.
+    #[inline]
+    #[must_use]
+    pub const fn new(wlow: u16, whigh: u16, bval: f64, minval_db: f64, tmn_db: f64) -> Self {
+        Self {
+            wlow,
+            whigh,
+            bval,
+            minval_db,
+            tmn_db,
+        }
+    }
+}
+
+/// Table D.3a — calculation partition table, Fs = 32 kHz (49
+/// partitions, printed p.133).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.3a-calc-partition-32kHz-p133.png`.
+pub const MODEL2_PARTITION_D3A: [Model2PartitionEntry; 49] = [
+    Model2PartitionEntry::new(1, 1, 0.00, 0.0, 24.5),
+    Model2PartitionEntry::new(2, 4, 0.63, 0.0, 24.5),
+    Model2PartitionEntry::new(5, 7, 1.56, 20.0, 24.5),
+    Model2PartitionEntry::new(8, 10, 2.50, 20.0, 24.5),
+    Model2PartitionEntry::new(11, 13, 3.44, 20.0, 24.5),
+    Model2PartitionEntry::new(14, 16, 4.34, 20.0, 24.5),
+    Model2PartitionEntry::new(17, 19, 5.17, 20.0, 24.5),
+    Model2PartitionEntry::new(20, 22, 5.94, 20.0, 24.5),
+    Model2PartitionEntry::new(23, 25, 6.63, 17.0, 24.5),
+    Model2PartitionEntry::new(26, 28, 7.28, 15.0, 24.5),
+    Model2PartitionEntry::new(29, 31, 7.90, 15.0, 24.5),
+    Model2PartitionEntry::new(32, 34, 8.50, 10.0, 24.5),
+    Model2PartitionEntry::new(35, 37, 9.06, 7.0, 24.5),
+    Model2PartitionEntry::new(38, 41, 9.65, 7.0, 24.5),
+    Model2PartitionEntry::new(42, 45, 10.28, 4.4, 24.8),
+    Model2PartitionEntry::new(46, 49, 10.87, 4.4, 25.4),
+    Model2PartitionEntry::new(50, 53, 11.41, 4.5, 25.9),
+    Model2PartitionEntry::new(54, 57, 11.92, 4.5, 26.4),
+    Model2PartitionEntry::new(58, 61, 12.39, 4.5, 26.9),
+    Model2PartitionEntry::new(62, 65, 12.83, 4.5, 27.3),
+    Model2PartitionEntry::new(66, 70, 13.29, 4.5, 27.8),
+    Model2PartitionEntry::new(71, 75, 13.78, 4.5, 28.3),
+    Model2PartitionEntry::new(76, 81, 14.27, 4.5, 28.8),
+    Model2PartitionEntry::new(82, 87, 14.76, 4.5, 29.3),
+    Model2PartitionEntry::new(88, 93, 15.22, 4.5, 29.7),
+    Model2PartitionEntry::new(94, 99, 15.63, 4.5, 30.1),
+    Model2PartitionEntry::new(100, 106, 16.06, 4.5, 30.6),
+    Model2PartitionEntry::new(107, 113, 16.47, 4.5, 31.0),
+    Model2PartitionEntry::new(114, 120, 16.86, 4.5, 31.4),
+    Model2PartitionEntry::new(121, 129, 17.25, 4.5, 31.8),
+    Model2PartitionEntry::new(130, 138, 17.65, 4.5, 32.2),
+    Model2PartitionEntry::new(139, 148, 18.05, 4.5, 32.5),
+    Model2PartitionEntry::new(149, 159, 18.42, 4.5, 32.9),
+    Model2PartitionEntry::new(160, 170, 18.81, 4.5, 33.3),
+    Model2PartitionEntry::new(171, 183, 19.18, 4.5, 33.7),
+    Model2PartitionEntry::new(184, 196, 19.55, 4.5, 34.1),
+    Model2PartitionEntry::new(197, 210, 19.93, 4.5, 34.4),
+    Model2PartitionEntry::new(211, 225, 20.29, 4.5, 34.8),
+    Model2PartitionEntry::new(226, 240, 20.65, 4.5, 35.2),
+    Model2PartitionEntry::new(241, 258, 21.02, 4.5, 35.5),
+    Model2PartitionEntry::new(259, 279, 21.38, 4.5, 35.9),
+    Model2PartitionEntry::new(280, 300, 21.74, 4.5, 36.2),
+    Model2PartitionEntry::new(301, 326, 22.10, 4.5, 36.6),
+    Model2PartitionEntry::new(327, 354, 22.44, 4.5, 36.9),
+    Model2PartitionEntry::new(355, 382, 22.79, 4.5, 37.3),
+    Model2PartitionEntry::new(383, 420, 23.14, 4.5, 37.6),
+    Model2PartitionEntry::new(421, 458, 23.49, 4.5, 38.0),
+    Model2PartitionEntry::new(459, 496, 23.83, 4.5, 38.3),
+    Model2PartitionEntry::new(497, 513, 24.07, 4.5, 38.6),
+];
+
+/// Table D.3b — calculation partition table, Fs = 44,1 kHz (57
+/// partitions, printed p.134).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.3b-calc-partition-44k1Hz-p134.png`.
+pub const MODEL2_PARTITION_D3B: [Model2PartitionEntry; 57] = [
+    Model2PartitionEntry::new(1, 1, 0.00, 0.0, 24.5),
+    Model2PartitionEntry::new(2, 2, 0.43, 0.0, 24.5),
+    Model2PartitionEntry::new(3, 3, 0.86, 0.0, 24.5),
+    Model2PartitionEntry::new(4, 4, 1.29, 20.0, 24.5),
+    Model2PartitionEntry::new(5, 5, 1.72, 20.0, 24.5),
+    Model2PartitionEntry::new(6, 6, 2.15, 20.0, 24.5),
+    Model2PartitionEntry::new(7, 7, 2.58, 20.0, 24.5),
+    Model2PartitionEntry::new(8, 8, 3.01, 20.0, 24.5),
+    Model2PartitionEntry::new(9, 9, 3.45, 20.0, 24.5),
+    Model2PartitionEntry::new(10, 10, 3.88, 20.0, 24.5),
+    Model2PartitionEntry::new(11, 11, 4.28, 20.0, 24.5),
+    Model2PartitionEntry::new(12, 12, 4.67, 20.0, 24.5),
+    Model2PartitionEntry::new(13, 13, 5.06, 20.0, 24.5),
+    Model2PartitionEntry::new(14, 14, 5.42, 20.0, 24.5),
+    Model2PartitionEntry::new(15, 15, 5.77, 20.0, 24.5),
+    Model2PartitionEntry::new(16, 16, 6.11, 17.0, 24.5),
+    Model2PartitionEntry::new(17, 19, 6.73, 17.0, 24.5),
+    Model2PartitionEntry::new(20, 22, 7.61, 15.0, 24.5),
+    Model2PartitionEntry::new(23, 25, 8.44, 10.0, 24.5),
+    Model2PartitionEntry::new(26, 28, 9.21, 7.0, 24.5),
+    Model2PartitionEntry::new(29, 31, 9.88, 7.0, 24.5),
+    Model2PartitionEntry::new(32, 34, 10.51, 4.4, 25.0),
+    Model2PartitionEntry::new(35, 37, 11.11, 4.5, 25.6),
+    Model2PartitionEntry::new(38, 40, 11.65, 4.5, 26.2),
+    Model2PartitionEntry::new(41, 44, 12.24, 4.5, 26.7),
+    Model2PartitionEntry::new(45, 48, 12.85, 4.5, 27.4),
+    Model2PartitionEntry::new(49, 52, 13.41, 4.5, 27.9),
+    Model2PartitionEntry::new(53, 56, 13.94, 4.5, 28.4),
+    Model2PartitionEntry::new(57, 60, 14.42, 4.5, 28.9),
+    Model2PartitionEntry::new(61, 64, 14.86, 4.5, 29.4),
+    Model2PartitionEntry::new(65, 69, 15.32, 4.5, 29.8),
+    Model2PartitionEntry::new(70, 74, 15.79, 4.5, 30.3),
+    Model2PartitionEntry::new(75, 80, 16.26, 4.5, 30.8),
+    Model2PartitionEntry::new(81, 86, 16.73, 4.5, 31.2),
+    Model2PartitionEntry::new(87, 93, 17.19, 4.5, 31.7),
+    Model2PartitionEntry::new(94, 100, 17.62, 4.5, 32.1),
+    Model2PartitionEntry::new(101, 108, 18.05, 4.5, 32.5),
+    Model2PartitionEntry::new(109, 116, 18.45, 4.5, 32.9),
+    Model2PartitionEntry::new(117, 124, 18.83, 4.5, 33.3),
+    Model2PartitionEntry::new(125, 134, 19.21, 4.5, 33.7),
+    Model2PartitionEntry::new(135, 144, 19.60, 4.5, 34.1),
+    Model2PartitionEntry::new(145, 155, 20.00, 4.5, 34.5),
+    Model2PartitionEntry::new(156, 166, 20.38, 4.5, 34.9),
+    Model2PartitionEntry::new(167, 177, 20.74, 4.5, 35.2),
+    Model2PartitionEntry::new(178, 192, 21.12, 4.5, 35.6),
+    Model2PartitionEntry::new(193, 207, 21.48, 4.5, 36.0),
+    Model2PartitionEntry::new(208, 222, 21.84, 4.5, 36.3),
+    Model2PartitionEntry::new(223, 243, 22.20, 4.5, 36.7),
+    Model2PartitionEntry::new(244, 264, 22.56, 4.5, 37.1),
+    Model2PartitionEntry::new(265, 286, 22.91, 4.5, 37.4),
+    Model2PartitionEntry::new(287, 314, 23.26, 4.5, 37.8),
+    Model2PartitionEntry::new(315, 342, 23.60, 4.5, 38.1),
+    Model2PartitionEntry::new(343, 371, 23.95, 4.5, 38.4),
+    Model2PartitionEntry::new(372, 401, 24.30, 4.5, 38.8),
+    Model2PartitionEntry::new(402, 431, 24.65, 4.5, 39.1),
+    Model2PartitionEntry::new(432, 469, 25.00, 4.5, 39.5),
+    Model2PartitionEntry::new(470, 513, 25.33, 3.5, 39.8),
+];
+
+/// Table D.3c — calculation partition table, Fs = 48 kHz (58
+/// partitions, printed p.135).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.3c-calc-partition-48kHz-p135.png`.
+pub const MODEL2_PARTITION_D3C: [Model2PartitionEntry; 58] = [
+    Model2PartitionEntry::new(1, 1, 0.00, 0.0, 24.5),
+    Model2PartitionEntry::new(2, 2, 0.47, 0.0, 24.5),
+    Model2PartitionEntry::new(3, 3, 0.94, 0.0, 24.5),
+    Model2PartitionEntry::new(4, 4, 1.41, 20.0, 24.5),
+    Model2PartitionEntry::new(5, 5, 1.88, 20.0, 24.5),
+    Model2PartitionEntry::new(6, 6, 2.34, 20.0, 24.5),
+    Model2PartitionEntry::new(7, 7, 2.81, 20.0, 24.5),
+    Model2PartitionEntry::new(8, 8, 3.28, 20.0, 24.5),
+    Model2PartitionEntry::new(9, 9, 3.75, 20.0, 24.5),
+    Model2PartitionEntry::new(10, 10, 4.20, 20.0, 24.5),
+    Model2PartitionEntry::new(11, 11, 4.63, 20.0, 24.5),
+    Model2PartitionEntry::new(12, 12, 5.05, 20.0, 24.5),
+    Model2PartitionEntry::new(13, 13, 5.44, 20.0, 24.5),
+    Model2PartitionEntry::new(14, 14, 5.83, 20.0, 24.5),
+    Model2PartitionEntry::new(15, 15, 6.19, 20.0, 24.5),
+    Model2PartitionEntry::new(16, 16, 6.52, 17.0, 24.5),
+    Model2PartitionEntry::new(17, 17, 6.86, 17.0, 24.5),
+    Model2PartitionEntry::new(18, 20, 7.49, 15.0, 24.5),
+    Model2PartitionEntry::new(21, 23, 8.40, 10.0, 24.5),
+    Model2PartitionEntry::new(24, 26, 9.24, 7.0, 24.5),
+    Model2PartitionEntry::new(27, 29, 9.97, 7.0, 24.5),
+    Model2PartitionEntry::new(30, 32, 10.65, 4.4, 25.1),
+    Model2PartitionEntry::new(33, 35, 11.28, 4.5, 25.8),
+    Model2PartitionEntry::new(36, 38, 11.86, 4.5, 26.4),
+    Model2PartitionEntry::new(39, 41, 12.39, 4.5, 26.9),
+    Model2PartitionEntry::new(42, 45, 12.96, 4.5, 27.5),
+    Model2PartitionEntry::new(46, 49, 13.56, 4.5, 28.1),
+    Model2PartitionEntry::new(50, 53, 14.12, 4.5, 28.6),
+    Model2PartitionEntry::new(54, 57, 14.62, 4.5, 29.1),
+    Model2PartitionEntry::new(58, 62, 15.14, 4.5, 29.6),
+    Model2PartitionEntry::new(63, 67, 15.67, 4.5, 30.2),
+    Model2PartitionEntry::new(68, 72, 16.15, 4.5, 30.7),
+    Model2PartitionEntry::new(73, 77, 16.58, 4.5, 31.1),
+    Model2PartitionEntry::new(78, 83, 17.02, 4.5, 31.5),
+    Model2PartitionEntry::new(84, 89, 17.44, 4.5, 31.9),
+    Model2PartitionEntry::new(90, 95, 17.84, 4.5, 32.3),
+    Model2PartitionEntry::new(96, 103, 18.24, 4.5, 32.7),
+    Model2PartitionEntry::new(104, 111, 18.66, 4.5, 33.2),
+    Model2PartitionEntry::new(112, 120, 19.07, 4.5, 33.6),
+    Model2PartitionEntry::new(121, 129, 19.47, 4.5, 34.0),
+    Model2PartitionEntry::new(130, 138, 19.85, 4.5, 34.3),
+    Model2PartitionEntry::new(139, 149, 20.23, 4.5, 34.7),
+    Model2PartitionEntry::new(150, 160, 20.63, 4.5, 35.1),
+    Model2PartitionEntry::new(161, 173, 21.02, 4.5, 35.5),
+    Model2PartitionEntry::new(174, 187, 21.40, 4.5, 35.9),
+    Model2PartitionEntry::new(188, 201, 21.76, 4.5, 36.3),
+    Model2PartitionEntry::new(202, 219, 22.12, 4.5, 36.6),
+    Model2PartitionEntry::new(220, 238, 22.47, 4.5, 37.0),
+    Model2PartitionEntry::new(239, 257, 22.83, 4.5, 37.3),
+    Model2PartitionEntry::new(258, 283, 23.18, 4.5, 37.7),
+    Model2PartitionEntry::new(284, 309, 23.53, 4.5, 38.0),
+    Model2PartitionEntry::new(310, 335, 23.88, 4.5, 38.4),
+    Model2PartitionEntry::new(336, 363, 24.23, 4.5, 38.7),
+    Model2PartitionEntry::new(364, 391, 24.58, 4.5, 39.1),
+    Model2PartitionEntry::new(392, 423, 24.93, 4.5, 39.4),
+    Model2PartitionEntry::new(424, 465, 25.27, 4.5, 39.8),
+    Model2PartitionEntry::new(466, 507, 25.61, 3.5, 40.1),
+    Model2PartitionEntry::new(508, 513, 25.81, 3.5, 40.3),
+];
+
+/// Return the verbatim Annex D Table D.3 calculation-partition slice
+/// for `fs`. Unlike the Model 1 tables, the Model 2 partition tables
+/// are common to all Layers, so there is no Layer dimension.
+#[inline]
+#[must_use]
+pub fn model2_partition_table(fs: AnnexDSamplingRate) -> &'static [Model2PartitionEntry] {
+    match fs {
+        AnnexDSamplingRate::Hz32000 => &MODEL2_PARTITION_D3A,
+        AnnexDSamplingRate::Hz44100 => &MODEL2_PARTITION_D3B,
+        AnnexDSamplingRate::Hz48000 => &MODEL2_PARTITION_D3C,
+    }
+}
+
+/// The `bval` column of the Table D.3 partition table for `fs`, in
+/// partition order — the spreading-function coordinate vector the
+/// §D.2.4 step f) reductions ([`model2_step_f_spread`] /
+/// [`model2_step_f_rnorm`]) take as `bval`.
+#[must_use]
+pub fn model2_bval(fs: AnnexDSamplingRate) -> Vec<f64> {
+    model2_partition_table(fs).iter().map(|e| e.bval).collect()
+}
+
+/// Map a 1-based FFT line (1..=513) to the 1-based Table D.3
+/// calculation-partition `Index` containing it. Returns `None` for
+/// `line == 0` or `line > 513` (the tables cover the 1024-point-FFT
+/// half-spectrum exactly: every table's first ωlow is 1 and last
+/// ωhigh is 513, with contiguous coverage in between).
+#[must_use]
+pub fn model2_partition_index_for_line(fs: AnnexDSamplingRate, line: u16) -> Option<u16> {
+    let table = model2_partition_table(fs);
+    table
+        .iter()
+        .position(|e| e.wlow <= line && line <= e.whigh)
+        .map(|p| p as u16 + 1)
+}
+
+/// One row of Annex D Table D.4 (absolute threshold table): the
+/// threshold in quiet `absthr` for the 1-based FFT lines
+/// `lower..=higher`.
+///
+/// Per the printed page note, "A value of 0 dB represents a level in
+/// the absolute threshold calculation of 96 dB below the energy of a
+/// sine wave of amplitude +-32 760."
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Model2AbsThrEntry {
+    /// `index [line] lower` column — first 1-based FFT line.
+    pub lower: u16,
+    /// `index [line] higher` column — last 1-based FFT line.
+    pub higher: u16,
+    /// `absthr [dB]` column.
+    pub absthr_db: f64,
+}
+
+impl Model2AbsThrEntry {
+    /// Construct a table row at compile time.
+    #[inline]
+    #[must_use]
+    pub const fn new(lower: u16, higher: u16, absthr_db: f64) -> Self {
+        Self {
+            lower,
+            higher,
+            absthr_db,
+        }
+    }
+}
+
+/// Table D.4a — absolute threshold table, Fs = 32 kHz (132 rows,
+/// lines 1..=480 except the printed line-58 gap; printed p.136).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.4a-absolute-threshold-32kHz-p136.png`
+/// — including the printed `57 | 57` row (see the section comment) and
+/// the printed `51,03` final value.
+// The 6,28 dB threshold at line 16 (500 Hz) is the spec's printed
+// table value, not an approximation of a mathematical constant.
+#[allow(clippy::approx_constant)]
+pub const MODEL2_ABSTHR_D4A: [Model2AbsThrEntry; 132] = [
+    Model2AbsThrEntry::new(1, 1, 58.23),
+    Model2AbsThrEntry::new(2, 2, 33.44),
+    Model2AbsThrEntry::new(3, 3, 24.17),
+    Model2AbsThrEntry::new(4, 4, 19.20),
+    Model2AbsThrEntry::new(5, 5, 16.05),
+    Model2AbsThrEntry::new(6, 6, 13.87),
+    Model2AbsThrEntry::new(7, 7, 12.26),
+    Model2AbsThrEntry::new(8, 8, 11.01),
+    Model2AbsThrEntry::new(9, 9, 10.01),
+    Model2AbsThrEntry::new(10, 10, 9.20),
+    Model2AbsThrEntry::new(11, 11, 8.52),
+    Model2AbsThrEntry::new(12, 12, 7.94),
+    Model2AbsThrEntry::new(13, 13, 7.44),
+    Model2AbsThrEntry::new(14, 14, 7.00),
+    Model2AbsThrEntry::new(15, 15, 6.62),
+    Model2AbsThrEntry::new(16, 16, 6.28),
+    Model2AbsThrEntry::new(17, 17, 5.97),
+    Model2AbsThrEntry::new(18, 18, 5.70),
+    Model2AbsThrEntry::new(19, 19, 5.44),
+    Model2AbsThrEntry::new(20, 20, 5.21),
+    Model2AbsThrEntry::new(21, 21, 5.00),
+    Model2AbsThrEntry::new(22, 22, 4.80),
+    Model2AbsThrEntry::new(23, 23, 4.62),
+    Model2AbsThrEntry::new(24, 24, 4.45),
+    Model2AbsThrEntry::new(25, 25, 4.29),
+    Model2AbsThrEntry::new(26, 26, 4.14),
+    Model2AbsThrEntry::new(27, 27, 4.00),
+    Model2AbsThrEntry::new(28, 28, 3.86),
+    Model2AbsThrEntry::new(29, 29, 3.73),
+    Model2AbsThrEntry::new(30, 30, 3.61),
+    Model2AbsThrEntry::new(31, 31, 3.49),
+    Model2AbsThrEntry::new(32, 32, 3.37),
+    Model2AbsThrEntry::new(33, 33, 3.26),
+    Model2AbsThrEntry::new(34, 34, 3.15),
+    Model2AbsThrEntry::new(35, 35, 3.04),
+    Model2AbsThrEntry::new(36, 36, 2.93),
+    Model2AbsThrEntry::new(37, 37, 2.83),
+    Model2AbsThrEntry::new(38, 38, 2.73),
+    Model2AbsThrEntry::new(39, 39, 2.63),
+    Model2AbsThrEntry::new(40, 40, 2.53),
+    Model2AbsThrEntry::new(41, 41, 2.42),
+    Model2AbsThrEntry::new(42, 42, 2.32),
+    Model2AbsThrEntry::new(43, 43, 2.22),
+    Model2AbsThrEntry::new(44, 44, 2.12),
+    Model2AbsThrEntry::new(45, 45, 2.02),
+    Model2AbsThrEntry::new(46, 46, 1.92),
+    Model2AbsThrEntry::new(47, 47, 1.81),
+    Model2AbsThrEntry::new(48, 48, 1.71),
+    Model2AbsThrEntry::new(49, 50, 1.49),
+    Model2AbsThrEntry::new(51, 52, 1.27),
+    Model2AbsThrEntry::new(53, 54, 1.04),
+    Model2AbsThrEntry::new(55, 56, 0.80),
+    Model2AbsThrEntry::new(57, 57, 0.55),
+    Model2AbsThrEntry::new(59, 60, 0.29),
+    Model2AbsThrEntry::new(61, 62, 0.02),
+    Model2AbsThrEntry::new(63, 64, -0.25),
+    Model2AbsThrEntry::new(65, 66, -0.54),
+    Model2AbsThrEntry::new(67, 68, -0.83),
+    Model2AbsThrEntry::new(69, 70, -1.12),
+    Model2AbsThrEntry::new(71, 72, -1.43),
+    Model2AbsThrEntry::new(73, 74, -1.73),
+    Model2AbsThrEntry::new(75, 76, -2.04),
+    Model2AbsThrEntry::new(77, 78, -2.34),
+    Model2AbsThrEntry::new(79, 80, -2.64),
+    Model2AbsThrEntry::new(81, 82, -2.93),
+    Model2AbsThrEntry::new(83, 84, -3.22),
+    Model2AbsThrEntry::new(85, 86, -3.49),
+    Model2AbsThrEntry::new(87, 88, -3.74),
+    Model2AbsThrEntry::new(89, 90, -3.98),
+    Model2AbsThrEntry::new(91, 92, -4.20),
+    Model2AbsThrEntry::new(93, 94, -4.40),
+    Model2AbsThrEntry::new(95, 96, -4.57),
+    Model2AbsThrEntry::new(97, 100, -4.82),
+    Model2AbsThrEntry::new(101, 104, -4.96),
+    Model2AbsThrEntry::new(105, 108, -4.97),
+    Model2AbsThrEntry::new(109, 112, -4.86),
+    Model2AbsThrEntry::new(113, 116, -4.63),
+    Model2AbsThrEntry::new(117, 120, -4.29),
+    Model2AbsThrEntry::new(121, 124, -3.87),
+    Model2AbsThrEntry::new(125, 128, -3.39),
+    Model2AbsThrEntry::new(129, 132, -2.86),
+    Model2AbsThrEntry::new(133, 136, -2.31),
+    Model2AbsThrEntry::new(137, 140, -1.77),
+    Model2AbsThrEntry::new(141, 144, -1.24),
+    Model2AbsThrEntry::new(145, 148, -0.74),
+    Model2AbsThrEntry::new(149, 152, -0.29),
+    Model2AbsThrEntry::new(153, 156, 0.12),
+    Model2AbsThrEntry::new(157, 160, 0.48),
+    Model2AbsThrEntry::new(161, 164, 0.79),
+    Model2AbsThrEntry::new(165, 168, 1.06),
+    Model2AbsThrEntry::new(169, 172, 1.29),
+    Model2AbsThrEntry::new(173, 176, 1.49),
+    Model2AbsThrEntry::new(177, 180, 1.66),
+    Model2AbsThrEntry::new(181, 184, 1.81),
+    Model2AbsThrEntry::new(185, 188, 1.95),
+    Model2AbsThrEntry::new(189, 192, 2.08),
+    Model2AbsThrEntry::new(193, 200, 2.33),
+    Model2AbsThrEntry::new(201, 208, 2.59),
+    Model2AbsThrEntry::new(209, 216, 2.86),
+    Model2AbsThrEntry::new(217, 224, 3.17),
+    Model2AbsThrEntry::new(225, 232, 3.51),
+    Model2AbsThrEntry::new(233, 240, 3.89),
+    Model2AbsThrEntry::new(241, 248, 4.31),
+    Model2AbsThrEntry::new(249, 256, 4.79),
+    Model2AbsThrEntry::new(257, 264, 5.31),
+    Model2AbsThrEntry::new(265, 272, 5.88),
+    Model2AbsThrEntry::new(273, 280, 6.50),
+    Model2AbsThrEntry::new(281, 288, 7.19),
+    Model2AbsThrEntry::new(289, 296, 7.93),
+    Model2AbsThrEntry::new(297, 304, 8.75),
+    Model2AbsThrEntry::new(305, 312, 9.63),
+    Model2AbsThrEntry::new(313, 320, 10.58),
+    Model2AbsThrEntry::new(321, 328, 11.60),
+    Model2AbsThrEntry::new(329, 336, 12.71),
+    Model2AbsThrEntry::new(337, 344, 13.90),
+    Model2AbsThrEntry::new(345, 352, 15.18),
+    Model2AbsThrEntry::new(353, 360, 16.54),
+    Model2AbsThrEntry::new(361, 368, 18.01),
+    Model2AbsThrEntry::new(369, 376, 19.57),
+    Model2AbsThrEntry::new(377, 384, 21.23),
+    Model2AbsThrEntry::new(385, 392, 23.01),
+    Model2AbsThrEntry::new(393, 400, 24.90),
+    Model2AbsThrEntry::new(401, 408, 26.90),
+    Model2AbsThrEntry::new(409, 416, 29.03),
+    Model2AbsThrEntry::new(417, 424, 31.28),
+    Model2AbsThrEntry::new(425, 432, 33.67),
+    Model2AbsThrEntry::new(433, 440, 36.19),
+    Model2AbsThrEntry::new(441, 448, 38.86),
+    Model2AbsThrEntry::new(449, 456, 41.67),
+    Model2AbsThrEntry::new(457, 464, 44.63),
+    Model2AbsThrEntry::new(465, 472, 47.76),
+    Model2AbsThrEntry::new(473, 480, 51.03),
+];
+
+/// Table D.4b — absolute threshold table, Fs = 44,1 kHz (130 rows,
+/// lines 1..=464; printed p.137).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.4b-absolute-threshold-44k1Hz-p137.png`.
+pub const MODEL2_ABSTHR_D4B: [Model2AbsThrEntry; 130] = [
+    Model2AbsThrEntry::new(1, 1, 45.05),
+    Model2AbsThrEntry::new(2, 2, 25.87),
+    Model2AbsThrEntry::new(3, 3, 18.70),
+    Model2AbsThrEntry::new(4, 4, 14.85),
+    Model2AbsThrEntry::new(5, 5, 12.41),
+    Model2AbsThrEntry::new(6, 6, 10.72),
+    Model2AbsThrEntry::new(7, 7, 9.47),
+    Model2AbsThrEntry::new(8, 8, 8.50),
+    Model2AbsThrEntry::new(9, 9, 7.73),
+    Model2AbsThrEntry::new(10, 10, 7.10),
+    Model2AbsThrEntry::new(11, 11, 6.56),
+    Model2AbsThrEntry::new(12, 12, 6.11),
+    Model2AbsThrEntry::new(13, 13, 5.72),
+    Model2AbsThrEntry::new(14, 14, 5.37),
+    Model2AbsThrEntry::new(15, 15, 5.07),
+    Model2AbsThrEntry::new(16, 16, 4.79),
+    Model2AbsThrEntry::new(17, 17, 4.55),
+    Model2AbsThrEntry::new(18, 18, 4.32),
+    Model2AbsThrEntry::new(19, 19, 4.11),
+    Model2AbsThrEntry::new(20, 20, 3.92),
+    Model2AbsThrEntry::new(21, 21, 3.74),
+    Model2AbsThrEntry::new(22, 22, 3.57),
+    Model2AbsThrEntry::new(23, 23, 3.40),
+    Model2AbsThrEntry::new(24, 24, 3.25),
+    Model2AbsThrEntry::new(25, 25, 3.10),
+    Model2AbsThrEntry::new(26, 26, 2.95),
+    Model2AbsThrEntry::new(27, 27, 2.81),
+    Model2AbsThrEntry::new(28, 28, 2.67),
+    Model2AbsThrEntry::new(29, 29, 2.53),
+    Model2AbsThrEntry::new(30, 30, 2.39),
+    Model2AbsThrEntry::new(31, 31, 2.25),
+    Model2AbsThrEntry::new(32, 32, 2.11),
+    Model2AbsThrEntry::new(33, 33, 1.97),
+    Model2AbsThrEntry::new(34, 34, 1.83),
+    Model2AbsThrEntry::new(35, 35, 1.68),
+    Model2AbsThrEntry::new(36, 36, 1.53),
+    Model2AbsThrEntry::new(37, 37, 1.38),
+    Model2AbsThrEntry::new(38, 38, 1.23),
+    Model2AbsThrEntry::new(39, 39, 1.07),
+    Model2AbsThrEntry::new(40, 40, 0.90),
+    Model2AbsThrEntry::new(41, 41, 0.74),
+    Model2AbsThrEntry::new(42, 42, 0.56),
+    Model2AbsThrEntry::new(43, 43, 0.39),
+    Model2AbsThrEntry::new(44, 44, 0.21),
+    Model2AbsThrEntry::new(45, 45, 0.02),
+    Model2AbsThrEntry::new(46, 46, -0.17),
+    Model2AbsThrEntry::new(47, 47, -0.36),
+    Model2AbsThrEntry::new(48, 48, -0.56),
+    Model2AbsThrEntry::new(49, 50, -0.96),
+    Model2AbsThrEntry::new(51, 52, -1.37),
+    Model2AbsThrEntry::new(53, 54, -1.79),
+    Model2AbsThrEntry::new(55, 56, -2.21),
+    Model2AbsThrEntry::new(57, 58, -2.63),
+    Model2AbsThrEntry::new(59, 60, -3.03),
+    Model2AbsThrEntry::new(61, 62, -3.41),
+    Model2AbsThrEntry::new(63, 64, -3.77),
+    Model2AbsThrEntry::new(65, 66, -4.09),
+    Model2AbsThrEntry::new(67, 68, -4.37),
+    Model2AbsThrEntry::new(69, 70, -4.60),
+    Model2AbsThrEntry::new(71, 72, -4.78),
+    Model2AbsThrEntry::new(73, 74, -4.91),
+    Model2AbsThrEntry::new(75, 76, -4.97),
+    Model2AbsThrEntry::new(77, 78, -4.98),
+    Model2AbsThrEntry::new(79, 80, -4.92),
+    Model2AbsThrEntry::new(81, 82, -4.81),
+    Model2AbsThrEntry::new(83, 84, -4.65),
+    Model2AbsThrEntry::new(85, 86, -4.43),
+    Model2AbsThrEntry::new(87, 88, -4.17),
+    Model2AbsThrEntry::new(89, 90, -3.87),
+    Model2AbsThrEntry::new(91, 92, -3.54),
+    Model2AbsThrEntry::new(93, 94, -3.19),
+    Model2AbsThrEntry::new(95, 96, -2.82),
+    Model2AbsThrEntry::new(97, 100, -2.06),
+    Model2AbsThrEntry::new(101, 104, -1.33),
+    Model2AbsThrEntry::new(105, 108, -0.64),
+    Model2AbsThrEntry::new(109, 112, -0.04),
+    Model2AbsThrEntry::new(113, 116, 0.47),
+    Model2AbsThrEntry::new(117, 120, 0.89),
+    Model2AbsThrEntry::new(121, 124, 1.23),
+    Model2AbsThrEntry::new(125, 128, 1.51),
+    Model2AbsThrEntry::new(129, 132, 1.74),
+    Model2AbsThrEntry::new(133, 136, 1.93),
+    Model2AbsThrEntry::new(137, 140, 2.11),
+    Model2AbsThrEntry::new(141, 144, 2.28),
+    Model2AbsThrEntry::new(145, 148, 2.45),
+    Model2AbsThrEntry::new(149, 152, 2.63),
+    Model2AbsThrEntry::new(153, 156, 2.82),
+    Model2AbsThrEntry::new(157, 160, 3.03),
+    Model2AbsThrEntry::new(161, 164, 3.25),
+    Model2AbsThrEntry::new(165, 168, 3.49),
+    Model2AbsThrEntry::new(169, 172, 3.74),
+    Model2AbsThrEntry::new(173, 176, 4.02),
+    Model2AbsThrEntry::new(177, 180, 4.32),
+    Model2AbsThrEntry::new(181, 184, 4.64),
+    Model2AbsThrEntry::new(185, 188, 4.98),
+    Model2AbsThrEntry::new(189, 192, 5.35),
+    Model2AbsThrEntry::new(193, 200, 6.15),
+    Model2AbsThrEntry::new(201, 208, 7.07),
+    Model2AbsThrEntry::new(209, 216, 8.10),
+    Model2AbsThrEntry::new(217, 224, 9.25),
+    Model2AbsThrEntry::new(225, 232, 10.54),
+    Model2AbsThrEntry::new(233, 240, 11.97),
+    Model2AbsThrEntry::new(241, 248, 13.56),
+    Model2AbsThrEntry::new(249, 256, 15.30),
+    Model2AbsThrEntry::new(257, 264, 17.23),
+    Model2AbsThrEntry::new(265, 272, 19.33),
+    Model2AbsThrEntry::new(273, 280, 21.64),
+    Model2AbsThrEntry::new(281, 288, 24.15),
+    Model2AbsThrEntry::new(289, 296, 26.88),
+    Model2AbsThrEntry::new(297, 304, 29.84),
+    Model2AbsThrEntry::new(305, 312, 33.04),
+    Model2AbsThrEntry::new(313, 320, 36.51),
+    Model2AbsThrEntry::new(321, 328, 40.24),
+    Model2AbsThrEntry::new(329, 336, 44.26),
+    Model2AbsThrEntry::new(337, 344, 48.58),
+    Model2AbsThrEntry::new(345, 352, 53.21),
+    Model2AbsThrEntry::new(353, 360, 58.17),
+    Model2AbsThrEntry::new(361, 368, 63.48),
+    Model2AbsThrEntry::new(369, 376, 69.13),
+    Model2AbsThrEntry::new(377, 384, 69.13),
+    Model2AbsThrEntry::new(385, 392, 69.13),
+    Model2AbsThrEntry::new(393, 400, 69.13),
+    Model2AbsThrEntry::new(401, 408, 69.13),
+    Model2AbsThrEntry::new(409, 416, 69.13),
+    Model2AbsThrEntry::new(417, 424, 69.13),
+    Model2AbsThrEntry::new(425, 432, 69.13),
+    Model2AbsThrEntry::new(433, 440, 69.13),
+    Model2AbsThrEntry::new(441, 448, 69.13),
+    Model2AbsThrEntry::new(449, 456, 69.13),
+    Model2AbsThrEntry::new(457, 464, 69.13),
+];
+
+/// Table D.4c — absolute threshold table, Fs = 48 kHz (126 rows,
+/// lines 1..=428; printed p.138).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.4c-absolute-threshold-48kHz-p138.png`
+/// — including the printed 4-line group `329 | 332` (see the section
+/// comment).
+pub const MODEL2_ABSTHR_D4C: [Model2AbsThrEntry; 126] = [
+    Model2AbsThrEntry::new(1, 1, 42.10),
+    Model2AbsThrEntry::new(2, 2, 24.17),
+    Model2AbsThrEntry::new(3, 3, 17.47),
+    Model2AbsThrEntry::new(4, 4, 13.87),
+    Model2AbsThrEntry::new(5, 5, 11.60),
+    Model2AbsThrEntry::new(6, 6, 10.01),
+    Model2AbsThrEntry::new(7, 7, 8.84),
+    Model2AbsThrEntry::new(8, 8, 7.94),
+    Model2AbsThrEntry::new(9, 9, 7.22),
+    Model2AbsThrEntry::new(10, 10, 6.62),
+    Model2AbsThrEntry::new(11, 11, 6.12),
+    Model2AbsThrEntry::new(12, 12, 5.70),
+    Model2AbsThrEntry::new(13, 13, 5.33),
+    Model2AbsThrEntry::new(14, 14, 5.00),
+    Model2AbsThrEntry::new(15, 15, 4.71),
+    Model2AbsThrEntry::new(16, 16, 4.45),
+    Model2AbsThrEntry::new(17, 17, 4.21),
+    Model2AbsThrEntry::new(18, 18, 4.00),
+    Model2AbsThrEntry::new(19, 19, 3.79),
+    Model2AbsThrEntry::new(20, 20, 3.61),
+    Model2AbsThrEntry::new(21, 21, 3.43),
+    Model2AbsThrEntry::new(22, 22, 3.26),
+    Model2AbsThrEntry::new(23, 23, 3.09),
+    Model2AbsThrEntry::new(24, 24, 2.93),
+    Model2AbsThrEntry::new(25, 25, 2.78),
+    Model2AbsThrEntry::new(26, 26, 2.63),
+    Model2AbsThrEntry::new(27, 27, 2.47),
+    Model2AbsThrEntry::new(28, 28, 2.32),
+    Model2AbsThrEntry::new(29, 29, 2.17),
+    Model2AbsThrEntry::new(30, 30, 2.02),
+    Model2AbsThrEntry::new(31, 31, 1.86),
+    Model2AbsThrEntry::new(32, 32, 1.71),
+    Model2AbsThrEntry::new(33, 33, 1.55),
+    Model2AbsThrEntry::new(34, 34, 1.38),
+    Model2AbsThrEntry::new(35, 35, 1.21),
+    Model2AbsThrEntry::new(36, 36, 1.04),
+    Model2AbsThrEntry::new(37, 37, 0.86),
+    Model2AbsThrEntry::new(38, 38, 0.67),
+    Model2AbsThrEntry::new(39, 39, 0.49),
+    Model2AbsThrEntry::new(40, 40, 0.29),
+    Model2AbsThrEntry::new(41, 41, 0.09),
+    Model2AbsThrEntry::new(42, 42, -0.11),
+    Model2AbsThrEntry::new(43, 43, -0.32),
+    Model2AbsThrEntry::new(44, 44, -0.54),
+    Model2AbsThrEntry::new(45, 45, -0.75),
+    Model2AbsThrEntry::new(46, 46, -0.97),
+    Model2AbsThrEntry::new(47, 47, -1.20),
+    Model2AbsThrEntry::new(48, 48, -1.43),
+    Model2AbsThrEntry::new(49, 50, -1.88),
+    Model2AbsThrEntry::new(51, 52, -2.34),
+    Model2AbsThrEntry::new(53, 54, -2.79),
+    Model2AbsThrEntry::new(55, 56, -3.22),
+    Model2AbsThrEntry::new(57, 58, -3.62),
+    Model2AbsThrEntry::new(59, 60, -3.98),
+    Model2AbsThrEntry::new(61, 62, -4.30),
+    Model2AbsThrEntry::new(63, 64, -4.57),
+    Model2AbsThrEntry::new(65, 66, -4.77),
+    Model2AbsThrEntry::new(67, 68, -4.91),
+    Model2AbsThrEntry::new(69, 70, -4.98),
+    Model2AbsThrEntry::new(71, 72, -4.97),
+    Model2AbsThrEntry::new(73, 74, -4.90),
+    Model2AbsThrEntry::new(75, 76, -4.76),
+    Model2AbsThrEntry::new(77, 78, -4.55),
+    Model2AbsThrEntry::new(79, 80, -4.29),
+    Model2AbsThrEntry::new(81, 82, -3.99),
+    Model2AbsThrEntry::new(83, 84, -3.64),
+    Model2AbsThrEntry::new(85, 86, -3.26),
+    Model2AbsThrEntry::new(87, 88, -2.86),
+    Model2AbsThrEntry::new(89, 90, -2.45),
+    Model2AbsThrEntry::new(91, 92, -2.04),
+    Model2AbsThrEntry::new(93, 94, -1.63),
+    Model2AbsThrEntry::new(95, 96, -1.24),
+    Model2AbsThrEntry::new(97, 100, -0.51),
+    Model2AbsThrEntry::new(101, 104, 0.12),
+    Model2AbsThrEntry::new(105, 108, 0.64),
+    Model2AbsThrEntry::new(109, 112, 1.06),
+    Model2AbsThrEntry::new(113, 116, 1.39),
+    Model2AbsThrEntry::new(117, 120, 1.66),
+    Model2AbsThrEntry::new(121, 124, 1.88),
+    Model2AbsThrEntry::new(125, 128, 2.08),
+    Model2AbsThrEntry::new(129, 132, 2.27),
+    Model2AbsThrEntry::new(133, 136, 2.46),
+    Model2AbsThrEntry::new(137, 140, 2.65),
+    Model2AbsThrEntry::new(141, 144, 2.86),
+    Model2AbsThrEntry::new(145, 148, 3.09),
+    Model2AbsThrEntry::new(149, 152, 3.33),
+    Model2AbsThrEntry::new(153, 156, 3.60),
+    Model2AbsThrEntry::new(157, 160, 3.89),
+    Model2AbsThrEntry::new(161, 164, 4.20),
+    Model2AbsThrEntry::new(165, 168, 4.54),
+    Model2AbsThrEntry::new(169, 172, 4.91),
+    Model2AbsThrEntry::new(173, 176, 5.31),
+    Model2AbsThrEntry::new(177, 180, 5.73),
+    Model2AbsThrEntry::new(181, 184, 6.18),
+    Model2AbsThrEntry::new(185, 188, 6.67),
+    Model2AbsThrEntry::new(189, 192, 7.19),
+    Model2AbsThrEntry::new(193, 200, 8.33),
+    Model2AbsThrEntry::new(201, 208, 9.63),
+    Model2AbsThrEntry::new(209, 216, 11.08),
+    Model2AbsThrEntry::new(217, 224, 12.71),
+    Model2AbsThrEntry::new(225, 232, 14.53),
+    Model2AbsThrEntry::new(233, 240, 16.54),
+    Model2AbsThrEntry::new(241, 248, 18.77),
+    Model2AbsThrEntry::new(249, 256, 21.23),
+    Model2AbsThrEntry::new(257, 264, 23.94),
+    Model2AbsThrEntry::new(265, 272, 26.90),
+    Model2AbsThrEntry::new(273, 280, 30.14),
+    Model2AbsThrEntry::new(281, 288, 33.67),
+    Model2AbsThrEntry::new(289, 296, 37.51),
+    Model2AbsThrEntry::new(297, 304, 41.67),
+    Model2AbsThrEntry::new(305, 312, 46.17),
+    Model2AbsThrEntry::new(313, 320, 51.04),
+    Model2AbsThrEntry::new(321, 328, 56.29),
+    Model2AbsThrEntry::new(329, 332, 61.94),
+    Model2AbsThrEntry::new(333, 340, 68.00),
+    Model2AbsThrEntry::new(341, 348, 68.00),
+    Model2AbsThrEntry::new(349, 356, 68.00),
+    Model2AbsThrEntry::new(357, 364, 68.00),
+    Model2AbsThrEntry::new(365, 372, 68.00),
+    Model2AbsThrEntry::new(373, 380, 68.00),
+    Model2AbsThrEntry::new(381, 388, 68.00),
+    Model2AbsThrEntry::new(389, 396, 68.00),
+    Model2AbsThrEntry::new(397, 404, 68.00),
+    Model2AbsThrEntry::new(405, 412, 68.00),
+    Model2AbsThrEntry::new(413, 420, 68.00),
+    Model2AbsThrEntry::new(421, 428, 68.00),
+];
+
+/// Return the verbatim Annex D Table D.4 absolute-threshold slice for
+/// `fs` (common to all Layers, like the Table D.3 partition tables).
+#[inline]
+#[must_use]
+pub fn model2_absthr_table(fs: AnnexDSamplingRate) -> &'static [Model2AbsThrEntry] {
+    match fs {
+        AnnexDSamplingRate::Hz32000 => &MODEL2_ABSTHR_D4A,
+        AnnexDSamplingRate::Hz44100 => &MODEL2_ABSTHR_D4B,
+        AnnexDSamplingRate::Hz48000 => &MODEL2_ABSTHR_D4C,
+    }
+}
+
+/// The Table D.4 absolute threshold (dB, in the printed 0-dB
+/// convention — 96 dB below a +-32 760 sine) for the 1-based FFT line
+/// `line`, or `None` where the printed table has no covering row:
+/// `line == 0`, `line` above the table's last covered line (480 /
+/// 464 / 428 at 32 / 44,1 / 48 kHz — the tables stop short of line
+/// 513), and the printed D.4a line-58 gap at 32 kHz.
+#[must_use]
+pub fn model2_absthr_for_line(fs: AnnexDSamplingRate, line: u16) -> Option<f64> {
+    model2_absthr_table(fs)
+        .iter()
+        .find(|e| e.lower <= line && line <= e.higher)
+        .map(|e| e.absthr_db)
 }
 
 #[cfg(test)]
@@ -15307,5 +16103,319 @@ mod tests {
         let t2 = model2_step_g_tonality(0.2);
         let t3 = model2_step_g_tonality(0.45);
         assert!(t1 > t2 && t2 > t3, "{t1} {t2} {t3}");
+    }
+
+    // ----- Tables D.3a–c / D.4a–c transcription (step 82 / r280) -----
+
+    const ALL_RATES: [AnnexDSamplingRate; 3] = [
+        AnnexDSamplingRate::Hz32000,
+        AnnexDSamplingRate::Hz44100,
+        AnnexDSamplingRate::Hz48000,
+    ];
+
+    #[test]
+    fn table_d3_lengths_and_full_contiguous_line_coverage() {
+        // Printed partition counts (the docs extracts file's "63
+        // partitions at 32 kHz" prose is an erratum; the renders are
+        // authoritative and end at 49 / 57 / 58).
+        assert_eq!(MODEL2_PARTITION_D3A.len(), 49);
+        assert_eq!(MODEL2_PARTITION_D3B.len(), 57);
+        assert_eq!(MODEL2_PARTITION_D3C.len(), 58);
+        for fs in ALL_RATES {
+            let t = model2_partition_table(fs);
+            // Exact half-spectrum coverage: 1..=513, contiguous.
+            assert_eq!(t[0].wlow, 1, "{fs:?}");
+            assert_eq!(t[t.len() - 1].whigh, 513, "{fs:?}");
+            for (i, w) in t.windows(2).enumerate() {
+                assert!(w[0].wlow <= w[0].whigh, "{fs:?} index {}", i + 1);
+                assert_eq!(
+                    w[1].wlow,
+                    w[0].whigh + 1,
+                    "{fs:?} index {} -> {}",
+                    i + 1,
+                    i + 2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_d3_columns_are_well_formed() {
+        for fs in ALL_RATES {
+            let t = model2_partition_table(fs);
+            // bval starts at 0,00 and increases strictly.
+            assert_eq!(t[0].bval, 0.00, "{fs:?}");
+            for (i, w) in t.windows(2).enumerate() {
+                assert!(w[0].bval < w[1].bval, "{fs:?} bval index {}", i + 1);
+                // TMN is non-decreasing down the table.
+                assert!(w[0].tmn_db <= w[1].tmn_db, "{fs:?} TMN index {}", i + 1);
+            }
+            // minval only takes the printed value set.
+            for (i, e) in t.iter().enumerate() {
+                assert!(
+                    [0.0, 4.4, 4.5, 3.5, 7.0, 10.0, 15.0, 17.0, 20.0].contains(&e.minval_db),
+                    "{fs:?} minval index {}: {}",
+                    i + 1,
+                    e.minval_db
+                );
+            }
+            // TMN spans the printed range.
+            assert_eq!(t[0].tmn_db, 24.5, "{fs:?}");
+            assert!(t[t.len() - 1].tmn_db <= 40.3, "{fs:?}");
+        }
+    }
+
+    #[test]
+    fn table_d3_spot_rows_match_renders() {
+        // D.3a anchors (also printed as text in the docs extracts
+        // file, rows 1..=20): row 15 is the first non-24,5 TMN.
+        let r15 = &MODEL2_PARTITION_D3A[14];
+        assert_eq!((r15.wlow, r15.whigh), (42, 45));
+        assert_eq!((r15.bval, r15.minval_db, r15.tmn_db), (10.28, 4.4, 24.8));
+        // Last rows of each table.
+        let a49 = &MODEL2_PARTITION_D3A[48];
+        assert_eq!((a49.wlow, a49.whigh, a49.bval), (497, 513, 24.07));
+        assert_eq!((a49.minval_db, a49.tmn_db), (4.5, 38.6));
+        let b57 = &MODEL2_PARTITION_D3B[56];
+        assert_eq!((b57.wlow, b57.whigh, b57.bval), (470, 513, 25.33));
+        assert_eq!((b57.minval_db, b57.tmn_db), (3.5, 39.8));
+        let c58 = &MODEL2_PARTITION_D3C[57];
+        assert_eq!((c58.wlow, c58.whigh, c58.bval), (508, 513, 25.81));
+        assert_eq!((c58.minval_db, c58.tmn_db), (3.5, 40.3));
+        // Single-line head regions: D.3b lines 1..=16 / D.3c 1..=17
+        // are one-line partitions; D.3a only line 1.
+        assert!(MODEL2_PARTITION_D3B[..16].iter().all(|e| e.wlow == e.whigh));
+        assert_eq!(MODEL2_PARTITION_D3B[16].whigh, 19);
+        assert!(MODEL2_PARTITION_D3C[..17].iter().all(|e| e.wlow == e.whigh));
+        assert_eq!(MODEL2_PARTITION_D3C[17].whigh, 20);
+    }
+
+    #[test]
+    fn table_d3_bval_consistent_with_d1_bark_column() {
+        // Redundancy check: a partition's `bval` tracks the Bark
+        // range its FFT lines span per the Layer II Tables D.1 (same
+        // 1024-point FFT line grid). The two tables use different
+        // Bark conventions at the band edges (D.3 prints `bval =
+        // 0,00` for partition 1 where D.1 prints the line-center
+        // Bark, 0,309 at 32 kHz), so the guard allows half a Bark of
+        // slack — still tight enough to catch a digit-level
+        // transcription error in any `bval` cell.
+        use crate::frame::Layer;
+        for fs in ALL_RATES {
+            let d1 = model1_threshold_table(Layer::LayerII, fs).unwrap();
+            let last_line = model1_d1_line_for_index(Layer::LayerII, fs, d1.len() as u16).unwrap();
+            for (i, e) in model2_partition_table(fs).iter().enumerate() {
+                if e.whigh > last_line {
+                    continue; // partition extends past the D.1 grid
+                }
+                let z_lo = model1_d1_entry_for_line(Layer::LayerII, fs, e.wlow)
+                    .unwrap()
+                    .z_bark;
+                let z_hi = model1_d1_entry_for_line(Layer::LayerII, fs, e.whigh)
+                    .unwrap()
+                    .z_bark;
+                assert!(
+                    z_lo - 0.5 <= e.bval && e.bval <= z_hi + 0.5,
+                    "{fs:?} partition {}: bval {} outside [{z_lo}, {z_hi}] ± 0,5",
+                    i + 1,
+                    e.bval
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model2_bval_extracts_partition_bval_column() {
+        for fs in ALL_RATES {
+            let bval = model2_bval(fs);
+            let t = model2_partition_table(fs);
+            assert_eq!(bval.len(), t.len());
+            assert!(bval.iter().zip(t.iter()).all(|(&b, e)| b == e.bval));
+            // And it feeds the step-f) reductions directly.
+            assert!(model2_step_f_spread(&vec![1.0; bval.len()], &bval).is_some());
+        }
+    }
+
+    #[test]
+    fn model2_partition_index_for_line_covers_and_bounds() {
+        for fs in ALL_RATES {
+            let t = model2_partition_table(fs);
+            assert_eq!(model2_partition_index_for_line(fs, 0), None, "{fs:?}");
+            assert_eq!(model2_partition_index_for_line(fs, 514), None, "{fs:?}");
+            assert_eq!(model2_partition_index_for_line(fs, 1), Some(1), "{fs:?}");
+            assert_eq!(
+                model2_partition_index_for_line(fs, 513),
+                Some(t.len() as u16),
+                "{fs:?}"
+            );
+            // Every line maps to the partition whose [wlow, whigh]
+            // contains it.
+            for (i, e) in t.iter().enumerate() {
+                for line in [e.wlow, e.whigh] {
+                    assert_eq!(
+                        model2_partition_index_for_line(fs, line),
+                        Some(i as u16 + 1),
+                        "{fs:?} line {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_d4_lengths_and_coverage_with_printed_quirks() {
+        assert_eq!(MODEL2_ABSTHR_D4A.len(), 132);
+        assert_eq!(MODEL2_ABSTHR_D4B.len(), 130);
+        assert_eq!(MODEL2_ABSTHR_D4C.len(), 126);
+        // Last covered line per rate (the tables stop short of 513).
+        for (fs, last) in [
+            (AnnexDSamplingRate::Hz32000, 480),
+            (AnnexDSamplingRate::Hz44100, 464),
+            (AnnexDSamplingRate::Hz48000, 428),
+        ] {
+            let t = model2_absthr_table(fs);
+            assert_eq!(t[0].lower, 1, "{fs:?}");
+            assert_eq!(t[t.len() - 1].higher, last, "{fs:?}");
+            for (i, w) in t.windows(2).enumerate() {
+                assert!(w[0].lower <= w[0].higher, "{fs:?} row {}", i + 1);
+                // Contiguous coverage — except the printed D.4a
+                // `57 | 57` → `59 | 60` gap (line 58 uncovered).
+                if fs == AnnexDSamplingRate::Hz32000 && w[0].higher == 57 && w[0].lower == 57 {
+                    assert_eq!(w[1].lower, 59, "the printed line-58 gap");
+                    continue;
+                }
+                assert_eq!(
+                    w[1].lower,
+                    w[0].higher + 1,
+                    "{fs:?} row {} -> {}",
+                    i + 1,
+                    i + 2
+                );
+            }
+        }
+        // The D.4c reduced 4-line group inside the 8-line tail.
+        let quirk = MODEL2_ABSTHR_D4C
+            .iter()
+            .find(|e| e.lower == 329)
+            .expect("printed row 329");
+        assert_eq!((quirk.higher, quirk.absthr_db), (332, 61.94));
+    }
+
+    #[test]
+    fn model2_absthr_for_line_lookup_and_printed_gap() {
+        for fs in ALL_RATES {
+            assert_eq!(model2_absthr_for_line(fs, 0), None, "{fs:?}");
+            assert_eq!(model2_absthr_for_line(fs, 481), None, "32k past end");
+        }
+        assert_eq!(
+            model2_absthr_for_line(AnnexDSamplingRate::Hz32000, 1),
+            Some(58.23)
+        );
+        assert_eq!(
+            model2_absthr_for_line(AnnexDSamplingRate::Hz44100, 1),
+            Some(45.05)
+        );
+        assert_eq!(
+            model2_absthr_for_line(AnnexDSamplingRate::Hz48000, 1),
+            Some(42.10)
+        );
+        // Range lookups land on the covering row.
+        assert_eq!(
+            model2_absthr_for_line(AnnexDSamplingRate::Hz32000, 99),
+            Some(-4.82)
+        );
+        assert_eq!(
+            model2_absthr_for_line(AnnexDSamplingRate::Hz44100, 464),
+            Some(69.13)
+        );
+        assert_eq!(
+            model2_absthr_for_line(AnnexDSamplingRate::Hz48000, 330),
+            Some(61.94)
+        );
+        // The printed D.4a gap: line 58 has no row at 32 kHz (the
+        // `57 | 57` row's 0,55 dB matches Table D.1d's LTq at line
+        // 58 — see the next test — so `higher = 57` is almost
+        // certainly a misprint, but the verbatim print rules).
+        assert_eq!(
+            model2_absthr_for_line(AnnexDSamplingRate::Hz32000, 58),
+            None
+        );
+        assert_eq!(
+            model2_absthr_for_line(AnnexDSamplingRate::Hz32000, 57),
+            Some(0.55)
+        );
+        assert_eq!(
+            model2_absthr_for_line(AnnexDSamplingRate::Hz44100, 58),
+            Some(-2.63)
+        );
+    }
+
+    #[test]
+    fn table_d4_agrees_with_layer2_d1_ltq_on_shared_lines() {
+        // Redundancy check: the Layer II Tables D.1 tabulate the
+        // threshold in quiet on the same 1024-point FFT line grid.
+        // Wherever a D.4 row's `higher` line is D.1-tabulated, the
+        // printed values agree — exceptions below are printed-spec
+        // rounding inconsistencies, not transcription errors.
+        use crate::frame::Layer;
+        let mut mismatches = Vec::new();
+        for fs in ALL_RATES {
+            let d1 = model1_threshold_table(Layer::LayerII, fs).unwrap();
+            let mut ltq_by_line = std::collections::HashMap::new();
+            for i in 1..=d1.len() as u16 {
+                let line = model1_d1_line_for_index(Layer::LayerII, fs, i).unwrap();
+                ltq_by_line.insert(line, d1[i as usize - 1].ltq_db);
+            }
+            for e in model2_absthr_table(fs) {
+                let Some(&ltq) = ltq_by_line.get(&e.higher) else {
+                    continue;
+                };
+                if e.absthr_db != ltq {
+                    mismatches.push((fs, e.higher, e.absthr_db, ltq));
+                }
+            }
+            // The D.4a `57 | 57` quirk row: its absthr equals the
+            // D.1d LTq at line *58* (the line the printed pair
+            // skips).
+            if fs == AnnexDSamplingRate::Hz32000 {
+                assert_eq!(ltq_by_line[&58], 0.55);
+            }
+        }
+        // Pinned printed-spec inconsistencies (sample cells of both
+        // sides re-verified at 300–400 % zoom on the renders; each
+        // side is legible). At 32 / 48 kHz the two tables agree on
+        // every shared line except D.4a's last row (51,03 vs 51,04
+        // at 15 000 Hz). At 44,1 kHz the printed D.4b systematically
+        // disagrees with the printed D.1e in two ways — evidently
+        // the 44,1 kHz absolute-threshold table was generated /
+        // rounded separately when the spec was typeset:
+        //   - 14 shared lines print exactly 0,01 dB lower in D.4b
+        //     (e.g. lines 51..=52: -1,37 vs D.1e row 50's -1,38 at
+        //     2 239,45 Hz);
+        //   - the top-of-band saturation plateau prints 69,13 dB in
+        //     D.4b (lines 369..=464) where D.1e clamps at 68,00 dB
+        //     (and D.4c/D.1f both use 68,00).
+        let mut expected = vec![
+            (AnnexDSamplingRate::Hz32000, 480, 51.03, 51.04),
+            (AnnexDSamplingRate::Hz44100, 52, -1.37, -1.38),
+            (AnnexDSamplingRate::Hz44100, 104, -1.33, -1.32),
+            (AnnexDSamplingRate::Hz44100, 148, 2.45, 2.46),
+            (AnnexDSamplingRate::Hz44100, 256, 15.30, 15.31),
+            (AnnexDSamplingRate::Hz44100, 272, 19.33, 19.34),
+            (AnnexDSamplingRate::Hz44100, 312, 33.04, 33.05),
+            (AnnexDSamplingRate::Hz44100, 320, 36.51, 36.52),
+            (AnnexDSamplingRate::Hz44100, 328, 40.24, 40.25),
+            (AnnexDSamplingRate::Hz44100, 336, 44.26, 44.27),
+            (AnnexDSamplingRate::Hz44100, 344, 48.58, 48.59),
+            (AnnexDSamplingRate::Hz44100, 352, 53.21, 53.22),
+            (AnnexDSamplingRate::Hz44100, 360, 58.17, 58.18),
+            (AnnexDSamplingRate::Hz44100, 368, 63.48, 63.49),
+        ];
+        expected.extend(
+            (376..=464)
+                .step_by(8)
+                .map(|l| (AnnexDSamplingRate::Hz44100, l, 69.13, 68.00)),
+        );
+        assert_eq!(mismatches, expected);
     }
 }
