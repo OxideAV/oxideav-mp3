@@ -31,19 +31,22 @@
 //! perceptually transparent, regardless of what other tones are
 //! present.
 //!
-//! The Table D.1 columns themselves (108–132 rows × 4 columns) are
-//! staged as 200-DPI PNG renders under
-//! `docs/audio/mp3/annex-d-renders/`; the only **textually
-//! transcribed** values in `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
-//! are the orientation anchors (the first five rows of Table D.1a and
+//! The full Table D.1a–f columns (frequency / critical-band rate /
+//! absolute threshold; 102–132 rows per table) are transcribed in
+//! this module from the staged 200-DPI PNG renders under
+//! `docs/audio/mp3/annex-d-renders/Table-D.1*.png` — see
+//! [`MODEL1_THRESHOLD_D1A`]–[`MODEL1_THRESHOLD_D1F`] and the
+//! [`model1_threshold_table`] dispatcher further down. Before that
+//! transcription landed (r278), the only **textually transcribed**
+//! values in `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
+//! were the orientation anchors (the first five rows of Table D.1a and
 //! the last row, plus the prose-anchored minimum near i = 51, f ≈ 3.375
-//! kHz at ≈ −4.97 dB). This module derives `LTq(f)` for arbitrary
-//! frequencies via **monotone piecewise-linear interpolation in
-//! log-frequency through those textually-transcribed anchors only** —
-//! the PNG-only rows are deliberately not OCR'd this round (the brief's
-//! DOCS-GAP rule applies: if a higher-precision derivation is needed
-//! later, the gap is "no textual transcription of the inner rows of
-//! Table D.1a–f exists in the docs repo; render → text needed").
+//! kHz at ≈ −4.97 dB). The [`ltq_db_at_hz`] helper below predates the
+//! full tables and still derives `LTq(f)` for arbitrary frequencies via
+//! **monotone piecewise-linear interpolation in log-frequency through
+//! those textually-transcribed anchors only**; the anchors agree
+//! exactly with the corresponding rows of the full tables (pinned by a
+//! unit test).
 //!
 //! The textual anchors and their provenance (line numbers in the .md):
 //!
@@ -801,14 +804,19 @@ impl CriticalBandBoundary {
 
 /// Documented illegibility marker: D.2e band 17's Bark coordinate
 /// prints as `16,11` with a clipped final digit in the staged PDF
-/// render. This module records the legible prefix `16.11` (a strict
-/// under-estimate within ±0.01 Bark of the true value, and not the
-/// docs file's prose `16,116` estimate, which is explicitly NOT
+/// render. This module records the legible prefix `16.11` (and not
+/// the docs file's prose `16,116` estimate, which is explicitly NOT
 /// adopted as a verbatim source value).
 ///
-/// Marker set to `true` only for the affected (Layer II, 44.1 kHz)
-/// row 17 cell; consumers that need to widen the under-estimate by
-/// the `~0.006 Bark` typesetting tolerance can read this marker.
+/// **Resolved via Table D.1 (r278):** the D.2 Bark column repeats the
+/// `Crit.Band Rate` of the Table D.1 row its `index F&CB` cites, and
+/// D.1e row 62 (the row band 17 cites, same frequency 3 273,05 Hz)
+/// legibly prints `16,110` — as does D.1b row 38 at the same
+/// frequency. The clipped digit is therefore `0`: the stored `16.11`
+/// IS the exact value (and the docs prose estimate `16,116` is
+/// wrong). The marker stays `true` because the D.2e cell itself
+/// remains illegible in its render; the cross-table resolution is
+/// pinned by the `table_d1_agrees_with_d2_boundary_rows` unit test.
 pub const D2E_BAND_17_BARK_IS_ILLEGIBLE: bool = true;
 
 /// Table D.2a — Layer I, Fs = 32 kHz (24 bands, `no` 0..=23).
@@ -846,6 +854,11 @@ pub const CRITICAL_BANDS_D2A: [CriticalBandBoundary; 24] = [
 ///
 /// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.2b - Layer I, Fs = 44,1 kHz (25 bands, no 0..24)".
+///
+/// **Print discrepancies:** rows 17, 20, 24, `z_bark` — the spec
+/// prints `17,904` / `20,971` / `24,573` here but `17,905` /
+/// `20,972` / `24,574` in the Table D.1b rows they cite (indices 50,
+/// 68, 106). See the matching note on [`CRITICAL_BANDS_D2E`].
 pub const CRITICAL_BANDS_D2B: [CriticalBandBoundary; 25] = [
     CriticalBandBoundary::new(0, 1, 86.133, 0.850),
     CriticalBandBoundary::new(1, 2, 172.266, 1.694),
@@ -948,8 +961,19 @@ pub const CRITICAL_BANDS_D2D: [CriticalBandBoundary; 25] = [
 /// final digit, printing `16,11` with a fragment of a fourth digit.
 /// The docs file marks it `[illegible]`. This array records the
 /// legible-only value `16.11`; the docs file's prose estimate
-/// (`16,116`) is explicitly NOT adopted. See
-/// [`D2E_BAND_17_BARK_IS_ILLEGIBLE`].
+/// (`16,116`) is explicitly NOT adopted. Resolved r278 via Table
+/// D.1e row 62 (legibly `16,110` — the clipped digit is `0`, so the
+/// stored value is exact). See [`D2E_BAND_17_BARK_IS_ILLEGIBLE`].
+///
+/// **Print discrepancies:** rows 19, 22, 26, `z_bark`. This table
+/// prints `17,904` / `20,971` / `24,573`, but the Table D.1e rows
+/// they cite (indices 74, 92, 130) print `17,905` / `20,972` /
+/// `24,574`, as do D.1b rows 50, 68, 106 at the same frequencies.
+/// D.2b prints the same three lower values at its bands 17, 20, 24,
+/// so each side is double-printed and self-consistent — a rounding
+/// inconsistency in the printed spec. The verbatim D.2e prints are
+/// kept here; the Table D.1 values are what the Step 4 → Bark
+/// bridge reads.
 pub const CRITICAL_BANDS_D2E: [CriticalBandBoundary; 27] = [
     CriticalBandBoundary::new(0, 1, 43.066, 0.425),
     CriticalBandBoundary::new(1, 2, 86.133, 0.850),
@@ -5917,6 +5941,1062 @@ pub fn model1_step4_components(
     let tonal = model1_step4_extract_tonal(&mut residue, layer)?;
     let non_tonal = model1_step4_non_tonal_components(&residue, layer, fs)?;
     Some((tonal, non_tonal))
+}
+
+// =====================================================================
+// Annex D Model 1 — Tables D.1a–f (frequencies, critical band rates,
+// absolute thresholds) + the Step 4 → Bark bridge and the end-to-end
+// §D.1 Step 5 sieve (Phase 2 step 80 / r278).
+//
+// Spec context (ISO/IEC 11172-3:1993, informative Annex D): the six
+// "Table D.1x -- Frequencies, critical band rates and absolute
+// threshold" pages tabulate, per (Layer, Fs) pair, the subsampled
+// frequency grid the model works on. Each row carries four columns:
+//
+//   Index Number i | Frequency [Hz] | Crit.Band Rate [z] | Absolute
+//                                                          Thresh. [dB]
+//
+//   D.1a — Layer I,  Fs = 32 kHz   (108 rows, printed p.116)
+//   D.1b — Layer I,  Fs = 44,1 kHz (106 rows, printed p.117)
+//   D.1c — Layer I,  Fs = 48 kHz   (102 rows, printed p.118)
+//   D.1d — Layer II, Fs = 32 kHz   (132 rows, printed p.119)
+//   D.1e — Layer II, Fs = 44,1 kHz (130 rows, printed p.120)
+//   D.1f — Layer II, Fs = 48 kHz   (126 rows, printed p.121)
+//
+// Transcribed from the staged page renders
+// `docs/audio/mp3/annex-d-renders/Table-D.1{a,b,c,d,e,f}-*.png`
+// (read at high magnification in cropped strips; every previously
+// ambiguous cell re-read in a dedicated zoom). Decimal commas are
+// reproduced as periods and thin-space thousands separators stripped,
+// the same convention as the Tables D.2 constants above.
+//
+// The index column is implicit (row position + 1). The printed
+// frequency column reveals the table's subsampling structure — the
+// rows sit on the FFT line grid `Fs/N` (`N` = 512 Layer I / 1 024
+// Layer II) at:
+//
+//   rows  1..=48 : lines   1..=48  (every line)
+//   rows 49..=72 : lines  50..=96  (every 2nd line)
+//   rows 73..=96 : lines 100..=192 (every 4th line; Layer I tables
+//                  continue this region to their last row)
+//   rows 97..    : lines 200..     (every 8th line; Layer II only)
+//
+// which [`model1_d1_line_for_index`] encodes and a unit test verifies
+// against the printed frequency column of all 704 rows.
+//
+// Redundancy in the printed tables (used as transcription
+// cross-checks, all pinned by unit tests):
+//   - a Layer II table prints exactly the same frequency / z / LTq
+//     values as the Layer I table at the same Fs wherever the two
+//     grids coincide (Layer I line L = Layer II line 2L); rows 49..
+//     of D.1d/e/f equal rows 25.. of D.1a/b/c verbatim.
+//   - the Tables D.2 `index F&CB` column indexes into these tables:
+//     every D.2 boundary row's frequency / Bark pair equals the
+//     Table D.1 row it cites. This resolves the documented D.2e
+//     band-17 illegible Bark digit: D.1e row 62 legibly prints
+//     `16,110` (so the docs file's prose estimate of `16,116` is
+//     wrong, and the stored legible-prefix `16.11` is in fact the
+//     exact value). A systematic print difference also surfaces:
+//     at 44,1 kHz the spec's D.2 tables print a Bark value exactly
+//     0,001 below the D.1 tables' at three frequencies —
+//     4 478,9 Hz (D.2b band 17 / D.2e band 19: `17,904` vs D.1b row
+//     50 / D.1e row 74: `17,905`), 7 579,7 Hz (D.2b band 20 / D.2e
+//     band 22: `20,971` vs `20,972`) and 19 982,8 Hz (D.2b band 24 /
+//     D.2e band 26: `24,573` vs `24,574`). Each side is
+//     double-printed and self-consistent (D.2b = D.2e, D.1b = D.1e),
+//     so this is a rounding inconsistency in the printed spec, not a
+//     transcription error; both verbatim prints are kept, the bridge
+//     below reads the D.1 values, and the
+//     `table_d1_agrees_with_d2_boundary_rows` test pins the exact
+//     six-cell exception list.
+//
+// With the z column in hand, the §D.1 Step 4 component lists (line
+// index k + SPL, r277) can finally be lifted into the Bark-domain
+// [`Masker`] carrier consumed by the already-landed Step 5(a)/(b)
+// primitives (r229) and the Step 6/7 threshold evaluators (r219):
+// `model1_masker_from_component` does the per-component lift via the
+// nearest Table D.1 row, and `model1_step5_components` composes
+// bridge + Step 5(a) threshold-in-quiet screening (against the same
+// row's Absolute Thresh. column) + Step 5(b) 0,5-Bark tonal
+// decimation into the spec's full Step 5 sieve.
+//
+// Provenance: only the six PNG renders named above plus the §D.1
+// Step 5 prose (printed p.112) already quoted on the Step 5
+// primitives; no external implementation was consulted.
+// =====================================================================
+
+/// One row of Annex D Table D.1 (frequencies, critical band rates and
+/// absolute threshold). The row's 1-based `Index Number i` column is
+/// implicit (slice position + 1); [`model1_d1_line_for_index`] maps it
+/// to the raw FFT-line index the step-77 spectrum uses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Model1ThresholdEntry {
+    /// `Frequency [Hz]` column (the FFT line-center frequency, printed
+    /// to two decimals).
+    pub frequency_hz: f64,
+    /// `Crit.Band Rate [z]` column — the critical-band rate (Bark
+    /// coordinate) of this frequency.
+    pub z_bark: f64,
+    /// `Absolute Thresh. [dB]` column — the threshold in quiet
+    /// `LTq` at this frequency, in dB SPL.
+    pub ltq_db: f64,
+}
+
+impl Model1ThresholdEntry {
+    /// Construct a table row at compile time.
+    #[inline]
+    #[must_use]
+    pub const fn new(frequency_hz: f64, z_bark: f64, ltq_db: f64) -> Self {
+        Self {
+            frequency_hz,
+            z_bark,
+            ltq_db,
+        }
+    }
+}
+
+/// Table D.1a — Layer I, Fs = 32 kHz (108 rows, printed p.116).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.1a-threshold-in-quiet-LayerI-32kHz-p116.png`.
+// The 6,28 dB threshold at 500 Hz is the spec's printed table value,
+// not an approximation of a mathematical constant.
+#[allow(clippy::approx_constant)]
+pub const MODEL1_THRESHOLD_D1A: [Model1ThresholdEntry; 108] = [
+    Model1ThresholdEntry::new(62.50, 0.617, 33.44),
+    Model1ThresholdEntry::new(125.00, 1.232, 19.20),
+    Model1ThresholdEntry::new(187.50, 1.842, 13.87),
+    Model1ThresholdEntry::new(250.00, 2.445, 11.01),
+    Model1ThresholdEntry::new(312.50, 3.037, 9.20),
+    Model1ThresholdEntry::new(375.00, 3.618, 7.94),
+    Model1ThresholdEntry::new(437.50, 4.185, 7.00),
+    Model1ThresholdEntry::new(500.00, 4.736, 6.28),
+    Model1ThresholdEntry::new(562.50, 5.272, 5.70),
+    Model1ThresholdEntry::new(625.00, 5.789, 5.21),
+    Model1ThresholdEntry::new(687.50, 6.289, 4.80),
+    Model1ThresholdEntry::new(750.00, 6.770, 4.45),
+    Model1ThresholdEntry::new(812.50, 7.233, 4.14),
+    Model1ThresholdEntry::new(875.00, 7.677, 3.86),
+    Model1ThresholdEntry::new(937.50, 8.103, 3.61),
+    Model1ThresholdEntry::new(1000.00, 8.511, 3.37),
+    Model1ThresholdEntry::new(1062.50, 8.901, 3.15),
+    Model1ThresholdEntry::new(1125.00, 9.275, 2.93),
+    Model1ThresholdEntry::new(1187.50, 9.632, 2.73),
+    Model1ThresholdEntry::new(1250.00, 9.974, 2.53),
+    Model1ThresholdEntry::new(1312.50, 10.301, 2.32),
+    Model1ThresholdEntry::new(1375.00, 10.614, 2.12),
+    Model1ThresholdEntry::new(1437.50, 10.913, 1.92),
+    Model1ThresholdEntry::new(1500.00, 11.199, 1.71),
+    Model1ThresholdEntry::new(1562.50, 11.474, 1.49),
+    Model1ThresholdEntry::new(1625.00, 11.736, 1.27),
+    Model1ThresholdEntry::new(1687.50, 11.988, 1.04),
+    Model1ThresholdEntry::new(1750.00, 12.230, 0.80),
+    Model1ThresholdEntry::new(1812.50, 12.461, 0.55),
+    Model1ThresholdEntry::new(1875.00, 12.684, 0.29),
+    Model1ThresholdEntry::new(1937.50, 12.898, 0.02),
+    Model1ThresholdEntry::new(2000.00, 13.104, -0.25),
+    Model1ThresholdEntry::new(2062.50, 13.302, -0.54),
+    Model1ThresholdEntry::new(2125.00, 13.493, -0.83),
+    Model1ThresholdEntry::new(2187.50, 13.678, -1.12),
+    Model1ThresholdEntry::new(2250.00, 13.855, -1.43),
+    Model1ThresholdEntry::new(2312.50, 14.027, -1.73),
+    Model1ThresholdEntry::new(2375.00, 14.193, -2.04),
+    Model1ThresholdEntry::new(2437.50, 14.354, -2.34),
+    Model1ThresholdEntry::new(2500.00, 14.509, -2.64),
+    Model1ThresholdEntry::new(2562.50, 14.660, -2.93),
+    Model1ThresholdEntry::new(2625.00, 14.807, -3.22),
+    Model1ThresholdEntry::new(2687.50, 14.949, -3.49),
+    Model1ThresholdEntry::new(2750.00, 15.087, -3.74),
+    Model1ThresholdEntry::new(2812.50, 15.221, -3.98),
+    Model1ThresholdEntry::new(2875.00, 15.351, -4.20),
+    Model1ThresholdEntry::new(2937.50, 15.478, -4.40),
+    Model1ThresholdEntry::new(3000.00, 15.602, -4.57),
+    Model1ThresholdEntry::new(3125.00, 15.841, -4.82),
+    Model1ThresholdEntry::new(3250.00, 16.069, -4.96),
+    Model1ThresholdEntry::new(3375.00, 16.287, -4.97),
+    Model1ThresholdEntry::new(3500.00, 16.496, -4.86),
+    Model1ThresholdEntry::new(3625.00, 16.697, -4.63),
+    Model1ThresholdEntry::new(3750.00, 16.891, -4.29),
+    Model1ThresholdEntry::new(3875.00, 17.078, -3.87),
+    Model1ThresholdEntry::new(4000.00, 17.259, -3.39),
+    Model1ThresholdEntry::new(4125.00, 17.434, -2.86),
+    Model1ThresholdEntry::new(4250.00, 17.605, -2.31),
+    Model1ThresholdEntry::new(4375.00, 17.770, -1.77),
+    Model1ThresholdEntry::new(4500.00, 17.932, -1.24),
+    Model1ThresholdEntry::new(4625.00, 18.089, -0.74),
+    Model1ThresholdEntry::new(4750.00, 18.242, -0.29),
+    Model1ThresholdEntry::new(4875.00, 18.392, 0.12),
+    Model1ThresholdEntry::new(5000.00, 18.539, 0.48),
+    Model1ThresholdEntry::new(5125.00, 18.682, 0.79),
+    Model1ThresholdEntry::new(5250.00, 18.823, 1.06),
+    Model1ThresholdEntry::new(5375.00, 18.960, 1.29),
+    Model1ThresholdEntry::new(5500.00, 19.095, 1.49),
+    Model1ThresholdEntry::new(5625.00, 19.226, 1.66),
+    Model1ThresholdEntry::new(5750.00, 19.356, 1.81),
+    Model1ThresholdEntry::new(5875.00, 19.482, 1.95),
+    Model1ThresholdEntry::new(6000.00, 19.606, 2.08),
+    Model1ThresholdEntry::new(6250.00, 19.847, 2.33),
+    Model1ThresholdEntry::new(6500.00, 20.079, 2.59),
+    Model1ThresholdEntry::new(6750.00, 20.300, 2.86),
+    Model1ThresholdEntry::new(7000.00, 20.513, 3.17),
+    Model1ThresholdEntry::new(7250.00, 20.717, 3.51),
+    Model1ThresholdEntry::new(7500.00, 20.912, 3.89),
+    Model1ThresholdEntry::new(7750.00, 21.098, 4.31),
+    Model1ThresholdEntry::new(8000.00, 21.275, 4.79),
+    Model1ThresholdEntry::new(8250.00, 21.445, 5.31),
+    Model1ThresholdEntry::new(8500.00, 21.606, 5.88),
+    Model1ThresholdEntry::new(8750.00, 21.760, 6.50),
+    Model1ThresholdEntry::new(9000.00, 21.906, 7.19),
+    Model1ThresholdEntry::new(9250.00, 22.046, 7.93),
+    Model1ThresholdEntry::new(9500.00, 22.178, 8.75),
+    Model1ThresholdEntry::new(9750.00, 22.304, 9.63),
+    Model1ThresholdEntry::new(10000.00, 22.424, 10.58),
+    Model1ThresholdEntry::new(10250.00, 22.538, 11.60),
+    Model1ThresholdEntry::new(10500.00, 22.646, 12.71),
+    Model1ThresholdEntry::new(10750.00, 22.749, 13.90),
+    Model1ThresholdEntry::new(11000.00, 22.847, 15.18),
+    Model1ThresholdEntry::new(11250.00, 22.941, 16.54),
+    Model1ThresholdEntry::new(11500.00, 23.030, 18.01),
+    Model1ThresholdEntry::new(11750.00, 23.114, 19.57),
+    Model1ThresholdEntry::new(12000.00, 23.195, 21.23),
+    Model1ThresholdEntry::new(12250.00, 23.272, 23.01),
+    Model1ThresholdEntry::new(12500.00, 23.345, 24.90),
+    Model1ThresholdEntry::new(12750.00, 23.415, 26.90),
+    Model1ThresholdEntry::new(13000.00, 23.482, 29.03),
+    Model1ThresholdEntry::new(13250.00, 23.546, 31.28),
+    Model1ThresholdEntry::new(13500.00, 23.607, 33.67),
+    Model1ThresholdEntry::new(13750.00, 23.666, 36.19),
+    Model1ThresholdEntry::new(14000.00, 23.722, 38.86),
+    Model1ThresholdEntry::new(14250.00, 23.775, 41.67),
+    Model1ThresholdEntry::new(14500.00, 23.827, 44.63),
+    Model1ThresholdEntry::new(14750.00, 23.876, 47.76),
+    Model1ThresholdEntry::new(15000.00, 23.923, 51.04),
+];
+
+/// Table D.1b — Layer I, Fs = 44,1 kHz (106 rows, printed p.117).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.1b-threshold-in-quiet-LayerI-44k1Hz-p117.png`.
+pub const MODEL1_THRESHOLD_D1B: [Model1ThresholdEntry; 106] = [
+    Model1ThresholdEntry::new(86.13, 0.850, 25.87),
+    Model1ThresholdEntry::new(172.27, 1.694, 14.85),
+    Model1ThresholdEntry::new(258.40, 2.525, 10.72),
+    Model1ThresholdEntry::new(344.53, 3.337, 8.50),
+    Model1ThresholdEntry::new(430.66, 4.124, 7.10),
+    Model1ThresholdEntry::new(516.80, 4.882, 6.11),
+    Model1ThresholdEntry::new(602.93, 5.608, 5.37),
+    Model1ThresholdEntry::new(689.06, 6.301, 4.79),
+    Model1ThresholdEntry::new(775.20, 6.959, 4.32),
+    Model1ThresholdEntry::new(861.33, 7.581, 3.92),
+    Model1ThresholdEntry::new(947.46, 8.169, 3.57),
+    Model1ThresholdEntry::new(1033.59, 8.723, 3.25),
+    Model1ThresholdEntry::new(1119.73, 9.244, 2.95),
+    Model1ThresholdEntry::new(1205.86, 9.734, 2.67),
+    Model1ThresholdEntry::new(1291.99, 10.195, 2.39),
+    Model1ThresholdEntry::new(1378.13, 10.629, 2.11),
+    Model1ThresholdEntry::new(1464.26, 11.037, 1.83),
+    Model1ThresholdEntry::new(1550.39, 11.421, 1.53),
+    Model1ThresholdEntry::new(1636.52, 11.783, 1.23),
+    Model1ThresholdEntry::new(1722.66, 12.125, 0.90),
+    Model1ThresholdEntry::new(1808.79, 12.448, 0.56),
+    Model1ThresholdEntry::new(1894.92, 12.753, 0.21),
+    Model1ThresholdEntry::new(1981.05, 13.042, -0.17),
+    Model1ThresholdEntry::new(2067.19, 13.317, -0.56),
+    Model1ThresholdEntry::new(2153.32, 13.578, -0.96),
+    Model1ThresholdEntry::new(2239.45, 13.826, -1.38),
+    Model1ThresholdEntry::new(2325.59, 14.062, -1.79),
+    Model1ThresholdEntry::new(2411.72, 14.288, -2.21),
+    Model1ThresholdEntry::new(2497.85, 14.504, -2.63),
+    Model1ThresholdEntry::new(2583.98, 14.711, -3.03),
+    Model1ThresholdEntry::new(2670.12, 14.909, -3.41),
+    Model1ThresholdEntry::new(2756.25, 15.100, -3.77),
+    Model1ThresholdEntry::new(2842.38, 15.284, -4.09),
+    Model1ThresholdEntry::new(2928.52, 15.460, -4.37),
+    Model1ThresholdEntry::new(3014.65, 15.631, -4.60),
+    Model1ThresholdEntry::new(3100.78, 15.796, -4.78),
+    Model1ThresholdEntry::new(3186.91, 15.955, -4.91),
+    Model1ThresholdEntry::new(3273.05, 16.110, -4.97),
+    Model1ThresholdEntry::new(3359.18, 16.260, -4.98),
+    Model1ThresholdEntry::new(3445.31, 16.406, -4.92),
+    Model1ThresholdEntry::new(3531.45, 16.547, -4.81),
+    Model1ThresholdEntry::new(3617.58, 16.685, -4.65),
+    Model1ThresholdEntry::new(3703.71, 16.820, -4.43),
+    Model1ThresholdEntry::new(3789.84, 16.951, -4.17),
+    Model1ThresholdEntry::new(3875.98, 17.079, -3.87),
+    Model1ThresholdEntry::new(3962.11, 17.205, -3.54),
+    Model1ThresholdEntry::new(4048.24, 17.327, -3.19),
+    Model1ThresholdEntry::new(4134.38, 17.447, -2.82),
+    Model1ThresholdEntry::new(4306.64, 17.680, -2.06),
+    Model1ThresholdEntry::new(4478.91, 17.905, -1.32),
+    Model1ThresholdEntry::new(4651.17, 18.121, -0.64),
+    Model1ThresholdEntry::new(4823.44, 18.331, -0.04),
+    Model1ThresholdEntry::new(4995.70, 18.534, 0.47),
+    Model1ThresholdEntry::new(5167.97, 18.731, 0.89),
+    Model1ThresholdEntry::new(5340.23, 18.922, 1.23),
+    Model1ThresholdEntry::new(5512.50, 19.108, 1.51),
+    Model1ThresholdEntry::new(5684.77, 19.289, 1.74),
+    Model1ThresholdEntry::new(5857.03, 19.464, 1.93),
+    Model1ThresholdEntry::new(6029.30, 19.635, 2.11),
+    Model1ThresholdEntry::new(6201.56, 19.801, 2.28),
+    Model1ThresholdEntry::new(6373.83, 19.963, 2.46),
+    Model1ThresholdEntry::new(6546.09, 20.120, 2.63),
+    Model1ThresholdEntry::new(6718.36, 20.273, 2.82),
+    Model1ThresholdEntry::new(6890.63, 20.421, 3.03),
+    Model1ThresholdEntry::new(7062.89, 20.565, 3.25),
+    Model1ThresholdEntry::new(7235.16, 20.705, 3.49),
+    Model1ThresholdEntry::new(7407.42, 20.840, 3.74),
+    Model1ThresholdEntry::new(7579.69, 20.972, 4.02),
+    Model1ThresholdEntry::new(7751.95, 21.099, 4.32),
+    Model1ThresholdEntry::new(7924.22, 21.222, 4.64),
+    Model1ThresholdEntry::new(8096.48, 21.342, 4.98),
+    Model1ThresholdEntry::new(8268.75, 21.457, 5.35),
+    Model1ThresholdEntry::new(8613.28, 21.677, 6.15),
+    Model1ThresholdEntry::new(8957.81, 21.882, 7.07),
+    Model1ThresholdEntry::new(9302.34, 22.074, 8.10),
+    Model1ThresholdEntry::new(9646.88, 22.253, 9.25),
+    Model1ThresholdEntry::new(9991.41, 22.420, 10.54),
+    Model1ThresholdEntry::new(10335.94, 22.576, 11.97),
+    Model1ThresholdEntry::new(10680.47, 22.721, 13.56),
+    Model1ThresholdEntry::new(11025.00, 22.857, 15.31),
+    Model1ThresholdEntry::new(11369.53, 22.984, 17.23),
+    Model1ThresholdEntry::new(11714.06, 23.102, 19.34),
+    Model1ThresholdEntry::new(12058.59, 23.213, 21.64),
+    Model1ThresholdEntry::new(12403.13, 23.317, 24.15),
+    Model1ThresholdEntry::new(12747.66, 23.415, 26.88),
+    Model1ThresholdEntry::new(13092.19, 23.506, 29.84),
+    Model1ThresholdEntry::new(13436.72, 23.592, 33.05),
+    Model1ThresholdEntry::new(13781.25, 23.673, 36.52),
+    Model1ThresholdEntry::new(14125.78, 23.749, 40.25),
+    Model1ThresholdEntry::new(14470.31, 23.821, 44.27),
+    Model1ThresholdEntry::new(14814.84, 23.888, 48.59),
+    Model1ThresholdEntry::new(15159.38, 23.952, 53.22),
+    Model1ThresholdEntry::new(15503.91, 24.013, 58.18),
+    Model1ThresholdEntry::new(15848.44, 24.070, 63.49),
+    Model1ThresholdEntry::new(16192.97, 24.125, 68.00),
+    Model1ThresholdEntry::new(16537.50, 24.176, 68.00),
+    Model1ThresholdEntry::new(16882.03, 24.225, 68.00),
+    Model1ThresholdEntry::new(17226.56, 24.271, 68.00),
+    Model1ThresholdEntry::new(17571.09, 24.316, 68.00),
+    Model1ThresholdEntry::new(17915.63, 24.358, 68.00),
+    Model1ThresholdEntry::new(18260.16, 24.398, 68.00),
+    Model1ThresholdEntry::new(18604.69, 24.436, 68.00),
+    Model1ThresholdEntry::new(18949.22, 24.473, 68.00),
+    Model1ThresholdEntry::new(19293.75, 24.508, 68.00),
+    Model1ThresholdEntry::new(19638.28, 24.542, 68.00),
+    Model1ThresholdEntry::new(19982.81, 24.574, 68.00),
+];
+
+/// Table D.1c — Layer I, Fs = 48 kHz (102 rows, printed p.118).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.1c-threshold-in-quiet-LayerI-48kHz-p118.png`.
+pub const MODEL1_THRESHOLD_D1C: [Model1ThresholdEntry; 102] = [
+    Model1ThresholdEntry::new(93.75, 0.925, 24.17),
+    Model1ThresholdEntry::new(187.50, 1.842, 13.87),
+    Model1ThresholdEntry::new(281.25, 2.742, 10.01),
+    Model1ThresholdEntry::new(375.00, 3.618, 7.94),
+    Model1ThresholdEntry::new(468.75, 4.463, 6.62),
+    Model1ThresholdEntry::new(562.50, 5.272, 5.70),
+    Model1ThresholdEntry::new(656.25, 6.041, 5.00),
+    Model1ThresholdEntry::new(750.00, 6.770, 4.45),
+    Model1ThresholdEntry::new(843.75, 7.457, 4.00),
+    Model1ThresholdEntry::new(937.50, 8.103, 3.61),
+    Model1ThresholdEntry::new(1031.25, 8.708, 3.26),
+    Model1ThresholdEntry::new(1125.00, 9.275, 2.93),
+    Model1ThresholdEntry::new(1218.75, 9.805, 2.63),
+    Model1ThresholdEntry::new(1312.50, 10.301, 2.32),
+    Model1ThresholdEntry::new(1406.25, 10.765, 2.02),
+    Model1ThresholdEntry::new(1500.00, 11.199, 1.71),
+    Model1ThresholdEntry::new(1593.75, 11.606, 1.38),
+    Model1ThresholdEntry::new(1687.50, 11.988, 1.04),
+    Model1ThresholdEntry::new(1781.25, 12.347, 0.67),
+    Model1ThresholdEntry::new(1875.00, 12.684, 0.29),
+    Model1ThresholdEntry::new(1968.75, 13.002, -0.11),
+    Model1ThresholdEntry::new(2062.50, 13.302, -0.54),
+    Model1ThresholdEntry::new(2156.25, 13.586, -0.97),
+    Model1ThresholdEntry::new(2250.00, 13.855, -1.43),
+    Model1ThresholdEntry::new(2343.75, 14.111, -1.88),
+    Model1ThresholdEntry::new(2437.50, 14.354, -2.34),
+    Model1ThresholdEntry::new(2531.25, 14.585, -2.79),
+    Model1ThresholdEntry::new(2625.00, 14.807, -3.22),
+    Model1ThresholdEntry::new(2718.75, 15.018, -3.62),
+    Model1ThresholdEntry::new(2812.50, 15.221, -3.98),
+    Model1ThresholdEntry::new(2906.25, 15.415, -4.30),
+    Model1ThresholdEntry::new(3000.00, 15.602, -4.57),
+    Model1ThresholdEntry::new(3093.75, 15.783, -4.77),
+    Model1ThresholdEntry::new(3187.50, 15.956, -4.91),
+    Model1ThresholdEntry::new(3281.25, 16.124, -4.98),
+    Model1ThresholdEntry::new(3375.00, 16.287, -4.97),
+    Model1ThresholdEntry::new(3468.75, 16.445, -4.90),
+    Model1ThresholdEntry::new(3562.50, 16.598, -4.76),
+    Model1ThresholdEntry::new(3656.25, 16.746, -4.55),
+    Model1ThresholdEntry::new(3750.00, 16.891, -4.29),
+    Model1ThresholdEntry::new(3843.75, 17.032, -3.99),
+    Model1ThresholdEntry::new(3937.50, 17.169, -3.64),
+    Model1ThresholdEntry::new(4031.25, 17.303, -3.26),
+    Model1ThresholdEntry::new(4125.00, 17.434, -2.86),
+    Model1ThresholdEntry::new(4218.75, 17.563, -2.45),
+    Model1ThresholdEntry::new(4312.50, 17.688, -2.04),
+    Model1ThresholdEntry::new(4406.25, 17.811, -1.63),
+    Model1ThresholdEntry::new(4500.00, 17.932, -1.24),
+    Model1ThresholdEntry::new(4687.50, 18.166, -0.51),
+    Model1ThresholdEntry::new(4875.00, 18.392, 0.12),
+    Model1ThresholdEntry::new(5062.50, 18.611, 0.64),
+    Model1ThresholdEntry::new(5250.00, 18.823, 1.06),
+    Model1ThresholdEntry::new(5437.50, 19.028, 1.39),
+    Model1ThresholdEntry::new(5625.00, 19.226, 1.66),
+    Model1ThresholdEntry::new(5812.50, 19.419, 1.88),
+    Model1ThresholdEntry::new(6000.00, 19.606, 2.08),
+    Model1ThresholdEntry::new(6187.50, 19.788, 2.27),
+    Model1ThresholdEntry::new(6375.00, 19.964, 2.46),
+    Model1ThresholdEntry::new(6562.50, 20.135, 2.65),
+    Model1ThresholdEntry::new(6750.00, 20.300, 2.86),
+    Model1ThresholdEntry::new(6937.50, 20.461, 3.09),
+    Model1ThresholdEntry::new(7125.00, 20.616, 3.33),
+    Model1ThresholdEntry::new(7312.50, 20.766, 3.60),
+    Model1ThresholdEntry::new(7500.00, 20.912, 3.89),
+    Model1ThresholdEntry::new(7687.50, 21.052, 4.20),
+    Model1ThresholdEntry::new(7875.00, 21.188, 4.54),
+    Model1ThresholdEntry::new(8062.50, 21.318, 4.91),
+    Model1ThresholdEntry::new(8250.00, 21.445, 5.31),
+    Model1ThresholdEntry::new(8437.50, 21.567, 5.73),
+    Model1ThresholdEntry::new(8625.00, 21.684, 6.18),
+    Model1ThresholdEntry::new(8812.50, 21.797, 6.67),
+    Model1ThresholdEntry::new(9000.00, 21.906, 7.19),
+    Model1ThresholdEntry::new(9375.00, 22.113, 8.33),
+    Model1ThresholdEntry::new(9750.00, 22.304, 9.63),
+    Model1ThresholdEntry::new(10125.00, 22.482, 11.08),
+    Model1ThresholdEntry::new(10500.00, 22.646, 12.71),
+    Model1ThresholdEntry::new(10875.00, 22.799, 14.53),
+    Model1ThresholdEntry::new(11250.00, 22.941, 16.54),
+    Model1ThresholdEntry::new(11625.00, 23.072, 18.77),
+    Model1ThresholdEntry::new(12000.00, 23.195, 21.23),
+    Model1ThresholdEntry::new(12375.00, 23.309, 23.94),
+    Model1ThresholdEntry::new(12750.00, 23.415, 26.90),
+    Model1ThresholdEntry::new(13125.00, 23.515, 30.14),
+    Model1ThresholdEntry::new(13500.00, 23.607, 33.67),
+    Model1ThresholdEntry::new(13875.00, 23.694, 37.51),
+    Model1ThresholdEntry::new(14250.00, 23.775, 41.67),
+    Model1ThresholdEntry::new(14625.00, 23.852, 46.17),
+    Model1ThresholdEntry::new(15000.00, 23.923, 51.04),
+    Model1ThresholdEntry::new(15375.00, 23.991, 56.29),
+    Model1ThresholdEntry::new(15750.00, 24.054, 61.94),
+    Model1ThresholdEntry::new(16125.00, 24.114, 68.00),
+    Model1ThresholdEntry::new(16500.00, 24.171, 68.00),
+    Model1ThresholdEntry::new(16875.00, 24.224, 68.00),
+    Model1ThresholdEntry::new(17250.00, 24.275, 68.00),
+    Model1ThresholdEntry::new(17625.00, 24.322, 68.00),
+    Model1ThresholdEntry::new(18000.00, 24.368, 68.00),
+    Model1ThresholdEntry::new(18375.00, 24.411, 68.00),
+    Model1ThresholdEntry::new(18750.00, 24.452, 68.00),
+    Model1ThresholdEntry::new(19125.00, 24.491, 68.00),
+    Model1ThresholdEntry::new(19500.00, 24.528, 68.00),
+    Model1ThresholdEntry::new(19875.00, 24.564, 68.00),
+    Model1ThresholdEntry::new(20250.00, 24.597, 68.00),
+];
+
+/// Table D.1d — Layer II, Fs = 32 kHz (132 rows, printed p.119).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.1d-threshold-in-quiet-LayerII-32kHz-p119.png`.
+///
+/// Rows 49.. print the same frequency / z / LTq values as the
+/// matching Layer I table's rows 25.. (the two line grids coincide
+/// there) — verified on the renders and pinned by a unit test.
+// The 6,28 dB threshold at 500 Hz is the spec's printed table value,
+// not an approximation of a mathematical constant.
+#[allow(clippy::approx_constant)]
+pub const MODEL1_THRESHOLD_D1D: [Model1ThresholdEntry; 132] = [
+    Model1ThresholdEntry::new(31.25, 0.309, 58.23),
+    Model1ThresholdEntry::new(62.50, 0.617, 33.44),
+    Model1ThresholdEntry::new(93.75, 0.925, 24.17),
+    Model1ThresholdEntry::new(125.00, 1.232, 19.20),
+    Model1ThresholdEntry::new(156.25, 1.538, 16.05),
+    Model1ThresholdEntry::new(187.50, 1.842, 13.87),
+    Model1ThresholdEntry::new(218.75, 2.145, 12.26),
+    Model1ThresholdEntry::new(250.00, 2.445, 11.01),
+    Model1ThresholdEntry::new(281.25, 2.742, 10.01),
+    Model1ThresholdEntry::new(312.50, 3.037, 9.20),
+    Model1ThresholdEntry::new(343.75, 3.329, 8.52),
+    Model1ThresholdEntry::new(375.00, 3.618, 7.94),
+    Model1ThresholdEntry::new(406.25, 3.903, 7.44),
+    Model1ThresholdEntry::new(437.50, 4.185, 7.00),
+    Model1ThresholdEntry::new(468.75, 4.463, 6.62),
+    Model1ThresholdEntry::new(500.00, 4.736, 6.28),
+    Model1ThresholdEntry::new(531.25, 5.006, 5.97),
+    Model1ThresholdEntry::new(562.50, 5.272, 5.70),
+    Model1ThresholdEntry::new(593.75, 5.533, 5.44),
+    Model1ThresholdEntry::new(625.00, 5.789, 5.21),
+    Model1ThresholdEntry::new(656.25, 6.041, 5.00),
+    Model1ThresholdEntry::new(687.50, 6.289, 4.80),
+    Model1ThresholdEntry::new(718.75, 6.532, 4.62),
+    Model1ThresholdEntry::new(750.00, 6.770, 4.45),
+    Model1ThresholdEntry::new(781.25, 7.004, 4.29),
+    Model1ThresholdEntry::new(812.50, 7.233, 4.14),
+    Model1ThresholdEntry::new(843.75, 7.457, 4.00),
+    Model1ThresholdEntry::new(875.00, 7.677, 3.86),
+    Model1ThresholdEntry::new(906.25, 7.892, 3.73),
+    Model1ThresholdEntry::new(937.50, 8.103, 3.61),
+    Model1ThresholdEntry::new(968.75, 8.309, 3.49),
+    Model1ThresholdEntry::new(1000.00, 8.511, 3.37),
+    Model1ThresholdEntry::new(1031.25, 8.708, 3.26),
+    Model1ThresholdEntry::new(1062.50, 8.901, 3.15),
+    Model1ThresholdEntry::new(1093.75, 9.090, 3.04),
+    Model1ThresholdEntry::new(1125.00, 9.275, 2.93),
+    Model1ThresholdEntry::new(1156.25, 9.456, 2.83),
+    Model1ThresholdEntry::new(1187.50, 9.632, 2.73),
+    Model1ThresholdEntry::new(1218.75, 9.805, 2.63),
+    Model1ThresholdEntry::new(1250.00, 9.974, 2.53),
+    Model1ThresholdEntry::new(1281.25, 10.139, 2.42),
+    Model1ThresholdEntry::new(1312.50, 10.301, 2.32),
+    Model1ThresholdEntry::new(1343.75, 10.459, 2.22),
+    Model1ThresholdEntry::new(1375.00, 10.614, 2.12),
+    Model1ThresholdEntry::new(1406.25, 10.765, 2.02),
+    Model1ThresholdEntry::new(1437.50, 10.913, 1.92),
+    Model1ThresholdEntry::new(1468.75, 11.058, 1.81),
+    Model1ThresholdEntry::new(1500.00, 11.199, 1.71),
+    Model1ThresholdEntry::new(1562.50, 11.474, 1.49),
+    Model1ThresholdEntry::new(1625.00, 11.736, 1.27),
+    Model1ThresholdEntry::new(1687.50, 11.988, 1.04),
+    Model1ThresholdEntry::new(1750.00, 12.230, 0.80),
+    Model1ThresholdEntry::new(1812.50, 12.461, 0.55),
+    Model1ThresholdEntry::new(1875.00, 12.684, 0.29),
+    Model1ThresholdEntry::new(1937.50, 12.898, 0.02),
+    Model1ThresholdEntry::new(2000.00, 13.104, -0.25),
+    Model1ThresholdEntry::new(2062.50, 13.302, -0.54),
+    Model1ThresholdEntry::new(2125.00, 13.493, -0.83),
+    Model1ThresholdEntry::new(2187.50, 13.678, -1.12),
+    Model1ThresholdEntry::new(2250.00, 13.855, -1.43),
+    Model1ThresholdEntry::new(2312.50, 14.027, -1.73),
+    Model1ThresholdEntry::new(2375.00, 14.193, -2.04),
+    Model1ThresholdEntry::new(2437.50, 14.354, -2.34),
+    Model1ThresholdEntry::new(2500.00, 14.509, -2.64),
+    Model1ThresholdEntry::new(2562.50, 14.660, -2.93),
+    Model1ThresholdEntry::new(2625.00, 14.807, -3.22),
+    Model1ThresholdEntry::new(2687.50, 14.949, -3.49),
+    Model1ThresholdEntry::new(2750.00, 15.087, -3.74),
+    Model1ThresholdEntry::new(2812.50, 15.221, -3.98),
+    Model1ThresholdEntry::new(2875.00, 15.351, -4.20),
+    Model1ThresholdEntry::new(2937.50, 15.478, -4.40),
+    Model1ThresholdEntry::new(3000.00, 15.602, -4.57),
+    Model1ThresholdEntry::new(3125.00, 15.841, -4.82),
+    Model1ThresholdEntry::new(3250.00, 16.069, -4.96),
+    Model1ThresholdEntry::new(3375.00, 16.287, -4.97),
+    Model1ThresholdEntry::new(3500.00, 16.496, -4.86),
+    Model1ThresholdEntry::new(3625.00, 16.697, -4.63),
+    Model1ThresholdEntry::new(3750.00, 16.891, -4.29),
+    Model1ThresholdEntry::new(3875.00, 17.078, -3.87),
+    Model1ThresholdEntry::new(4000.00, 17.259, -3.39),
+    Model1ThresholdEntry::new(4125.00, 17.434, -2.86),
+    Model1ThresholdEntry::new(4250.00, 17.605, -2.31),
+    Model1ThresholdEntry::new(4375.00, 17.770, -1.77),
+    Model1ThresholdEntry::new(4500.00, 17.932, -1.24),
+    Model1ThresholdEntry::new(4625.00, 18.089, -0.74),
+    Model1ThresholdEntry::new(4750.00, 18.242, -0.29),
+    Model1ThresholdEntry::new(4875.00, 18.392, 0.12),
+    Model1ThresholdEntry::new(5000.00, 18.539, 0.48),
+    Model1ThresholdEntry::new(5125.00, 18.682, 0.79),
+    Model1ThresholdEntry::new(5250.00, 18.823, 1.06),
+    Model1ThresholdEntry::new(5375.00, 18.960, 1.29),
+    Model1ThresholdEntry::new(5500.00, 19.095, 1.49),
+    Model1ThresholdEntry::new(5625.00, 19.226, 1.66),
+    Model1ThresholdEntry::new(5750.00, 19.356, 1.81),
+    Model1ThresholdEntry::new(5875.00, 19.482, 1.95),
+    Model1ThresholdEntry::new(6000.00, 19.606, 2.08),
+    Model1ThresholdEntry::new(6250.00, 19.847, 2.33),
+    Model1ThresholdEntry::new(6500.00, 20.079, 2.59),
+    Model1ThresholdEntry::new(6750.00, 20.300, 2.86),
+    Model1ThresholdEntry::new(7000.00, 20.513, 3.17),
+    Model1ThresholdEntry::new(7250.00, 20.717, 3.51),
+    Model1ThresholdEntry::new(7500.00, 20.912, 3.89),
+    Model1ThresholdEntry::new(7750.00, 21.098, 4.31),
+    Model1ThresholdEntry::new(8000.00, 21.275, 4.79),
+    Model1ThresholdEntry::new(8250.00, 21.445, 5.31),
+    Model1ThresholdEntry::new(8500.00, 21.606, 5.88),
+    Model1ThresholdEntry::new(8750.00, 21.760, 6.50),
+    Model1ThresholdEntry::new(9000.00, 21.906, 7.19),
+    Model1ThresholdEntry::new(9250.00, 22.046, 7.93),
+    Model1ThresholdEntry::new(9500.00, 22.178, 8.75),
+    Model1ThresholdEntry::new(9750.00, 22.304, 9.63),
+    Model1ThresholdEntry::new(10000.00, 22.424, 10.58),
+    Model1ThresholdEntry::new(10250.00, 22.538, 11.60),
+    Model1ThresholdEntry::new(10500.00, 22.646, 12.71),
+    Model1ThresholdEntry::new(10750.00, 22.749, 13.90),
+    Model1ThresholdEntry::new(11000.00, 22.847, 15.18),
+    Model1ThresholdEntry::new(11250.00, 22.941, 16.54),
+    Model1ThresholdEntry::new(11500.00, 23.030, 18.01),
+    Model1ThresholdEntry::new(11750.00, 23.114, 19.57),
+    Model1ThresholdEntry::new(12000.00, 23.195, 21.23),
+    Model1ThresholdEntry::new(12250.00, 23.272, 23.01),
+    Model1ThresholdEntry::new(12500.00, 23.345, 24.90),
+    Model1ThresholdEntry::new(12750.00, 23.415, 26.90),
+    Model1ThresholdEntry::new(13000.00, 23.482, 29.03),
+    Model1ThresholdEntry::new(13250.00, 23.546, 31.28),
+    Model1ThresholdEntry::new(13500.00, 23.607, 33.67),
+    Model1ThresholdEntry::new(13750.00, 23.666, 36.19),
+    Model1ThresholdEntry::new(14000.00, 23.722, 38.86),
+    Model1ThresholdEntry::new(14250.00, 23.775, 41.67),
+    Model1ThresholdEntry::new(14500.00, 23.827, 44.63),
+    Model1ThresholdEntry::new(14750.00, 23.876, 47.76),
+    Model1ThresholdEntry::new(15000.00, 23.923, 51.04),
+];
+
+/// Table D.1e — Layer II, Fs = 44,1 kHz (130 rows, printed p.120).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.1e-threshold-in-quiet-LayerII-44k1Hz-p120.png`.
+///
+/// Rows 49.. print the same frequency / z / LTq values as the
+/// matching Layer I table's rows 25.. (the two line grids coincide
+/// there) — verified on the renders and pinned by a unit test.
+pub const MODEL1_THRESHOLD_D1E: [Model1ThresholdEntry; 130] = [
+    Model1ThresholdEntry::new(43.07, 0.425, 45.05),
+    Model1ThresholdEntry::new(86.13, 0.850, 25.87),
+    Model1ThresholdEntry::new(129.20, 1.273, 18.70),
+    Model1ThresholdEntry::new(172.27, 1.694, 14.85),
+    Model1ThresholdEntry::new(215.33, 2.112, 12.41),
+    Model1ThresholdEntry::new(258.40, 2.525, 10.72),
+    Model1ThresholdEntry::new(301.46, 2.934, 9.47),
+    Model1ThresholdEntry::new(344.53, 3.337, 8.50),
+    Model1ThresholdEntry::new(387.60, 3.733, 7.73),
+    Model1ThresholdEntry::new(430.66, 4.124, 7.10),
+    Model1ThresholdEntry::new(473.73, 4.507, 6.56),
+    Model1ThresholdEntry::new(516.80, 4.882, 6.11),
+    Model1ThresholdEntry::new(559.86, 5.249, 5.72),
+    Model1ThresholdEntry::new(602.93, 5.608, 5.37),
+    Model1ThresholdEntry::new(646.00, 5.959, 5.07),
+    Model1ThresholdEntry::new(689.06, 6.301, 4.79),
+    Model1ThresholdEntry::new(732.13, 6.634, 4.55),
+    Model1ThresholdEntry::new(775.20, 6.959, 4.32),
+    Model1ThresholdEntry::new(818.26, 7.274, 4.11),
+    Model1ThresholdEntry::new(861.33, 7.581, 3.92),
+    Model1ThresholdEntry::new(904.39, 7.879, 3.74),
+    Model1ThresholdEntry::new(947.46, 8.169, 3.57),
+    Model1ThresholdEntry::new(990.53, 8.450, 3.40),
+    Model1ThresholdEntry::new(1033.59, 8.723, 3.25),
+    Model1ThresholdEntry::new(1076.66, 8.987, 3.10),
+    Model1ThresholdEntry::new(1119.73, 9.244, 2.95),
+    Model1ThresholdEntry::new(1162.79, 9.493, 2.81),
+    Model1ThresholdEntry::new(1205.86, 9.734, 2.67),
+    Model1ThresholdEntry::new(1248.93, 9.968, 2.53),
+    Model1ThresholdEntry::new(1291.99, 10.195, 2.39),
+    Model1ThresholdEntry::new(1335.06, 10.416, 2.25),
+    Model1ThresholdEntry::new(1378.13, 10.629, 2.11),
+    Model1ThresholdEntry::new(1421.19, 10.836, 1.97),
+    Model1ThresholdEntry::new(1464.26, 11.037, 1.83),
+    Model1ThresholdEntry::new(1507.32, 11.232, 1.68),
+    Model1ThresholdEntry::new(1550.39, 11.421, 1.53),
+    Model1ThresholdEntry::new(1593.46, 11.605, 1.38),
+    Model1ThresholdEntry::new(1636.52, 11.783, 1.23),
+    Model1ThresholdEntry::new(1679.59, 11.957, 1.07),
+    Model1ThresholdEntry::new(1722.66, 12.125, 0.90),
+    Model1ThresholdEntry::new(1765.72, 12.289, 0.74),
+    Model1ThresholdEntry::new(1808.79, 12.448, 0.56),
+    Model1ThresholdEntry::new(1851.86, 12.603, 0.39),
+    Model1ThresholdEntry::new(1894.92, 12.753, 0.21),
+    Model1ThresholdEntry::new(1937.99, 12.900, 0.02),
+    Model1ThresholdEntry::new(1981.05, 13.042, -0.17),
+    Model1ThresholdEntry::new(2024.12, 13.181, -0.36),
+    Model1ThresholdEntry::new(2067.19, 13.317, -0.56),
+    Model1ThresholdEntry::new(2153.32, 13.578, -0.96),
+    Model1ThresholdEntry::new(2239.45, 13.826, -1.38),
+    Model1ThresholdEntry::new(2325.59, 14.062, -1.79),
+    Model1ThresholdEntry::new(2411.72, 14.288, -2.21),
+    Model1ThresholdEntry::new(2497.85, 14.504, -2.63),
+    Model1ThresholdEntry::new(2583.98, 14.711, -3.03),
+    Model1ThresholdEntry::new(2670.12, 14.909, -3.41),
+    Model1ThresholdEntry::new(2756.25, 15.100, -3.77),
+    Model1ThresholdEntry::new(2842.38, 15.284, -4.09),
+    Model1ThresholdEntry::new(2928.52, 15.460, -4.37),
+    Model1ThresholdEntry::new(3014.65, 15.631, -4.60),
+    Model1ThresholdEntry::new(3100.78, 15.796, -4.78),
+    Model1ThresholdEntry::new(3186.91, 15.955, -4.91),
+    Model1ThresholdEntry::new(3273.05, 16.110, -4.97),
+    Model1ThresholdEntry::new(3359.18, 16.260, -4.98),
+    Model1ThresholdEntry::new(3445.31, 16.406, -4.92),
+    Model1ThresholdEntry::new(3531.45, 16.547, -4.81),
+    Model1ThresholdEntry::new(3617.58, 16.685, -4.65),
+    Model1ThresholdEntry::new(3703.71, 16.820, -4.43),
+    Model1ThresholdEntry::new(3789.84, 16.951, -4.17),
+    Model1ThresholdEntry::new(3875.98, 17.079, -3.87),
+    Model1ThresholdEntry::new(3962.11, 17.205, -3.54),
+    Model1ThresholdEntry::new(4048.24, 17.327, -3.19),
+    Model1ThresholdEntry::new(4134.38, 17.447, -2.82),
+    Model1ThresholdEntry::new(4306.64, 17.680, -2.06),
+    Model1ThresholdEntry::new(4478.91, 17.905, -1.32),
+    Model1ThresholdEntry::new(4651.17, 18.121, -0.64),
+    Model1ThresholdEntry::new(4823.44, 18.331, -0.04),
+    Model1ThresholdEntry::new(4995.70, 18.534, 0.47),
+    Model1ThresholdEntry::new(5167.97, 18.731, 0.89),
+    Model1ThresholdEntry::new(5340.23, 18.922, 1.23),
+    Model1ThresholdEntry::new(5512.50, 19.108, 1.51),
+    Model1ThresholdEntry::new(5684.77, 19.289, 1.74),
+    Model1ThresholdEntry::new(5857.03, 19.464, 1.93),
+    Model1ThresholdEntry::new(6029.30, 19.635, 2.11),
+    Model1ThresholdEntry::new(6201.56, 19.801, 2.28),
+    Model1ThresholdEntry::new(6373.83, 19.963, 2.46),
+    Model1ThresholdEntry::new(6546.09, 20.120, 2.63),
+    Model1ThresholdEntry::new(6718.36, 20.273, 2.82),
+    Model1ThresholdEntry::new(6890.63, 20.421, 3.03),
+    Model1ThresholdEntry::new(7062.89, 20.565, 3.25),
+    Model1ThresholdEntry::new(7235.16, 20.705, 3.49),
+    Model1ThresholdEntry::new(7407.42, 20.840, 3.74),
+    Model1ThresholdEntry::new(7579.69, 20.972, 4.02),
+    Model1ThresholdEntry::new(7751.95, 21.099, 4.32),
+    Model1ThresholdEntry::new(7924.22, 21.222, 4.64),
+    Model1ThresholdEntry::new(8096.48, 21.342, 4.98),
+    Model1ThresholdEntry::new(8268.75, 21.457, 5.35),
+    Model1ThresholdEntry::new(8613.28, 21.677, 6.15),
+    Model1ThresholdEntry::new(8957.81, 21.882, 7.07),
+    Model1ThresholdEntry::new(9302.34, 22.074, 8.10),
+    Model1ThresholdEntry::new(9646.88, 22.253, 9.25),
+    Model1ThresholdEntry::new(9991.41, 22.420, 10.54),
+    Model1ThresholdEntry::new(10335.94, 22.576, 11.97),
+    Model1ThresholdEntry::new(10680.47, 22.721, 13.56),
+    Model1ThresholdEntry::new(11025.00, 22.857, 15.31),
+    Model1ThresholdEntry::new(11369.53, 22.984, 17.23),
+    Model1ThresholdEntry::new(11714.06, 23.102, 19.34),
+    Model1ThresholdEntry::new(12058.59, 23.213, 21.64),
+    Model1ThresholdEntry::new(12403.13, 23.317, 24.15),
+    Model1ThresholdEntry::new(12747.66, 23.415, 26.88),
+    Model1ThresholdEntry::new(13092.19, 23.506, 29.84),
+    Model1ThresholdEntry::new(13436.72, 23.592, 33.05),
+    Model1ThresholdEntry::new(13781.25, 23.673, 36.52),
+    Model1ThresholdEntry::new(14125.78, 23.749, 40.25),
+    Model1ThresholdEntry::new(14470.31, 23.821, 44.27),
+    Model1ThresholdEntry::new(14814.84, 23.888, 48.59),
+    Model1ThresholdEntry::new(15159.38, 23.952, 53.22),
+    Model1ThresholdEntry::new(15503.91, 24.013, 58.18),
+    Model1ThresholdEntry::new(15848.44, 24.070, 63.49),
+    Model1ThresholdEntry::new(16192.97, 24.125, 68.00),
+    Model1ThresholdEntry::new(16537.50, 24.176, 68.00),
+    Model1ThresholdEntry::new(16882.03, 24.225, 68.00),
+    Model1ThresholdEntry::new(17226.56, 24.271, 68.00),
+    Model1ThresholdEntry::new(17571.09, 24.316, 68.00),
+    Model1ThresholdEntry::new(17915.63, 24.358, 68.00),
+    Model1ThresholdEntry::new(18260.16, 24.398, 68.00),
+    Model1ThresholdEntry::new(18604.69, 24.436, 68.00),
+    Model1ThresholdEntry::new(18949.22, 24.473, 68.00),
+    Model1ThresholdEntry::new(19293.75, 24.508, 68.00),
+    Model1ThresholdEntry::new(19638.28, 24.542, 68.00),
+    Model1ThresholdEntry::new(19982.81, 24.574, 68.00),
+];
+
+/// Table D.1f — Layer II, Fs = 48 kHz (126 rows, printed p.121).
+///
+/// Verbatim from
+/// `docs/audio/mp3/annex-d-renders/Table-D.1f-threshold-in-quiet-LayerII-48kHz-p121.png`.
+///
+/// Rows 49.. print the same frequency / z / LTq values as the
+/// matching Layer I table's rows 25.. (the two line grids coincide
+/// there) — verified on the renders and pinned by a unit test.
+pub const MODEL1_THRESHOLD_D1F: [Model1ThresholdEntry; 126] = [
+    Model1ThresholdEntry::new(46.88, 0.463, 42.10),
+    Model1ThresholdEntry::new(93.75, 0.925, 24.17),
+    Model1ThresholdEntry::new(140.63, 1.385, 17.47),
+    Model1ThresholdEntry::new(187.50, 1.842, 13.87),
+    Model1ThresholdEntry::new(234.38, 2.295, 11.60),
+    Model1ThresholdEntry::new(281.25, 2.742, 10.01),
+    Model1ThresholdEntry::new(328.13, 3.184, 8.84),
+    Model1ThresholdEntry::new(375.00, 3.618, 7.94),
+    Model1ThresholdEntry::new(421.88, 4.045, 7.22),
+    Model1ThresholdEntry::new(468.75, 4.463, 6.62),
+    Model1ThresholdEntry::new(515.63, 4.872, 6.12),
+    Model1ThresholdEntry::new(562.50, 5.272, 5.70),
+    Model1ThresholdEntry::new(609.38, 5.661, 5.33),
+    Model1ThresholdEntry::new(656.25, 6.041, 5.00),
+    Model1ThresholdEntry::new(703.13, 6.411, 4.71),
+    Model1ThresholdEntry::new(750.00, 6.770, 4.45),
+    Model1ThresholdEntry::new(796.88, 7.119, 4.21),
+    Model1ThresholdEntry::new(843.75, 7.457, 4.00),
+    Model1ThresholdEntry::new(890.63, 7.785, 3.79),
+    Model1ThresholdEntry::new(937.50, 8.103, 3.61),
+    Model1ThresholdEntry::new(984.38, 8.410, 3.43),
+    Model1ThresholdEntry::new(1031.25, 8.708, 3.26),
+    Model1ThresholdEntry::new(1078.13, 8.996, 3.09),
+    Model1ThresholdEntry::new(1125.00, 9.275, 2.93),
+    Model1ThresholdEntry::new(1171.88, 9.544, 2.78),
+    Model1ThresholdEntry::new(1218.75, 9.805, 2.63),
+    Model1ThresholdEntry::new(1265.63, 10.057, 2.47),
+    Model1ThresholdEntry::new(1312.50, 10.301, 2.32),
+    Model1ThresholdEntry::new(1359.38, 10.537, 2.17),
+    Model1ThresholdEntry::new(1406.25, 10.765, 2.02),
+    Model1ThresholdEntry::new(1453.13, 10.986, 1.86),
+    Model1ThresholdEntry::new(1500.00, 11.199, 1.71),
+    Model1ThresholdEntry::new(1546.88, 11.406, 1.55),
+    Model1ThresholdEntry::new(1593.75, 11.606, 1.38),
+    Model1ThresholdEntry::new(1640.63, 11.800, 1.21),
+    Model1ThresholdEntry::new(1687.50, 11.988, 1.04),
+    Model1ThresholdEntry::new(1734.38, 12.170, 0.86),
+    Model1ThresholdEntry::new(1781.25, 12.347, 0.67),
+    Model1ThresholdEntry::new(1828.13, 12.518, 0.49),
+    Model1ThresholdEntry::new(1875.00, 12.684, 0.29),
+    Model1ThresholdEntry::new(1921.88, 12.845, 0.09),
+    Model1ThresholdEntry::new(1968.75, 13.002, -0.11),
+    Model1ThresholdEntry::new(2015.63, 13.154, -0.32),
+    Model1ThresholdEntry::new(2062.50, 13.302, -0.54),
+    Model1ThresholdEntry::new(2109.38, 13.446, -0.75),
+    Model1ThresholdEntry::new(2156.25, 13.586, -0.97),
+    Model1ThresholdEntry::new(2203.13, 13.723, -1.20),
+    Model1ThresholdEntry::new(2250.00, 13.855, -1.43),
+    Model1ThresholdEntry::new(2343.75, 14.111, -1.88),
+    Model1ThresholdEntry::new(2437.50, 14.354, -2.34),
+    Model1ThresholdEntry::new(2531.25, 14.585, -2.79),
+    Model1ThresholdEntry::new(2625.00, 14.807, -3.22),
+    Model1ThresholdEntry::new(2718.75, 15.018, -3.62),
+    Model1ThresholdEntry::new(2812.50, 15.221, -3.98),
+    Model1ThresholdEntry::new(2906.25, 15.415, -4.30),
+    Model1ThresholdEntry::new(3000.00, 15.602, -4.57),
+    Model1ThresholdEntry::new(3093.75, 15.783, -4.77),
+    Model1ThresholdEntry::new(3187.50, 15.956, -4.91),
+    Model1ThresholdEntry::new(3281.25, 16.124, -4.98),
+    Model1ThresholdEntry::new(3375.00, 16.287, -4.97),
+    Model1ThresholdEntry::new(3468.75, 16.445, -4.90),
+    Model1ThresholdEntry::new(3562.50, 16.598, -4.76),
+    Model1ThresholdEntry::new(3656.25, 16.746, -4.55),
+    Model1ThresholdEntry::new(3750.00, 16.891, -4.29),
+    Model1ThresholdEntry::new(3843.75, 17.032, -3.99),
+    Model1ThresholdEntry::new(3937.50, 17.169, -3.64),
+    Model1ThresholdEntry::new(4031.25, 17.303, -3.26),
+    Model1ThresholdEntry::new(4125.00, 17.434, -2.86),
+    Model1ThresholdEntry::new(4218.75, 17.563, -2.45),
+    Model1ThresholdEntry::new(4312.50, 17.688, -2.04),
+    Model1ThresholdEntry::new(4406.25, 17.811, -1.63),
+    Model1ThresholdEntry::new(4500.00, 17.932, -1.24),
+    Model1ThresholdEntry::new(4687.50, 18.166, -0.51),
+    Model1ThresholdEntry::new(4875.00, 18.392, 0.12),
+    Model1ThresholdEntry::new(5062.50, 18.611, 0.64),
+    Model1ThresholdEntry::new(5250.00, 18.823, 1.06),
+    Model1ThresholdEntry::new(5437.50, 19.028, 1.39),
+    Model1ThresholdEntry::new(5625.00, 19.226, 1.66),
+    Model1ThresholdEntry::new(5812.50, 19.419, 1.88),
+    Model1ThresholdEntry::new(6000.00, 19.606, 2.08),
+    Model1ThresholdEntry::new(6187.50, 19.788, 2.27),
+    Model1ThresholdEntry::new(6375.00, 19.964, 2.46),
+    Model1ThresholdEntry::new(6562.50, 20.135, 2.65),
+    Model1ThresholdEntry::new(6750.00, 20.300, 2.86),
+    Model1ThresholdEntry::new(6937.50, 20.461, 3.09),
+    Model1ThresholdEntry::new(7125.00, 20.616, 3.33),
+    Model1ThresholdEntry::new(7312.50, 20.766, 3.60),
+    Model1ThresholdEntry::new(7500.00, 20.912, 3.89),
+    Model1ThresholdEntry::new(7687.50, 21.052, 4.20),
+    Model1ThresholdEntry::new(7875.00, 21.188, 4.54),
+    Model1ThresholdEntry::new(8062.50, 21.318, 4.91),
+    Model1ThresholdEntry::new(8250.00, 21.445, 5.31),
+    Model1ThresholdEntry::new(8437.50, 21.567, 5.73),
+    Model1ThresholdEntry::new(8625.00, 21.684, 6.18),
+    Model1ThresholdEntry::new(8812.50, 21.797, 6.67),
+    Model1ThresholdEntry::new(9000.00, 21.906, 7.19),
+    Model1ThresholdEntry::new(9375.00, 22.113, 8.33),
+    Model1ThresholdEntry::new(9750.00, 22.304, 9.63),
+    Model1ThresholdEntry::new(10125.00, 22.482, 11.08),
+    Model1ThresholdEntry::new(10500.00, 22.646, 12.71),
+    Model1ThresholdEntry::new(10875.00, 22.799, 14.53),
+    Model1ThresholdEntry::new(11250.00, 22.941, 16.54),
+    Model1ThresholdEntry::new(11625.00, 23.072, 18.77),
+    Model1ThresholdEntry::new(12000.00, 23.195, 21.23),
+    Model1ThresholdEntry::new(12375.00, 23.309, 23.94),
+    Model1ThresholdEntry::new(12750.00, 23.415, 26.90),
+    Model1ThresholdEntry::new(13125.00, 23.515, 30.14),
+    Model1ThresholdEntry::new(13500.00, 23.607, 33.67),
+    Model1ThresholdEntry::new(13875.00, 23.694, 37.51),
+    Model1ThresholdEntry::new(14250.00, 23.775, 41.67),
+    Model1ThresholdEntry::new(14625.00, 23.852, 46.17),
+    Model1ThresholdEntry::new(15000.00, 23.923, 51.04),
+    Model1ThresholdEntry::new(15375.00, 23.991, 56.29),
+    Model1ThresholdEntry::new(15750.00, 24.054, 61.94),
+    Model1ThresholdEntry::new(16125.00, 24.114, 68.00),
+    Model1ThresholdEntry::new(16500.00, 24.171, 68.00),
+    Model1ThresholdEntry::new(16875.00, 24.224, 68.00),
+    Model1ThresholdEntry::new(17250.00, 24.275, 68.00),
+    Model1ThresholdEntry::new(17625.00, 24.322, 68.00),
+    Model1ThresholdEntry::new(18000.00, 24.368, 68.00),
+    Model1ThresholdEntry::new(18375.00, 24.411, 68.00),
+    Model1ThresholdEntry::new(18750.00, 24.452, 68.00),
+    Model1ThresholdEntry::new(19125.00, 24.491, 68.00),
+    Model1ThresholdEntry::new(19500.00, 24.528, 68.00),
+    Model1ThresholdEntry::new(19875.00, 24.564, 68.00),
+    Model1ThresholdEntry::new(20250.00, 24.597, 68.00),
+];
+
+/// Return the verbatim Annex D Table D.1 slice for `(layer, fs)`.
+/// Returns `None` for Layer III under the same convention as
+/// [`critical_band_boundaries`]: Annex D defines its tables for
+/// Layer I and Layer II only, and a Layer III caller (clause
+/// C.1.5.3.2.1 re-uses the Layer I/II model) passes the matching
+/// Layer explicitly.
+#[inline]
+#[must_use]
+pub fn model1_threshold_table(
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+) -> Option<&'static [Model1ThresholdEntry]> {
+    use crate::frame::Layer;
+    match (layer, fs) {
+        (Layer::LayerI, AnnexDSamplingRate::Hz32000) => Some(&MODEL1_THRESHOLD_D1A),
+        (Layer::LayerI, AnnexDSamplingRate::Hz44100) => Some(&MODEL1_THRESHOLD_D1B),
+        (Layer::LayerI, AnnexDSamplingRate::Hz48000) => Some(&MODEL1_THRESHOLD_D1C),
+        (Layer::LayerII, AnnexDSamplingRate::Hz32000) => Some(&MODEL1_THRESHOLD_D1D),
+        (Layer::LayerII, AnnexDSamplingRate::Hz44100) => Some(&MODEL1_THRESHOLD_D1E),
+        (Layer::LayerII, AnnexDSamplingRate::Hz48000) => Some(&MODEL1_THRESHOLD_D1F),
+        (Layer::LayerIII, _) => None,
+    }
+}
+
+/// Map a 1-based Table D.1 `Index Number i` to the raw FFT-line index
+/// (the step-77 spectrum index `k`) the row sits on, per the table's
+/// printed frequency column: rows 1..=48 are lines 1..=48, rows
+/// 49..=72 are every 2nd line (50..=96), rows 73..=96 every 4th line
+/// (100..=192; Layer I tables continue this region to their end), and
+/// Layer II rows 97.. every 8th line (200..). Returns `None` for
+/// `index == 0`, an index past the table's last row, or a Layer III
+/// dispatch.
+#[inline]
+#[must_use]
+pub fn model1_d1_line_for_index(
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+    index: u16,
+) -> Option<u16> {
+    use crate::frame::Layer;
+    let table = model1_threshold_table(layer, fs)?;
+    if index == 0 || (index as usize) > table.len() {
+        return None;
+    }
+    Some(match index {
+        1..=48 => index,
+        49..=72 => 2 * index - 48,
+        // Layer I stays in the 4-line region to its last row; Layer II
+        // switches to the 8-line region at row 97.
+        _ if matches!(layer, Layer::LayerI) || index <= 96 => 4 * index - 192,
+        _ => 8 * index - 576,
+    })
+}
+
+/// Map a raw FFT-line index `k` (0-based step-77 spectrum index) to
+/// the 1-based Table D.1 `Index Number i` of the **nearest** tabulated
+/// line. In the subsampled regions an unlisted line maps to the
+/// closest listed neighbour; an exact mid-point tie resolves to the
+/// **lower** index (the spec subsamples without prescribing a rounding
+/// rule for off-grid lines — the tie-down choice is documented here
+/// and pinned by a unit test; the z error of either choice is bounded
+/// by half the local Bark step). Returns `None` for `k == 0` (DC; the
+/// tables are 1-based), for `k` above the table's last tabulated line
+/// (no extrapolation past the audio band the spec tabulates), and for
+/// a Layer III dispatch.
+#[must_use]
+pub fn model1_d1_index_for_line(
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+    k: u16,
+) -> Option<u16> {
+    let table = model1_threshold_table(layer, fs)?;
+    let len = table.len() as u16;
+    let line = |i: u16| model1_d1_line_for_index(layer, fs, i).expect("index in 1..=len");
+    if k == 0 || k > line(len) {
+        return None;
+    }
+    // Binary search for the greatest index whose line is <= k (exists:
+    // line(1) = 1 <= k).
+    let (mut lo, mut hi) = (1u16, len);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if line(mid) <= k {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    // Nearest of floor / ceil; ties resolve down.
+    if lo < len && (line(lo + 1) - k) < (k - line(lo)) {
+        lo += 1;
+    }
+    Some(lo)
+}
+
+/// Convenience lookup: the Table D.1 row nearest to the raw FFT line
+/// `k`, under the [`model1_d1_index_for_line`] mapping (same `None`
+/// conditions).
+#[inline]
+#[must_use]
+pub fn model1_d1_entry_for_line(
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+    k: u16,
+) -> Option<&'static Model1ThresholdEntry> {
+    let table = model1_threshold_table(layer, fs)?;
+    let index = model1_d1_index_for_line(layer, fs, k)?;
+    Some(&table[index as usize - 1])
+}
+
+/// Lift one §D.1 Step 4 component (line index `k` + SPL + kind, r277)
+/// into the Bark-domain [`Masker`] carrier consumed by the Step 5
+/// primitives and the Step 6/7 threshold evaluators: the masker's
+/// `z_bark` is the `Crit.Band Rate` column of the Table D.1 row
+/// nearest to `k`, and its SPL and tonal/non-tonal kind pass through
+/// unchanged. Returns `None` when `k` has no Table D.1 row (DC, or
+/// above the table's last tabulated line) or for a Layer III dispatch.
+#[inline]
+#[must_use]
+pub fn model1_masker_from_component(
+    component: &Model1Step4Component,
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+) -> Option<Masker> {
+    let entry = model1_d1_entry_for_line(layer, fs, component.k)?;
+    Some(Masker {
+        kind: component.kind,
+        z_bark: entry.z_bark,
+        spl_db: component.spl_db,
+    })
+}
+
+/// §D.1 Step 5 end-to-end sieve over the Step 4 component lists
+/// (Phase 2 step 80 / r278): lifts every tonal and non-tonal component
+/// onto the Table D.1 Bark grid ([`model1_masker_from_component`]),
+/// applies the Step 5(a) threshold-in-quiet screen against the same
+/// row's `Absolute Thresh.` column (`X_tm(k) >= LTq(k)` /
+/// `X_nm(k) >= LTq(k)`, via [`masker_above_threshold_in_quiet`]), and
+/// collapses tonal clusters within the 0,5-Bark sliding window
+/// ([`decimate_tonal_within_half_bark`], Step 5(b)). The returned
+/// maskers are ready for the Step 6/7 evaluators
+/// ([`individual_masking_threshold_db`] /
+/// [`global_masking_threshold_db`]).
+///
+/// Components whose line lies above the table's last tabulated line
+/// are dropped: the spec tabulates neither a Bark coordinate nor an
+/// LTq there, and the Tables D.2 critical bands (whose top line equals
+/// the Table D.1 top line) end at the same point, so such components
+/// sit outside the audio band the model evaluates. Output order is
+/// the tonal list followed by the non-tonal list (each in input
+/// order), the order Step 5(b) preserves.
+///
+/// Returns `None` only for a Layer III dispatch (no Annex D tables).
+///
+/// **Determinism.** Pure function of the component lists.
+///
+/// Provenance: composition of the Step 5(a)/(b) primitives (spec text
+/// printed p.112) with the Tables D.1 transcription above; no
+/// external implementation was consulted.
+#[must_use]
+pub fn model1_step5_components(
+    tonal: &[Model1Step4Component],
+    non_tonal: &[Model1Step4Component],
+    layer: crate::frame::Layer,
+    fs: AnnexDSamplingRate,
+) -> Option<Vec<Masker>> {
+    // Distinguish "no table" (None) from "components dropped" (Some).
+    model1_threshold_table(layer, fs)?;
+    let screened: Vec<Masker> = tonal
+        .iter()
+        .chain(non_tonal.iter())
+        .filter_map(|c| {
+            let entry = model1_d1_entry_for_line(layer, fs, c.k)?;
+            let masker = model1_masker_from_component(c, layer, fs)?;
+            masker_above_threshold_in_quiet(&masker, entry.ltq_db).then_some(masker)
+        })
+        .collect();
+    Some(decimate_tonal_within_half_bark(&screened))
 }
 
 #[cfg(test)]
@@ -13419,5 +14499,362 @@ mod tests {
             assert_eq!(c.spl_db, f64::NEG_INFINITY);
             assert_eq!(c.kind, MaskerKind::NonTonal);
         }
+    }
+
+    // ---- Phase 2 step 80 — Tables D.1a–f + Step 4 → Bark bridge +
+    // end-to-end §D.1 Step 5 sieve.
+
+    /// All six (table, layer, fs, FFT length) dispatch cases.
+    fn d1_cases() -> [(
+        &'static [Model1ThresholdEntry],
+        crate::frame::Layer,
+        AnnexDSamplingRate,
+        usize,
+    ); 6] {
+        use crate::frame::Layer;
+        [
+            (
+                &MODEL1_THRESHOLD_D1A,
+                Layer::LayerI,
+                AnnexDSamplingRate::Hz32000,
+                512,
+            ),
+            (
+                &MODEL1_THRESHOLD_D1B,
+                Layer::LayerI,
+                AnnexDSamplingRate::Hz44100,
+                512,
+            ),
+            (
+                &MODEL1_THRESHOLD_D1C,
+                Layer::LayerI,
+                AnnexDSamplingRate::Hz48000,
+                512,
+            ),
+            (
+                &MODEL1_THRESHOLD_D1D,
+                Layer::LayerII,
+                AnnexDSamplingRate::Hz32000,
+                1024,
+            ),
+            (
+                &MODEL1_THRESHOLD_D1E,
+                Layer::LayerII,
+                AnnexDSamplingRate::Hz44100,
+                1024,
+            ),
+            (
+                &MODEL1_THRESHOLD_D1F,
+                Layer::LayerII,
+                AnnexDSamplingRate::Hz48000,
+                1024,
+            ),
+        ]
+    }
+
+    #[test]
+    fn table_d1_lengths_and_dispatch() {
+        use crate::frame::Layer;
+        let expect = [108usize, 106, 102, 132, 130, 126];
+        for ((table, layer, fs, _), len) in d1_cases().into_iter().zip(expect) {
+            assert_eq!(table.len(), len, "{layer:?}/{fs:?}");
+            let dispatched = model1_threshold_table(layer, fs).unwrap();
+            assert_eq!(dispatched, table);
+        }
+        assert!(model1_threshold_table(Layer::LayerIII, AnnexDSamplingRate::Hz44100).is_none());
+    }
+
+    #[test]
+    fn table_d1_frequency_column_matches_line_grid() {
+        // Every printed frequency is the line-center frequency of the
+        // raw FFT line `model1_d1_line_for_index` assigns to the row
+        // (within the 2-decimal print rounding) — this pins both the
+        // frequency-column transcription and the index → line map for
+        // all 704 rows.
+        for (table, layer, fs, n_fft) in d1_cases() {
+            let delta_f = f64::from(fs.as_hz()) / (n_fft as f64);
+            for (pos, entry) in table.iter().enumerate() {
+                let i = pos as u16 + 1;
+                let line = model1_d1_line_for_index(layer, fs, i).unwrap();
+                let grid = f64::from(line) * delta_f;
+                assert!(
+                    (entry.frequency_hz - grid).abs() < 0.006,
+                    "{layer:?}/{fs:?} row {i}: {} vs line {line} = {grid}",
+                    entry.frequency_hz,
+                );
+            }
+            // One past the end (and index 0) refuse.
+            assert!(model1_d1_line_for_index(layer, fs, 0).is_none());
+            assert!(model1_d1_line_for_index(layer, fs, table.len() as u16 + 1).is_none());
+        }
+    }
+
+    #[test]
+    fn table_d1_bark_column_strictly_increasing() {
+        for (table, layer, fs, _) in d1_cases() {
+            let mut prev = f64::NEG_INFINITY;
+            for (pos, entry) in table.iter().enumerate() {
+                assert!(
+                    entry.z_bark > prev,
+                    "{layer:?}/{fs:?} row {}: z {} after {}",
+                    pos + 1,
+                    entry.z_bark,
+                    prev
+                );
+                prev = entry.z_bark;
+                // LTq stays within the printed range (minimum −4,98 dB
+                // near 3,3 kHz; 68,00 dB cap at the top of the band).
+                assert!((-4.99..=68.0).contains(&entry.ltq_db), "{layer:?}/{fs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn table_d1_layer2_embeds_layer1_rows() {
+        use crate::frame::Layer;
+        // At the same Fs, Layer I line L and Layer II line 2L are the
+        // same frequency, and the spec prints identical z / LTq for
+        // them. Every Layer I row therefore reappears in the Layer II
+        // table (rows 49.. of D.1d/e/f are rows 25.. of D.1a/b/c).
+        for fs in [
+            AnnexDSamplingRate::Hz32000,
+            AnnexDSamplingRate::Hz44100,
+            AnnexDSamplingRate::Hz48000,
+        ] {
+            let t1 = model1_threshold_table(Layer::LayerI, fs).unwrap();
+            let t2 = model1_threshold_table(Layer::LayerII, fs).unwrap();
+            for (pos, e1) in t1.iter().enumerate() {
+                let i1 = pos as u16 + 1;
+                let line2 = 2 * model1_d1_line_for_index(Layer::LayerI, fs, i1).unwrap();
+                let i2 = model1_d1_index_for_line(Layer::LayerII, fs, line2).unwrap();
+                assert_eq!(
+                    model1_d1_line_for_index(Layer::LayerII, fs, i2).unwrap(),
+                    line2,
+                    "{fs:?} L1 row {i1}: Layer II line {line2} not on the grid"
+                );
+                let e2 = &t2[i2 as usize - 1];
+                assert!(
+                    (e1.frequency_hz - e2.frequency_hz).abs() < 0.005,
+                    "{fs:?} row {i1}"
+                );
+                assert_eq!(e1.z_bark, e2.z_bark, "{fs:?} L1 row {i1} → L2 row {i2}");
+                assert_eq!(e1.ltq_db, e2.ltq_db, "{fs:?} L1 row {i1} → L2 row {i2}");
+            }
+        }
+    }
+
+    #[test]
+    fn table_d1_agrees_with_d2_boundary_rows() {
+        // The Tables D.2 `index F&CB` column indexes into Table D.1:
+        // every boundary row's frequency / Bark pair equals the cited
+        // Table D.1 row. This includes D.2e band 17, whose clipped
+        // `16,11[.]` print D.1e row 62 resolves to exactly 16,110 =
+        // the stored 16.11. Exceptions: the six 44,1 kHz cells where
+        // the printed spec's D.2 tables sit exactly 0,001 Bark below
+        // the (double-printed, self-consistent) D.1 tables — see the
+        // print-discrepancy notes on `CRITICAL_BANDS_D2B` /
+        // `CRITICAL_BANDS_D2E`.
+        let exceptions = [
+            // (fs, band no per layer pair, D.2 print, D.1 print)
+            (17u16, 19u16, 17.904, 17.905),
+            (20, 22, 20.971, 20.972),
+            (24, 26, 24.573, 24.574),
+        ];
+        use crate::frame::Layer;
+        for (table, layer, fs, _) in d1_cases() {
+            let boundaries = critical_band_boundaries(layer, fs).unwrap();
+            for b in boundaries {
+                let entry = &table[b.index_fcb as usize - 1];
+                // D.2 prints 3 decimals, D.1 prints 2: the two
+                // roundings can differ by up to 0,005 Hz.
+                assert!(
+                    (b.frequency_hz - entry.frequency_hz).abs() < 0.0051,
+                    "{layer:?}/{fs:?} band {}: D.2 {} vs D.1 {}",
+                    b.no,
+                    b.frequency_hz,
+                    entry.frequency_hz,
+                );
+                let exception = fs == AnnexDSamplingRate::Hz44100
+                    && exceptions.iter().any(|&(no1, no2, d2, d1)| {
+                        let no = match layer {
+                            Layer::LayerI => no1,
+                            _ => no2,
+                        };
+                        b.no == no && b.z_bark == d2 && entry.z_bark == d1
+                    });
+                assert!(
+                    exception || b.z_bark == entry.z_bark,
+                    "{layer:?}/{fs:?} band {} (D.1 index {}): D.2 z {} vs D.1 z {}",
+                    b.no,
+                    b.index_fcb,
+                    b.z_bark,
+                    entry.z_bark,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_d1_matches_textual_ltq_anchors() {
+        // The seven textually-transcribed Table D.1a anchors that
+        // `ltq_db_at_hz` interpolates through are rows 1–5, 51 and
+        // 108 of the full table.
+        for (i, hz, ltq) in [
+            (1u16, 62.5, 33.44),
+            (2, 125.0, 19.20),
+            (3, 187.5, 13.87),
+            (4, 250.0, 11.01),
+            (5, 312.5, 9.20),
+            (51, 3375.0, -4.97),
+            (108, 15000.0, 51.04),
+        ] {
+            let entry = &MODEL1_THRESHOLD_D1A[i as usize - 1];
+            assert_eq!(entry.frequency_hz, hz);
+            assert_eq!(entry.ltq_db, ltq);
+            assert!((ltq_db_at_hz(hz) - ltq).abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn table_d1_index_for_line_round_trip_and_nearest() {
+        use crate::frame::Layer;
+        // Round-trip: every tabulated line maps back to its own row.
+        for (table, layer, fs, _) in d1_cases() {
+            for i in 1..=table.len() as u16 {
+                let line = model1_d1_line_for_index(layer, fs, i).unwrap();
+                assert_eq!(
+                    model1_d1_index_for_line(layer, fs, line),
+                    Some(i),
+                    "{layer:?}/{fs:?} row {i} line {line}"
+                );
+            }
+        }
+        // Nearest-with-tie-down on unlisted lines (Layer II tables;
+        // listed lines …48, 50, 52, …, 96, 100, 104, …, 192, 200,
+        // 208, …).
+        let (l2, fs) = (Layer::LayerII, AnnexDSamplingRate::Hz44100);
+        assert_eq!(model1_d1_index_for_line(l2, fs, 51), Some(49)); // tie → down
+        assert_eq!(model1_d1_index_for_line(l2, fs, 53), Some(50)); // tie → down
+        assert_eq!(model1_d1_index_for_line(l2, fs, 97), Some(72)); // 96 at 1 vs 100 at 3
+        assert_eq!(model1_d1_index_for_line(l2, fs, 98), Some(72)); // tie → down
+        assert_eq!(model1_d1_index_for_line(l2, fs, 99), Some(73)); // 100 at 1 vs 96 at 3
+        assert_eq!(model1_d1_index_for_line(l2, fs, 203), Some(97)); // 200 at 3 vs 208 at 5
+        assert_eq!(model1_d1_index_for_line(l2, fs, 205), Some(98)); // 208 at 3 vs 200 at 5
+                                                                     // Bounds: DC and above the last tabulated line refuse.
+        assert_eq!(model1_d1_index_for_line(l2, fs, 0), None);
+        assert_eq!(model1_d1_index_for_line(l2, fs, 464), Some(130));
+        assert_eq!(model1_d1_index_for_line(l2, fs, 465), None);
+        let (l1, fs32) = (Layer::LayerI, AnnexDSamplingRate::Hz32000);
+        assert_eq!(model1_d1_index_for_line(l1, fs32, 240), Some(108));
+        assert_eq!(model1_d1_index_for_line(l1, fs32, 241), None);
+        assert_eq!(model1_d1_index_for_line(Layer::LayerIII, fs, 100), None);
+    }
+
+    #[test]
+    fn step5_masker_bridge_places_components_on_table_d1_bark() {
+        use crate::frame::Layer;
+        let (l2, fs) = (Layer::LayerII, AnnexDSamplingRate::Hz44100);
+        // Tonal component at line 100 → D.1e row 73 (4 306,64 Hz,
+        // z = 17,680).
+        let tonal = Model1Step4Component {
+            k: 100,
+            spl_db: 60.0,
+            kind: MaskerKind::Tonal,
+        };
+        let m = model1_masker_from_component(&tonal, l2, fs).unwrap();
+        assert_eq!(m.kind, MaskerKind::Tonal);
+        assert_eq!(m.z_bark, 17.680);
+        assert_eq!(m.spl_db, 60.0);
+        // Non-tonal component at line 50 → D.1e row 49 (2 153,32 Hz,
+        // z = 13,578); kind passes through.
+        let non_tonal = Model1Step4Component {
+            k: 50,
+            spl_db: 40.0,
+            kind: MaskerKind::NonTonal,
+        };
+        let m = model1_masker_from_component(&non_tonal, l2, fs).unwrap();
+        assert_eq!(m.kind, MaskerKind::NonTonal);
+        assert_eq!(m.z_bark, 13.578);
+        // Above the table's last tabulated line (464) and Layer III:
+        // no placement.
+        let high = Model1Step4Component {
+            k: 470,
+            spl_db: 60.0,
+            kind: MaskerKind::Tonal,
+        };
+        assert!(model1_masker_from_component(&high, l2, fs).is_none());
+        assert!(model1_masker_from_component(&tonal, Layer::LayerIII, fs).is_none());
+    }
+
+    #[test]
+    fn step5_components_screen_and_decimate_end_to_end() {
+        use crate::frame::Layer;
+        let (l2, fs) = (Layer::LayerII, AnnexDSamplingRate::Hz44100);
+        let t = |k: u16, spl_db: f64| Model1Step4Component {
+            k,
+            spl_db,
+            kind: MaskerKind::Tonal,
+        };
+        let n = |k: u16, spl_db: f64| Model1Step4Component {
+            k,
+            spl_db,
+            kind: MaskerKind::NonTonal,
+        };
+        let tonal = [
+            t(100, 60.0), // kept: 60 ≥ LTq(row 73) = −2,06
+            t(101, 50.0), // same nearest row (73) → same z → Step 5(b)
+            // cluster with the 60 dB masker → dropped
+            t(24, -10.0), // Step 5(a): −10 < LTq(row 24) = 3,25 → dropped
+        ];
+        let non_tonal = [
+            n(50, 40.0),  // kept: 40 ≥ LTq(row 49) = −0,96
+            n(470, 20.0), // above the last tabulated line → dropped
+        ];
+        let maskers = model1_step5_components(&tonal, &non_tonal, l2, fs).unwrap();
+        assert_eq!(maskers.len(), 2);
+        assert_eq!(maskers[0].kind, MaskerKind::Tonal);
+        assert_eq!(maskers[0].z_bark, 17.680);
+        assert_eq!(maskers[0].spl_db, 60.0);
+        assert_eq!(maskers[1].kind, MaskerKind::NonTonal);
+        assert_eq!(maskers[1].z_bark, 13.578);
+        assert_eq!(maskers[1].spl_db, 40.0);
+        // Layer III: no Annex D tables.
+        assert!(model1_step5_components(&tonal, &non_tonal, Layer::LayerIII, fs).is_none());
+    }
+
+    #[test]
+    fn step5_chain_from_step1_pure_tone_through_global_threshold() {
+        use crate::frame::Layer;
+        // Full Step 1 → normalize → Step 4 → Step 5 chain on a pure
+        // sine at bin 100 (Layer II, 44,1 kHz): exactly one masker
+        // survives the sieve — the tonal component at line 100, on
+        // the D.1e row-73 Bark coordinate — and feeds Step 6/7.
+        let n_fft = MODEL1_FFT_LEN_LAYER2;
+        let s: Vec<f64> = (0..n_fft)
+            .map(|l| (2.0 * core::f64::consts::PI * 100.0 * (l as f64) / (n_fft as f64)).sin())
+            .collect();
+        let mut x = model1_power_density_spectrum(&s).unwrap();
+        model1_normalize_to_96db_spl(&mut x).unwrap();
+        let (tonal, non_tonal) =
+            model1_step4_components(&x, Layer::LayerII, AnnexDSamplingRate::Hz44100).unwrap();
+        let maskers = model1_step5_components(
+            &tonal,
+            &non_tonal,
+            Layer::LayerII,
+            AnnexDSamplingRate::Hz44100,
+        )
+        .unwrap();
+        assert_eq!(maskers.len(), 1, "only the tone survives Step 5");
+        assert_eq!(maskers[0].kind, MaskerKind::Tonal);
+        assert_eq!(maskers[0].z_bark, 17.680);
+        let expected_spl = MODEL1_SPL_REFERENCE_DB + 10.0 * 1.5_f64.log10();
+        assert!((maskers[0].spl_db - expected_spl).abs() < 1e-6);
+        // Step 6/7: the global threshold next to the masker is
+        // dominated by its individual threshold (LTq term is tiny).
+        let z_i = maskers[0].z_bark + 0.32;
+        let ltq_db = -0.04; // D.1e row 76 neighbourhood
+        let ltg = global_masking_threshold_db(&maskers, z_i, ltq_db);
+        let lt = individual_masking_threshold_db(&maskers[0], z_i).unwrap();
+        assert!(ltg >= lt && ltg < lt + 0.01, "ltg {ltg} vs lt {lt}");
     }
 }

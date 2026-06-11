@@ -2373,6 +2373,53 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 80 (r278)** — Annex D **Tables D.1a–f** (frequencies,
+critical band rates and absolute thresholds) + the **Step 4 → Bark
+bridge** + the end-to-end **§D.1 Step 5 sieve**. The six per-(Layer,
+Fs) Table D.1 pages — D.1a/b/c Layer I (108/106/102 rows, printed
+p.116–118), D.1d/e/f Layer II (132/130/126 rows, printed p.119–121) —
+are transcribed in full (all 704 rows × 3 columns) from the staged
+renders `docs/audio/mp3/annex-d-renders/Table-D.1*.png`, read at high
+magnification in cropped strips with every ambiguous cell re-read in a
+dedicated zoom. Public surface: `Model1ThresholdEntry { frequency_hz,
+z_bark, ltq_db }`, the `MODEL1_THRESHOLD_D1A…D1F` constants, the
+`model1_threshold_table(layer, fs)` dispatcher, the subsampling maps
+`model1_d1_line_for_index` / `model1_d1_index_for_line` (rows 1…48 are
+FFT lines 1…48, rows 49…72 every 2nd line 50…96, rows 73…96 every 4th
+line 100…192 — Layer I continues this region to its end — and Layer II
+rows 97… every 8th line 200…; nearest-entry inverse with documented
+tie-down), `model1_d1_entry_for_line`, the bridge
+`model1_masker_from_component` (lifts an r277 `Model1Step4Component`
+onto the Table D.1 Bark grid), and `model1_step5_components(tonal,
+non_tonal, layer, fs)` — the spec's full Step 5: bridge + Step 5(a)
+threshold-in-quiet screen against the same row's `Absolute Thresh.`
+column + Step 5(b) 0,5-Bark tonal decimation, emitting `Masker`s ready
+for the Step 6/7 evaluators. **Model 1 Steps 1–7 now compose
+end-to-end** (pinned by a chain test: sine → Step 1 FFT → 96 dB
+normalize → Step 4 classification → Step 5 sieve → Step 6/7 global
+threshold). Transcription integrity is pinned by structural
+redundancy: the printed frequency column equals the line grid
+`k·Fs/N` for all 704 rows; z is strictly increasing per table; every
+Layer I row reprints in the same-Fs Layer II table (line L ↔ 2L) with
+identical z/LTq; and every Tables D.2 boundary row's frequency/Bark
+pair equals the Table D.1 row its `index F&CB` cites. The
+cross-checks resolved the **D.2e band-17 illegible Bark digit** —
+D.1e row 62 legibly prints `16,110` (= D.1b row 38), so the stored
+`16.11` is exact and the docs file's prose estimate `16,116` is wrong
+— and surfaced a **systematic spec print inconsistency**: at 44,1 kHz
+the D.2 tables print exactly 0,001 Bark below the D.1 tables at three
+frequencies (D.2b 17/20/24 = D.2e 19/22/26: `17,904`/`20,971`/`24,573`
+vs the double-printed D.1 `17,905`/`20,972`/`24,574`); both verbatim
+prints are kept and the exception list is pinned in
+`table_d1_agrees_with_d2_boundary_rows`. 10 new unit tests (the five
+integrity sweeps above, the seven textual LTq anchors = rows 1–5 / 51
+/ 108 of D.1a, round-trip + nearest/tie/bounds cases for the index
+maps, bridge placement + out-of-band/Layer III refusals, a synthetic
+screen-and-decimate end-to-end, and the Steps 1–7 chain). Tests: 977
+lib (was 967; +10 unit). No external implementation consulted; only
+the six Table D.1 PNG renders plus the in-repo Tables D.2
+transcription were read.
+
 **Phase 2 step 79 (r277)** — Annex D Model 1 §D.1 **Step 4 "Finding
 of tonal and non-tonal components"**: the tonality classifier that
 turns the step-77/78 SPL spectrum into the discrete masker lists that

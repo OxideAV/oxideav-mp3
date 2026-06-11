@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Tables D.1a–f transcription + Step 4 → Bark bridge +
+  end-to-end §D.1 Step 5 sieve (Phase 2 step 80). All 704 rows × 3
+  columns of the six "Frequencies, critical band rates and absolute
+  threshold" pages (D.1a/b/c Layer I 108/106/102 rows, D.1d/e/f
+  Layer II 132/130/126 rows) transcribed from the staged
+  `docs/audio/mp3/annex-d-renders/Table-D.1*.png` renders into
+  `Model1ThresholdEntry` constants `MODEL1_THRESHOLD_D1A…D1F` with a
+  `model1_threshold_table(layer, fs)` dispatcher. New subsampling
+  maps `model1_d1_line_for_index` / `model1_d1_index_for_line`
+  (1:1/2:1/4:1/8:1 row→line regions per the printed frequency grid;
+  nearest-entry inverse, tie-down) and `model1_d1_entry_for_line`;
+  `model1_masker_from_component` lifts the step-79
+  `Model1Step4Component` lists onto the Table D.1 Bark grid, and
+  `model1_step5_components` composes bridge + Step 5(a) LTq screen +
+  Step 5(b) 0,5-Bark tonal decimation — Model 1 Steps 1–7 now chain
+  end-to-end (pinned by a sine → FFT → Step 4 → Step 5 → Step 6/7
+  test). Cross-table redundancy (frequency = line grid for all 704
+  rows; Layer I rows reprint in same-Fs Layer II tables; D.2
+  boundary rows equal the D.1 rows they cite) resolved the D.2e
+  band-17 illegible Bark digit (D.1e row 62 prints `16,110` — the
+  stored `16.11` is exact; the docs prose estimate `16,116` is
+  wrong) and surfaced a systematic 44,1 kHz print inconsistency
+  (D.2b 17/20/24 = D.2e 19/22/26 print 0,001 Bark below the
+  double-printed D.1 values; both verbatim prints kept, exception
+  list pinned in tests). +10 unit tests (977 lib).
 - psy: Annex D Model 1 §D.1 Step 4 "Finding of tonal and non-tonal
   components" (Phase 2 step 79). New public primitives:
   `model1_step4_is_local_maximum(x, k)` (verbatim operation (a)
