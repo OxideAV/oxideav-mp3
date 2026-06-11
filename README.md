@@ -2373,6 +2373,50 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 81 (r279)** — Annex D Model 2 **§D.2.3 "The spreading
+function"** + **§D.2.4 step f)** convolution / renormalization +
+**step g)** tonality index — the first base-Model-2 increment (the
+§C.1.5.3.2.1 Layer III *modified* spread landed back in step 48; this
+is the unmodified Layers I/II function it replaces). §D.2.3 is read
+from the staged ISO PDF (printed p.129) via the corrected extract in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` — the
+envelope is `10^((x + tmpy)/10)` (an earlier docs revision dropped
+the `x` term; the erratum fix is what unblocked this arc). Public
+surface: `model2_sprdngf_tmpx` (`1,05·(j−i)` over *Bark values*, not
+partition indices), `model2_sprdngf_x_db` (the parabolic correction,
+non-zero only on the near-upward skirt `0,5 < tmpx < 2,5`, floor −8
+dB at `tmpx = 1,5`), `model2_sprdngf_tmpy_db` (the asymmetric
+envelope — exactly 0 dB on the diagonal because the printed
+`15,811389` equals `17,5·sqrt(1+0,474²) − 7,5·0,474`; ≈ −10 dB/tmpx
+upward vs ≈ −25 dB downward), `model2_sprdngf` (with the verbatim
+`tmpy < −100` → 0 cutoff, applied to `tmpy` alone, zeroing spreads
+beyond ≈ 4,8 Bark down / ≈ 10,5 Bark up), `MODEL2_SPRDNGF_TMPY_CUTOFF_DB`,
+`model2_step_f_spread(per_partition, bval)` (one reduction serving
+both printed convolutions `ecb_b` and `ct_b`; `bval` caller-injected
+— the full Tables D.3a–c stay a PNG transcription gap),
+`model2_step_f_rnorm` (reciprocal row sum; the printed `bb=0` lower
+bound vs D.2.2's "partition numbering starts at 1" is noted — the
+slice API sums every provided partition, satisfying both readings),
+`model2_step_f_cb` (`ct_b/ecb_b`, documented `0` convention at
+`ecb_b = 0`), `model2_step_f_en` (`ecb_b·rnorm_b`), and
+`model2_step_g_tonality` (`−0,299 − 0,43·ln(cb_b)` clamped to
+`[0, 1]`). 12 new unit tests: diagonal-unity within the printed
+constant's rounding, parabola active-region + −8 dB floor,
+hand-substituted 1-Bark-up value, cutoff at ±far spreads,
+upward-reach > downward-reach asymmetry, impulse convolution
+recovers the `sprdngf` row (on the Table D.3a 20-row `bval` text
+anchor), uniform-energy `en ≈ 1` renormalization identity,
+constant-`c_ω` recovery through `cb`, zero-energy convention,
+tonality clamps at both ends + formula/monotonicity. Tests: 989 lib
+(was 977; +12 unit). No external implementation consulted; only the
+staged ISO PDF pages (printed 127–132 prose + tables) and the
+extracts/anchor transcriptions in
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were read.
+Next Model 2 steps: h) required SNR per partition (needs the
+`minval`/`TMN` columns — full D.3 tables are PNG-only), i)–l) power
+ratio / energy threshold / line spread / absolute-threshold floor
+(D.4 tables PNG-only), then b)–e) FFT-side inputs.
+
 **Phase 2 step 80 (r278)** — Annex D **Tables D.1a–f** (frequencies,
 critical band rates and absolute thresholds) + the **Step 4 → Bark
 bridge** + the end-to-end **§D.1 Step 5 sieve**. The six per-(Layer,

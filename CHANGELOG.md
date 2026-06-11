@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 2 §D.2.3 base spreading function + §D.2.4
+  step f) convolution/renormalization + step g) tonality index
+  (Phase 2 step 81) — the first base-Model-2 increment, unblocked by
+  the docs-file erratum fix restoring the `x` term in the printed
+  `sprdngf = 10^((x + tmpy)/10)` envelope. New public surface:
+  `model2_sprdngf_tmpx` / `model2_sprdngf_x_db` /
+  `model2_sprdngf_tmpy_db` / `model2_sprdngf` (Bark-valued, with the
+  verbatim `tmpy < −100` → 0 cutoff applied to `tmpy` alone) +
+  `MODEL2_SPRDNGF_TMPY_CUTOFF_DB`, `model2_step_f_spread` (one
+  reduction serving both printed convolutions `ecb_b`/`ct_b` over a
+  caller-injected Tables-D.3 `bval` column — the full D.3a–c tables
+  remain a PNG transcription gap), `model2_step_f_rnorm` (reciprocal
+  spreading row sum; printed `bb=0` lower bound vs D.2.2's
+  partitions-start-at-1 noted, slice API satisfies both),
+  `model2_step_f_cb` (`ct_b/ecb_b`, documented zero-energy
+  convention), `model2_step_f_en`, and `model2_step_g_tonality`
+  (`−0,299 − 0,43·ln(cb_b)` clamped to `[0, 1]`). +12 unit tests
+  (989 lib) anchored on the Table D.3a 20-row `bval` text
+  transcription, including the diagonal-unity identity
+  (`15,811389 = 17,5·sqrt(1+0,474²) − 7,5·0,474`), the −8 dB
+  parabola floor, the upward/downward reach asymmetry, the
+  impulse-recovers-`sprdngf`-row convolution, and the
+  uniform-energy `en ≈ 1` renormalization identity.
 - psy: Annex D Tables D.1a–f transcription + Step 4 → Bark bridge +
   end-to-end §D.1 Step 5 sieve (Phase 2 step 80). All 704 rows × 3
   columns of the six "Frequencies, critical band rates and absolute

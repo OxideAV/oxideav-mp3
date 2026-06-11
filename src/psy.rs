@@ -1521,6 +1521,239 @@ pub fn model2_layer3_spread_linear(i: i32, j: i32) -> f64 {
     }
 }
 
+// =====================================================================
+// Annex D Model 2 — §D.2.3 "The spreading function" + §D.2.4 steps f)
+// and g) (Phase 2 step 81 / r279).
+//
+// Spec context (ISO/IEC 11172-3:1993 Annex D clause D.2.3, printed
+// p.129 / PDF p.135, as transcribed in
+// docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md — including
+// the corrected `10^((x + tmpy)/10)` envelope; an earlier docs-file
+// revision dropped the `x` term):
+//
+//   tmpx = 1,05 * (j - i)
+//   x    = 8 * minimum( (tmpx - 0,5)^2 - 2*(tmpx - 0,5), 0 )
+//   tmpy = 15,811389 + 7,5*(tmpx + 0,474)
+//          - 17,5*(1,0 + (tmpx + 0,474)^2)^0,5
+//   if (tmpy < -100) then sprdngf(i,j) = 0
+//   else sprdngf(i,j) = 10^((x + tmpy)/10)
+//
+// Per the D.2.3 prose, `i` is the **Bark value** of the signal being
+// spread and `j` the **Bark value** of the band being spread into —
+// real-valued Bark coordinates (the `bval` column of Tables D.3a–c),
+// NOT integer partition indices. (The §C.1.5.3.2.1 Layer III variant
+// above replaces `tmpy` with a piecewise-linear function of the
+// partition-index difference; this section is the *base* Model 2
+// function used by the §D.2.4 step f) convolution for Layers I/II.)
+//
+// Structure of the curve: `tmpy` is a hyperbola-like asymmetric
+// envelope whose constant `15,811389 = 17,5*sqrt(1 + 0,474^2)
+// - 7,5*0,474` makes it exactly 0 dB at `tmpx = 0` (the diagonal),
+// falling off at ≈ -10 dB/Bark-unit-of-tmpx upward (`tmpx → +∞`:
+// `7,5v - 17,5v`) and ≈ -25 dB downward (`tmpx → -∞`:
+// `7,5v + 17,5|v|`). The parabolic correction `x` is non-zero only
+// for `0,5 < tmpx < 2,5` (where `(tmpx-0,5)^2 - 2*(tmpx-0,5) < 0`),
+// carving up to -8 dB (at `tmpx = 1,5`) out of the near-upward skirt.
+// The `tmpy < -100` cutoff is applied to `tmpy` ALONE (before adding
+// `x`), exactly as printed.
+// =====================================================================
+
+/// §D.2.3 cutoff: when `tmpy` falls below this value (in dB) the
+/// spreading-function value is forced to exact zero (spec verbatim:
+/// "if (tmpy < -100) then sprdngf(i,j) = 0").
+///
+/// The comparison is strict (`<`) and tests `tmpy` alone — the
+/// parabolic `x` term does not participate in the cutoff decision.
+pub const MODEL2_SPRDNGF_TMPY_CUTOFF_DB: f64 = -100.0;
+
+/// §D.2.3 temporary variable `tmpx = 1,05 * (j - i)` — the scaled
+/// Bark distance from the masker (`i_bark`, "the Bark value of the
+/// signal being spread") to the destination band (`j_bark`, "the
+/// Bark value of the band being spread into").
+///
+/// Positive for upward spread (into higher Bark), negative for
+/// downward spread.
+#[inline]
+#[must_use]
+pub fn model2_sprdngf_tmpx(i_bark: f64, j_bark: f64) -> f64 {
+    1.05 * (j_bark - i_bark)
+}
+
+/// §D.2.3 parabolic correction term
+/// `x = 8 * minimum((tmpx - 0,5)^2 - 2*(tmpx - 0,5), 0)` in dB.
+///
+/// The spec defines "minimum(a,b)" as "a function returning the more
+/// negative of a or b", so `x` is never positive. Writing
+/// `u = tmpx - 0,5`, the inner expression `u^2 - 2u` is negative
+/// exactly for `0 < u < 2`, i.e. the correction is active only on
+/// the near-upward skirt `0,5 < tmpx < 2,5`, reaching its most
+/// negative value `8 * (1 - 2) = -8` dB at `tmpx = 1,5`.
+#[inline]
+#[must_use]
+pub fn model2_sprdngf_x_db(tmpx: f64) -> f64 {
+    let u = tmpx - 0.5;
+    8.0 * (u * u - 2.0 * u).min(0.0)
+}
+
+/// §D.2.3 envelope term `tmpy = 15,811389 + 7,5*(tmpx + 0,474)
+/// - 17,5*(1,0 + (tmpx + 0,474)^2)^0,5` in dB.
+///
+/// Exactly `0` dB at `tmpx = 0` (the printed constant `15,811389`
+/// equals `17,5*sqrt(1 + 0,474^2) - 7,5*0,474` to the printed
+/// precision), asymptotically `-10 dB` per unit of `tmpx` upward and
+/// `-25 dB` per unit downward — the classic asymmetric Bark-domain
+/// masking skirt (upward masking reaches much farther than downward).
+#[inline]
+#[must_use]
+pub fn model2_sprdngf_tmpy_db(tmpx: f64) -> f64 {
+    let v = tmpx + 0.474;
+    15.811_389 + 7.5 * v - 17.5 * (1.0 + v * v).sqrt()
+}
+
+/// §D.2.3 spreading function `sprdngf(i,j)` — the linear
+/// energy-domain factor by which energy in a partition with median
+/// Bark value `i_bark` spreads into a partition with median Bark
+/// value `j_bark`.
+///
+/// Spec procedure (verbatim order): compute `tmpx`, `x`, `tmpy`;
+/// `if (tmpy < -100) then sprdngf(i,j) = 0 else
+/// sprdngf(i,j) = 10^((x + tmpy)/10)`.
+///
+/// On the diagonal (`i_bark == j_bark`) the value is `1.0` to within
+/// the rounding of the printed `15,811389` constant (≈ `5e-7`
+/// relative). The cutoff zeroes the factor beyond ≈ 4,8 Bark
+/// downward and ≈ 10,5 Bark upward.
+#[inline]
+#[must_use]
+pub fn model2_sprdngf(i_bark: f64, j_bark: f64) -> f64 {
+    let tmpx = model2_sprdngf_tmpx(i_bark, j_bark);
+    let tmpy = model2_sprdngf_tmpy_db(tmpx);
+    if tmpy < MODEL2_SPRDNGF_TMPY_CUTOFF_DB {
+        0.0
+    } else {
+        let x = model2_sprdngf_x_db(tmpx);
+        (10.0_f64).powf((x + tmpy) / 10.0)
+    }
+}
+
+/// §D.2.4 step f) — convolve a per-partition quantity with the
+/// §D.2.3 spreading function:
+///
+/// ```text
+/// out_b = Σ_{bb=1}^{bmax} in_bb * sprdngf(bval_bb, bval_b)
+/// ```
+///
+/// The same reduction serves both printed step-f) convolutions: with
+/// `per_partition = e_b` (partition energy, step e) it yields
+/// `ecb_b`, and with `per_partition = c_b` (weighted
+/// unpredictability, step e) it yields `ct_b`.
+///
+/// `bval` carries the median Bark value of each calculation
+/// partition (the `bval` column of Tables D.3a–c; the full tables
+/// remain a PNG-render transcription gap, so the column is
+/// caller-injected like the other Annex D numeric tables). Returns
+/// `None` when the two slices disagree in length; the output has one
+/// entry per partition, in slice order.
+#[must_use]
+pub fn model2_step_f_spread(per_partition: &[f64], bval: &[f64]) -> Option<Vec<f64>> {
+    if per_partition.len() != bval.len() {
+        return None;
+    }
+    Some(
+        bval.iter()
+            .map(|&bval_b| {
+                per_partition
+                    .iter()
+                    .zip(bval.iter())
+                    .map(|(&in_bb, &bval_bb)| in_bb * model2_sprdngf(bval_bb, bval_b))
+                    .sum()
+            })
+            .collect(),
+    )
+}
+
+/// §D.2.4 step f) normalization coefficient
+/// `rnorm_b = 1 / Σ_bb sprdngf(bval_bb, bval_b)`.
+///
+/// "Due to the non-normalized nature of the spreading function,
+/// `ecb_b` should be renormalized" — `rnorm_b` is the reciprocal of
+/// the spreading-function row sum over all calculation partitions.
+/// (The printed summation bound reads `bb=0` while clause D.2.2
+/// states "Partition numbering starts at 1" and the step-f)
+/// convolutions sum from `bb=1`; with a slice-based API the sum
+/// simply runs over every provided partition, which satisfies both
+/// readings.) One entry per partition, in slice order.
+#[must_use]
+pub fn model2_step_f_rnorm(bval: &[f64]) -> Vec<f64> {
+    bval.iter()
+        .map(|&bval_b| {
+            let row_sum: f64 = bval
+                .iter()
+                .map(|&bval_bb| model2_sprdngf(bval_bb, bval_b))
+                .sum();
+            1.0 / row_sum
+        })
+        .collect()
+}
+
+/// §D.2.4 step f) renormalized weighted unpredictability
+/// `cb_b = ct_b / ecb_b` ("Because `ct_b` is weighted by the signal
+/// energy, it must be renormalized to `cb_b`").
+///
+/// Returns `None` on length mismatch. The spec does not define the
+/// quotient for a partition with zero spread energy (`ecb_b = 0`,
+/// only possible for an all-zero spectrum, where `ct_b` is zero
+/// too); this implementation defines `cb_b = 0` there so the
+/// downstream step g) tonality index stays finite.
+#[must_use]
+pub fn model2_step_f_cb(ct: &[f64], ecb: &[f64]) -> Option<Vec<f64>> {
+    if ct.len() != ecb.len() {
+        return None;
+    }
+    Some(
+        ct.iter()
+            .zip(ecb.iter())
+            .map(|(&ct_b, &ecb_b)| if ecb_b == 0.0 { 0.0 } else { ct_b / ecb_b })
+            .collect(),
+    )
+}
+
+/// §D.2.4 step f) normalized energy `en_b = ecb_b * rnorm_b`.
+///
+/// Returns `None` on length mismatch.
+#[must_use]
+pub fn model2_step_f_en(ecb: &[f64], rnorm: &[f64]) -> Option<Vec<f64>> {
+    if ecb.len() != rnorm.len() {
+        return None;
+    }
+    Some(
+        ecb.iter()
+            .zip(rnorm.iter())
+            .map(|(&ecb_b, &rnorm_b)| ecb_b * rnorm_b)
+            .collect(),
+    )
+}
+
+/// §D.2.4 step g) — tonality index
+/// `tb_b = -0,299 - 0,43 * log_e(cb_b)`, limited to `0 ≤ tb_b ≤ 1`
+/// (the spec prints the limit as "the range of 0<tb_b<1"; values
+/// outside are clamped to the nearer bound).
+///
+/// `cb` is the step-f) renormalized weighted unpredictability: small
+/// `cb` (predictable signal) maps to a tonality index near 1
+/// (tone-like), large `cb` (unpredictable signal) to 0 (noise-like).
+/// The unclamped expression crosses 1 at `cb = e^(-1,299/0,43)
+/// ≈ 0,0488` and 0 at `cb = e^(-0,299/0,43) ≈ 0,4989`. `cb = 0`
+/// (e.g. the zero-energy convention of [`model2_step_f_cb`]) clamps
+/// to exactly 1. Inputs below 0 are outside the spec domain
+/// (`cb_b` is a power-weighted average of the unpredictability
+/// measure `c_ω ≥ 0`).
+#[inline]
+#[must_use]
+pub fn model2_step_g_tonality(cb: f64) -> f64 {
+    (-0.299 - 0.43 * cb.ln()).clamp(0.0, 1.0)
+}
+
 /// One row of Annex D Table D.5 — *Layer I and Layer II coder
 /// partition table*.
 ///
@@ -14856,5 +15089,223 @@ mod tests {
         let ltg = global_masking_threshold_db(&maskers, z_i, ltq_db);
         let lt = individual_masking_threshold_db(&maskers[0], z_i).unwrap();
         assert!(ltg >= lt && ltg < lt + 0.01, "ltg {ltg} vs lt {lt}");
+    }
+
+    // ---- Phase 2 step 81 / r279 — §D.2.3 base Model 2 spreading
+    // function + §D.2.4 step f) convolution/renormalization + step g)
+    // tonality index.
+
+    /// The `bval` column of the first 20 rows of Table D.3a (Fs =
+    /// 32 kHz calculation partition table) — the text anchor
+    /// transcribed in
+    /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`. A
+    /// realistic, strictly-increasing median-Bark fixture for the
+    /// step-f) reductions (the full 63-row table stays a PNG
+    /// transcription gap).
+    const D3A_BVAL_ANCHOR_20: [f64; 20] = [
+        0.00, 0.63, 1.56, 2.50, 3.44, 4.34, 5.17, 5.94, 6.63, 7.28, 7.90, 8.50, 9.06, 9.65, 10.28,
+        10.87, 11.41, 11.92, 12.39, 12.83,
+    ];
+
+    #[test]
+    fn model2_sprdngf_diagonal_is_unity_within_printed_constant_rounding() {
+        // At i == j: tmpx = 0, u = -0.5 gives u^2 - 2u = 1.25 > 0 so
+        // x = 0, and tmpy = 15.811389 + 7.5*0.474
+        // - 17.5*sqrt(1 + 0.474^2) — the printed constant 15,811389
+        // equals 17,5*sqrt(1 + 0,474^2) - 7,5*0,474 to its printed
+        // precision, so tmpy ≈ 0 and sprdngf ≈ 10^0 = 1. The
+        // residual is the rounding of the 6-decimal constant
+        // (≈ 5e-7 relative).
+        for z in [0.0, 0.63, 5.17, 12.83, 24.5] {
+            let f = model2_sprdngf(z, z);
+            assert!((f - 1.0).abs() < 1.0e-5, "sprdngf({z},{z}) = {f}");
+            assert_eq!(model2_sprdngf_x_db(model2_sprdngf_tmpx(z, z)), 0.0);
+        }
+    }
+
+    #[test]
+    fn model2_sprdngf_x_parabola_active_only_on_near_upward_skirt() {
+        // x = 8 * min((tmpx-0.5)^2 - 2*(tmpx-0.5), 0): with
+        // u = tmpx - 0.5 the inner expression u^2 - 2u is negative
+        // exactly for 0 < u < 2, i.e. 0.5 < tmpx < 2.5.
+        assert_eq!(model2_sprdngf_x_db(0.5), 0.0);
+        assert_eq!(model2_sprdngf_x_db(2.5), 0.0);
+        assert_eq!(model2_sprdngf_x_db(0.0), 0.0);
+        assert_eq!(model2_sprdngf_x_db(-3.0), 0.0);
+        assert_eq!(model2_sprdngf_x_db(4.0), 0.0);
+        // Most negative at tmpx = 1.5 (u = 1): 8 * (1 - 2) = -8 dB.
+        assert_eq!(model2_sprdngf_x_db(1.5), -8.0);
+        for tmpx in [0.6, 1.0, 2.0, 2.4] {
+            let x = model2_sprdngf_x_db(tmpx);
+            assert!((-8.0..0.0).contains(&x), "x({tmpx}) = {x}");
+        }
+    }
+
+    #[test]
+    fn model2_sprdngf_matches_hand_substituted_one_bark_up() {
+        // j - i = 1 Bark upward: tmpx = 1.05. Substituting into the
+        // printed formulas (independent re-derivation):
+        //   u = 0.55, x = 8*(0.3025 - 1.1) = -6.38
+        //   v = 1.524, tmpy = 15.811389 + 11.43 - 17.5*sqrt(3.322576)
+        //   sprdngf = 10^((x + tmpy)/10)
+        let x = 8.0 * (0.55_f64 * 0.55 - 2.0 * 0.55);
+        assert!((x + 6.38).abs() < 1.0e-12);
+        let tmpy = 15.811_389 + 7.5 * 1.524 - 17.5 * (1.0 + 1.524_f64 * 1.524).sqrt();
+        let expected = (10.0_f64).powf((x + tmpy) / 10.0);
+        let got = model2_sprdngf(10.0, 11.0);
+        assert!((got - expected).abs() < 1.0e-12, "{got} vs {expected}");
+        // And the components agree with the helpers.
+        assert!((model2_sprdngf_tmpy_db(1.05) - tmpy).abs() < 1.0e-12);
+        assert!((model2_sprdngf_x_db(1.05) - x).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn model2_sprdngf_tmpy_cutoff_zeroes_far_spreads() {
+        // 6 Bark downward: tmpx = -6.3, v = -5.826 gives
+        // tmpy = 15.811389 - 43.695 - 17.5*sqrt(34.942276) ≈ -131.3,
+        // below the -100 dB cutoff → exact 0.
+        assert!(model2_sprdngf_tmpy_db(-6.3) < MODEL2_SPRDNGF_TMPY_CUTOFF_DB);
+        assert_eq!(model2_sprdngf(10.0, 4.0), 0.0);
+        // 12 Bark upward: tmpx = 12.6, tmpy ≈ -115.6 → exact 0.
+        assert!(model2_sprdngf_tmpy_db(12.6) < MODEL2_SPRDNGF_TMPY_CUTOFF_DB);
+        assert_eq!(model2_sprdngf(4.0, 16.0), 0.0);
+        // 4 Bark downward: tmpx = -4.2, tmpy ≈ -79.6 → survives.
+        assert!(model2_sprdngf_tmpy_db(-4.2) > MODEL2_SPRDNGF_TMPY_CUTOFF_DB);
+        assert!(model2_sprdngf(10.0, 6.0) > 0.0);
+    }
+
+    #[test]
+    fn model2_sprdngf_upward_reach_exceeds_downward_reach() {
+        // The asymmetric skirt: ~-10 dB per tmpx upward vs ~-25 dB
+        // downward. At 5 Bark distance the upward factor survives
+        // (tmpy(5.25) ≈ -42.9) while the downward factor is already
+        // cut off (tmpy(-5.25) ≈ -105.4 < -100).
+        let z = 12.0;
+        assert!(model2_sprdngf(z, z + 5.0) > 0.0);
+        assert_eq!(model2_sprdngf(z, z - 5.0), 0.0);
+        // Within the surviving range the factor decays monotonically
+        // with distance in both directions.
+        let up1 = model2_sprdngf(z, z + 1.0);
+        let up3 = model2_sprdngf(z, z + 3.0);
+        let dn1 = model2_sprdngf(z, z - 1.0);
+        let dn3 = model2_sprdngf(z, z - 3.0);
+        assert!(up1 < 1.0 && up3 < up1, "up: {up1} {up3}");
+        assert!(dn1 < 1.0 && dn3 < dn1, "down: {dn1} {dn3}");
+        // And at equal distance the downward factor is the smaller
+        // one (steeper downward skirt).
+        assert!(dn3 < up3, "asymmetry: {dn3} vs {up3}");
+    }
+
+    #[test]
+    fn model2_step_f_spread_impulse_recovers_sprdngf_row() {
+        // A unit impulse in partition 5 (index 4): the convolution
+        // out_b = Σ_bb in_bb * sprdngf(bval_bb, bval_b) collapses to
+        // the single term sprdngf(bval_4, bval_b).
+        let bval = &D3A_BVAL_ANCHOR_20;
+        let mut e = [0.0; 20];
+        e[4] = 1.0;
+        let ecb = model2_step_f_spread(&e, bval).unwrap();
+        assert_eq!(ecb.len(), 20);
+        for (b, &got) in ecb.iter().enumerate() {
+            let expected = model2_sprdngf(bval[4], bval[b]);
+            assert!(
+                (got - expected).abs() < 1.0e-12,
+                "b={b}: {got} vs {expected}"
+            );
+        }
+        // The masker's own partition holds the largest entry.
+        let peak = ecb.iter().cloned().fold(f64::MIN, f64::max);
+        assert!((ecb[4] - peak).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn model2_step_f_length_mismatches_return_none() {
+        let bval = &D3A_BVAL_ANCHOR_20;
+        assert!(model2_step_f_spread(&[1.0; 19], bval).is_none());
+        assert!(model2_step_f_cb(&[1.0; 3], &[1.0; 4]).is_none());
+        assert!(model2_step_f_en(&[1.0; 4], &[1.0; 3]).is_none());
+    }
+
+    #[test]
+    fn model2_step_f_rnorm_normalizes_uniform_energy() {
+        // With e_b = 1 everywhere, ecb_b is exactly the
+        // spreading-function row sum, so en_b = ecb_b * rnorm_b must
+        // come back to 1 in every partition — the spec's stated
+        // purpose of rnorm ("due to the non-normalized nature of the
+        // spreading function").
+        let bval = &D3A_BVAL_ANCHOR_20;
+        let ones = [1.0; 20];
+        let ecb = model2_step_f_spread(&ones, bval).unwrap();
+        let rnorm = model2_step_f_rnorm(bval);
+        assert!(rnorm.iter().all(|&r| r > 0.0 && r <= 1.0));
+        let en = model2_step_f_en(&ecb, &rnorm).unwrap();
+        for (b, &en_b) in en.iter().enumerate() {
+            assert!((en_b - 1.0).abs() < 1.0e-12, "en[{b}] = {en_b}");
+        }
+    }
+
+    #[test]
+    fn model2_step_f_cb_recovers_constant_unpredictability() {
+        // If every FFT line carries the same unpredictability
+        // c_ω = 0.3, then step e) gives c_b = 0.3 * e_b in every
+        // partition, both convolutions scale identically, and the
+        // renormalization cb_b = ct_b / ecb_b recovers 0.3 exactly.
+        let bval = &D3A_BVAL_ANCHOR_20;
+        let e: Vec<f64> = (0..20).map(|b| 1.0 + 0.5 * b as f64).collect();
+        let c: Vec<f64> = e.iter().map(|&eb| 0.3 * eb).collect();
+        let ecb = model2_step_f_spread(&e, bval).unwrap();
+        let ct = model2_step_f_spread(&c, bval).unwrap();
+        let cb = model2_step_f_cb(&ct, &ecb).unwrap();
+        for (b, &cb_b) in cb.iter().enumerate() {
+            assert!((cb_b - 0.3).abs() < 1.0e-12, "cb[{b}] = {cb_b}");
+        }
+    }
+
+    #[test]
+    fn model2_step_f_cb_zero_energy_partition_yields_zero() {
+        // All-zero spectrum: ecb_b = ct_b = 0 everywhere; the
+        // documented convention defines cb_b = 0 (instead of 0/0).
+        let bval = &D3A_BVAL_ANCHOR_20;
+        let zeros = [0.0; 20];
+        let ecb = model2_step_f_spread(&zeros, bval).unwrap();
+        let cb = model2_step_f_cb(&ecb, &ecb).unwrap();
+        assert!(cb.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn model2_step_g_tonality_clamps_at_both_ends() {
+        // cb = 1: ln(1) = 0 → unclamped tb = -0.299 → clamps to 0
+        // (fully noise-like).
+        assert_eq!(model2_step_g_tonality(1.0), 0.0);
+        // Unclamped tb crosses 0 at cb = e^(-0.299/0.43) ≈ 0.4989;
+        // anything above that clamps to 0.
+        assert_eq!(model2_step_g_tonality(0.6), 0.0);
+        // cb = 0 (the zero-energy convention): ln → -∞, unclamped tb
+        // → +∞ → clamps to 1 (fully tone-like).
+        assert_eq!(model2_step_g_tonality(0.0), 1.0);
+        // Unclamped tb crosses 1 at cb = e^(-1.299/0.43) ≈ 0.0488;
+        // anything below that clamps to 1.
+        assert_eq!(model2_step_g_tonality(0.01), 1.0);
+    }
+
+    #[test]
+    fn model2_step_g_tonality_matches_formula_and_is_monotone() {
+        // Interior point: tb = -0.299 - 0.43*ln(cb), re-derived
+        // inline from the printed step g) formula.
+        for cb in [0.05, 0.1, 0.2, 0.3, 0.45] {
+            let expected = -0.299 - 0.43 * f64::ln(cb);
+            let got = model2_step_g_tonality(cb);
+            assert!(
+                (got - expected).abs() < 1.0e-12,
+                "cb={cb}: {got} vs {expected}"
+            );
+            assert!((0.0..=1.0).contains(&got));
+        }
+        // Monotone non-increasing in cb: more unpredictability →
+        // less tonal.
+        let t1 = model2_step_g_tonality(0.06);
+        let t2 = model2_step_g_tonality(0.2);
+        let t3 = model2_step_g_tonality(0.45);
+        assert!(t1 > t2 && t2 > t3, "{t1} {t2} {t3}");
     }
 }
