@@ -124,6 +124,50 @@ pub fn crc16_layer3(header_bytes: &[u8; 4], side_info_bytes: &[u8], channels: u8
     crc16_bits(header_iter.chain(side_iter))
 }
 
+/// Compute the Layer III CRC-16 over the protected-bit set of one
+/// **LSF** (MPEG-2 / MPEG-2.5) frame.
+///
+/// ISO/IEC 13818-3 §2.4.1.4 ("Error Check") and §2.4.2 defer the CRC
+/// definition wholesale to ISO/IEC 11172-3 — same generator, same
+/// initial state, same protected-region shape: header bits 16…31
+/// followed by the side-information bits that precede the main data.
+/// For MPEG-1 Layer III that side-info region is 136 bits (mono) /
+/// 256 bits (other modes); the LSF §2.4.1.7 side info is shorter —
+/// 8 (`main_data_begin`) + 1 (`private_bits`) + 63 (one
+/// granule-channel) = **72 bits** for single-channel mode, and
+/// 8 + 2 + 2·63 = **136 bits** for every other mode — so the
+/// protected window shrinks with it (the region is "the side
+/// information", not a fixed bit count).
+///
+/// `header_bytes` / `side_info_bytes` follow the same conventions as
+/// [`crc16_layer3`].
+///
+/// # Panics
+///
+/// Panics if `side_info_bytes` is shorter than the protected length
+/// (9 bytes mono / 17 bytes otherwise — exactly the LSF side-info
+/// block lengths the writer produces).
+#[must_use]
+pub fn crc16_layer3_lsf(header_bytes: &[u8; 4], side_info_bytes: &[u8], channels: u8) -> u16 {
+    let si_bits: usize = if channels == 1 { 72 } else { 136 };
+    let needed_bytes = si_bits.div_ceil(8);
+    assert!(
+        side_info_bytes.len() >= needed_bytes,
+        "crc16_layer3_lsf: side_info_bytes len {} < {needed_bytes} required for channels={channels}",
+        side_info_bytes.len(),
+    );
+
+    let header_iter = [header_bytes[2], header_bytes[3]]
+        .into_iter()
+        .flat_map(byte_bits_msb_first);
+    let side_iter = side_info_bytes
+        .iter()
+        .copied()
+        .flat_map(byte_bits_msb_first)
+        .take(si_bits);
+    crc16_bits(header_iter.chain(side_iter))
+}
+
 /// Decompose one byte into its eight bits, MSB first (bit 7, then bit
 /// 6, …, then bit 0).
 fn byte_bits_msb_first(byte: u8) -> [u8; 8] {

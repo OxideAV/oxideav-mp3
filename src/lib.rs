@@ -430,7 +430,7 @@ pub use codec_encoder::{
     make_encoder_with_outer_loop, make_encoder_with_threshold_in_quiet,
     make_encoder_with_threshold_in_quiet_offset, Mp3CoreEncoder,
 };
-pub use crc::{crc16_bits, crc16_layer3, INITIAL_STATE as CRC_INITIAL_STATE};
+pub use crc::{crc16_bits, crc16_layer3, crc16_layer3_lsf, INITIAL_STATE as CRC_INITIAL_STATE};
 pub use demuxer::{
     lame_magic_offset, open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer,
     Mp3Tags, XingTag, XingTagId, CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,
@@ -476,7 +476,8 @@ pub use outer_loop::{
     outer_loop_search_short_per_band, scalefac_long_upper_limit, scalefac_short_upper_limit,
     OuterLoopMixedResult, OuterLoopResult, OuterLoopShortResult, OuterLoopStats,
     MIXED_FIRST_SHORT_SFB, MIXED_LAST_LONG_SFB, MIXED_SCALEFAC_L_MAX, OUTER_LOOP_SCALEFAC_COMPRESS,
-    SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW, SCALEFAC_S_MAX_HIGH, SCALEFAC_S_MAX_LOW,
+    OUTER_LOOP_SCALEFAC_COMPRESS_LSF, SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW, SCALEFAC_S_MAX_HIGH,
+    SCALEFAC_S_MAX_LOW,
 };
 pub use psy::{
     decimate_tonal_within_half_bark, masker_above_threshold_in_quiet, masker_at_band,
@@ -499,8 +500,8 @@ pub use side_info::{
 };
 pub use stereo::process_stereo;
 pub use stream_encoder::{
-    Mp3Encoder, StreamEncodeError, MPEG1_L3_BITRATE_LADDER_KBPS, SAMPLES_PER_FRAME_MPEG1,
-    SAMPLES_PER_GRANULE,
+    Mp3Encoder, StreamEncodeError, LSF_L3_BITRATE_LADDER_KBPS, MPEG1_L3_BITRATE_LADDER_KBPS,
+    SAMPLES_PER_FRAME_MPEG1, SAMPLES_PER_GRANULE,
 };
 pub use synth::{n_coefficient, synth_granule, synth_row, SynthState, D_TABLE, PCM_PER_GRANULE};
 pub use xing_info::{

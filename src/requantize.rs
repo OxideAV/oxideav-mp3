@@ -95,14 +95,21 @@ pub fn scalefac_multiplier(scalefac_scale: bool) -> f32 {
 /// same long-block band layout when applying per-band MS / intensity
 /// processing.
 pub(crate) fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 22] {
-    // MPEG-1 (ISO/IEC 11172-3 Table B.8a/b/c). LSF (13818-3) reuses
-    // these long-block layouts for the band→scalefactor mapping this
-    // round; the LSF-specific band tables are deferred (see report).
+    // MPEG-1 rates: ISO/IEC 11172-3 Table B.8a/b/c. MPEG-2 LSF rates
+    // (16 / 22.05 / 24 kHz): ISO/IEC 13818-3:1997 Table B.2 ("Layer III
+    // scalefactor bands", long blocks). The MPEG-2.5 rates (8 / 11.025 /
+    // 12 kHz) have no published band tables — the Fraunhofer patent
+    // describes only the derivation method, a documented residual gap
+    // (`docs/audio/mp3/MPEG-2.5-GAP.md`, "Scalefactor band index table
+    // values") — so they keep the half-rate MPEG-1 layouts as a
+    // self-consistent placeholder until observer-trace fills the gap.
     let _ = version;
     match sample_rate_hz {
-        32000 | 16000 | 8000 => &LONG_STARTS_32,
-        48000 | 24000 | 12000 => &LONG_STARTS_48,
-        _ => &LONG_STARTS_44, // 44100, 22050, 11025 and any default.
+        16000 | 22050 => &LONG_STARTS_LSF_16_22,
+        24000 => &LONG_STARTS_LSF_24,
+        32000 | 8000 => &LONG_STARTS_32,
+        48000 | 12000 => &LONG_STARTS_48,
+        _ => &LONG_STARTS_44, // 44100, 11025 and any default.
     }
 }
 
@@ -114,10 +121,16 @@ pub(crate) fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'s
 /// Shared with the §2.4.3.4.8 [`crate::reorder`] stage, which maps the
 /// same native band layout into subband order.
 pub(crate) fn short_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 13] {
+    // Same per-rate provenance split as [`long_band_starts`]: MPEG-1
+    // rates from 11172-3 Table B.8, LSF rates from 13818-3 Table B.2
+    // (short blocks), MPEG-2.5 rates on the documented placeholder.
     let _ = version;
     match sample_rate_hz {
-        32000 | 16000 | 8000 => &SHORT_STARTS_32,
-        48000 | 24000 | 12000 => &SHORT_STARTS_48,
+        16000 => &SHORT_STARTS_LSF_16,
+        22050 => &SHORT_STARTS_LSF_22,
+        24000 => &SHORT_STARTS_LSF_24,
+        32000 | 8000 => &SHORT_STARTS_32,
+        48000 | 12000 => &SHORT_STARTS_48,
         _ => &SHORT_STARTS_44,
     }
 }
@@ -135,12 +148,43 @@ const LONG_STARTS_48: [usize; 22] = [
     0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384,
 ];
 
+/// ISO/IEC 13818-3:1997 Table B.2 — 16 kHz and 22,05 kHz long-block
+/// band start indices + end+1. The spec prints the two rates' long
+/// tables with identical "width of band" columns (6×6, 8, 10, 12, 14,
+/// 16, 20, 24, 28, 32, 38, 46, 52, 60, 68, 58, 54), so they share one
+/// constant; band 21 spans `starts[21]..576`.
+const LONG_STARTS_LSF_16_22: [usize; 22] = [
+    0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 284, 336, 396, 464, 522,
+];
+/// ISO/IEC 13818-3:1997 Table B.2 — 24 kHz long-block band start
+/// indices + end+1 (widths 6×6, 8, 10, 12, 14, 16, 18, 22, 26, 32, 38,
+/// 46, 54, 62, 70, 76, 36); band 21 spans `starts[21]..576`.
+const LONG_STARTS_LSF_24: [usize; 22] = [
+    0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 114, 136, 162, 194, 232, 278, 332, 394, 464, 540,
+];
+
 /// Table B.8a (32 kHz) short-block per-window band start indices + end+1.
 const SHORT_STARTS_32: [usize; 13] = [0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180];
 /// Table B.8b (44.1 kHz) short-block per-window band start indices + end+1.
 const SHORT_STARTS_44: [usize; 13] = [0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136];
 /// Table B.8c (48 kHz) short-block per-window band start indices + end+1.
 const SHORT_STARTS_48: [usize; 13] = [0, 4, 8, 12, 16, 22, 28, 38, 50, 64, 80, 100, 126];
+
+/// ISO/IEC 13818-3:1997 Table B.2 — 16 kHz short-block per-window band
+/// start indices + end+1 (widths 4, 4, 4, 6, 8, 10, 12, 14, 18, 24, 30,
+/// 40, 18); band 12 spans `starts[12]..192` per window.
+const SHORT_STARTS_LSF_16: [usize; 13] = [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174];
+/// ISO/IEC 13818-3:1997 Table B.2 — 22,05 kHz short-block per-window
+/// band start indices + end+1 (widths 4, 4, 4, 6, 6, 8, 10, 14, 18, 26,
+/// 32, 42, 18); band 12 spans `starts[12]..192` per window.
+const SHORT_STARTS_LSF_22: [usize; 13] = [0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174];
+/// ISO/IEC 13818-3:1997 Table B.2 — 24 kHz short-block per-window band
+/// start indices + end+1 (widths 4, 4, 4, 6, 8, 10, 12, 14, 18, 24, 32,
+/// 44, 12); band 12 spans `starts[12]..192` per window. The start
+/// indices are accumulated from the "width of band" column — the
+/// authoritative one (the rendered "index of start/end" columns for
+/// this rate carry off-by-one typography).
+const SHORT_STARTS_LSF_24: [usize; 13] = [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180];
 
 /// In a mixed block the two lowest polyphase subbands (36 lines) are
 /// coded as a long block; the remainder uses short windows (§2.4.2.7,

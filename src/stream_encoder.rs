@@ -80,11 +80,11 @@ use crate::main_data::{
 use crate::mdct::{forward_overlap, mdct, window_long_family_analysis, MdctState, LONG_N};
 use crate::outer_loop::{
     outer_loop_search_long, outer_loop_search_mixed, outer_loop_search_short,
-    OUTER_LOOP_SCALEFAC_COMPRESS,
+    OUTER_LOOP_SCALEFAC_COMPRESS, OUTER_LOOP_SCALEFAC_COMPRESS_LSF,
 };
 use crate::quantize::quantize;
 use crate::scalefactors::{FrameScaleFactors, ScaleFactors, LONG_SFB};
-use crate::side_info::{BlockType, GranuleChannel, SideInfo, GRANULES};
+use crate::side_info::{BlockType, GranuleChannel, SideInfo, GRANULES, GRANULES_LSF};
 use crate::{make_silent_header, write_header, write_side_info, EncodeError};
 
 /// MPEG-1 Layer III bitrate ladder (ISO/IEC 11172-3 §2.4.2.3, Table
@@ -94,6 +94,14 @@ use crate::{make_silent_header, write_header, write_side_info, EncodeError};
 pub const MPEG1_L3_BITRATE_LADDER_KBPS: [u32; 14] = [
     32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
 ];
+
+/// MPEG-2 / MPEG-2.5 LSF Layer III bitrate ladder (ISO/IEC 13818-3
+/// §2.4.2.3, the `ID = 0` bitrate_index table shared by Layers II and
+/// III; the MPEG-2.5 extension inherits it). Same indexing convention
+/// as [`MPEG1_L3_BITRATE_LADDER_KBPS`]: entry `i` is `bitrate_index
+/// i + 1`, indices `0` (free format) and `15` (forbidden) excluded.
+pub const LSF_L3_BITRATE_LADDER_KBPS: [u32; 14] =
+    [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
 
 /// Default outer-loop per-band noise threshold (the uniform `xmin[sb]`
 /// the loop tests `xfsf(sb)` against). With our scalefactor amplification
@@ -149,8 +157,14 @@ pub enum StreamEncodeError {
     /// [`ChannelMode::DualChannel`] for independent two-channel
     /// content.
     StereoUnsupported,
-    /// Caller chose an MPEG-2 LSF sample rate (16 / 22.05 / 24 kHz);
-    /// LSF is deferred to a later round.
+    /// An LSF (MPEG-2 16 / 22.05 / 24 kHz or MPEG-2.5 8 / 11.025 /
+    /// 12 kHz) encoder was asked for a feature whose LSF wire format
+    /// is not implemented yet: intensity-stereo coupling (the
+    /// 13818-3 §2.4.3.2 `int_scalefac_compress` right-channel format)
+    /// or the §C.1.5.2 auto block-type scheduler (whose frame walk is
+    /// still two-granule shaped). Core LSF encode — CBR / VBR, mono /
+    /// stereo / dual-channel, MS joint stereo, forced block types,
+    /// outer loop, CRC, Xing — is supported as of r285.
     LsfUnsupported,
     /// VBR configuration is malformed: `min_kbps` / `max_kbps` are not
     /// both on the §2.4.2.3 ladder, are reversed, or `max_kbps`
@@ -206,9 +220,10 @@ impl core::fmt::Display for StreamEncodeError {
             StreamEncodeError::StereoUnsupported => f.write_str(
                 "ChannelMode::JointStereo not supported on this constructor (use Mp3Encoder::new_joint_stereo_ms, Stereo, or DualChannel)",
             ),
-            StreamEncodeError::LsfUnsupported => {
-                f.write_str("only MPEG-1 sample rates are supported in this round")
-            }
+            StreamEncodeError::LsfUnsupported => f.write_str(
+                "feature not yet ported to the LSF (MPEG-2 / MPEG-2.5) wire format \
+                 (intensity stereo and auto block-type remain MPEG-1 only)",
+            ),
             StreamEncodeError::InvalidVbrConfig => {
                 f.write_str("VBR config: min/max kbps off-ladder or out of range")
             }
@@ -674,16 +689,22 @@ impl Mp3Encoder {
     ///   methods (MS, intensity) require an encoder-side stereo
     ///   analysis stage that this round does not implement.
     ///
-    /// Sample rates: 32 / 44.1 / 48 kHz (MPEG-1 only; MPEG-2 / 2.5 LSF
-    /// remains deferred).
+    /// Sample rates: 32 / 44.1 / 48 kHz (MPEG-1, ISO/IEC 11172-3,
+    /// 1152 samples / two granules per frame), 16 / 22.05 / 24 kHz
+    /// (MPEG-2 LSF, ISO/IEC 13818-3 §2.4.3.2: one 576-sample granule
+    /// per frame, `slots_per_frame` constant 72), and 8 / 11.025 /
+    /// 12 kHz (MPEG-2.5, the Fraunhofer-IIS lower-rate extension that
+    /// inherits the 13818-3 LSF framing — see
+    /// `docs/audio/mp3/MPEG-2.5-GAP.md`). The version is inferred from
+    /// the sample rate; the LSF versions emit the §2.4.1.7 LSF
+    /// side-info layout (8-bit `main_data_begin`, no `scfsi`, 9-bit
+    /// `scalefac_compress`) and the §2.4.2.3 LSF bitrate ladder.
     ///
     /// # Errors
     ///
     /// * [`StreamEncodeError::StereoUnsupported`] for
     ///   [`ChannelMode::JointStereo`] (the only unsupported mode this
     ///   round).
-    /// * [`StreamEncodeError::LsfUnsupported`] for a non-MPEG-1
-    ///   sample rate.
     /// * [`StreamEncodeError::Header`] for a bad bitrate /
     ///   sample-rate combination (per
     ///   [`crate::make_silent_header`]).
@@ -702,9 +723,6 @@ impl Mp3Encoder {
         }
         let header_template = make_silent_header(bitrate_kbps, sample_rate_hz, mode)
             .map_err(StreamEncodeError::Header)?;
-        if header_template.version != MpegVersion::Mpeg1 {
-            return Err(StreamEncodeError::LsfUnsupported);
-        }
         let nch = header_template.channel_count() as usize;
         let analysis_state = (0..nch).map(|_| AnalysisState::new()).collect();
         let mdct_state = (0..nch)
@@ -714,7 +732,7 @@ impl Mp3Encoder {
         Ok(Mp3Encoder {
             header_template,
             sample_rate_hz,
-            version: MpegVersion::Mpeg1,
+            version: header_template.version,
             nch,
             analysis_state,
             mdct_state,
@@ -756,6 +774,27 @@ impl Mp3Encoder {
     #[must_use]
     fn ms_joint_stereo_active(&self) -> bool {
         self.ms_stereo || self.ms_auto_threshold.is_some()
+    }
+
+    /// Granules per frame: 2 for MPEG-1 (ISO/IEC 11172-3 §2.4.1.7),
+    /// 1 for MPEG-2 / MPEG-2.5 LSF (ISO/IEC 13818-3 §2.4.3.2: "a
+    /// Layer III frame contains only one granule").
+    #[must_use]
+    fn granules_per_frame(&self) -> usize {
+        if self.version.is_lsf() {
+            GRANULES_LSF
+        } else {
+            GRANULES
+        }
+    }
+
+    /// PCM samples consumed per assembled frame and per channel:
+    /// `granules_per_frame() × 576` — 1152 for MPEG-1, 576 for the LSF
+    /// versions (ISO/IEC 13818-3 §2.4.3.2 "the number of samples per
+    /// frame is 576").
+    #[must_use]
+    fn samples_per_frame(&self) -> usize {
+        self.granules_per_frame() * SAMPLES_PER_GRANULE
     }
 
     /// Force every assembled granule onto the §2.4.2.7 short-block
@@ -908,7 +947,15 @@ impl Mp3Encoder {
     /// Returns `Ok` for every channel layout this round; the
     /// previous round's [`StreamEncodeError::StereoUnsupported`]
     /// guard was dropped in r163.
+    /// [`StreamEncodeError::LsfUnsupported`] on an LSF (MPEG-2 /
+    /// MPEG-2.5) encoder: the §C.1.5.2 scheduler walk in
+    /// `assemble_frame_with_lookahead` steps the per-channel state
+    /// machine twice per frame (the MPEG-1 two-granule geometry); the
+    /// one-granule LSF restructure of that walk is deferred.
     pub fn enable_auto_block_type(&mut self, threshold: f64) -> Result<(), StreamEncodeError> {
+        if self.version.is_lsf() {
+            return Err(StreamEncodeError::LsfUnsupported);
+        }
         if self.intensity_start_sfb.is_some() {
             // Intensity coupling is long-block only this round; the
             // auto scheduler emits Start / Short / End granules whose
@@ -1382,6 +1429,17 @@ impl Mp3Encoder {
     /// constructors. `start_sfb` must leave at least one normally-coded
     /// long band below the bound and one intensity band at or above it.
     fn arm_intensity(&mut self, start_sfb: usize) -> Result<(), StreamEncodeError> {
+        // LSF intensity stereo is a different wire format altogether:
+        // ISO/IEC 13818-3 §2.4.3.2 routes the right channel through
+        // `int_scalefac_compress = scalefac_compress >> 1` with its own
+        // partition tables, an `intensity_scale` selector, and a
+        // slen-dependent illegal-position marker (not the fixed 7).
+        // The encoder's intensity path emits the MPEG-1 §2.4.3.4.9.3
+        // format only, so the LSF versions reject intensity arming
+        // until the LSF intensity encode lands.
+        if self.version.is_lsf() {
+            return Err(StreamEncodeError::LsfUnsupported);
+        }
         if !(1..=20).contains(&start_sfb) {
             return Err(StreamEncodeError::InvalidIntensityStartSfb { start_sfb });
         }
@@ -1473,8 +1531,10 @@ impl Mp3Encoder {
     ///   carrier / inner-loop budget would no longer cover the chosen
     ///   max).
     pub fn enable_vbr(&mut self, min_kbps: u32, max_kbps: u32) -> Result<(), StreamEncodeError> {
-        let min_idx = ladder_index(min_kbps).ok_or(StreamEncodeError::InvalidVbrConfig)?;
-        let max_idx = ladder_index(max_kbps).ok_or(StreamEncodeError::InvalidVbrConfig)?;
+        let min_idx =
+            ladder_index(self.version, min_kbps).ok_or(StreamEncodeError::InvalidVbrConfig)?;
+        let max_idx =
+            ladder_index(self.version, max_kbps).ok_or(StreamEncodeError::InvalidVbrConfig)?;
         if min_idx > max_idx {
             return Err(StreamEncodeError::InvalidVbrConfig);
         }
@@ -1725,8 +1785,10 @@ impl Mp3Encoder {
     /// dual-channel encoders the input is **interleaved** LR pairs
     /// (`[L0, R0, L1, R1, …]`). The encoder splits the interleaved
     /// stream into its per-channel buffers and assembles whole MP3
-    /// frames as soon as each per-channel buffer has accumulated
-    /// `SAMPLES_PER_FRAME_MPEG1 = 1152` samples.
+    /// frames as soon as each per-channel buffer has accumulated one
+    /// frame's worth of samples — `SAMPLES_PER_FRAME_MPEG1 = 1152`
+    /// (two granules) for MPEG-1, 576 (one granule, ISO/IEC 13818-3
+    /// §2.4.3.2) for the MPEG-2 / MPEG-2.5 LSF rates.
     ///
     /// The interleaved length is therefore expected to be a multiple
     /// of `nch` (1 for mono, 2 for stereo); a trailing partial pair is
@@ -1766,23 +1828,22 @@ impl Mp3Encoder {
         // Assemble frames as long as EVERY channel's pending buffer
         // holds at least one full granule-frame worth of samples
         // PLUS the auto-block-type lookahead (zero when auto is off).
+        let frame_samples = self.samples_per_frame();
         while self
             .pending_pcm
             .iter()
-            .all(|buf| buf.len() >= SAMPLES_PER_FRAME_MPEG1 + lookahead_pad)
+            .all(|buf| buf.len() >= frame_samples + lookahead_pad)
         {
             let mut per_ch_frame_pcm: Vec<Vec<f32>> = Vec::with_capacity(nch);
             let mut per_ch_lookahead: Vec<Vec<f32>> = Vec::with_capacity(nch);
             for buf in self.pending_pcm.iter_mut() {
-                let mut take = vec![0.0f32; SAMPLES_PER_FRAME_MPEG1];
-                take.copy_from_slice(&buf[..SAMPLES_PER_FRAME_MPEG1]);
+                let mut take = vec![0.0f32; frame_samples];
+                take.copy_from_slice(&buf[..frame_samples]);
                 let mut peek = vec![0.0f32; lookahead_pad];
                 if lookahead_pad > 0 {
-                    peek.copy_from_slice(
-                        &buf[SAMPLES_PER_FRAME_MPEG1..SAMPLES_PER_FRAME_MPEG1 + lookahead_pad],
-                    );
+                    peek.copy_from_slice(&buf[frame_samples..frame_samples + lookahead_pad]);
                 }
-                buf.drain(..SAMPLES_PER_FRAME_MPEG1);
+                buf.drain(..frame_samples);
                 per_ch_frame_pcm.push(take);
                 per_ch_lookahead.push(peek);
             }
@@ -1806,12 +1867,14 @@ impl Mp3Encoder {
     pub fn finish<W: Write>(mut self, sink: &mut W) -> Result<usize, StreamEncodeError> {
         // Tail-flush. With auto block-type on, `push_samples` holds
         // back one extra granule of PCM as the §C.1.5.2 lookahead,
-        // so at finish time we may have between 1 and 1152 + 576
-        // samples per channel still buffered. We emit them as one or
-        // two frames as needed, with a zero-padded "no attack ahead"
-        // lookahead for the very last frame.
+        // so at finish time we may have between 1 and
+        // `samples_per_frame() + 576` samples per channel still
+        // buffered. We emit them as one or two frames as needed, with
+        // a zero-padded "no attack ahead" lookahead for the very last
+        // frame.
         let nch = self.nch;
         let auto_on = self.auto_block_type.is_some();
+        let frame_samples = self.samples_per_frame();
         loop {
             let any_pending = self.pending_pcm.iter().any(|b| !b.is_empty());
             if !any_pending {
@@ -1820,8 +1883,8 @@ impl Mp3Encoder {
             let mut per_ch_tail: Vec<Vec<f32>> = Vec::with_capacity(nch);
             let mut per_ch_lookahead: Vec<Vec<f32>> = Vec::with_capacity(nch);
             for buf in self.pending_pcm.iter_mut() {
-                let mut tail = vec![0.0f32; SAMPLES_PER_FRAME_MPEG1];
-                let take = buf.len().min(SAMPLES_PER_FRAME_MPEG1);
+                let mut tail = vec![0.0f32; frame_samples];
+                let take = buf.len().min(frame_samples);
                 tail[..take].copy_from_slice(&buf[..take]);
                 buf.drain(..take);
                 per_ch_tail.push(tail);
@@ -1856,7 +1919,7 @@ impl Mp3Encoder {
     /// pick a smaller bitrate index; the budget is the upper bound on
     /// per-granule-channel bits, not a target to fill.
     fn per_gc_bit_budget(&self) -> usize {
-        let si_bytes = side_info_byte_len(self.nch);
+        let si_bytes = side_info_byte_len(self.version, self.nch);
         let crc_bytes = if self.crc_enabled { 2 } else { 0 };
         // VBR caps per-granule bits at the max-index slot; CBR caps at
         // the constructor slot. In both cases the CRC (when enabled)
@@ -1869,7 +1932,7 @@ impl Mp3Encoder {
                 frame_len.saturating_sub(4 + crc_bytes + si_bytes)
             }
         };
-        let denom = GRANULES.saturating_mul(self.nch).max(1);
+        let denom = self.granules_per_frame().saturating_mul(self.nch).max(1);
         // Hold back a small margin (16 bits) per granule-channel for
         // the assembler's last partial-byte pad and any rounding.
         slot_bytes
@@ -1903,8 +1966,12 @@ impl Mp3Encoder {
     ) -> Result<(), StreamEncodeError> {
         debug_assert_eq!(per_ch_frame_pcm.len(), self.nch);
         for buf in per_ch_frame_pcm.iter() {
-            debug_assert_eq!(buf.len(), SAMPLES_PER_FRAME_MPEG1);
+            debug_assert_eq!(buf.len(), self.samples_per_frame());
         }
+        // Granules in this frame: 2 (MPEG-1) or 1 (LSF). The
+        // fixed-size `[..; 2]` scratch arrays keep their MPEG-1 shape;
+        // the LSF path simply never touches index 1.
+        let ngr = self.granules_per_frame();
 
         // ---- Build the side-info skeleton (all-long, zero scalefactors) ----
         let mut side_info = SideInfo {
@@ -1913,12 +1980,12 @@ impl Mp3Encoder {
             scfsi: [[false; 4]; 2],
             granules: [[default_long_gc(); 2]; GRANULES],
             channels: self.nch as u8,
-            granule_count: GRANULES as u8,
-            lsf: false,
+            granule_count: ngr as u8,
+            lsf: self.version.is_lsf(),
         };
         let mut scalefactors = FrameScaleFactors {
             granules: [[ScaleFactors::default(); 2]; 2],
-            granule_count: GRANULES as u8,
+            granule_count: ngr as u8,
             channels: self.nch as u8,
         };
         let mut gc_data: [[GranuleChannelData; 2]; 2] = Default::default();
@@ -1939,7 +2006,7 @@ impl Mp3Encoder {
         // `MDCT_fwd → alias_inv → stereo_inv (MS forward) → quantize`,
         // so the MS step belongs between `inverse_alias_reduce` and the
         // quantize loop — which is exactly the pass-1/pass-2 split here.
-        let mut xr_pre_per_gc: Vec<Vec<[f32; NUM_LINES]>> = (0..GRANULES)
+        let mut xr_pre_per_gc: Vec<Vec<[f32; NUM_LINES]>> = (0..ngr)
             .map(|_| (0..self.nch).map(|_| [0.0f32; NUM_LINES]).collect())
             .collect();
 
@@ -2151,7 +2218,7 @@ impl Mp3Encoder {
                 [[BlockType::Long; 2]; GRANULES]
             };
 
-        for gr in 0..GRANULES {
+        for gr in 0..ngr {
             for ch in 0..self.nch {
                 let gr_pcm =
                     &per_ch_frame_pcm[ch][gr * SAMPLES_PER_GRANULE..(gr + 1) * SAMPLES_PER_GRANULE];
@@ -2511,7 +2578,7 @@ impl Mp3Encoder {
         if let Some(start_sfb) = self.intensity_start_sfb {
             if self.nch == 2 {
                 let starts = long_band_starts_for(self.sample_rate_hz);
-                for (gr, is_pos_bands) in is_pos_per_gr.iter_mut().enumerate() {
+                for (gr, is_pos_bands) in is_pos_per_gr.iter_mut().enumerate().take(ngr) {
                     let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
                     let left = &mut left_slice[0];
                     let right = &mut right_slice[0];
@@ -2597,7 +2664,7 @@ impl Mp3Encoder {
                 // would actually apply to (above the bound the right
                 // channel is already the coupled zero-part).
                 let mut all_ok = true;
-                for gr in 0..GRANULES {
+                for gr in 0..ngr {
                     let left = &xr_pre_per_gc[gr][0];
                     let right = &xr_pre_per_gc[gr][1];
                     let mut lr_energy = 0.0f64;
@@ -2635,7 +2702,7 @@ impl Mp3Encoder {
         };
         if apply_ms_this_frame {
             const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
-            for gr in 0..GRANULES {
+            for gr in 0..ngr {
                 // Split the per-channel borrow without copying both
                 // arrays: `split_at_mut(1)` gives us `[L]` and `[R]`
                 // as disjoint slices, then we index into them.
@@ -2680,7 +2747,7 @@ impl Mp3Encoder {
         }
 
         // ---- Pass 2: per-(gr, ch) quantization + side-info build ----
-        for gr in 0..GRANULES {
+        for gr in 0..ngr {
             for ch in 0..self.nch {
                 let xr_pre = xr_pre_per_gc[gr][ch];
 
@@ -3079,11 +3146,54 @@ impl Mp3Encoder {
                 // `scalefac_compress = 15` gives `slen1 = 4` /
                 // `slen2 = 3` (§2.4.2.7 table) — every position fits.
                 let intensity_right = intensity_active && ch == 1;
-                let scalefac_compress = if ran_outer_loop || intensity_right {
+                // LSF carries a 9-bit scalefac_compress with the
+                // §2.4.3.2 (13818-3) slen derivation. The LSF
+                // outer-loop value 399 decodes to slen (4, 4, 3, 3)
+                // over the long-block partition (6, 5, 5, 5) — i.e.
+                // slen 4 on bands 0..=10 and slen 3 on bands 11..=20,
+                // the same per-band caps (15 / 7) and the same 74-bit
+                // part2 cost as the MPEG-1 outer-loop value 15
+                // (slen1 = 4, slen2 = 3); the short-block partition
+                // (9, 9, 9, 9) likewise reproduces the MPEG-1 short
+                // caps (sfb 0..=5 at 4 bits, 6..=11 at 3 bits,
+                // 126 bits). The outer loop's internal bit accounting
+                // therefore carries over unchanged; only the written
+                // field value differs.
+                let outer_sfc = if self.version.is_lsf() {
+                    OUTER_LOOP_SCALEFAC_COMPRESS_LSF
+                } else {
                     OUTER_LOOP_SCALEFAC_COMPRESS
+                };
+                let scalefac_compress = if ran_outer_loop || intensity_right {
+                    outer_sfc
                 } else {
                     0
                 };
+                // LSF has no preflag bit on the wire and the
+                // scalefac_compress ranges below 500 all decode
+                // preflag = 0 (13818-3 §2.4.3.2), so a preflag the
+                // outer loop converged on cannot be transmitted as a
+                // flag. Fold the Table B.6 pretab into the long
+                // scalefactors instead — the §2.4.3.4.7.1 exponent
+                // reads `scalefac + preflag·pretab`, so transmitting
+                // `scalefac + pretab` with preflag = 0 reproduces the
+                // identical requantize exponent — and drop the fold
+                // (clearing preflag before the re-quantize below, so
+                // encoder and side-info stay in agreement) on the rare
+                // band where the folded value would overflow its
+                // 3-bit upper-band cap.
+                if self.version.is_lsf() && sf.preflag {
+                    let fits = (0..21).all(|sfb| {
+                        let cap = if sfb < 11 { 15 } else { 7 };
+                        u16::from(sf.long[sfb]) + u16::from(crate::requantize::PRETAB[sfb]) <= cap
+                    });
+                    if fits {
+                        for sfb in 0..21 {
+                            sf.long[sfb] += crate::requantize::PRETAB[sfb];
+                        }
+                    }
+                    sf.preflag = false;
+                }
                 let mut gc;
                 let mut is;
                 let mut split;
@@ -3300,7 +3410,7 @@ impl Mp3Encoder {
         // when [`Mp3Encoder::with_protection_bit`] is on, the §2.4.3.1
         // 2-byte CRC slot sits between the header and the side-info
         // block and shrinks the main-data capacity by two bytes.
-        let si_bytes = side_info_byte_len(self.nch);
+        let si_bytes = side_info_byte_len(self.version, self.nch);
         let crc_bytes: usize = if self.crc_enabled { 2 } else { 0 };
         let frames = self.frames;
         let n = frames.len();
@@ -3315,14 +3425,17 @@ impl Mp3Encoder {
         let base_frame_len = self.header_template.frame_len().expect("CBR frame_len");
         // Padded length is base + 1 byte. To average the right bitrate
         // we need every K-th frame padded where K = sample_rate /
-        // ((bitrate * 144) mod sample_rate). For deterministic mono
-        // 128 kbit/s @ 44.1 kHz that's pad every ~9 frames. Use a
-        // running accumulator: `acc += rem; if acc >= sr { pad =
-        // true; acc -= sr }` — the classic Bresenham-style CBR pad
-        // ladder.
+        // ((bitrate * slots_per_frame) mod sample_rate). For
+        // deterministic mono 128 kbit/s @ 44.1 kHz that's pad every ~9
+        // frames. Use a running accumulator: `acc += rem; if acc >= sr
+        // { pad = true; acc -= sr }` — the classic Bresenham-style CBR
+        // pad ladder. The slots_per_frame constant is 144 for MPEG-1
+        // and 72 for the LSF versions (ISO/IEC 13818-3 §2.4.3.2,
+        // "Changed constants for ISO/IEC 13818-3 Layer III").
         let bitrate_bps = u64::from(self.header_template.bitrate_kbps.unwrap_or(0)) * 1000;
         let sr64 = u64::from(self.sample_rate_hz);
-        let rem = (144 * bitrate_bps) % sr64;
+        let slots_coeff: u64 = if self.version.is_lsf() { 72 } else { 144 };
+        let rem = (slots_coeff * bitrate_bps) % sr64;
         let mut acc: u64 = 0;
         for (i, f) in frames.into_iter().enumerate() {
             let mut hdr = f.header;
@@ -3342,8 +3455,8 @@ impl Mp3Encoder {
                 // `main_data_begin == 0`.
                 let need = f.main_data.len();
                 let (idx_kbps, idx_byte) =
-                    pick_vbr_bitrate(self.sample_rate_hz, vbr_cfg, need, crc_bytes).ok_or(
-                        StreamEncodeError::VbrSlotTooSmall {
+                    pick_vbr_bitrate(self.sample_rate_hz, vbr_cfg, need, si_bytes, crc_bytes)
+                        .ok_or(StreamEncodeError::VbrSlotTooSmall {
                             frame_index: i,
                             main_data_len: need,
                             max_slot_bytes: ladder_slot_capacity(
@@ -3353,8 +3466,7 @@ impl Mp3Encoder {
                                 /*padded=*/ true,
                             )
                             .saturating_sub(crc_bytes),
-                        },
-                    )?;
+                        })?;
                 hdr.bitrate_index = idx_byte;
                 hdr.bitrate_kbps = Some(idx_kbps);
                 // VBR sub-step: choose padding to fit `need` exactly
@@ -3398,17 +3510,19 @@ impl Mp3Encoder {
 
         // Step 2: run the bit-reservoir scheduler.
         //
-        // §2.4.2.7 caps `main_data_begin` at 511 bytes (MPEG-1).
-        // Without a psychoacoustic model the per-frame main_data tends
-        // to be much smaller than the slot, so the rolling reservoir
-        // would grow unbounded across frames. We bound it by
-        // **zero-padding** every frame's main_data up to at least its
-        // own slot size: the reservoir then never grows above 0 byte
-        // (the no-reservoir schedule), every `main_data_begin` is 0,
-        // and the scheduler walks the trivial schedule. (A real
-        // encoder uses the reservoir to absorb busy-frame overflow;
-        // we revisit that once the psy / outer loop lands.)
-        let lsf = false; // MPEG-1 only this round.
+        // §2.4.2.7 caps `main_data_begin` at 511 bytes (MPEG-1) / 255
+        // bytes (LSF, 8-bit field — `schedule_reservoir` reads the
+        // per-frame `lsf` flag for the cap). Without a psychoacoustic
+        // model the per-frame main_data tends to be much smaller than
+        // the slot, so the rolling reservoir would grow unbounded
+        // across frames. We bound it by **zero-padding** every frame's
+        // main_data up to at least its own slot size: the reservoir
+        // then never grows above 0 byte (the no-reservoir schedule),
+        // every `main_data_begin` is 0, and the scheduler walks the
+        // trivial schedule. (A real encoder uses the reservoir to
+        // absorb busy-frame overflow; we revisit that once the psy /
+        // outer loop lands.)
+        let lsf = self.version.is_lsf();
         let padded_main_datas: Vec<Vec<u8>> = main_datas
             .iter()
             .zip(slots.iter())
@@ -3509,10 +3623,18 @@ impl Mp3Encoder {
             debug_assert_eq!(sib.len(), si_bytes);
             if self.crc_enabled {
                 // §2.4.3.1: 16-bit CRC of header bits 16..31 plus the
-                // first 135 (mono) / 256 (other modes) bits of the
-                // side-info block, written big-endian (MSB first) in
-                // the two-byte slot between header and side_info.
-                let crc = crate::crc::crc16_layer3(&hbytes, &sib, self.nch as u8);
+                // side-info bits, written big-endian (MSB first) in
+                // the two-byte slot between header and side_info. The
+                // protected side-info window follows the version: 135
+                // (mono) / 256 (other modes) bits for MPEG-1, 72 / 136
+                // bits for the shorter LSF side info (ISO/IEC 13818-3
+                // §2.4.1.4 defers to the 11172-3 definition over the
+                // LSF layout).
+                let crc = if lsf {
+                    crate::crc::crc16_layer3_lsf(&hbytes, &sib, self.nch as u8)
+                } else {
+                    crate::crc::crc16_layer3(&hbytes, &sib, self.nch as u8)
+                };
                 sink.write_all(&crc.to_be_bytes())?;
                 written += 2;
             }
@@ -3539,27 +3661,24 @@ impl Default for GranuleChannelData {
     }
 }
 
-/// Long-block scalefactor-band start indices (Table 3-B.8) for the
-/// active sample rate, transcribed locally so the encoder doesn't
-/// reach into a decoder-private helper. Index 21 (one past band 20)
-/// is the end+1 boundary so callers can read the top of the long-block
-/// range as a "next" boundary.
+/// Long-block scalefactor-band start indices for the active sample
+/// rate. Index 21 (one past band 20) is the end+1 boundary so callers
+/// can read the top of the long-block range as a "next" boundary.
+///
+/// Delegates to [`crate::requantize::long_band_starts`] — the single
+/// in-crate transcription of ISO/IEC 11172-3 Table 3-B.8 (MPEG-1
+/// rates) and ISO/IEC 13818-3:1997 Table B.2 (MPEG-2 LSF rates) — so
+/// the encoder's region split / intensity band walk and the decoder's
+/// requantizer always agree on band boundaries. The sample rate alone
+/// determines the version (the three rate families are disjoint), so
+/// the version argument is derived here.
 fn long_band_starts_for(sample_rate_hz: u32) -> &'static [usize; 22] {
-    const LONG_BANDS_32: [usize; 22] = [
-        0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 54, 66, 82, 102, 126, 156, 194, 240, 296, 364, 448,
-        550,
-    ];
-    const LONG_BANDS_44: [usize; 22] = [
-        0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342, 418,
-    ];
-    const LONG_BANDS_48: [usize; 22] = [
-        0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384,
-    ];
-    match sample_rate_hz {
-        32_000 | 16_000 | 8_000 => &LONG_BANDS_32,
-        48_000 | 24_000 | 12_000 => &LONG_BANDS_48,
-        _ => &LONG_BANDS_44,
-    }
+    let version = match sample_rate_hz {
+        16_000 | 22_050 | 24_000 => MpegVersion::Mpeg2,
+        8_000 | 11_025 | 12_000 => MpegVersion::Mpeg25,
+        _ => MpegVersion::Mpeg1,
+    };
+    crate::requantize::long_band_starts(sample_rate_hz, version)
 }
 
 /// Derive the §2.4.3.4.9.3 intensity-stereo position for one
@@ -3837,43 +3956,60 @@ fn default_transition_gc(block_type: BlockType) -> GranuleChannel {
     }
 }
 
-/// Side-info byte length lookup mirroring
-/// [`crate::demuxer::side_info_len`] without taking a `MpegVersion`
-/// dep (we know MPEG-1 only).
-fn side_info_byte_len(nch: usize) -> usize {
-    if nch == 1 {
-        17
-    } else {
-        32
-    }
+/// Side-info byte length for the active version + channel count:
+/// ISO/IEC 11172-3 §2.4.1.7 (17 / 32 bytes) for MPEG-1, ISO/IEC
+/// 13818-3 §2.4.1.7 (9 / 17 bytes) for the LSF versions. Delegates to
+/// the demuxer's shared lookup.
+fn side_info_byte_len(version: MpegVersion, nch: usize) -> usize {
+    crate::demuxer::side_info_len(version, nch as u8)
 }
 
 /// Resolve an MPEG-1 Layer III bitrate (kbit/s) to its position
 /// (1..=14) on the §2.4.2.3 ladder. Returns `None` for an off-ladder
 /// value (free format `0`, forbidden `15`, or any kbps not in
 /// [`MPEG1_L3_BITRATE_LADDER_KBPS`]).
-fn ladder_index(kbps: u32) -> Option<u8> {
-    MPEG1_L3_BITRATE_LADDER_KBPS
+fn ladder_index(version: MpegVersion, kbps: u32) -> Option<u8> {
+    bitrate_ladder_for(version)
         .iter()
         .position(|&v| v == kbps)
         .map(|i| (i + 1) as u8)
+}
+
+/// The Layer III bitrate ladder for `version`: the MPEG-1 §2.4.2.3
+/// table or the 13818-3 LSF table (which MPEG-2.5 inherits).
+fn bitrate_ladder_for(version: MpegVersion) -> &'static [u32; 14] {
+    if version.is_lsf() {
+        &LSF_L3_BITRATE_LADDER_KBPS
+    } else {
+        &MPEG1_L3_BITRATE_LADDER_KBPS
+    }
 }
 
 /// Compute the main-data slot byte capacity for the §2.4.2.3 ladder
 /// `bitrate_index` (1..=14) at the given `sample_rate_hz`, after
 /// subtracting the 4-byte header and `si_bytes` side-info bytes (no
 /// CRC). When `padded` is true, the slot includes the one-byte padding
-/// slot the per-frame `padding` bit absorbs.
+/// slot the per-frame `padding` bit absorbs. The version (and with it
+/// the bitrate ladder + the 144-vs-72 `slots_per_frame` constant of
+/// ISO/IEC 13818-3 §2.4.3.2) follows from the sample rate — the three
+/// rate families are disjoint.
 fn ladder_slot_capacity(
     sample_rate_hz: u32,
     bitrate_index: u8,
     si_bytes: usize,
     padded: bool,
 ) -> usize {
-    let kbps = MPEG1_L3_BITRATE_LADDER_KBPS[(bitrate_index - 1) as usize];
+    let lsf = sample_rate_hz < 32_000;
+    let ladder = if lsf {
+        &LSF_L3_BITRATE_LADDER_KBPS
+    } else {
+        &MPEG1_L3_BITRATE_LADDER_KBPS
+    };
+    let kbps = ladder[(bitrate_index - 1) as usize];
     let bps = u64::from(kbps) * 1000;
     let sr = u64::from(sample_rate_hz);
-    let unpadded = (144 * bps / sr) as usize;
+    let coeff: u64 = if lsf { 72 } else { 144 };
+    let unpadded = (coeff * bps / sr) as usize;
     let frame_len = unpadded + usize::from(padded);
     frame_len.saturating_sub(4 + si_bytes)
 }
@@ -3888,9 +4024,10 @@ fn pick_vbr_bitrate(
     sample_rate_hz: u32,
     cfg: VbrConfig,
     need: usize,
+    si_bytes: usize,
     crc_bytes: usize,
 ) -> Option<(u32, u8)> {
-    let si_bytes = 17; // mono-only this round; matches side_info_byte_len(1).
+    let lsf = sample_rate_hz < 32_000;
     for idx in cfg.min_index..=cfg.max_index {
         // Try unpadded first, then padded — the per-frame padding bit
         // adds one byte to the slot at the same `bitrate_index`. For
@@ -3900,7 +4037,12 @@ fn pick_vbr_bitrate(
         let cap_padded =
             ladder_slot_capacity(sample_rate_hz, idx, si_bytes, true).saturating_sub(crc_bytes);
         if cap_padded >= need {
-            let kbps = MPEG1_L3_BITRATE_LADDER_KBPS[(idx - 1) as usize];
+            let ladder = if lsf {
+                &LSF_L3_BITRATE_LADDER_KBPS
+            } else {
+                &MPEG1_L3_BITRATE_LADDER_KBPS
+            };
+            let kbps = ladder[(idx - 1) as usize];
             return Some((kbps, idx));
         }
     }
@@ -4338,7 +4480,7 @@ mod tests {
             assert!(hdr.crc_protected);
             let wire_crc = u16::from_be_bytes([f.data[4], f.data[5]]);
             let nch = hdr.channel_count();
-            let si_bytes = side_info_byte_len(nch as usize);
+            let si_bytes = side_info_byte_len(hdr.version, nch as usize);
             let si_slice = &f.data[6..6 + si_bytes];
             let expected = crate::crc::crc16_layer3(&hdr_bytes, si_slice, nch);
             assert_eq!(

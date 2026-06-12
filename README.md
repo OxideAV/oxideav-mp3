@@ -161,9 +161,16 @@ float frequency lines `xr[576]` for one granule-channel:
   Short-block lines stay in their native `(sfb, window, freqline)`
   interleave; the §2.4.3.4.8 reorder is the next stage (`reorder` module
   below).
-- Band→scalefactor mapping uses the Table B.8 long- and short-block
-  start indices for 32 / 44.1 / 48 kHz (LSF reuses the long layouts
-  this round; LSF-specific band tables are deferred). 19 unit tests
+- Band→scalefactor mapping uses the ISO/IEC 11172-3 Table B.8 long- and
+  short-block start indices for 32 / 44.1 / 48 kHz and (as of r285) the
+  ISO/IEC 13818-3:1997 Table B.2 indices for the LSF rates 16 / 22.05 /
+  24 kHz (long + short; 16 and 22.05 kHz share one long layout per the
+  spec). The MPEG-2.5 rates 8 / 11.025 / 12 kHz keep the half-rate
+  MPEG-1 layouts as a self-consistent placeholder — their band tables
+  are a documented residual gap (`docs/audio/mp3/MPEG-2.5-GAP.md`).
+  These tables are the crate's single transcription: the Huffman
+  region-boundary derivation and the encoder's region-split /
+  intensity band walks delegate here. 19 unit tests
   cover long-block unit-gain identity, the global-gain 4-step doubling,
   the scalefactor and `scalefac_scale` terms, the preflag/pretab effect
   (on and off), per-window `subblock_gain` and `scalefac_s`, short-band
@@ -4447,7 +4454,33 @@ round-trip on every in-range index, accessor rejection on
 out-of-range indices, the 1-based FFT-line indexing
 convention (row 0 carries ω = 1), and the top-of-table pin
 (row 32 carries ω = 513 = 1 + 32·16, matching the
-1024-sample FFT's 1..=513 one-based half-spectrum) — it
+1024-sample FFT's 1..=513 one-based half-spectrum) + r285
+**MPEG-2 LSF + MPEG-2.5 stream-level encode**: `Mp3Encoder::new`
+(and the registry `make_encoder` path) accepts 16 / 22.05 / 24 kHz
+(MPEG-2 LSF) and 8 / 11.025 / 12 kHz (MPEG-2.5) — one 576-sample
+granule per frame, `slots_per_frame` 72 (ISO/IEC 13818-3
+§2.4.3.2), the §2.4.1.7 LSF side-info layout, the LSF §2.4.2.3
+bitrate ladder (`LSF_L3_BITRATE_LADDER_KBPS`), the LSF CBR
+padding ladder, the 255-byte reservoir cap, LSF CRC
+(`crc16_layer3_lsf` over header bits 16..31 + the full 72 /
+136-bit LSF side info), VBR on the LSF ladder, MS joint stereo,
+forced short / mixed blocks, and the outer loop writing
+`scalefac_compress = 399` (`OUTER_LOOP_SCALEFAC_COMPRESS_LSF` —
+the §2.4.3.2 slen derivation (4, 4, 3, 3) over partition
+(6, 5, 5, 5) reproducing the MPEG-1 value-15 caps and part2
+cost; an outer-loop preflag is folded into the long
+scalefactors since sub-500 `scalefac_compress` cannot carry the
+flag). The 13818-3 Table B.2 scalefactor-band tables for the
+three LSF rates (long + short) land in `requantize` and back
+every band-mapping consumer (requantizer, Huffman region split,
+encoder region / intensity walks);
+`tests/lsf_reference_pcm.rs` pins the 22.05 kHz staged
+fixture's decode to its reference `expected.wav` at 0.000026
+steady-state normalized RMS error, and
+`tests/lsf_encoder_roundtrip.rs` (10 tests) round-trips the
+LSF / MPEG-2.5 rates at 56–88 dB self-decode PSNR with
+black-box `ffmpeg` / `mpg123` cross-decodes recovering the
+exact test tones at every MPEG-2 rate — it
 still lacks
 the rest of
 Annex D Model 2 (steps h)–l) — required SNR per partition,
@@ -4455,13 +4488,18 @@ power ratio, energy threshold, line spread and the
 absolute-threshold floor, all of whose table inputs
 (`minval` / `TMN` from Tables D.3a–c and `absthr` from
 Tables D.4a–c) are now transcribed in-tree — plus the
-steps b)–e) FFT-side inputs), and
-LSF / MPEG-2.5 encode (the
-framing layer round-trips MPEG-2.5 headers but the encoder's
-stream-level driver still rejects non-MPEG-1 streams; the
-MPEG-2.5-specific scalefactor-band tables + Huffman table mapping
-+ low-rate frame-size validation items in `MPEG-2.5-GAP.md` are
-needed before bit-exact MPEG-2.5 encode is implementable).
+steps b)–e) FFT-side inputs),
+LSF intensity-stereo encode (the 13818-3 §2.4.3.2
+`int_scalefac_compress` right-channel format; intensity
+constructors reject LSF rates with `LsfUnsupported`),
+LSF auto block-type (the §C.1.5.2 scheduler walk is still
+two-granule shaped), and
+externally-valid MPEG-2.5 encode (the encoder emits
+self-consistent MPEG-2.5 streams this crate's decoder
+round-trips, but the MPEG-2.5-specific scalefactor-band tables
+remain the documented `MPEG-2.5-GAP.md` placeholder — external
+decoders place the bands differently at 8 / 11.025 / 12 kHz
+until the gap's observer-trace tables land).
 
 **Spec gap (alias reduction, mixed blocks):** §2.4.3.4.10.1 scopes the
 stage purely on `block_type` ("block-type != 2" applies; "block-type ==

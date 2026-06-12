@@ -282,11 +282,12 @@ fn lsf_preflag_amplifies_high_bands() {
         preflag: true,
         ..ScaleFactors::default()
     };
-    // Band 17 at 24 kHz uses the 48 kHz long layout (start index 190).
+    // Band 17 at 24 kHz starts at line 278 (ISO/IEC 13818-3:1997
+    // Table B.2, 24 kHz long blocks: "index of start" 278).
     let mut is = [0i32; NUM_LINES];
-    is[190] = 1;
+    is[278] = 1;
     let xr = requantize(&is, &gc, &sf, 24000, MpegVersion::Mpeg2);
-    approx(xr[190], 2f32.powf(-1.5));
+    approx(xr[278], 2f32.powf(-1.5));
 }
 
 #[test]

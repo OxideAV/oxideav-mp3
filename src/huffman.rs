@@ -349,36 +349,18 @@ fn region_boundaries(
 }
 
 /// The long-block scalefactor-band *start* line indices for the active
-/// sampling rate (Table 3-B.8a/b/c). Index `i` is the first line of
-/// band `i`; entry 21 (one past band 20) is the band's end+1 so callers
-/// can read a region boundary at the top of the long-block range.
+/// sampling rate. Index `i` is the first line of band `i`; entry 21
+/// (one past band 20) is the band's end+1 so callers can read a region
+/// boundary at the top of the long-block range.
+///
+/// Delegates to [`crate::requantize::long_band_starts`] — the single
+/// in-crate transcription of ISO/IEC 11172-3 Table 3-B.8 (MPEG-1
+/// rates) and ISO/IEC 13818-3:1997 Table B.2 (MPEG-2 LSF rates) — so
+/// the §2.4.2.7 region split and the §2.4.3.4.7 requantizer can never
+/// disagree on band boundaries.
 fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 22] {
-    // MPEG-1 (ISO/IEC 11172-3 Table 3-B.8). MPEG-2 LSF (13818-3) reuses
-    // these long-block band layouts for the region split this round; the
-    // LSF-specific band tables are deferred (see module docs / report).
-    let _ = version;
-    match sample_rate_hz {
-        32000 | 16000 | 8000 => &LONG_BANDS_32,
-        48000 | 24000 | 12000 => &LONG_BANDS_48,
-        // 44100, 22050, 11025 and any default.
-        _ => &LONG_BANDS_44,
-    }
+    crate::requantize::long_band_starts(sample_rate_hz, version)
 }
-
-/// Table 3-B.8a (32 kHz) long-block band start indices + end+1.
-const LONG_BANDS_32: [usize; 22] = [
-    0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 54, 66, 82, 102, 126, 156, 194, 240, 296, 364, 448, 550,
-];
-
-/// Table 3-B.8b (44.1 kHz) long-block band start indices + end+1.
-const LONG_BANDS_44: [usize; 22] = [
-    0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342, 418,
-];
-
-/// Table 3-B.8c (48 kHz) long-block band start indices + end+1.
-const LONG_BANDS_48: [usize; 22] = [
-    0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384,
-];
 
 /// Maximum unsigned magnitude that big-values codebook `idx` can encode
 /// **without truncation** — i.e. the largest `|is_i|` whose round-trip

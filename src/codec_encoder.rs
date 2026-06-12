@@ -68,15 +68,18 @@ use oxideav_core::{
 
 use crate::demuxer::{CODEC_ID_STR, WAVE_FORMAT_MP3};
 use crate::frame::{ChannelMode, FrameWalker};
-use crate::stream_encoder::{Mp3Encoder, SAMPLES_PER_FRAME_MPEG1};
+use crate::stream_encoder::Mp3Encoder;
 
-/// Build a boxed MPEG-1 Audio Layer III mono CBR [`Encoder`] from
-/// `params`.
+/// Build a boxed MPEG Audio Layer III CBR [`Encoder`] from `params`.
 ///
-/// `params.sample_rate` (32_000 / 44_100 / 48_000), `params.channels`
-/// (must be 1), and `params.bit_rate` (one of the §2.4.2.3 Layer III
-/// MPEG-1 ladder values, in bits/s — defaults to 128_000 when absent)
-/// drive the underlying [`Mp3Encoder`] configuration.
+/// `params.sample_rate` — any rate the underlying [`Mp3Encoder`]
+/// accepts: 32 / 44.1 / 48 kHz (MPEG-1), 16 / 22.05 / 24 kHz (MPEG-2
+/// LSF, one 576-sample granule per frame per ISO/IEC 13818-3
+/// §2.4.3.2), or 8 / 11.025 / 12 kHz (MPEG-2.5) — `params.channels`
+/// (1 or 2), and `params.bit_rate` (one of the §2.4.2.3 Layer III
+/// ladder values for the rate's version, in bits/s — defaults to
+/// 128_000 when absent, which sits on both ladders) drive the
+/// underlying [`Mp3Encoder`] configuration.
 ///
 /// # Errors
 ///
@@ -619,16 +622,20 @@ impl Encoder for Mp3CoreEncoder {
         // Per-packet PTS is computed from a running sample-position
         // counter under the encoder's time_base = 1 / sample_rate.
         // Each MPEG-1 Layer III frame represents
-        // SAMPLES_PER_FRAME_MPEG1 = 1152 PCM samples per channel.
+        // SAMPLES_PER_FRAME_MPEG1 = 1152 PCM samples per channel; an
+        // LSF (MPEG-2 / MPEG-2.5) frame carries one 576-sample granule
+        // (ISO/IEC 13818-3 §2.4.3.2) — read the per-frame count off
+        // each walked header so both stamp correctly.
         let tb = TimeBase::new(1, i64::from(self.sample_rate));
         let mut pts_samples: i64 = 0;
         for f in FrameWalker::new(&bytes) {
+            let frame_samples = i64::from(f.header.samples_per_frame());
             let mut pkt = Packet::new(0, tb, f.data.to_vec());
             pkt.pts = Some(pts_samples);
-            pkt.duration = Some(SAMPLES_PER_FRAME_MPEG1 as i64);
+            pkt.duration = Some(frame_samples);
             pkt.flags.keyframe = true;
             self.pending_packets.push_back(pkt);
-            pts_samples = pts_samples.saturating_add(SAMPLES_PER_FRAME_MPEG1 as i64);
+            pts_samples = pts_samples.saturating_add(frame_samples);
         }
         self.eof = true;
         Ok(())
@@ -661,7 +668,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD;
+    use crate::stream_encoder::{DEFAULT_OUTER_LOOP_THRESHOLD, SAMPLES_PER_FRAME_MPEG1};
     use oxideav_core::Frame;
 
     /// A 440 Hz mono sine in interleaved S16, `n_samples` per channel.

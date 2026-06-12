@@ -8,6 +8,48 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **MPEG-2 LSF + MPEG-2.5 encode support** (r285, Phase 2
+  step 87) — `Mp3Encoder::new` (and the registry `make_encoder` path)
+  now accepts the LSF sample rates 16 / 22.05 / 24 kHz and the
+  MPEG-2.5 rates 8 / 11.025 / 12 kHz. Per ISO/IEC 13818-3 §2.4.3.2
+  the LSF frame carries **one** 576-sample granule
+  (`slots_per_frame` constant 72), the §2.4.1.7 LSF side-info layout
+  (8-bit `main_data_begin`, no `scfsi`, 9-bit `scalefac_compress`,
+  no transmitted `preflag`), the LSF §2.4.2.3 bitrate ladder
+  (`LSF_L3_BITRATE_LADDER_KBPS`, 8…160 kbit/s), the LSF CBR padding
+  ladder, and the 255-byte LSF `main_data_begin` reservoir cap.
+  Supported at LSF: CBR + VBR, mono / stereo / dual-channel, MS
+  joint stereo (`new_joint_stereo_ms` / `new_joint_stereo_auto`),
+  forced short / mixed block types, the §C.1.5.4.3 outer loop
+  (writing `scalefac_compress = 399` — `OUTER_LOOP_SCALEFAC_COMPRESS_LSF`,
+  whose §2.4.3.2 slen derivation (4, 4, 3, 3) over partition
+  (6, 5, 5, 5) reproduces the MPEG-1 value-15 caps and part2 cost;
+  an outer-loop `preflag` is folded into the long scalefactors since
+  the sub-500 `scalefac_compress` ranges cannot carry the flag), CRC
+  (`crc16_layer3_lsf`: header bits 16..31 + the full 72 / 136-bit
+  LSF side info), and the Xing/Info carrier. Intensity stereo (the
+  §2.4.3.2 `int_scalefac_compress` right-channel format) and the
+  auto block-type scheduler reject with `LsfUnsupported`.
+  Validated by `tests/lsf_encoder_roundtrip.rs` (10 tests): own-decoder
+  round-trips at 56–88 dB PSNR across the LSF / MPEG-2.5 rates,
+  framing + ladder assertions, CRC wire verification, VBR index
+  bounds, and black-box external-decoder runs (`ffmpeg` / `mpg123`
+  as opaque CLIs) recovering the test tones at the exact frequency
+  and amplitude on every MPEG-2 rate, mono and stereo, MS included.
+- decoder + encoder: **ISO/IEC 13818-3:1997 Table B.2 scalefactor-band
+  tables** for the LSF rates (16 / 22.05 / 24 kHz, long + short),
+  replacing the prior half-rate MPEG-1 placeholder mapping in
+  `requantize::long_band_starts` / `short_band_starts`; the single
+  transcription now also backs the Huffman `region_boundaries` and
+  the encoder's region-split / intensity band walks.
+  `tests/lsf_reference_pcm.rs` decodes the staged
+  `layer3-mpeg2-22050-64kbps` fixture and tracks its reference
+  `expected.wav` at 0.000026 normalized RMS error (sample-exact
+  steady state at the canonical 1105-sample alignment lag) — the
+  placeholder layout could not approach this. The MPEG-2.5 rates
+  keep the documented placeholder (`MPEG-2.5-GAP.md`: the
+  extension's band tables remain unpublished), which stays
+  self-consistent encoder↔decoder.
 - encoder: §2.4.3.4.9.3 **intensity-stereo encode** (Phase 2 step 86)
   — the last encoder "lacks" item. Three opt-in constructors:
   `Mp3Encoder::new_joint_stereo_is(bitrate, sample_rate, start_sfb)`

@@ -125,6 +125,19 @@ pub const SCALEFAC_MAX_HIGH: u8 = 7;
 /// CBR slot at every MPEG-1 bitrate the encoder supports.
 pub const OUTER_LOOP_SCALEFAC_COMPRESS: u16 = 15;
 
+/// The `scalefac_compress` the encoder writes for an LSF (MPEG-2 /
+/// MPEG-2.5) granule whose scalefactors came from the outer loop. Per
+/// ISO/IEC 13818-3 §2.4.3.2 (the `scalefac_compress < 400` branch),
+/// 399 decodes to `slen = (4, 4, 3, 3)` over the long-block partition
+/// `nr_of_sfb = (6, 5, 5, 5)` — 4 bits on bands 0..=10 and 3 bits on
+/// bands 11..=20 — and over the short-block partition `(9, 9, 9, 9)` —
+/// 4 bits on sfb 0..=5, 3 bits on sfb 6..=11 (×3 windows). Those are
+/// exactly the [`SCALEFAC_MAX_LOW`] / [`SCALEFAC_MAX_HIGH`] caps and
+/// the same 74-bit (long) / 126-bit (pure-short) part2 cost the MPEG-1
+/// value 15 produces, so every outer-loop primitive's internal
+/// accounting applies unchanged; only the on-wire field value differs.
+pub const OUTER_LOOP_SCALEFAC_COMPRESS_LSF: u16 = 399;
+
 /// The per-band scalefactor upper limit for long-block `sfb` per
 /// §C.1.5.4.3.6.
 #[must_use]

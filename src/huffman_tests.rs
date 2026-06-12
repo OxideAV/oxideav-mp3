@@ -303,14 +303,26 @@ mod tests {
         assert_eq!(is[1], 0);
     }
 
-    // ----- band-table sanity (Table 3-B.8 transcribed widths) -----
+    // ----- band-table sanity (Table 3-B.8 / 13818-3 Table B.2) -----
 
     #[test]
     fn long_band_widths_sum_to_576_at_each_rate() {
         // Each table's last entry is "end of band 20 + 1"; the bands
         // span lines 0..end. The frame total is 576 lines, so a
         // sensible check is that the highest band-end is <= 576.
-        for &table in &[&LONG_BANDS_32, &LONG_BANDS_44, &LONG_BANDS_48] {
+        // `region_boundaries` delegates to the shared
+        // `crate::requantize::long_band_starts` transcription, so probe
+        // every rate the region split can see: the MPEG-1 Table 3-B.8
+        // rates and the LSF 13818-3 Table B.2 rates.
+        for &(rate, version) in &[
+            (32_000u32, MpegVersion::Mpeg1),
+            (44_100, MpegVersion::Mpeg1),
+            (48_000, MpegVersion::Mpeg1),
+            (16_000, MpegVersion::Mpeg2),
+            (22_050, MpegVersion::Mpeg2),
+            (24_000, MpegVersion::Mpeg2),
+        ] {
+            let table = long_band_starts(rate, version);
             assert!(table[21] <= NUM_LINES);
             // Band starts are strictly increasing.
             for i in 1..22 {
