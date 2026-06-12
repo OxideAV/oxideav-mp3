@@ -2373,6 +2373,64 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 85 (r283)** — **§C.1.5.3.2.1 Layer III adaptation of
+Model 2 + §D.2.4 step m) pre-echo control + §C.1.5.3.2 window
+switching**, closing the "remaining Layer III adaptations" tail left
+open by step 84. Read from the staged ISO PDF (printed pp.80–95 /
+PDF pp.86–101; Tables C.7/C.8 and Figures C.6.a–d/C.7 transcribed
+from 150-DPI page renders with 300–600-DPI re-reads of every cell
+the PDF text layer disagreed on — the renders resolved C.7.a row 12
+`bval = 5,437`, rows 57/58 `qthr = 22,607`, C.7.b row 47
+`norm = 0,527`, and the replaced-spreading slopes `3,0(j−i)` /
+`1,5(j−i)` verbatim). Tables (all in `psy`): the six **Table C.7**
+threshold-calculation-partition tables (`Layer3PartitionLong` ×
+62/63/59 rows with `FFT-lines`/`minval`/`qthr`/`norm`/`bval`;
+`Layer3PartitionShort` × 38/39/42 rows with the constant `SNR (db)`
+column) and the six **Table C.8** partition→scalefactor-band
+conversion tables (`Layer3SfbConversion` × 21 long / 12 short rows
+with `cbw`/`bu`/`bo`/`w1`/`w2`), with suffix→rate dispatchers
+(C.7.a/C.8.a = 48 kHz — the *reverse* of the D.3 suffix order).
+Model surface: dual-path constants (576/192 shifts, 256-point short
+FFT via `model2_layer3_hann_window_short` /
+`model2_layer3_step_a_reconstruct_short` /
+`model2_layer3_step_b_spectrum_short`); the printed `cw(w)`
+composition `model2_layer3_cw_compose` (long FFT lines 0–5, second
+short block `(w+2) DIV 4` for 6–205, 0,4 above); `conv1/conv2`
+(= step g) constants); `NMT = 6,0` / `TMN = 29,0` dB overrides in
+`model2_layer3_step_h_snr_db`; the Figure C.6.b threshold
+`model2_layer3_long_nb` (step i) sign convention documented against
+the unsigned printed exponent) and the C.6.d short-path
+`model2_layer3_short_nb` over the negative table SNR; **step m)**
+`model2_layer3_step_m_thr` + `Model2Layer3PreEcho` (the printed
+`thr = MAX(qthr, nbb, rpelev·nbb_l, rpelev2·nbb_ll)` with
+`rpelev = 2` / `rpelev2 = 16` and two-block history rotation;
+short path history-free per C.6.d); the psychoacoustic entropy
+`model2_layer3_pe` (`−Σ cbwidth·ln(thr/(eb+1))`) with the verbatim
+PE > 1800 switch (`layer3_pe_attack`), the Figure C.7 state diagram
+(`layer3_window_state_next`), the Figure C.6.a one-block-delay
+retrofit (`layer3_retrofit_start`) and the composed
+`Layer3WindowSwitcher` (PE in → delayed block type out); the Figure
+C.6.c reduction `layer3_partitions_to_sfb` + `layer3_sfb_ratio`;
+and `Model2Layer3State::process` running the whole dual-FFT walk
+per 576-sample granule (long ratio over 21 bands + 3 × 12 short
+subblock ratios + PE + attack flag). 14 new unit tests: row counts
++ printed width sums (481/465/488 long, 107/109/110 short within
+the 513/129-line domains); bval monotonicity + column domain
+membership; render-anchor spot pins (incl. every text-layer
+disagreement); C.8 `bu`/`bo` tiling chains against the C.7 row
+counts; the `cw` composition mapping with boundary lines 6/9/10/205
+/206; SNR/`nb` conventions (short ≡ long with the sign pre-baked);
+the step m) maximum + 2×/16×/expiry history walk; the PE zero/sign/
+width-scaling anchors + strict-1800 boundary; all eight printed
+state-diagram arrows + the start-short-short-stop burst; the
+delayed switcher; partition accumulation/reduction/ratio edge
+cases; short-window symmetry + DC spectrum; impulse spreading at
+±1 partition; and an end-to-end silence/tone/3-rate
+`Model2Layer3State` walk (silence keeps `en = 0`, `thm > 0`,
+no attack). Tests: 1038 lib (was 1024; +14). No external
+implementation consulted; only the staged ISO PDF and
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were read.
+
 **Phase 2 step 84 (r282)** — Annex D Model 2 **§D.2.1 inputs +
 §D.2.4 steps a)–e)** — the FFT-side front half of the Model 2
 threshold calculation, completing the §D.2.4 chain end-to-end

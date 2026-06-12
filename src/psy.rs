@@ -8820,6 +8820,1491 @@ pub fn model2_absthr_for_line(fs: AnnexDSamplingRate, line: u16) -> Option<f64> 
         .map(|e| e.absthr_db)
 }
 
+// =====================================================================
+// §C.1.5.3.2.1 — Adaptation of psychoacoustic model 2 for Layer III,
+// plus §D.2.4 step m) pre-echo control and the §C.1.5.3.2 window
+// switching decision (Phase 2 step 85 / r283).
+//
+// Spec context (staged ISO/IEC 11172-3:1993 PDF, printed pp.80–95 /
+// PDF pp.86–101 — prose, Tables C.7/C.8 and Figures C.6.a–C.6.d/C.7
+// read from 150–600-DPI page renders of the in-repo PDF):
+//
+// * §C.1.5.3.2 — "The model is run twice per block, using a shift
+//   length of 576 samples. A signal-to-mask-ratio is provided for
+//   every scalefactor band."
+// * §C.1.5.3.2.1 "General considerations" — "The model is calculated
+//   twice in parallel. One computation is done with a shift length
+//   iblen of 192 samples (to be used with short blocks), the other is
+//   done with a shift length of 576 samples. For the shift length of
+//   192 samples the block length of the FFT is changed to 256, and
+//   the parameters changed accordingly."
+// * "Change to unpredictability calculation" — cw is calculated for
+//   the first 206 spectral lines only (0,4 above); lines 0..5 from
+//   the long FFT (window 1024 / shiftlen 576), lines 6..205 from the
+//   *second* short FFT (window 256 / shiftlen 192) of the granule's
+//   three, decimated by `(w+2) DIV 4`.
+// * "The spreading function has been replaced" — the piecewise-linear
+//   `tmpy` already landed as [`model2_layer3_spread_db`] /
+//   [`model2_layer3_spread_linear`] (Phase 2 step 48).
+// * conv1 = −0,299 / conv2 = −0,43 — the unpredictability→tonality
+//   conversion parameters (numerically the §D.2.4 step g)
+//   coefficients, so [`model2_step_g_tonality`] is reused verbatim).
+// * NMT = 6,0 dB and TMN = 29,0 dB for **all** threshold calculation
+//   partitions (replacing §D.2.4's NMT = 5,5 dB / Table D.3 per-row
+//   TMN); minval comes from Table C.7.
+// * Psychoacoustic entropy `pe = −Σ_k cbwidth_k · log(thr_k/(eb_k+1))`
+//   and the window switching decision "switching when the PE exceeds
+//   the value 1800" with the Figure C.7 state diagram.
+// * "pre-echo control" (the §D.2.4 step m) hook: "For Layer III,
+//   pre-echo control occurs at this point. The actual control is
+//   described as part of the Layer III encoder specification. This
+//   step is omitted for Layers I and II.") — rpelev = 2, rpelev2 = 16
+//   and the Figure C.6.b maximum (see [`model2_layer3_step_m_thr`]).
+// * "The threshold is not spread over the FFT lines. The threshold
+//   calculation partitions are converted directly to scalefactor
+//   bands" — Table C.8 (w1/w2/cbw/bu/bo) and the Figure C.6.c
+//   en/thm/ratio reduction.
+// * "For short blocks a simplified version of the threshold
+//   calculation (constant signal to noise ratio) is used" — Figure
+//   C.6.d with the Table C.7 short-block `SNR (db)` column and the
+//   history-free `thr(b) = maximum(qthr(b), nbb(b))`.
+// =====================================================================
+
+/// §C.1.5.3.2 / §C.1.5.3.2.1 long-path shift length — "a shift length
+/// of 576 samples" (one Layer III granule per call).
+pub const MODEL2_LAYER3_SHIFT_LONG: usize = 576;
+
+/// §C.1.5.3.2.1 short-path shift length — "a shift length iblen of
+/// 192 samples (to be used with short blocks)"; three short shifts
+/// per 576-sample granule.
+pub const MODEL2_LAYER3_SHIFT_SHORT: usize = 192;
+
+/// §C.1.5.3.2.1 short-path FFT block length — "For the shift length
+/// of 192 samples the block length of the FFT is changed to 256".
+pub const MODEL2_LAYER3_FFT_LEN_SHORT: usize = 256;
+
+/// Number of spectral lines of the short 256-point FFT (DC through
+/// Nyquist), mirroring the long path's [`MODEL2_FFT_LINES`].
+pub const MODEL2_LAYER3_FFT_LINES_SHORT: usize = 129;
+
+/// §C.1.5.3.2.1 unpredictability composition — number of low spectral
+/// lines taken from the long FFT (verbatim: "The unpredictability for
+/// the first 6 lines is calculated from the long FFT").
+pub const MODEL2_LAYER3_CW_LONG_LINES: usize = 6;
+
+/// §C.1.5.3.2.1 unpredictability composition — first spectral line
+/// *not* calculated (verbatim: "The unpredictability cw is calculated
+/// for the first 206 spectral lines. For the other spectral lines,
+/// the unpredictability is set to 0,4").
+pub const MODEL2_LAYER3_CW_CALC_LINES: usize = 206;
+
+/// §C.1.5.3.2.1 default unpredictability for spectral lines `w >= 206`
+/// (verbatim `0,4`; note this differs from the Layer I/II §D.2.4
+/// step d) partial-calculation default [`MODEL2_CW_ABOVE_LIMIT`] of
+/// `0,3`).
+pub const MODEL2_LAYER3_CW_ABOVE: f64 = 0.4;
+
+/// §C.1.5.3.2.1 unpredictability→tonality conversion parameter
+/// (verbatim "conv1 = −0,299"). Numerically identical to the §D.2.4
+/// step g) constant term, so [`model2_step_g_tonality`] implements
+/// the Layer III conversion unchanged.
+pub const MODEL2_LAYER3_CONV1: f64 = -0.299;
+
+/// §C.1.5.3.2.1 unpredictability→tonality conversion parameter
+/// (verbatim "conv2 = −0,43"); see [`MODEL2_LAYER3_CONV1`].
+pub const MODEL2_LAYER3_CONV2: f64 = -0.43;
+
+/// §C.1.5.3.2.1 noise-masking-tone parameter — verbatim: "The
+/// parameter NMT (noise masking tone) is set to 6,0 dB for all
+/// threshold calculation partions." (Replaces the Layer I/II
+/// [`MODEL2_NMT_DB`] of 5,5 dB.)
+pub const MODEL2_LAYER3_NMT_DB: f64 = 6.0;
+
+/// §C.1.5.3.2.1 tone-masking-noise parameter — verbatim: "The
+/// parameter TMN (tone masking noise) is set to 29,0 dB for all
+/// partitions." (Replaces the per-partition Table D.3 `TMN` column.)
+pub const MODEL2_LAYER3_TMN_DB: f64 = 29.0;
+
+/// §C.1.5.3.2.1 pre-echo-control constant (verbatim "rpelev = 2") —
+/// the factor applied to the previous block's partition threshold in
+/// the Figure C.6.b maximum.
+pub const MODEL2_LAYER3_RPELEV: f64 = 2.0;
+
+/// §C.1.5.3.2.1 pre-echo-control constant (verbatim "rpelev2 = 16") —
+/// the factor applied to the partition threshold of the block before
+/// the previous block.
+pub const MODEL2_LAYER3_RPELEV2: f64 = 16.0;
+
+/// §C.1.5.3.2.1 window switching threshold — verbatim: "switching
+/// when the PE exceeds the value 1800".
+pub const LAYER3_PE_SWITCH_THRESHOLD: f64 = 1800.0;
+
+/// Number of long-block scalefactor bands in the Table C.8 conversion
+/// tables (rows `no. sb` 0..=20 in Tables C.8.a–c).
+pub const LAYER3_SFB_CONV_LONG_BANDS: usize = 21;
+
+/// Number of short-block scalefactor bands in the Table C.8
+/// conversion tables (rows `no. sb` 0..=11 in Tables C.8.d–f).
+pub const LAYER3_SFB_CONV_SHORT_BANDS: usize = 12;
+
+/// §C.1.5.3.2.1 short-path analysis window — the step b) Hann window
+/// with the block length changed to 256 ("the parameters changed
+/// accordingly"): `w(i) = 0,5 − 0,5·cos(2π(i − 0,5)/256)` for the
+/// 1-based `1 <= i <= 256`; `None` outside that domain. Mirrors
+/// [`model2_hann_window`] (same half-sample symmetry, no power
+/// prefactor).
+#[must_use]
+pub fn model2_layer3_hann_window_short(i: usize) -> Option<f64> {
+    if i == 0 || i > MODEL2_LAYER3_FFT_LEN_SHORT {
+        return None;
+    }
+    let angle =
+        2.0 * core::f64::consts::PI * (i as f64 - 0.5) / (MODEL2_LAYER3_FFT_LEN_SHORT as f64);
+    Some(0.5 - 0.5 * angle.cos())
+}
+
+/// §C.1.5.3.2.1 short-path window reconstruction — the §D.2.4
+/// step a) sliding window with the block length changed to 256:
+/// concatenates the most recent `256 − new_samples.len()` samples of
+/// the previous 256-sample window with the new block (the standard
+/// short shift is [`MODEL2_LAYER3_SHIFT_SHORT`] = 192 samples).
+///
+/// Returns `None` when `prev_window.len() != 256` or `new_samples` is
+/// empty or longer than 256.
+#[must_use]
+pub fn model2_layer3_step_a_reconstruct_short(
+    prev_window: &[f64],
+    new_samples: &[f64],
+) -> Option<Vec<f64>> {
+    if prev_window.len() != MODEL2_LAYER3_FFT_LEN_SHORT
+        || new_samples.is_empty()
+        || new_samples.len() > MODEL2_LAYER3_FFT_LEN_SHORT
+    {
+        return None;
+    }
+    let keep = MODEL2_LAYER3_FFT_LEN_SHORT - new_samples.len();
+    let mut out = Vec::with_capacity(MODEL2_LAYER3_FFT_LEN_SHORT);
+    out.extend_from_slice(&prev_window[prev_window.len() - keep..]);
+    out.extend_from_slice(new_samples);
+    Some(out)
+}
+
+/// §C.1.5.3.2.1 short-path spectrum — the §D.2.4 step b) windowed
+/// forward FFT in polar representation with the block length changed
+/// to 256, yielding the 129-line DC..Nyquist half-spectrum. Same
+/// (absent) FFT normalization convention as [`model2_step_b_spectrum`].
+///
+/// Returns `None` unless `s.len() == 256`.
+#[must_use]
+pub fn model2_layer3_step_b_spectrum_short(s: &[f64]) -> Option<Model2Polar> {
+    if s.len() != MODEL2_LAYER3_FFT_LEN_SHORT {
+        return None;
+    }
+    let mut re: Vec<f64> = s
+        .iter()
+        .enumerate()
+        .map(|(l, &sample)| model2_layer3_hann_window_short(l + 1).unwrap_or(0.0) * sample)
+        .collect();
+    let mut im = vec![0.0_f64; MODEL2_LAYER3_FFT_LEN_SHORT];
+    fft_in_place(&mut re, &mut im);
+    let mut r = Vec::with_capacity(MODEL2_LAYER3_FFT_LINES_SHORT);
+    let mut f = Vec::with_capacity(MODEL2_LAYER3_FFT_LINES_SHORT);
+    for k in 0..MODEL2_LAYER3_FFT_LINES_SHORT {
+        r.push(re[k].hypot(im[k]));
+        f.push(im[k].atan2(re[k]));
+    }
+    Some(Model2Polar { r, f })
+}
+
+/// §C.1.5.3.2.1 unpredictability composition (printed equation,
+/// decimal comma as decimal point):
+///
+/// ```text
+/// cw(w) = cw_l(w)            for 0 <= w <   6
+///         cw_s((w+2) DIV 4)  for 6 <= w < 206
+///         0,4                for      w >= 206
+/// ```
+///
+/// "cw_l is the unpredictability calculated from the long FFT, cw_s
+/// is the unpredictability calculated from the second short block out
+/// of three short blocks within one granule."
+///
+/// `cw_long` carries the long-FFT unpredictability with slice index
+/// `w` holding spectral line `w` (DC at index 0 — the same layout
+/// [`model2_step_d_cw_lines`] produces); `cw_short_second` likewise
+/// for the granule's second short FFT. The output covers the long
+/// path's full [`MODEL2_FFT_LINES`]-line domain. Returns `None` when
+/// `cw_long` has fewer than 6 entries or `cw_short_second` has fewer
+/// than 52 (the largest decimated index is `(205+2) DIV 4 = 51`).
+#[must_use]
+pub fn model2_layer3_cw_compose(cw_long: &[f64], cw_short_second: &[f64]) -> Option<Vec<f64>> {
+    let max_short_index = (MODEL2_LAYER3_CW_CALC_LINES - 1 + 2) / 4;
+    if cw_long.len() < MODEL2_LAYER3_CW_LONG_LINES || cw_short_second.len() <= max_short_index {
+        return None;
+    }
+    Some(
+        (0..MODEL2_FFT_LINES)
+            .map(|w| {
+                if w < MODEL2_LAYER3_CW_LONG_LINES {
+                    cw_long[w]
+                } else if w < MODEL2_LAYER3_CW_CALC_LINES {
+                    cw_short_second[(w + 2) / 4]
+                } else {
+                    MODEL2_LAYER3_CW_ABOVE
+                }
+            })
+            .collect(),
+    )
+}
+
+/// One row of Table C.7.a–c — *Threshold calculation partitions* for
+/// Layer III **long blocks**, columns `FFT-lines` (partition width),
+/// `minval`, `qthr` (threshold in quiet), `norm` and `bval`.
+///
+/// Unlike the Layer I/II Table D.3 rows ([`Model2PartitionEntry`])
+/// the C.7 rows carry no explicit `ωlow`/`ωhigh` — partitions tile
+/// the spectrum contiguously from the DC line, each `lines` wide —
+/// and no per-row `TMN` (Layer III uses the constant
+/// [`MODEL2_LAYER3_TMN_DB`]). The `norm` column is the printed
+/// normalizing constant the Figure C.6.b threshold formula multiplies
+/// by (replacing the §D.2.4 step f) computed `rnorm`), and `qthr` is
+/// the printed per-partition threshold in quiet consumed by the
+/// pre-echo maximum (energy units under the table's own FFT
+/// normalization convention).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layer3PartitionLong {
+    /// `FFT-lines` — number of spectral lines in this partition.
+    pub lines: u16,
+    /// `minval` — lower limit of the required SNR (dB).
+    pub minval_db: f64,
+    /// `qthr` — threshold in quiet for this partition.
+    pub qthr: f64,
+    /// `norm` — printed normalizing constant.
+    pub norm: f64,
+    /// `bval` — median Bark value of the partition.
+    pub bval: f64,
+}
+
+impl Layer3PartitionLong {
+    const fn new(lines: u16, minval_db: f64, qthr: f64, norm: f64, bval: f64) -> Self {
+        Self {
+            lines,
+            minval_db,
+            qthr,
+            norm,
+            bval,
+        }
+    }
+}
+
+/// One row of Table C.7.d–f — *Threshold calculation partitions* for
+/// Layer III **short blocks**, columns `FFT-lines`, `qthr`, `norm`,
+/// `SNR (db)` and `bval`.
+///
+/// Short blocks use "a simplified version of the threshold
+/// calculation (constant signal to noise ratio)": no tonality and no
+/// minval — the required SNR is read directly from the printed
+/// `SNR (db)` column (negative throughout, so the Figure C.6.d
+/// `nbb(b) = ecbb(b)·norm(b)·10^(SNR(b)/10)` places the threshold
+/// below the spread energy).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layer3PartitionShort {
+    /// `FFT-lines` — number of spectral lines in this partition.
+    pub lines: u16,
+    /// `qthr` — threshold in quiet for this partition.
+    pub qthr: f64,
+    /// `norm` — printed normalizing constant.
+    pub norm: f64,
+    /// `SNR (db)` — constant required SNR (negative dB as printed).
+    pub snr_db: f64,
+    /// `bval` — median Bark value of the partition.
+    pub bval: f64,
+}
+
+impl Layer3PartitionShort {
+    const fn new(lines: u16, qthr: f64, norm: f64, snr_db: f64, bval: f64) -> Self {
+        Self {
+            lines,
+            qthr,
+            norm,
+            snr_db,
+            bval,
+        }
+    }
+}
+
+/// Table C.7.a — Layer III threshold calculation partitions,
+/// 48 kHz **long** blocks (62 rows, printed p.82 / PDF p.88;
+/// transcribed from a 150-DPI page render with 300-DPI re-reads of
+/// every cell the text layer disagreed on).
+pub const LAYER3_PARTITIONS_LONG_C7A: [Layer3PartitionLong; 62] = [
+    Layer3PartitionLong::new(1, 24.5, 4.532, 0.970, 0.000),
+    Layer3PartitionLong::new(1, 24.5, 4.532, 0.755, 0.469),
+    Layer3PartitionLong::new(1, 24.5, 4.532, 0.738, 0.937),
+    Layer3PartitionLong::new(1, 24.5, 0.904, 0.730, 1.406),
+    Layer3PartitionLong::new(1, 24.5, 0.904, 0.724, 1.875),
+    Layer3PartitionLong::new(1, 20.0, 0.090, 0.723, 2.344),
+    Layer3PartitionLong::new(1, 20.0, 0.090, 0.723, 2.812),
+    Layer3PartitionLong::new(1, 20.0, 0.029, 0.723, 3.281),
+    Layer3PartitionLong::new(1, 20.0, 0.029, 0.718, 3.750),
+    Layer3PartitionLong::new(1, 20.0, 0.009, 0.690, 4.199),
+    Layer3PartitionLong::new(1, 20.0, 0.009, 0.660, 4.625),
+    Layer3PartitionLong::new(1, 18.0, 0.009, 0.641, 5.047),
+    Layer3PartitionLong::new(1, 18.0, 0.009, 0.600, 5.437),
+    Layer3PartitionLong::new(1, 18.0, 0.009, 0.584, 5.828),
+    Layer3PartitionLong::new(1, 12.0, 0.009, 0.531, 6.187),
+    Layer3PartitionLong::new(1, 12.0, 0.009, 0.537, 6.522),
+    Layer3PartitionLong::new(2, 6.0, 0.018, 0.857, 7.174),
+    Layer3PartitionLong::new(2, 6.0, 0.018, 0.858, 7.800),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.853, 8.402),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.824, 8.966),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.778, 9.483),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.740, 9.966),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.709, 10.426),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.676, 10.866),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.632, 11.279),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.592, 11.669),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.553, 12.042),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.510, 12.386),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.513, 12.721),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.608, 13.115),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.673, 13.561),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.636, 13.983),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.586, 14.371),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.571, 14.741),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.616, 15.140),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.640, 15.562),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.597, 15.962),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.538, 16.324),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.512, 16.665),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.528, 17.020),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.516, 17.373),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.493, 17.708),
+    Layer3PartitionLong::new(6, 0.0, 0.054, 0.499, 18.045),
+    Layer3PartitionLong::new(7, 0.0, 0.063, 0.525, 18.398),
+    Layer3PartitionLong::new(7, 0.0, 0.063, 0.541, 18.762),
+    Layer3PartitionLong::new(8, 0.0, 0.072, 0.528, 19.120),
+    Layer3PartitionLong::new(8, 0.0, 0.072, 0.510, 19.466),
+    Layer3PartitionLong::new(8, 0.0, 0.072, 0.506, 19.807),
+    Layer3PartitionLong::new(10, 0.0, 0.180, 0.525, 20.159),
+    Layer3PartitionLong::new(10, 0.0, 0.180, 0.536, 20.522),
+    Layer3PartitionLong::new(10, 0.0, 0.180, 0.518, 20.873),
+    Layer3PartitionLong::new(13, 0.0, 0.372, 0.501, 21.214),
+    Layer3PartitionLong::new(13, 0.0, 0.372, 0.496, 21.553),
+    Layer3PartitionLong::new(14, 0.0, 0.400, 0.497, 21.892),
+    Layer3PartitionLong::new(18, 0.0, 1.628, 0.495, 22.231),
+    Layer3PartitionLong::new(18, 0.0, 1.628, 0.494, 22.569),
+    Layer3PartitionLong::new(20, 0.0, 1.808, 0.497, 22.909),
+    Layer3PartitionLong::new(25, 0.0, 22.607, 0.494, 23.248),
+    Layer3PartitionLong::new(25, 0.0, 22.607, 0.487, 23.583),
+    Layer3PartitionLong::new(35, 0.0, 31.650, 0.483, 23.915),
+    Layer3PartitionLong::new(67, 0.0, 605.867, 0.482, 24.246),
+    Layer3PartitionLong::new(67, 0.0, 605.867, 0.524, 24.576),
+];
+
+/// Table C.7.b — Layer III threshold calculation partitions,
+/// 44,1 kHz **long** blocks (63 rows, printed p.83 / PDF p.89).
+pub const LAYER3_PARTITIONS_LONG_C7B: [Layer3PartitionLong; 63] = [
+    Layer3PartitionLong::new(1, 24.5, 4.532, 0.951, 0.000),
+    Layer3PartitionLong::new(1, 24.5, 4.532, 0.700, 0.431),
+    Layer3PartitionLong::new(1, 24.5, 4.532, 0.681, 0.861),
+    Layer3PartitionLong::new(1, 24.5, 0.904, 0.675, 1.292),
+    Layer3PartitionLong::new(1, 24.5, 0.904, 0.667, 1.723),
+    Layer3PartitionLong::new(1, 20.0, 0.090, 0.665, 2.153),
+    Layer3PartitionLong::new(1, 20.0, 0.090, 0.664, 2.584),
+    Layer3PartitionLong::new(1, 20.0, 0.029, 0.664, 3.015),
+    Layer3PartitionLong::new(1, 20.0, 0.029, 0.664, 3.445),
+    Layer3PartitionLong::new(1, 20.0, 0.029, 0.655, 3.876),
+    Layer3PartitionLong::new(1, 20.0, 0.009, 0.616, 4.279),
+    Layer3PartitionLong::new(1, 20.0, 0.009, 0.597, 4.670),
+    Layer3PartitionLong::new(1, 18.0, 0.009, 0.578, 5.057),
+    Layer3PartitionLong::new(1, 18.0, 0.009, 0.541, 5.415),
+    Layer3PartitionLong::new(1, 18.0, 0.009, 0.575, 5.774),
+    Layer3PartitionLong::new(2, 12.0, 0.018, 0.856, 6.422),
+    Layer3PartitionLong::new(2, 6.0, 0.018, 0.846, 7.026),
+    Layer3PartitionLong::new(2, 6.0, 0.018, 0.840, 7.609),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.822, 8.168),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.800, 8.710),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.753, 9.207),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.704, 9.662),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.674, 10.099),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.640, 10.515),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.609, 10.917),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.566, 11.293),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.535, 11.652),
+    Layer3PartitionLong::new(2, 0.0, 0.018, 0.531, 11.997),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.615, 12.394),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.686, 12.850),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.650, 13.277),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.611, 13.681),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.567, 14.062),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.520, 14.411),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.513, 14.751),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.557, 15.119),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.584, 15.508),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.570, 15.883),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.579, 16.263),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.585, 16.654),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.548, 17.020),
+    Layer3PartitionLong::new(6, 0.0, 0.054, 0.536, 17.374),
+    Layer3PartitionLong::new(6, 0.0, 0.054, 0.550, 17.744),
+    Layer3PartitionLong::new(7, 0.0, 0.063, 0.532, 18.104),
+    Layer3PartitionLong::new(7, 0.0, 0.063, 0.504, 18.447),
+    Layer3PartitionLong::new(7, 0.0, 0.063, 0.496, 18.781),
+    Layer3PartitionLong::new(9, 0.0, 0.081, 0.516, 19.130),
+    Layer3PartitionLong::new(9, 0.0, 0.081, 0.527, 19.487),
+    Layer3PartitionLong::new(9, 0.0, 0.081, 0.516, 19.838),
+    Layer3PartitionLong::new(10, 0.0, 0.180, 0.497, 20.179),
+    Layer3PartitionLong::new(10, 0.0, 0.180, 0.489, 20.510),
+    Layer3PartitionLong::new(11, 0.0, 0.198, 0.502, 20.852),
+    Layer3PartitionLong::new(14, 0.0, 0.400, 0.502, 21.196),
+    Layer3PartitionLong::new(14, 0.0, 0.400, 0.491, 21.531),
+    Layer3PartitionLong::new(15, 0.0, 0.429, 0.497, 21.870),
+    Layer3PartitionLong::new(20, 0.0, 1.808, 0.504, 22.214),
+    Layer3PartitionLong::new(20, 0.0, 1.808, 0.504, 22.558),
+    Layer3PartitionLong::new(21, 0.0, 1.899, 0.495, 22.898),
+    Layer3PartitionLong::new(27, 0.0, 24.415, 0.486, 23.232),
+    Layer3PartitionLong::new(27, 0.0, 24.415, 0.484, 23.564),
+    Layer3PartitionLong::new(36, 0.0, 32.554, 0.483, 23.897),
+    Layer3PartitionLong::new(73, 0.0, 660.124, 0.475, 24.229),
+    Layer3PartitionLong::new(18, 0.0, 162.770, 0.515, 24.542),
+];
+
+/// Table C.7.c — Layer III threshold calculation partitions,
+/// 32 kHz **long** blocks (59 rows, printed p.84 / PDF p.90).
+pub const LAYER3_PARTITIONS_LONG_C7C: [Layer3PartitionLong; 59] = [
+    Layer3PartitionLong::new(2, 24.5, 9.064, 0.997, 0.312),
+    Layer3PartitionLong::new(2, 24.5, 9.064, 0.893, 0.937),
+    Layer3PartitionLong::new(2, 24.5, 1.808, 0.881, 1.562),
+    Layer3PartitionLong::new(2, 20.0, 0.181, 0.873, 2.187),
+    Layer3PartitionLong::new(2, 20.0, 0.181, 0.872, 2.812),
+    Layer3PartitionLong::new(2, 20.0, 0.057, 0.871, 3.437),
+    Layer3PartitionLong::new(2, 20.0, 0.018, 0.860, 4.045),
+    Layer3PartitionLong::new(2, 20.0, 0.018, 0.839, 4.625),
+    Layer3PartitionLong::new(2, 18.0, 0.018, 0.812, 5.173),
+    Layer3PartitionLong::new(2, 18.0, 0.018, 0.784, 5.698),
+    Layer3PartitionLong::new(2, 12.0, 0.018, 0.741, 6.184),
+    Layer3PartitionLong::new(2, 12.0, 0.018, 0.697, 6.634),
+    Layer3PartitionLong::new(2, 6.0, 0.018, 0.674, 7.070),
+    Layer3PartitionLong::new(2, 6.0, 0.018, 0.651, 7.492),
+    Layer3PartitionLong::new(2, 6.0, 0.018, 0.633, 7.905),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.611, 8.305),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.589, 8.695),
+    Layer3PartitionLong::new(2, 3.0, 0.018, 0.575, 9.064),
+    Layer3PartitionLong::new(3, 3.0, 0.027, 0.654, 9.483),
+    Layer3PartitionLong::new(3, 3.0, 0.027, 0.724, 9.966),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.701, 10.425),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.673, 10.866),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.631, 11.279),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.592, 11.669),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.553, 12.042),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.510, 12.386),
+    Layer3PartitionLong::new(3, 0.0, 0.027, 0.505, 12.721),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.562, 13.091),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.598, 13.488),
+    Layer3PartitionLong::new(4, 0.0, 0.036, 0.589, 13.873),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.607, 14.268),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.620, 14.679),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.580, 15.067),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.532, 15.424),
+    Layer3PartitionLong::new(5, 0.0, 0.045, 0.517, 15.771),
+    Layer3PartitionLong::new(6, 0.0, 0.054, 0.517, 16.120),
+    Layer3PartitionLong::new(6, 0.0, 0.054, 0.509, 16.466),
+    Layer3PartitionLong::new(6, 0.0, 0.054, 0.506, 16.807),
+    Layer3PartitionLong::new(8, 0.0, 0.072, 0.522, 17.158),
+    Layer3PartitionLong::new(8, 0.0, 0.072, 0.531, 17.518),
+    Layer3PartitionLong::new(8, 0.0, 0.072, 0.519, 17.869),
+    Layer3PartitionLong::new(10, 0.0, 0.090, 0.512, 18.215),
+    Layer3PartitionLong::new(10, 0.0, 0.090, 0.509, 18.562),
+    Layer3PartitionLong::new(10, 0.0, 0.090, 0.497, 18.902),
+    Layer3PartitionLong::new(12, 0.0, 0.108, 0.494, 19.239),
+    Layer3PartitionLong::new(12, 0.0, 0.108, 0.501, 19.579),
+    Layer3PartitionLong::new(13, 0.0, 0.117, 0.507, 19.925),
+    Layer3PartitionLong::new(14, 0.0, 0.252, 0.502, 20.269),
+    Layer3PartitionLong::new(14, 0.0, 0.252, 0.493, 20.606),
+    Layer3PartitionLong::new(16, 0.0, 0.289, 0.497, 20.944),
+    Layer3PartitionLong::new(20, 0.0, 0.572, 0.506, 21.288),
+    Layer3PartitionLong::new(20, 0.0, 0.572, 0.510, 21.635),
+    Layer3PartitionLong::new(23, 0.0, 0.658, 0.504, 21.979),
+    Layer3PartitionLong::new(27, 0.0, 2.441, 0.496, 22.319),
+    Layer3PartitionLong::new(27, 0.0, 2.441, 0.493, 22.656),
+    Layer3PartitionLong::new(32, 0.0, 2.894, 0.490, 22.993),
+    Layer3PartitionLong::new(37, 0.0, 33.458, 0.483, 23.326),
+    Layer3PartitionLong::new(37, 0.0, 33.458, 0.458, 23.656),
+    Layer3PartitionLong::new(12, 0.0, 10.851, 0.500, 23.937),
+];
+
+/// Table C.7.d — Layer III threshold calculation partitions,
+/// 48 kHz **short** blocks (38 rows, printed p.85 / PDF p.91).
+pub const LAYER3_PARTITIONS_SHORT_C7D: [Layer3PartitionShort; 38] = [
+    Layer3PartitionShort::new(1, 4.532, 0.970, -8.240, 0.000),
+    Layer3PartitionShort::new(1, 0.904, 0.755, -8.240, 1.875),
+    Layer3PartitionShort::new(1, 0.029, 0.738, -8.240, 3.750),
+    Layer3PartitionShort::new(1, 0.009, 0.730, -8.240, 5.437),
+    Layer3PartitionShort::new(1, 0.009, 0.724, -8.240, 6.857),
+    Layer3PartitionShort::new(1, 0.009, 0.723, -8.240, 8.109),
+    Layer3PartitionShort::new(1, 0.009, 0.723, -8.240, 9.237),
+    Layer3PartitionShort::new(1, 0.009, 0.723, -8.240, 10.202),
+    Layer3PartitionShort::new(1, 0.009, 0.718, -8.240, 11.083),
+    Layer3PartitionShort::new(1, 0.009, 0.690, -8.240, 11.864),
+    Layer3PartitionShort::new(1, 0.009, 0.660, -7.447, 12.553),
+    Layer3PartitionShort::new(1, 0.009, 0.641, -7.447, 13.195),
+    Layer3PartitionShort::new(1, 0.009, 0.600, -7.447, 13.781),
+    Layer3PartitionShort::new(1, 0.009, 0.584, -7.447, 14.309),
+    Layer3PartitionShort::new(1, 0.009, 0.532, -7.447, 14.803),
+    Layer3PartitionShort::new(1, 0.009, 0.537, -7.447, 15.250),
+    Layer3PartitionShort::new(1, 0.009, 0.857, -7.447, 15.667),
+    Layer3PartitionShort::new(1, 0.009, 0.858, -7.447, 16.068),
+    Layer3PartitionShort::new(1, 0.009, 0.853, -7.447, 16.409),
+    Layer3PartitionShort::new(2, 0.018, 0.824, -7.447, 17.044),
+    Layer3PartitionShort::new(2, 0.018, 0.778, -6.990, 17.607),
+    Layer3PartitionShort::new(2, 0.018, 0.740, -6.990, 18.097),
+    Layer3PartitionShort::new(2, 0.018, 0.709, -6.990, 18.528),
+    Layer3PartitionShort::new(2, 0.018, 0.676, -6.990, 18.930),
+    Layer3PartitionShort::new(2, 0.018, 0.632, -6.990, 19.295),
+    Layer3PartitionShort::new(2, 0.018, 0.592, -6.990, 19.636),
+    Layer3PartitionShort::new(3, 0.054, 0.553, -6.990, 20.038),
+    Layer3PartitionShort::new(3, 0.054, 0.510, -6.990, 20.486),
+    Layer3PartitionShort::new(3, 0.054, 0.513, -6.990, 20.900),
+    Layer3PartitionShort::new(4, 0.114, 0.608, -6.990, 21.305),
+    Layer3PartitionShort::new(4, 0.114, 0.673, -6.020, 21.722),
+    Layer3PartitionShort::new(5, 0.452, 0.637, -6.020, 22.128),
+    Layer3PartitionShort::new(5, 0.452, 0.586, -6.020, 22.512),
+    Layer3PartitionShort::new(5, 0.452, 0.571, -6.020, 22.877),
+    Layer3PartitionShort::new(7, 6.330, 0.616, -5.229, 23.241),
+    Layer3PartitionShort::new(7, 6.330, 0.640, -5.229, 23.616),
+    Layer3PartitionShort::new(11, 9.947, 0.597, -5.229, 23.974),
+    Layer3PartitionShort::new(17, 153.727, 0.538, -5.229, 24.312),
+];
+
+/// Table C.7.e — Layer III threshold calculation partitions,
+/// 44,1 kHz **short** blocks (39 rows, printed p.86 / PDF p.92).
+pub const LAYER3_PARTITIONS_SHORT_C7E: [Layer3PartitionShort; 39] = [
+    Layer3PartitionShort::new(1, 4.532, 0.952, -8.240, 0.000),
+    Layer3PartitionShort::new(1, 0.904, 0.700, -8.240, 1.723),
+    Layer3PartitionShort::new(1, 0.029, 0.681, -8.240, 3.445),
+    Layer3PartitionShort::new(1, 0.009, 0.675, -8.240, 5.057),
+    Layer3PartitionShort::new(1, 0.009, 0.667, -8.240, 6.422),
+    Layer3PartitionShort::new(1, 0.009, 0.665, -8.240, 7.609),
+    Layer3PartitionShort::new(1, 0.009, 0.664, -8.240, 8.710),
+    Layer3PartitionShort::new(1, 0.009, 0.664, -8.240, 9.662),
+    Layer3PartitionShort::new(1, 0.009, 0.664, -8.240, 10.515),
+    Layer3PartitionShort::new(1, 0.009, 0.655, -8.240, 11.293),
+    Layer3PartitionShort::new(1, 0.009, 0.616, -7.447, 12.009),
+    Layer3PartitionShort::new(1, 0.009, 0.597, -7.447, 12.625),
+    Layer3PartitionShort::new(1, 0.009, 0.578, -7.447, 13.210),
+    Layer3PartitionShort::new(1, 0.009, 0.541, -7.447, 13.748),
+    Layer3PartitionShort::new(1, 0.009, 0.575, -7.447, 14.241),
+    Layer3PartitionShort::new(1, 0.009, 0.856, -7.447, 14.695),
+    Layer3PartitionShort::new(1, 0.009, 0.846, -7.447, 15.125),
+    Layer3PartitionShort::new(1, 0.009, 0.840, -7.447, 15.508),
+    Layer3PartitionShort::new(1, 0.009, 0.822, -7.447, 15.891),
+    Layer3PartitionShort::new(2, 0.018, 0.800, -7.447, 16.537),
+    Layer3PartitionShort::new(2, 0.018, 0.753, -6.990, 17.112),
+    Layer3PartitionShort::new(2, 0.018, 0.704, -6.990, 17.620),
+    Layer3PartitionShort::new(2, 0.018, 0.674, -6.990, 18.073),
+    Layer3PartitionShort::new(2, 0.018, 0.640, -6.990, 18.470),
+    Layer3PartitionShort::new(2, 0.018, 0.609, -6.990, 18.849),
+    Layer3PartitionShort::new(3, 0.027, 0.566, -6.990, 19.271),
+    Layer3PartitionShort::new(3, 0.027, 0.535, -6.990, 19.741),
+    Layer3PartitionShort::new(3, 0.054, 0.531, -6.990, 20.177),
+    Layer3PartitionShort::new(3, 0.054, 0.615, -6.990, 20.576),
+    Layer3PartitionShort::new(3, 0.054, 0.686, -6.990, 20.950),
+    Layer3PartitionShort::new(4, 0.114, 0.650, -6.020, 21.316),
+    Layer3PartitionShort::new(4, 0.114, 0.612, -6.020, 21.699),
+    Layer3PartitionShort::new(5, 0.452, 0.567, -6.020, 22.078),
+    Layer3PartitionShort::new(5, 0.452, 0.520, -6.020, 22.438),
+    Layer3PartitionShort::new(5, 0.452, 0.513, -5.229, 22.782),
+    Layer3PartitionShort::new(7, 6.330, 0.557, -5.229, 23.133),
+    Layer3PartitionShort::new(7, 6.330, 0.584, -5.229, 23.484),
+    Layer3PartitionShort::new(7, 6.330, 0.570, -5.229, 23.828),
+    Layer3PartitionShort::new(19, 171.813, 0.578, -4.559, 24.173),
+];
+
+/// Table C.7.f — Layer III threshold calculation partitions,
+/// 32 kHz **short** blocks (42 rows, printed p.87 / PDF p.93).
+pub const LAYER3_PARTITIONS_SHORT_C7F: [Layer3PartitionShort; 42] = [
+    Layer3PartitionShort::new(1, 4.532, 0.997, -8.240, 0.000),
+    Layer3PartitionShort::new(1, 0.904, 0.893, -8.240, 1.250),
+    Layer3PartitionShort::new(1, 0.090, 0.881, -8.240, 2.500),
+    Layer3PartitionShort::new(1, 0.029, 0.873, -8.240, 3.750),
+    Layer3PartitionShort::new(1, 0.009, 0.872, -8.240, 4.909),
+    Layer3PartitionShort::new(1, 0.009, 0.871, -8.240, 5.958),
+    Layer3PartitionShort::new(1, 0.009, 0.860, -8.240, 6.857),
+    Layer3PartitionShort::new(1, 0.009, 0.839, -8.240, 7.700),
+    Layer3PartitionShort::new(1, 0.009, 0.812, -8.240, 8.500),
+    Layer3PartitionShort::new(1, 0.009, 0.784, -8.240, 9.237),
+    Layer3PartitionShort::new(1, 0.009, 0.741, -7.447, 9.895),
+    Layer3PartitionShort::new(1, 0.009, 0.697, -7.447, 10.500),
+    Layer3PartitionShort::new(1, 0.009, 0.674, -7.447, 11.083),
+    Layer3PartitionShort::new(1, 0.009, 0.651, -7.447, 11.604),
+    Layer3PartitionShort::new(1, 0.009, 0.633, -7.447, 12.107),
+    Layer3PartitionShort::new(1, 0.009, 0.611, -7.447, 12.554),
+    Layer3PartitionShort::new(1, 0.009, 0.589, -7.447, 13.000),
+    Layer3PartitionShort::new(1, 0.009, 0.575, -7.447, 13.391),
+    Layer3PartitionShort::new(1, 0.009, 0.654, -7.447, 13.781),
+    Layer3PartitionShort::new(2, 0.018, 0.724, -7.447, 14.474),
+    Layer3PartitionShort::new(2, 0.018, 0.701, -6.990, 15.096),
+    Layer3PartitionShort::new(2, 0.018, 0.673, -6.990, 15.667),
+    Layer3PartitionShort::new(2, 0.018, 0.631, -6.990, 16.177),
+    Layer3PartitionShort::new(2, 0.018, 0.592, -6.990, 16.636),
+    Layer3PartitionShort::new(2, 0.018, 0.553, -6.990, 17.057),
+    Layer3PartitionShort::new(2, 0.018, 0.510, -6.990, 17.429),
+    Layer3PartitionShort::new(2, 0.018, 0.506, -6.990, 17.786),
+    Layer3PartitionShort::new(3, 0.027, 0.562, -6.990, 18.177),
+    Layer3PartitionShort::new(3, 0.027, 0.598, -6.990, 18.597),
+    Layer3PartitionShort::new(3, 0.027, 0.589, -6.990, 18.994),
+    Layer3PartitionShort::new(3, 0.027, 0.607, -6.020, 19.352),
+    Layer3PartitionShort::new(3, 0.027, 0.620, -6.020, 19.693),
+    Layer3PartitionShort::new(4, 0.072, 0.580, -6.020, 20.066),
+    Layer3PartitionShort::new(4, 0.072, 0.532, -6.020, 20.461),
+    Layer3PartitionShort::new(4, 0.072, 0.517, -5.229, 20.841),
+    Layer3PartitionShort::new(5, 0.143, 0.517, -5.229, 21.201),
+    Layer3PartitionShort::new(5, 0.143, 0.509, -5.229, 21.549),
+    Layer3PartitionShort::new(6, 0.172, 0.506, -5.229, 21.911),
+    Layer3PartitionShort::new(7, 0.633, 0.522, -4.559, 22.275),
+    Layer3PartitionShort::new(7, 0.633, 0.531, -4.559, 22.625),
+    Layer3PartitionShort::new(8, 0.723, 0.519, -3.980, 22.971),
+    Layer3PartitionShort::new(10, 9.043, 0.512, -3.980, 23.321),
+];
+
+/// Table C.7 long-block dispatch. **Note the suffix order**: C.7.a is
+/// 48 kHz, C.7.b is 44,1 kHz and C.7.c is 32 kHz — the *reverse* of
+/// the Annex D Table D.3a–c rate order.
+#[inline]
+#[must_use]
+pub fn layer3_partitions_long(fs: AnnexDSamplingRate) -> &'static [Layer3PartitionLong] {
+    match fs {
+        AnnexDSamplingRate::Hz48000 => &LAYER3_PARTITIONS_LONG_C7A,
+        AnnexDSamplingRate::Hz44100 => &LAYER3_PARTITIONS_LONG_C7B,
+        AnnexDSamplingRate::Hz32000 => &LAYER3_PARTITIONS_LONG_C7C,
+    }
+}
+
+/// Table C.7 short-block dispatch (C.7.d = 48 kHz, C.7.e = 44,1 kHz,
+/// C.7.f = 32 kHz).
+#[inline]
+#[must_use]
+pub fn layer3_partitions_short(fs: AnnexDSamplingRate) -> &'static [Layer3PartitionShort] {
+    match fs {
+        AnnexDSamplingRate::Hz48000 => &LAYER3_PARTITIONS_SHORT_C7D,
+        AnnexDSamplingRate::Hz44100 => &LAYER3_PARTITIONS_SHORT_C7E,
+        AnnexDSamplingRate::Hz32000 => &LAYER3_PARTITIONS_SHORT_C7F,
+    }
+}
+
+/// Partition widths (`FFT-lines` column) for the Table C.7 long
+/// tables, in row order — the `cbwidth_k` of the §C.1.5.3.2.1
+/// psychoacoustic-entropy formula and the accumulation strides of
+/// [`layer3_partition_eb`].
+#[must_use]
+pub fn layer3_partition_widths_long(fs: AnnexDSamplingRate) -> Vec<u16> {
+    layer3_partitions_long(fs).iter().map(|e| e.lines).collect()
+}
+
+/// Partition widths (`FFT-lines` column) for the Table C.7 short
+/// tables, in row order.
+#[must_use]
+pub fn layer3_partition_widths_short(fs: AnnexDSamplingRate) -> Vec<u16> {
+    layer3_partitions_short(fs)
+        .iter()
+        .map(|e| e.lines)
+        .collect()
+}
+
+/// Figure C.6.b/C.6.d energy accumulation `eb(b) = Σ r(w)²` over the
+/// Table C.7 threshold calculation partitions.
+///
+/// Table C.7 gives each partition's width (`FFT-lines`) but no
+/// explicit line bounds: partitions tile the spectrum contiguously
+/// from the DC line (slice index 0). `r_lines` is the step b)
+/// magnitude spectrum (long: 513 lines; short: 129); `widths` the
+/// `FFT-lines` column ([`layer3_partition_widths_long`] /
+/// [`layer3_partition_widths_short`]). The printed width sums (481 /
+/// 465 / 488 long, 107 / 109 / 110 short) leave the topmost lines
+/// uncovered; they contribute to no partition, exactly as printed.
+///
+/// Returns `None` when `widths` is empty or the widths overrun
+/// `r_lines`.
+#[must_use]
+pub fn layer3_partition_eb(r_lines: &[f64], widths: &[u16]) -> Option<Vec<f64>> {
+    let total: usize = widths.iter().map(|&w| usize::from(w)).sum();
+    if widths.is_empty() || total > r_lines.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(widths.len());
+    let mut w0 = 0usize;
+    for &w in widths {
+        let w1 = w0 + usize::from(w);
+        out.push(r_lines[w0..w1].iter().map(|&r| r * r).sum());
+        w0 = w1;
+    }
+    Some(out)
+}
+
+/// Figure C.6.b weighted-unpredictability accumulation
+/// `cb(b) = Σ cw(w)·r(w)²` over the Table C.7 partitions (long path
+/// only — the Figure C.6.d short path computes no unpredictability).
+/// Same tiling convention as [`layer3_partition_eb`]; `cw` is the
+/// composed [`model2_layer3_cw_compose`] vector. Returns `None` when
+/// the widths overrun either input.
+#[must_use]
+pub fn layer3_partition_cb(r_lines: &[f64], cw: &[f64], widths: &[u16]) -> Option<Vec<f64>> {
+    let total: usize = widths.iter().map(|&w| usize::from(w)).sum();
+    if widths.is_empty() || total > r_lines.len() || total > cw.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(widths.len());
+    let mut w0 = 0usize;
+    for &w in widths {
+        let w1 = w0 + usize::from(w);
+        out.push(
+            r_lines[w0..w1]
+                .iter()
+                .zip(&cw[w0..w1])
+                .map(|(&r, &c)| c * r * r)
+                .sum(),
+        );
+        w0 = w1;
+    }
+    Some(out)
+}
+
+/// Figure C.6.b/C.6.d spreading convolution `ecbb = eb * sprdngf`
+/// (and `ctb = cb * sprdngf`) with the §C.1.5.3.2.1 **replaced**
+/// spreading function: `ecbb(j) = Σ_i sprdngf(i, j) · v(i)` over the
+/// partition indices, using [`model2_layer3_spread_linear`] (the
+/// piecewise `3,0(j−i)` / `1,5(j−i)` dB ramp with the printed
+/// greater-than-10⁻⁶ clamp).
+#[must_use]
+pub fn model2_layer3_spread_partitions(per_partition: &[f64]) -> Vec<f64> {
+    let n = per_partition.len();
+    (0..n)
+        .map(|j| {
+            (0..n)
+                .map(|i| model2_layer3_spread_linear(i as i32, j as i32) * per_partition[i])
+                .sum()
+        })
+        .collect()
+}
+
+/// §C.1.5.3.2.1 required SNR for one **long-block** partition — the
+/// Figure C.6.b formula with the Layer III constants substituted:
+///
+/// ```text
+/// SNR(b) = MAX(minval(b), TMN(b)·tbb(b) + NMT(b)·(1 − tbb(b)))
+/// ```
+///
+/// with `TMN(b) = 29,0 dB` and `NMT(b) = 6,0 dB` for all partitions
+/// and `minval` from Table C.7 (the §D.2.4 step h) shape with the
+/// §C.1.5.3.2.1 parameter overrides). `tb` is the step g) tonality
+/// index ([`model2_step_g_tonality`] — the Layer III `conv1`/`conv2`
+/// are numerically the step g) coefficients).
+#[inline]
+#[must_use]
+pub fn model2_layer3_step_h_snr_db(tb: f64, minval_db: f64) -> f64 {
+    minval_db.max(tb * MODEL2_LAYER3_TMN_DB + (1.0 - tb) * MODEL2_LAYER3_NMT_DB)
+}
+
+/// Figure C.6.b **long-block** partition threshold
+/// `nbb(b) = ecbb(b)·norm(b)·10^(−SNR(b)/10)`.
+///
+/// Sign note: the printed C.6.b box annotates the exponent as
+/// `SNR(b)/10` with no sign, but §C.1.5.3.2.1 introduces the Layer
+/// III model as clause D.2 "modified as described below" and none of
+/// the enumerated modifications touches the §D.2.4 step i) power
+/// ratio `bc_b = 10^(−SNR_b/10)` — so the step i) convention carries
+/// over (the long-path SNR is ≥ 0 dB, and a threshold a positive SNR
+/// *above* the spread energy would be vacuous). [`model2_step_i_bc`]
+/// supplies the conversion.
+#[inline]
+#[must_use]
+pub fn model2_layer3_long_nb(ecbb: f64, norm: f64, snr_db: f64) -> f64 {
+    ecbb * norm * model2_step_i_bc(snr_db)
+}
+
+/// Figure C.6.d **short-block** partition threshold
+/// `nbb(b) = ecbb(b)·norm(b)·10^(SNR(b)/10)`, with `SNR(b)` read
+/// verbatim from the Table C.7.d–f `SNR (db)` column ("The SNR for
+/// short blocks is read from a table").
+///
+/// The printed short-block SNR values are negative (−8,24 …
+/// −3,98 dB), so the exponent is applied exactly as printed — the
+/// negative table value already encodes the threshold-below-energy
+/// direction that the long path expresses through the step i)
+/// negation (`model2_layer3_short_nb(e, n, −x) ==
+/// model2_layer3_long_nb(e, n, x)`).
+#[inline]
+#[must_use]
+pub fn model2_layer3_short_nb(ecbb: f64, norm: f64, snr_db: f64) -> f64 {
+    ecbb * norm * (10.0_f64).powf(snr_db / 10.0)
+}
+
+/// §D.2.4 step m) / Figure C.6.b **pre-echo control** for one
+/// long-block partition (verbatim prose: "compare the threshold with
+/// the last threshold and the threshold in quiet and take the
+/// maximum"; printed formula, 300-DPI render re-read):
+///
+/// ```text
+/// thr(b)    = MAX(qthr(b), nbb(b), nbb_l(b), nbb_ll(b))
+/// nbb_l(b)  = rpelev  · nbb(b) from the last block
+/// nbb_ll(b) = rpelev2 · nbb(b) from the block before the last block
+/// ```
+///
+/// with `rpelev = 2` / `rpelev2 = 16` ([`MODEL2_LAYER3_RPELEV`] /
+/// [`MODEL2_LAYER3_RPELEV2`]). `nb_last` / `nb_before_last` are the
+/// **unscaled** `nbb(b)` of the two preceding blocks; the rpelev
+/// factors are applied here.
+///
+/// Behavioural reading of the printed maximum: a block following loud
+/// history inherits an elevated threshold floor (the post-masking
+/// economy), while an attack block out of quiet history keeps
+/// `max(qthr, nbb)` — the §C.1.5.3.2 window switching decision
+/// ([`layer3_pe_attack`]), not this step, is what shortens the
+/// transform around the attack. §D.2.4 step m) confines the whole
+/// step to Layer III: "This step is omitted for Layers I and II."
+#[inline]
+#[must_use]
+pub fn model2_layer3_step_m_thr(qthr: f64, nbb: f64, nb_last: f64, nb_before_last: f64) -> f64 {
+    qthr.max(nbb)
+        .max(MODEL2_LAYER3_RPELEV * nb_last)
+        .max(MODEL2_LAYER3_RPELEV2 * nb_before_last)
+}
+
+/// Figure C.6.d **short-block** threshold comparison — the
+/// history-free `thr(b) = maximum(qthr(b), nbb(b))` (no pre-echo
+/// memory in the short path).
+#[inline]
+#[must_use]
+pub fn model2_layer3_short_thr(qthr: f64, nbb: f64) -> f64 {
+    qthr.max(nbb)
+}
+
+/// Persistent §D.2.4 step m) pre-echo state — the `nbb(b)` vectors of
+/// the last block and the block before it, zeroed initially (the
+/// first two [`Self::step`] calls therefore reduce to
+/// `max(qthr, nbb)` on the affected history slots).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Model2Layer3PreEcho {
+    nb_last: Vec<f64>,
+    nb_before_last: Vec<f64>,
+}
+
+impl Model2Layer3PreEcho {
+    /// Zeroed pre-echo history over `partitions` threshold
+    /// calculation partitions (the matching Table C.7 long-table row
+    /// count).
+    #[must_use]
+    pub fn new(partitions: usize) -> Self {
+        Self {
+            nb_last: vec![0.0; partitions],
+            nb_before_last: vec![0.0; partitions],
+        }
+    }
+
+    /// Number of partitions this state was sized for.
+    #[must_use]
+    pub fn partitions(&self) -> usize {
+        self.nb_last.len()
+    }
+
+    /// Apply the Figure C.6.b pre-echo maximum to one block's
+    /// per-partition `nbb` and `qthr` vectors, returning `thr(b)` and
+    /// rotating the history (`nbb → nbb_l → nbb_ll`). Returns `None`
+    /// — leaving the history untouched — on any length mismatch.
+    #[must_use]
+    pub fn step(&mut self, qthr: &[f64], nbb: &[f64]) -> Option<Vec<f64>> {
+        let n = self.nb_last.len();
+        if qthr.len() != n || nbb.len() != n {
+            return None;
+        }
+        let thr = (0..n)
+            .map(|b| {
+                model2_layer3_step_m_thr(qthr[b], nbb[b], self.nb_last[b], self.nb_before_last[b])
+            })
+            .collect();
+        self.nb_before_last = core::mem::replace(&mut self.nb_last, nbb.to_vec());
+        Some(thr)
+    }
+}
+
+/// §C.1.5.3.2.1 psychoacoustic entropy (printed formula):
+///
+/// ```text
+/// pe = −Σ_k cbwidth_k · log(thr_k / (eb_k + 1))
+/// ```
+///
+/// "where k indexes the threshold calculation partitions and cbwidth
+/// is the width of the threshold calculation partition". The
+/// unannotated `log` is read as the natural logarithm — within the
+/// same clause the Figure C.6.b tonality box prints the §D.2.4
+/// step g) formula (whose log is explicitly `loge`) with the same
+/// bare `log`. `thr` is the final (post-step-m) threshold; `eb` the
+/// partition energy; `widths` the Table C.7 `FFT-lines` column.
+/// Returns `None` on length mismatch.
+#[must_use]
+pub fn model2_layer3_pe(eb: &[f64], thr: &[f64], widths: &[u16]) -> Option<f64> {
+    if eb.len() != thr.len() || eb.len() != widths.len() {
+        return None;
+    }
+    Some(
+        -eb.iter()
+            .zip(thr)
+            .zip(widths)
+            .map(|((&e, &t), &w)| f64::from(w) * (t / (e + 1.0)).ln())
+            .sum::<f64>(),
+    )
+}
+
+/// §C.1.5.3.2 window switching decision — verbatim: "switching when
+/// the PE exceeds the value 1800" (strictly greater).
+#[inline]
+#[must_use]
+pub fn layer3_pe_attack(pe: f64) -> bool {
+    pe > LAYER3_PE_SWITCH_THRESHOLD
+}
+
+/// Figure C.7 — *Window Switching State Diagram* transition function.
+///
+/// The four states are the §2.4.2.7 block types; the printed arrows
+/// are exactly:
+///
+/// ```text
+/// normal (0) --no attack--> normal      --attack--> start
+/// start  (1) -------------> short                  (unconditional)
+/// short  (2) --attack-----> short       --no attack--> stop
+/// stop   (3) --no attack--> normal      --attack--> start
+/// ```
+///
+/// "If this condition is met, the sequence start (block_type=1),
+/// short (block_type=2), short, stop (block_type=3) is started."
+/// (`stop` is [`crate::side_info::BlockType::End`].)
+#[must_use]
+pub fn layer3_window_state_next(
+    cur: crate::side_info::BlockType,
+    attack: bool,
+) -> crate::side_info::BlockType {
+    use crate::side_info::BlockType as B;
+    match (cur, attack) {
+        (B::Long, false) => B::Long,
+        (B::Long, true) | (B::End, true) => B::Start,
+        (B::Start, _) | (B::Short, true) => B::Short,
+        (B::Short, false) => B::End,
+        (B::End, false) => B::Long,
+    }
+}
+
+/// Figure C.6.a delayed-decision retrofit (printed pseudo-code):
+///
+/// ```text
+/// if (blocktype(n) == SHORT_TYPE && blocktype(n-1) == NORM_TYPE)
+///     blocktype(n-1) = START_TYPE;
+/// ```
+///
+/// Returns the (possibly rewritten) `blocktype(n-1)` given the
+/// just-decided `blocktype(n)`. With the [`layer3_window_state_next`]
+/// transition function the NORM→SHORT adjacency never arises (an
+/// attack inserts the START itself), so this is the printed safety
+/// net for model variants that decide SHORT directly; the
+/// [`Layer3WindowSwitcher`] pipeline applies it to every delayed
+/// emission regardless.
+#[inline]
+#[must_use]
+pub fn layer3_retrofit_start(
+    prev: crate::side_info::BlockType,
+    cur: crate::side_info::BlockType,
+) -> crate::side_info::BlockType {
+    use crate::side_info::BlockType as B;
+    if cur == B::Short && prev == B::Long {
+        B::Start
+    } else {
+        prev
+    }
+}
+
+/// §C.1.5.3.2 / Figure C.6.a window-switching pipeline — the Figure
+/// C.7 state machine driven by per-granule PE, with the printed
+/// one-block output delay ("delay threshold (ratio), blocktype,
+/// perceptual entropy by one block") and the [`layer3_retrofit_start`]
+/// rewrite applied to every delayed emission.
+///
+/// Distinct from [`crate::block_type_sm::BlockTypeStateMachine`]
+/// (which schedules from externally supplied attack flags with
+/// explicit lookahead): this type *is* the Annex C psychoacoustic
+/// coupling — PE in, delayed block type out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer3WindowSwitcher {
+    state: crate::side_info::BlockType,
+    pending: Option<crate::side_info::BlockType>,
+}
+
+impl Default for Layer3WindowSwitcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Layer3WindowSwitcher {
+    /// Fresh pipeline: state `normal`, empty delay slot.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: crate::side_info::BlockType::Long,
+            pending: None,
+        }
+    }
+
+    /// Feed one granule's PE; returns the **previous** granule's
+    /// final block type (`None` on the very first call while the
+    /// delay slot fills).
+    #[must_use]
+    pub fn push(&mut self, pe: f64) -> Option<crate::side_info::BlockType> {
+        let next = layer3_window_state_next(self.state, layer3_pe_attack(pe));
+        let emitted = self.pending.map(|p| layer3_retrofit_start(p, next));
+        self.pending = Some(next);
+        self.state = next;
+        emitted
+    }
+
+    /// Drain the delay slot at end of stream (the last granule's
+    /// block type, un-retrofitted since no successor exists).
+    #[must_use]
+    pub fn finish(&mut self) -> Option<crate::side_info::BlockType> {
+        self.pending.take()
+    }
+}
+
+/// One row of Table C.8 — *Tables for converting threshold
+/// calculation partitions to scalefactor bands* (columns `cbw`, `bu`,
+/// `bo`, `w1`, `w2`).
+///
+/// §C.1.5.3.2.1 (verbatim): "The threshold is not spread over the FFT
+/// lines. The threshold calculation partitions are converted directly
+/// to scalefactor bands. The first partition which is added to the
+/// scalefactor band is weighted with w1, the last with w2 … The table
+/// contains also the number of partitions (cbw) converted to one
+/// scalefactor band (excluding the first and the last partition)."
+/// `bu` / `bo` are the bounding partition indices consumed by the
+/// Figure C.6.c reduction ([`layer3_partitions_to_sfb`]). `cbw` is
+/// carried as printed (it is informative; the reduction is fully
+/// determined by `bu`/`bo`/`w1`/`w2`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layer3SfbConversion {
+    /// `cbw` — printed partition count for this band.
+    pub cbw: u16,
+    /// `bu` — first (lower) partition index, weighted by `w1`.
+    pub bu: u16,
+    /// `bo` — last (upper) partition index, weighted by `w2`.
+    pub bo: u16,
+    /// `w1` — weight of partition `bu`.
+    pub w1: f64,
+    /// `w2` — weight of partition `bo`.
+    pub w2: f64,
+}
+
+impl Layer3SfbConversion {
+    const fn new(cbw: u16, bu: u16, bo: u16, w1: f64, w2: f64) -> Self {
+        Self {
+            cbw,
+            bu,
+            bo,
+            w1,
+            w2,
+        }
+    }
+}
+
+/// Table C.8.a — 48 kHz **long** blocks (21 scalefactor bands,
+/// printed p.88 / PDF p.94).
+pub const LAYER3_SFB_CONVERSION_LONG_C8A: [Layer3SfbConversion; 21] = [
+    Layer3SfbConversion::new(3, 0, 4, 1.000, 0.056),
+    Layer3SfbConversion::new(3, 4, 7, 0.944, 0.611),
+    Layer3SfbConversion::new(4, 7, 11, 0.389, 0.167),
+    Layer3SfbConversion::new(3, 11, 14, 0.833, 0.722),
+    Layer3SfbConversion::new(3, 14, 17, 0.278, 0.639),
+    Layer3SfbConversion::new(2, 17, 19, 0.361, 0.417),
+    Layer3SfbConversion::new(3, 19, 22, 0.583, 0.083),
+    Layer3SfbConversion::new(2, 22, 24, 0.917, 0.750),
+    Layer3SfbConversion::new(3, 24, 27, 0.250, 0.417),
+    Layer3SfbConversion::new(3, 27, 30, 0.583, 0.648),
+    Layer3SfbConversion::new(3, 30, 33, 0.352, 0.611),
+    Layer3SfbConversion::new(3, 33, 36, 0.389, 0.625),
+    Layer3SfbConversion::new(4, 36, 40, 0.375, 0.144),
+    Layer3SfbConversion::new(3, 40, 43, 0.856, 0.389),
+    Layer3SfbConversion::new(3, 43, 46, 0.611, 0.160),
+    Layer3SfbConversion::new(3, 46, 49, 0.840, 0.217),
+    Layer3SfbConversion::new(3, 49, 52, 0.783, 0.184),
+    Layer3SfbConversion::new(2, 52, 54, 0.816, 0.886),
+    Layer3SfbConversion::new(3, 54, 57, 0.114, 0.313),
+    Layer3SfbConversion::new(2, 57, 59, 0.687, 0.452),
+    Layer3SfbConversion::new(1, 59, 60, 0.548, 0.908),
+];
+
+/// Table C.8.b — 44,1 kHz **long** blocks (21 bands, printed p.88 /
+/// PDF p.94).
+pub const LAYER3_SFB_CONVERSION_LONG_C8B: [Layer3SfbConversion; 21] = [
+    Layer3SfbConversion::new(3, 0, 4, 1.000, 0.056),
+    Layer3SfbConversion::new(3, 4, 7, 0.944, 0.611),
+    Layer3SfbConversion::new(4, 7, 11, 0.389, 0.167),
+    Layer3SfbConversion::new(3, 11, 14, 0.833, 0.722),
+    Layer3SfbConversion::new(3, 14, 17, 0.278, 0.139),
+    Layer3SfbConversion::new(1, 17, 18, 0.861, 0.917),
+    Layer3SfbConversion::new(3, 18, 21, 0.083, 0.583),
+    Layer3SfbConversion::new(3, 21, 24, 0.417, 0.250),
+    Layer3SfbConversion::new(3, 24, 27, 0.750, 0.805),
+    Layer3SfbConversion::new(3, 27, 30, 0.194, 0.574),
+    Layer3SfbConversion::new(3, 30, 33, 0.426, 0.537),
+    Layer3SfbConversion::new(3, 33, 36, 0.463, 0.819),
+    Layer3SfbConversion::new(4, 36, 40, 0.180, 0.100),
+    Layer3SfbConversion::new(3, 40, 43, 0.900, 0.468),
+    Layer3SfbConversion::new(3, 43, 46, 0.532, 0.623),
+    Layer3SfbConversion::new(3, 46, 49, 0.376, 0.450),
+    Layer3SfbConversion::new(3, 49, 52, 0.550, 0.552),
+    Layer3SfbConversion::new(3, 52, 55, 0.448, 0.403),
+    Layer3SfbConversion::new(2, 55, 57, 0.597, 0.643),
+    Layer3SfbConversion::new(2, 57, 59, 0.357, 0.722),
+    Layer3SfbConversion::new(2, 59, 61, 0.278, 0.960),
+];
+
+/// Table C.8.c — 32 kHz **long** blocks (21 bands, printed p.89 /
+/// PDF p.95).
+pub const LAYER3_SFB_CONVERSION_LONG_C8C: [Layer3SfbConversion; 21] = [
+    Layer3SfbConversion::new(1, 0, 2, 1.000, 0.528),
+    Layer3SfbConversion::new(2, 2, 4, 0.472, 0.305),
+    Layer3SfbConversion::new(2, 4, 6, 0.694, 0.083),
+    Layer3SfbConversion::new(1, 6, 7, 0.917, 0.861),
+    Layer3SfbConversion::new(2, 7, 9, 0.139, 0.639),
+    Layer3SfbConversion::new(2, 9, 11, 0.361, 0.417),
+    Layer3SfbConversion::new(3, 11, 14, 0.583, 0.083),
+    Layer3SfbConversion::new(2, 14, 16, 0.917, 0.750),
+    Layer3SfbConversion::new(3, 16, 19, 0.250, 0.870),
+    Layer3SfbConversion::new(3, 19, 22, 0.130, 0.833),
+    Layer3SfbConversion::new(4, 22, 26, 0.167, 0.389),
+    Layer3SfbConversion::new(4, 26, 30, 0.611, 0.478),
+    Layer3SfbConversion::new(4, 30, 34, 0.522, 0.033),
+    Layer3SfbConversion::new(3, 34, 37, 0.967, 0.917),
+    Layer3SfbConversion::new(4, 37, 41, 0.083, 0.617),
+    Layer3SfbConversion::new(3, 41, 44, 0.383, 0.995),
+    Layer3SfbConversion::new(4, 44, 48, 0.005, 0.274),
+    Layer3SfbConversion::new(3, 48, 51, 0.726, 0.480),
+    Layer3SfbConversion::new(3, 51, 54, 0.519, 0.261),
+    Layer3SfbConversion::new(2, 54, 56, 0.739, 0.884),
+    Layer3SfbConversion::new(2, 56, 58, 0.116, 1.000),
+];
+
+/// Table C.8.d — 48 kHz **short** blocks (12 bands, printed p.89 /
+/// PDF p.95).
+pub const LAYER3_SFB_CONVERSION_SHORT_C8D: [Layer3SfbConversion; 12] = [
+    Layer3SfbConversion::new(2, 0, 3, 1.000, 0.167),
+    Layer3SfbConversion::new(2, 3, 5, 0.833, 0.833),
+    Layer3SfbConversion::new(3, 5, 8, 0.167, 0.500),
+    Layer3SfbConversion::new(3, 8, 11, 0.500, 0.167),
+    Layer3SfbConversion::new(4, 11, 15, 0.833, 0.167),
+    Layer3SfbConversion::new(4, 15, 19, 0.833, 0.583),
+    Layer3SfbConversion::new(3, 19, 22, 0.417, 0.917),
+    Layer3SfbConversion::new(4, 22, 26, 0.083, 0.944),
+    Layer3SfbConversion::new(4, 26, 30, 0.055, 0.042),
+    Layer3SfbConversion::new(2, 30, 32, 0.958, 0.567),
+    Layer3SfbConversion::new(3, 32, 35, 0.433, 0.167),
+    Layer3SfbConversion::new(2, 35, 37, 0.833, 0.618),
+];
+
+/// Table C.8.e — 44,1 kHz **short** blocks (12 bands, printed p.90 /
+/// PDF p.96).
+pub const LAYER3_SFB_CONVERSION_SHORT_C8E: [Layer3SfbConversion; 12] = [
+    Layer3SfbConversion::new(2, 0, 3, 1.000, 0.167),
+    Layer3SfbConversion::new(2, 3, 5, 0.833, 0.833),
+    Layer3SfbConversion::new(3, 5, 8, 0.167, 0.500),
+    Layer3SfbConversion::new(3, 8, 11, 0.500, 0.167),
+    Layer3SfbConversion::new(4, 11, 15, 0.833, 0.167),
+    Layer3SfbConversion::new(5, 15, 20, 0.833, 0.250),
+    Layer3SfbConversion::new(3, 20, 23, 0.750, 0.583),
+    Layer3SfbConversion::new(4, 23, 27, 0.417, 0.055),
+    Layer3SfbConversion::new(3, 27, 30, 0.944, 0.375),
+    Layer3SfbConversion::new(3, 30, 33, 0.625, 0.300),
+    Layer3SfbConversion::new(3, 33, 36, 0.700, 0.167),
+    Layer3SfbConversion::new(2, 36, 38, 0.833, 1.000),
+];
+
+/// Table C.8.f — 32 kHz **short** blocks (12 bands, printed p.90 /
+/// PDF p.96).
+pub const LAYER3_SFB_CONVERSION_SHORT_C8F: [Layer3SfbConversion; 12] = [
+    Layer3SfbConversion::new(2, 0, 3, 1.000, 0.167),
+    Layer3SfbConversion::new(2, 3, 5, 0.833, 0.833),
+    Layer3SfbConversion::new(3, 5, 8, 0.167, 0.500),
+    Layer3SfbConversion::new(3, 8, 11, 0.500, 0.167),
+    Layer3SfbConversion::new(4, 11, 15, 0.833, 0.167),
+    Layer3SfbConversion::new(5, 15, 20, 0.833, 0.250),
+    Layer3SfbConversion::new(4, 20, 24, 0.750, 0.250),
+    Layer3SfbConversion::new(5, 24, 29, 0.750, 0.055),
+    Layer3SfbConversion::new(4, 29, 33, 0.944, 0.375),
+    Layer3SfbConversion::new(4, 33, 37, 0.625, 0.472),
+    Layer3SfbConversion::new(3, 37, 40, 0.528, 0.937),
+    Layer3SfbConversion::new(1, 40, 41, 0.062, 1.000),
+];
+
+/// Table C.8 long-block dispatch (C.8.a = 48 kHz, C.8.b = 44,1 kHz,
+/// C.8.c = 32 kHz — same reversed suffix order as Table C.7).
+#[inline]
+#[must_use]
+pub fn layer3_sfb_conversion_long(fs: AnnexDSamplingRate) -> &'static [Layer3SfbConversion] {
+    match fs {
+        AnnexDSamplingRate::Hz48000 => &LAYER3_SFB_CONVERSION_LONG_C8A,
+        AnnexDSamplingRate::Hz44100 => &LAYER3_SFB_CONVERSION_LONG_C8B,
+        AnnexDSamplingRate::Hz32000 => &LAYER3_SFB_CONVERSION_LONG_C8C,
+    }
+}
+
+/// Table C.8 short-block dispatch (C.8.d = 48 kHz, C.8.e = 44,1 kHz,
+/// C.8.f = 32 kHz).
+#[inline]
+#[must_use]
+pub fn layer3_sfb_conversion_short(fs: AnnexDSamplingRate) -> &'static [Layer3SfbConversion] {
+    match fs {
+        AnnexDSamplingRate::Hz48000 => &LAYER3_SFB_CONVERSION_SHORT_C8D,
+        AnnexDSamplingRate::Hz44100 => &LAYER3_SFB_CONVERSION_SHORT_C8E,
+        AnnexDSamplingRate::Hz32000 => &LAYER3_SFB_CONVERSION_SHORT_C8F,
+    }
+}
+
+/// Figure C.6.c reduction — convert a per-partition vector (energy
+/// `eb` or threshold `thr`) to scalefactor bands:
+///
+/// ```text
+/// v(sb) = w1·v(bu) + Σ_{b = bu+1}^{bo−1} v(b) + w2·v(bo)
+/// ```
+///
+/// (the printed `en(sb)` / `thm(sb)` sums). `conv` is a Table C.8
+/// slice ([`layer3_sfb_conversion_long`] /
+/// [`layer3_sfb_conversion_short`]); `per_partition` the matching
+/// Table C.7 partition-order vector. Returns `None` when any row's
+/// `bo` falls outside `per_partition` or `bo <= bu` (never the case
+/// for the printed tables).
+#[must_use]
+pub fn layer3_partitions_to_sfb(
+    per_partition: &[f64],
+    conv: &[Layer3SfbConversion],
+) -> Option<Vec<f64>> {
+    let mut out = Vec::with_capacity(conv.len());
+    for e in conv {
+        let bu = usize::from(e.bu);
+        let bo = usize::from(e.bo);
+        if bo <= bu || bo >= per_partition.len() {
+            return None;
+        }
+        let mid: f64 = per_partition[bu + 1..bo].iter().sum();
+        out.push(e.w1 * per_partition[bu] + mid + e.w2 * per_partition[bo]);
+    }
+    Some(out)
+}
+
+/// Figure C.6.c — "Calculate ratios for each scalefactor band:
+/// `ratio(sb) = thm(sb) / en(sb)`". A zero-energy band yields a zero
+/// ratio (no signal, nothing to mask — the same zero-energy
+/// convention as [`model2_step_f_cb`]). Returns `None` on length
+/// mismatch.
+#[must_use]
+pub fn layer3_sfb_ratio(thm: &[f64], en: &[f64]) -> Option<Vec<f64>> {
+    if thm.len() != en.len() {
+        return None;
+    }
+    Some(
+        thm.iter()
+            .zip(en)
+            .map(|(&t, &e)| if e > 0.0 { t / e } else { 0.0 })
+            .collect(),
+    )
+}
+
+/// Per-granule output of the [`Model2Layer3State`] walk — the
+/// §C.1.5.3.2 deliverables ("A signal-to-mask-ratio is provided for
+/// every scalefactor band") in their Figure C.6.c `ratio` form, plus
+/// the §C.1.5.3.2.1 psychoacoustic entropy and the window switching
+/// decision it implies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Model2Layer3Granule {
+    /// §C.1.5.3.2.1 psychoacoustic entropy of the long path.
+    pub pe: f64,
+    /// `pe > 1800` — the §C.1.5.3.2 window switching condition.
+    pub attack: bool,
+    /// Figure C.6.c `en(sb)` — long-path energy per scalefactor band
+    /// (21 bands).
+    pub en: Vec<f64>,
+    /// Figure C.6.c `thm(sb)` — long-path threshold per scalefactor
+    /// band (21 bands).
+    pub thm: Vec<f64>,
+    /// Figure C.6.c `ratio(sb) = thm(sb)/en(sb)` (21 bands).
+    pub ratio: Vec<f64>,
+    /// Figure C.6.d short-path `ratio(sb)` per subblock (3 × 12
+    /// bands; "subblock = 0 … subblock < 3").
+    pub ratio_short: [Vec<f64>; 3],
+}
+
+/// Persistent state of the §C.1.5.3.2.1 Layer III threshold
+/// generator — "The model is calculated twice in parallel": the long
+/// path (1 024-point FFT, 576-sample shift) and the short path
+/// (256-point FFT, 192-sample shift, three blocks per granule), plus
+/// the §D.2.4 step m) pre-echo history. All FFT history arrays start
+/// zeroed (§D.2.1 "known starting point").
+#[derive(Debug, Clone, PartialEq)]
+pub struct Model2Layer3State {
+    fs: AnnexDSamplingRate,
+    long_window: Vec<f64>,
+    long_prev: Model2Polar,
+    long_prev2: Model2Polar,
+    short_window: Vec<f64>,
+    short_prev: Model2Polar,
+    short_prev2: Model2Polar,
+    pre_echo: Model2Layer3PreEcho,
+}
+
+impl Model2Layer3State {
+    /// Freshly zeroed Layer III threshold generator for one sampling
+    /// rate (the rate "must remain constant over any particular
+    /// application" per §D.2.1, so it is fixed at construction).
+    #[must_use]
+    pub fn new(fs: AnnexDSamplingRate) -> Self {
+        let zeroed_short = Model2Polar {
+            r: vec![0.0; MODEL2_LAYER3_FFT_LINES_SHORT],
+            f: vec![0.0; MODEL2_LAYER3_FFT_LINES_SHORT],
+        };
+        Self {
+            fs,
+            long_window: vec![0.0; MODEL2_FFT_LEN],
+            long_prev: Model2Polar::zeroed(),
+            long_prev2: Model2Polar::zeroed(),
+            short_window: vec![0.0; MODEL2_LAYER3_FFT_LEN_SHORT],
+            short_prev: zeroed_short.clone(),
+            short_prev2: zeroed_short,
+            pre_echo: Model2Layer3PreEcho::new(layer3_partitions_long(fs).len()),
+        }
+    }
+
+    /// The construction-time sampling rate.
+    #[must_use]
+    pub fn sampling_rate(&self) -> AnnexDSamplingRate {
+        self.fs
+    }
+
+    /// Run one granule (576 samples) through the full §C.1.5.3.2.1
+    /// walk:
+    ///
+    /// 1. three short blocks (192 samples each) through the 256-point
+    ///    FFT chain, the second one supplying `cw_s`;
+    /// 2. the long block through the 1 024-point FFT chain, supplying
+    ///    `cw_l` for the first 6 lines;
+    /// 3. the composed unpredictability, Table C.7 partition
+    ///    energies, replaced-spreading-function convolution, tonality
+    ///    (`conv1`/`conv2`), the Layer III SNR
+    ///    (`TMN = 29 dB`/`NMT = 6 dB`/Table C.7 minval), the Figure
+    ///    C.6.b threshold, the step m) pre-echo maximum, the
+    ///    psychoacoustic entropy, and the Figure C.6.c conversion to
+    ///    scalefactor bands;
+    /// 4. the Figure C.6.d simplified short-path threshold per
+    ///    subblock (constant table SNR, history-free maximum, Table
+    ///    C.8 short conversion).
+    ///
+    /// Returns `None` — leaving every history array untouched —
+    /// unless `granule.len() == 576`.
+    #[must_use]
+    pub fn process(&mut self, granule: &[f64]) -> Option<Model2Layer3Granule> {
+        if granule.len() != MODEL2_LAYER3_SHIFT_LONG {
+            return None;
+        }
+        // --- short path: three 192-sample shifts through the
+        // 256-point FFT (state committed only after full success) ---
+        let mut short_window = self.short_window.clone();
+        let mut short_prev = self.short_prev.clone();
+        let mut short_prev2 = self.short_prev2.clone();
+        let mut short_r: Vec<Vec<f64>> = Vec::with_capacity(3);
+        let mut cw_short_second: Option<Vec<f64>> = None;
+        for k in 0..3 {
+            let block =
+                &granule[k * MODEL2_LAYER3_SHIFT_SHORT..(k + 1) * MODEL2_LAYER3_SHIFT_SHORT];
+            let win = model2_layer3_step_a_reconstruct_short(&short_window, block)?;
+            let polar = model2_layer3_step_b_spectrum_short(&win)?;
+            if k == 1 {
+                // "cw_s is the unpredictability calculated from the
+                // second short block out of three short blocks within
+                // one granule."
+                let predicted = model2_step_c_predict_polar(&short_prev, &short_prev2)?;
+                cw_short_second = Some(model2_step_d_cw_lines(&polar, &predicted, None)?);
+            }
+            short_r.push(polar.r.clone());
+            short_prev2 = core::mem::replace(&mut short_prev, polar);
+            short_window = win;
+        }
+        let cw_short_second = cw_short_second?;
+        // --- long path ---
+        let window = model2_step_a_reconstruct(&self.long_window, granule)?;
+        let polar = model2_step_b_spectrum(&window)?;
+        let predicted = model2_step_c_predict_polar(&self.long_prev, &self.long_prev2)?;
+        let cw_long =
+            model2_step_d_cw_lines(&polar, &predicted, Some(MODEL2_LAYER3_CW_LONG_LINES))?;
+        let cw = model2_layer3_cw_compose(&cw_long, &cw_short_second)?;
+        // --- long-path threshold over the Table C.7 partitions ---
+        let parts = layer3_partitions_long(self.fs);
+        let widths = layer3_partition_widths_long(self.fs);
+        let eb = layer3_partition_eb(&polar.r, &widths)?;
+        let cb = layer3_partition_cb(&polar.r, &cw, &widths)?;
+        let ecbb = model2_layer3_spread_partitions(&eb);
+        let ctb = model2_layer3_spread_partitions(&cb);
+        let nbb: Vec<f64> = ecbb
+            .iter()
+            .zip(&ctb)
+            .zip(parts)
+            .map(|((&e, &c), p)| {
+                let tb = model2_step_g_tonality(if e > 0.0 { c / e } else { 0.0 });
+                let snr_db = model2_layer3_step_h_snr_db(tb, p.minval_db);
+                model2_layer3_long_nb(e, p.norm, snr_db)
+            })
+            .collect();
+        let qthr: Vec<f64> = parts.iter().map(|p| p.qthr).collect();
+        // m) pre-echo control (Layer III only).
+        let thr = self.pre_echo.step(&qthr, &nbb)?;
+        let pe = model2_layer3_pe(&eb, &thr, &widths)?;
+        // Figure C.6.c conversion to scalefactor bands.
+        let conv = layer3_sfb_conversion_long(self.fs);
+        let en = layer3_partitions_to_sfb(&eb, conv)?;
+        let thm = layer3_partitions_to_sfb(&thr, conv)?;
+        let ratio = layer3_sfb_ratio(&thm, &en)?;
+        // --- short path thresholds (Figure C.6.d), per subblock ---
+        let sparts = layer3_partitions_short(self.fs);
+        let swidths = layer3_partition_widths_short(self.fs);
+        let sconv = layer3_sfb_conversion_short(self.fs);
+        let mut ratio_short: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (k, r_s) in short_r.iter().enumerate() {
+            let eb_s = layer3_partition_eb(r_s, &swidths)?;
+            let ecbb_s = model2_layer3_spread_partitions(&eb_s);
+            let thr_s: Vec<f64> = ecbb_s
+                .iter()
+                .zip(sparts)
+                .map(|(&e, p)| {
+                    model2_layer3_short_thr(p.qthr, model2_layer3_short_nb(e, p.norm, p.snr_db))
+                })
+                .collect();
+            let en_s = layer3_partitions_to_sfb(&eb_s, sconv)?;
+            let thm_s = layer3_partitions_to_sfb(&thr_s, sconv)?;
+            ratio_short[k] = layer3_sfb_ratio(&thm_s, &en_s)?;
+        }
+        // Commit the FFT histories only after the whole walk
+        // succeeded (the pre-echo history advanced inside step()).
+        self.long_prev2 = core::mem::replace(&mut self.long_prev, polar);
+        self.long_window = window;
+        self.short_prev = short_prev;
+        self.short_prev2 = short_prev2;
+        self.short_window = short_window;
+        Some(Model2Layer3Granule {
+            pe,
+            attack: layer3_pe_attack(pe),
+            en,
+            thm,
+            ratio,
+            ratio_short,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17741,5 +19226,478 @@ mod tests {
         let out = state.smr(&vec![0.5; 576], fs, 0.0, None).unwrap();
         assert_eq!(out.len(), 32);
         assert_ne!(state, before);
+    }
+
+    // ---- Phase 2 step 85 — §C.1.5.3.2.1 Layer III adaptation +
+    // step m) pre-echo control + window switching ----
+
+    #[test]
+    fn layer3_c7_row_counts_and_width_sums() {
+        // Row counts as printed (62/63/59 long, 38/39/42 short) and
+        // width sums within the respective FFT line domains.
+        let cases_long = [
+            (AnnexDSamplingRate::Hz48000, 62usize, 481u32),
+            (AnnexDSamplingRate::Hz44100, 63, 465),
+            (AnnexDSamplingRate::Hz32000, 59, 488),
+        ];
+        for (fs, rows, sum) in cases_long {
+            let t = layer3_partitions_long(fs);
+            assert_eq!(t.len(), rows);
+            let total: u32 = t.iter().map(|e| u32::from(e.lines)).sum();
+            assert_eq!(total, sum);
+            assert!(total as usize <= MODEL2_FFT_LINES);
+        }
+        let cases_short = [
+            (AnnexDSamplingRate::Hz48000, 38usize, 107u32),
+            (AnnexDSamplingRate::Hz44100, 39, 109),
+            (AnnexDSamplingRate::Hz32000, 42, 110),
+        ];
+        for (fs, rows, sum) in cases_short {
+            let t = layer3_partitions_short(fs);
+            assert_eq!(t.len(), rows);
+            let total: u32 = t.iter().map(|e| u32::from(e.lines)).sum();
+            assert_eq!(total, sum);
+            assert!(total as usize <= MODEL2_LAYER3_FFT_LINES_SHORT);
+        }
+    }
+
+    #[test]
+    fn layer3_c7_bval_monotone_and_column_domains() {
+        for fs in [
+            AnnexDSamplingRate::Hz32000,
+            AnnexDSamplingRate::Hz44100,
+            AnnexDSamplingRate::Hz48000,
+        ] {
+            let long = layer3_partitions_long(fs);
+            for w in long.windows(2) {
+                assert!(w[1].bval > w[0].bval);
+            }
+            for e in long {
+                // minval values printed in Tables C.7.a–c.
+                assert!([24.5, 20.0, 18.0, 12.0, 6.0, 3.0, 0.0].contains(&e.minval_db));
+                assert!(e.qthr > 0.0 && e.norm > 0.0 && e.lines >= 1);
+            }
+            let short = layer3_partitions_short(fs);
+            for w in short.windows(2) {
+                assert!(w[1].bval > w[0].bval);
+            }
+            for e in short {
+                // SNR (db) values printed in Tables C.7.d–f — all
+                // negative (threshold below the spread energy).
+                assert!(
+                    [-8.240, -7.447, -6.990, -6.020, -5.229, -4.559, -3.980].contains(&e.snr_db)
+                );
+                assert!(e.qthr > 0.0 && e.norm > 0.0 && e.lines >= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn layer3_c7_render_anchors() {
+        // Spot values re-read from the staged page renders at
+        // 300 DPI, including every cell where the PDF text layer
+        // disagreed with the render (the render is authoritative).
+        let a = &LAYER3_PARTITIONS_LONG_C7A;
+        assert_eq!(
+            a[0],
+            Layer3PartitionLong {
+                lines: 1,
+                minval_db: 24.5,
+                qthr: 4.532,
+                norm: 0.970,
+                bval: 0.000
+            }
+        );
+        assert_eq!(a[12].bval, 5.437); // text layer misread 5,431
+        assert_eq!(a[57].qthr, 22.607); // text layer misread 22,601
+        assert_eq!(a[58].qthr, 22.607);
+        assert_eq!(a[54].bval, 22.231);
+        assert_eq!(
+            a[61],
+            Layer3PartitionLong {
+                lines: 67,
+                minval_db: 0.0,
+                qthr: 605.867,
+                norm: 0.524,
+                bval: 24.576
+            }
+        );
+        let b = &LAYER3_PARTITIONS_LONG_C7B;
+        assert_eq!(b[47].norm, 0.527); // text layer misread 0,521
+        assert_eq!(b[61].lines, 73);
+        assert_eq!(b[62].qthr, 162.770);
+        let c = &LAYER3_PARTITIONS_LONG_C7C;
+        assert_eq!(c[0].qthr, 9.064);
+        assert_eq!(c[58].lines, 12);
+        let d = &LAYER3_PARTITIONS_SHORT_C7D;
+        assert_eq!(
+            d[37],
+            Layer3PartitionShort {
+                lines: 17,
+                qthr: 153.727,
+                norm: 0.538,
+                snr_db: -5.229,
+                bval: 24.312
+            }
+        );
+        let e = &LAYER3_PARTITIONS_SHORT_C7E;
+        assert_eq!(e[38].lines, 19); // FFT-lines cell dropped by the text layer
+        assert_eq!(e[38].qthr, 171.813);
+        let f = &LAYER3_PARTITIONS_SHORT_C7F;
+        assert_eq!(
+            f[41],
+            Layer3PartitionShort {
+                lines: 10,
+                qthr: 9.043,
+                norm: 0.512,
+                snr_db: -3.980,
+                bval: 23.321
+            }
+        );
+        // Suffix→rate order is reversed relative to Table D.3:
+        // C.7.a is 48 kHz, C.7.c is 32 kHz.
+        assert_eq!(
+            layer3_partitions_long(AnnexDSamplingRate::Hz48000)[0].norm,
+            0.970
+        );
+        assert_eq!(
+            layer3_partitions_long(AnnexDSamplingRate::Hz32000)[0].norm,
+            0.997
+        );
+    }
+
+    #[test]
+    fn layer3_c8_chains_and_bounds() {
+        for fs in [
+            AnnexDSamplingRate::Hz32000,
+            AnnexDSamplingRate::Hz44100,
+            AnnexDSamplingRate::Hz48000,
+        ] {
+            let long = layer3_sfb_conversion_long(fs);
+            assert_eq!(long.len(), LAYER3_SFB_CONV_LONG_BANDS);
+            let short = layer3_sfb_conversion_short(fs);
+            assert_eq!(short.len(), LAYER3_SFB_CONV_SHORT_BANDS);
+            for (conv, n_parts) in [
+                (long, layer3_partitions_long(fs).len()),
+                (short, layer3_partitions_short(fs).len()),
+            ] {
+                // Bands tile the partition axis: bu(0) = 0,
+                // bu(n+1) = bo(n), every bo within the matching
+                // Table C.7 partition count, weights in (0, 1].
+                assert_eq!(conv[0].bu, 0);
+                for w in conv.windows(2) {
+                    assert_eq!(w[1].bu, w[0].bo);
+                }
+                for e in conv {
+                    assert!(e.bu < e.bo);
+                    assert!(usize::from(e.bo) < n_parts);
+                    assert!(e.w1 > 0.0 && e.w1 <= 1.0);
+                    assert!(e.w2 > 0.0 && e.w2 <= 1.0);
+                }
+            }
+        }
+        // The last band reaches the last partition exactly for the
+        // short tables and stops at/near the top for the long ones
+        // (as printed: bo = 60/61/58 of 61/62/58).
+        assert_eq!(LAYER3_SFB_CONVERSION_SHORT_C8D[11].bo, 37);
+        assert_eq!(LAYER3_SFB_CONVERSION_SHORT_C8E[11].bo, 38);
+        assert_eq!(LAYER3_SFB_CONVERSION_SHORT_C8F[11].bo, 41);
+        assert_eq!(LAYER3_SFB_CONVERSION_LONG_C8A[20].bo, 60);
+        assert_eq!(LAYER3_SFB_CONVERSION_LONG_C8B[20].bo, 61);
+        assert_eq!(LAYER3_SFB_CONVERSION_LONG_C8C[20].bo, 58);
+    }
+
+    #[test]
+    fn layer3_cw_compose_mapping() {
+        // cw_long carries 100+w, cw_short carries 200+k, so every
+        // output line identifies its source.
+        let cw_long: Vec<f64> = (0..MODEL2_FFT_LINES).map(|w| 100.0 + w as f64).collect();
+        let cw_short: Vec<f64> = (0..MODEL2_LAYER3_FFT_LINES_SHORT)
+            .map(|k| 200.0 + k as f64)
+            .collect();
+        let cw = model2_layer3_cw_compose(&cw_long, &cw_short).unwrap();
+        assert_eq!(cw.len(), MODEL2_FFT_LINES);
+        for (w, &v) in cw.iter().enumerate().take(6) {
+            assert_eq!(v, 100.0 + w as f64);
+        }
+        // (w+2) DIV 4: w=6 → 2, w=9 → 2, w=10 → 3, w=205 → 51.
+        assert_eq!(cw[6], 202.0);
+        assert_eq!(cw[9], 202.0);
+        assert_eq!(cw[10], 203.0);
+        assert_eq!(cw[205], 251.0);
+        for &v in &cw[206..] {
+            assert_eq!(v, MODEL2_LAYER3_CW_ABOVE);
+        }
+        // Domain checks: too-short inputs are rejected (the largest
+        // decimated index is 51).
+        assert!(model2_layer3_cw_compose(&cw_long[..5], &cw_short).is_none());
+        assert!(model2_layer3_cw_compose(&cw_long, &cw_short[..51]).is_none());
+        assert!(model2_layer3_cw_compose(&cw_long[..6], &cw_short[..52]).is_some());
+    }
+
+    #[test]
+    fn layer3_snr_and_nb_conventions() {
+        // Pure tone (tb = 1) → TMN = 29 dB; pure noise (tb = 0) →
+        // NMT = 6 dB; minval floors both.
+        assert_eq!(model2_layer3_step_h_snr_db(1.0, 0.0), 29.0);
+        assert_eq!(model2_layer3_step_h_snr_db(0.0, 0.0), 6.0);
+        assert_eq!(model2_layer3_step_h_snr_db(0.0, 24.5), 24.5);
+        assert_eq!(model2_layer3_step_h_snr_db(0.5, 3.0), 17.5);
+        // Long path: nbb = ecbb·norm·10^(−SNR/10) — 29 dB below.
+        let nb = model2_layer3_long_nb(1000.0, 0.5, 29.0);
+        assert!((nb - 1000.0 * 0.5 * 10f64.powf(-2.9)).abs() < 1e-12);
+        assert!(nb < 1000.0 * 0.5);
+        // Short path: the printed positive exponent over the negative
+        // table SNR lands in the same direction…
+        let nb_s = model2_layer3_short_nb(1000.0, 0.5, -8.240);
+        assert!(nb_s < 1000.0 * 0.5);
+        // …and is exactly the long-path convention with the sign
+        // pre-baked into the table value.
+        assert_eq!(nb_s, model2_layer3_long_nb(1000.0, 0.5, 8.240));
+    }
+
+    #[test]
+    fn layer3_step_m_pre_echo_maximum_and_history() {
+        // Printed Figure C.6.b maximum over the four candidates.
+        assert_eq!(model2_layer3_step_m_thr(5.0, 1.0, 1.0, 0.1), 5.0); // qthr
+        assert_eq!(model2_layer3_step_m_thr(0.1, 7.0, 1.0, 0.1), 7.0); // nbb
+        assert_eq!(model2_layer3_step_m_thr(0.1, 1.0, 4.0, 0.1), 8.0); // 2·nbb_l
+        assert_eq!(model2_layer3_step_m_thr(0.1, 1.0, 1.0, 1.0), 16.0); // 16·nbb_ll
+                                                                        // Stateful walk: zeroed history → first block is
+                                                                        // max(qthr, nbb); a loud block elevates the next two blocks'
+                                                                        // floors by rpelev / rpelev2.
+        let mut pe = Model2Layer3PreEcho::new(2);
+        assert_eq!(pe.partitions(), 2);
+        let qthr = [0.5, 0.5];
+        let thr1 = pe.step(&qthr, &[100.0, 0.0]).unwrap();
+        assert_eq!(thr1, vec![100.0, 0.5]);
+        // Quiet block right after the loud one: floor = 2 × 100.
+        let thr2 = pe.step(&qthr, &[0.0, 0.0]).unwrap();
+        assert_eq!(thr2, vec![200.0, 0.5]);
+        // Two blocks after: floor = 16 × 100.
+        let thr3 = pe.step(&qthr, &[0.0, 0.0]).unwrap();
+        assert_eq!(thr3, vec![1600.0, 0.5]);
+        // Three blocks after: the loud block has left the window.
+        let thr4 = pe.step(&qthr, &[0.0, 0.0]).unwrap();
+        assert_eq!(thr4, vec![0.5, 0.5]);
+        // Length mismatches are rejected without touching history.
+        let before = pe.clone();
+        assert!(pe.step(&qthr, &[0.0]).is_none());
+        assert!(pe.step(&[0.5], &[0.0, 0.0]).is_none());
+        assert_eq!(pe, before);
+        // Short blocks have no history: bare maximum.
+        assert_eq!(model2_layer3_short_thr(0.5, 0.1), 0.5);
+        assert_eq!(model2_layer3_short_thr(0.5, 3.0), 3.0);
+    }
+
+    #[test]
+    fn layer3_pe_formula_and_attack_threshold() {
+        // thr = eb + 1 in every partition → every log term is 0.
+        let eb = [3.0, 7.0];
+        let thr = [4.0, 8.0];
+        assert_eq!(model2_layer3_pe(&eb, &thr, &[1, 2]).unwrap(), 0.0);
+        // Threshold below energy → positive entropy, scaled by the
+        // partition width: pe = −(w·ln(thr/(eb+1))).
+        let pe = model2_layer3_pe(&[9.0], &[1.0], &[3]).unwrap();
+        assert!((pe - (-3.0 * (1.0_f64 / 10.0).ln())).abs() < 1e-12);
+        assert!(pe > 0.0);
+        // Width scales linearly.
+        let pe2 = model2_layer3_pe(&[9.0], &[1.0], &[6]).unwrap();
+        assert!((pe2 - 2.0 * pe).abs() < 1e-9);
+        assert!(model2_layer3_pe(&[1.0], &[1.0], &[1, 2]).is_none());
+        // "switching when the PE exceeds the value 1800" — strict.
+        assert!(!layer3_pe_attack(1800.0));
+        assert!(layer3_pe_attack(1800.0 + 1e-9));
+        assert!(!layer3_pe_attack(0.0));
+    }
+
+    #[test]
+    fn layer3_window_state_diagram() {
+        use crate::side_info::BlockType as B;
+        // The eight printed Figure C.7 arrows.
+        assert_eq!(layer3_window_state_next(B::Long, false), B::Long);
+        assert_eq!(layer3_window_state_next(B::Long, true), B::Start);
+        assert_eq!(layer3_window_state_next(B::Start, false), B::Short);
+        assert_eq!(layer3_window_state_next(B::Start, true), B::Short);
+        assert_eq!(layer3_window_state_next(B::Short, true), B::Short);
+        assert_eq!(layer3_window_state_next(B::Short, false), B::End);
+        assert_eq!(layer3_window_state_next(B::End, false), B::Long);
+        assert_eq!(layer3_window_state_next(B::End, true), B::Start);
+        // "the sequence start, short, short, stop is started": a
+        // single attack out of long blocks runs the printed burst.
+        let mut s = B::Long;
+        let attacks = [false, true, false, false, false, false];
+        let mut seq = Vec::new();
+        for a in attacks {
+            s = layer3_window_state_next(s, a);
+            seq.push(s);
+        }
+        assert_eq!(seq, [B::Long, B::Start, B::Short, B::End, B::Long, B::Long]);
+        // Retrofit: only the NORM→SHORT adjacency is rewritten.
+        assert_eq!(layer3_retrofit_start(B::Long, B::Short), B::Start);
+        assert_eq!(layer3_retrofit_start(B::Long, B::Long), B::Long);
+        assert_eq!(layer3_retrofit_start(B::Start, B::Short), B::Start);
+        assert_eq!(layer3_retrofit_start(B::Short, B::Short), B::Short);
+        assert_eq!(layer3_retrofit_start(B::End, B::Long), B::End);
+    }
+
+    #[test]
+    fn layer3_window_switcher_delays_by_one_block() {
+        use crate::side_info::BlockType as B;
+        let mut sw = Layer3WindowSwitcher::new();
+        // PE stream: quiet, attack, quiet, quiet.
+        assert_eq!(sw.push(100.0), None); // delay slot fills
+        assert_eq!(sw.push(2000.0), Some(B::Long));
+        assert_eq!(sw.push(100.0), Some(B::Start));
+        assert_eq!(sw.push(100.0), Some(B::Short));
+        assert_eq!(sw.push(100.0), Some(B::End));
+        assert_eq!(sw.finish(), Some(B::Long));
+        assert_eq!(sw.finish(), None);
+        // Sustained attack holds the short state.
+        let mut sw = Layer3WindowSwitcher::new();
+        let _ = sw.push(5000.0);
+        assert_eq!(sw.push(5000.0), Some(B::Start));
+        assert_eq!(sw.push(5000.0), Some(B::Short));
+        assert_eq!(sw.push(100.0), Some(B::Short));
+        assert_eq!(sw.push(100.0), Some(B::End));
+        assert_eq!(sw.finish(), Some(B::Long));
+    }
+
+    #[test]
+    fn layer3_partition_accumulation_and_sfb_conversion() {
+        // eb: unit magnitudes → each partition's energy equals its
+        // width; the topmost uncovered lines contribute nowhere.
+        let r = vec![1.0; 10];
+        let eb = layer3_partition_eb(&r, &[1, 2, 3]).unwrap();
+        assert_eq!(eb, vec![1.0, 2.0, 3.0]);
+        // cb weights by cw.
+        let cw = vec![0.5; 10];
+        let cb = layer3_partition_cb(&r, &cw, &[1, 2, 3]).unwrap();
+        assert_eq!(cb, vec![0.5, 1.0, 1.5]);
+        // Overrun and empty-widths rejection.
+        assert!(layer3_partition_eb(&r, &[6, 5]).is_none());
+        assert!(layer3_partition_eb(&r, &[]).is_none());
+        assert!(layer3_partition_cb(&r, &cw[..2], &[1, 2, 3]).is_none());
+        // Figure C.6.c reduction: w1·v(bu) + Σ mid + w2·v(bo).
+        let conv = [
+            Layer3SfbConversion::new(2, 0, 3, 0.25, 0.75),
+            Layer3SfbConversion::new(0, 3, 4, 0.5, 0.5),
+        ];
+        let v = [1.0, 10.0, 100.0, 1000.0, 10000.0];
+        let out = layer3_partitions_to_sfb(&v, &conv).unwrap();
+        assert_eq!(out[0], 0.25 * 1.0 + 10.0 + 100.0 + 0.75 * 1000.0);
+        assert_eq!(out[1], 0.5 * 1000.0 + 0.5 * 10000.0);
+        // bo out of range → None.
+        assert!(layer3_partitions_to_sfb(&v[..4], &conv).is_none());
+        // Ratio with the zero-energy convention.
+        let ratio = layer3_sfb_ratio(&[1.0, 2.0], &[4.0, 0.0]).unwrap();
+        assert_eq!(ratio, vec![0.25, 0.0]);
+        assert!(layer3_sfb_ratio(&[1.0], &[1.0, 1.0]).is_none());
+    }
+
+    #[test]
+    fn layer3_short_fft_window_and_spectrum() {
+        // Domain: 1..=256, half-sample symmetry w(i) = w(257 − i).
+        assert!(model2_layer3_hann_window_short(0).is_none());
+        assert!(model2_layer3_hann_window_short(257).is_none());
+        for i in 1..=MODEL2_LAYER3_FFT_LEN_SHORT {
+            let w = model2_layer3_hann_window_short(i).unwrap();
+            let w_mirror = model2_layer3_hann_window_short(257 - i).unwrap();
+            assert!((w - w_mirror).abs() < 1e-12);
+            assert!((0.0..=1.0).contains(&w));
+        }
+        // Spectrum: 129 lines; a constant input concentrates at DC
+        // with r(0) = Σ w(i).
+        let s = vec![1.0; 256];
+        let polar = model2_layer3_step_b_spectrum_short(&s).unwrap();
+        assert_eq!(polar.r.len(), MODEL2_LAYER3_FFT_LINES_SHORT);
+        let window_sum: f64 = (1..=256)
+            .map(|i| model2_layer3_hann_window_short(i).unwrap())
+            .sum();
+        assert!((polar.r[0] - window_sum).abs() < 1e-9);
+        assert!(model2_layer3_step_b_spectrum_short(&s[..255]).is_none());
+        // Reconstruction: keeps the newest 64 of the previous window
+        // ahead of the 192 new samples.
+        let prev: Vec<f64> = (0..256).map(f64::from).collect();
+        let new = vec![-1.0; 192];
+        let win = model2_layer3_step_a_reconstruct_short(&prev, &new).unwrap();
+        assert_eq!(win.len(), 256);
+        assert_eq!(win[0], 192.0);
+        assert_eq!(win[63], 255.0);
+        assert!(win[64..].iter().all(|&x| x == -1.0));
+        assert!(model2_layer3_step_a_reconstruct_short(&prev[..255], &new).is_none());
+        assert!(model2_layer3_step_a_reconstruct_short(&prev, &[]).is_none());
+    }
+
+    #[test]
+    fn layer3_spread_partitions_convolution() {
+        // A single unit impulse at partition 2 spreads with the
+        // replaced piecewise ramp: upward +3 dB per index step,
+        // downward −1.5 dB per index step, unity on the diagonal.
+        let v = [0.0, 0.0, 1.0, 0.0];
+        let spread = model2_layer3_spread_partitions(&v);
+        assert!((spread[2] - 1.0).abs() < 1e-12);
+        assert!((spread[3] - 10f64.powf(0.3)).abs() < 1e-12);
+        assert!((spread[1] - 10f64.powf(-0.15)).abs() < 1e-12);
+        assert!((spread[0] - 10f64.powf(-0.30)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn layer3_state_end_to_end_walk() {
+        let fs = AnnexDSamplingRate::Hz48000;
+        let mut state = Model2Layer3State::new(fs);
+        assert_eq!(state.sampling_rate(), fs);
+        // Wrong granule length → rejected, state untouched.
+        let before = state.clone();
+        assert!(state.process(&vec![0.0; 575]).is_none());
+        assert_eq!(state, before);
+        // Silence: the walk completes, the threshold floor is the
+        // Table C.7 qthr column, PE stays far below the switch point.
+        let out = state.process(&vec![0.0; 576]).unwrap();
+        assert_eq!(out.en.len(), LAYER3_SFB_CONV_LONG_BANDS);
+        assert_eq!(out.thm.len(), LAYER3_SFB_CONV_LONG_BANDS);
+        assert_eq!(out.ratio.len(), LAYER3_SFB_CONV_LONG_BANDS);
+        for r in &out.ratio_short {
+            assert_eq!(r.len(), LAYER3_SFB_CONV_SHORT_BANDS);
+        }
+        assert!(out.pe.is_finite());
+        assert!(!out.attack);
+        assert!(out.en.iter().all(|&e| e == 0.0));
+        assert!(out.thm.iter().all(|&t| t > 0.0));
+        assert!(out.ratio.iter().all(|&r| r == 0.0));
+        // A live tone: finite positive band energies, finite
+        // positive thresholds and ratios on every covered band.
+        let mut state = Model2Layer3State::new(fs);
+        let tone = |n: usize| -> Vec<f64> {
+            (0..576)
+                .map(|i| {
+                    let t = (n * 576 + i) as f64;
+                    2000.0 * (2.0 * core::f64::consts::PI * 1000.0 * t / 48000.0).sin()
+                })
+                .collect()
+        };
+        let mut last = None;
+        for n in 0..4 {
+            last = state.process(&tone(n));
+            assert!(last.is_some());
+        }
+        let out = last.unwrap();
+        assert!(out.pe.is_finite());
+        assert!(out.en.iter().all(|&e| e.is_finite() && e >= 0.0));
+        assert!(out.en.iter().any(|&e| e > 0.0));
+        assert!(out.thm.iter().all(|&t| t.is_finite() && t > 0.0));
+        assert!(out.ratio.iter().all(|&r| r.is_finite() && r >= 0.0));
+        for sub in &out.ratio_short {
+            assert!(sub.iter().all(|&r| r.is_finite() && r >= 0.0));
+        }
+        // The state advances on success.
+        assert_ne!(state, Model2Layer3State::new(fs));
+        // All three rates run the full walk.
+        for fs in [AnnexDSamplingRate::Hz32000, AnnexDSamplingRate::Hz44100] {
+            let mut state = Model2Layer3State::new(fs);
+            let out = state.process(&vec![0.25; 576]).unwrap();
+            assert!(out.pe.is_finite());
+            assert_eq!(out.ratio.len(), LAYER3_SFB_CONV_LONG_BANDS);
+        }
     }
 }

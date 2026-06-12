@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: §C.1.5.3.2.1 Layer III adaptation of Model 2 + §D.2.4 step m)
+  pre-echo control + §C.1.5.3.2 window switching (Phase 2 step 85),
+  read from the staged ISO PDF printed pp.80–95 (Tables C.7/C.8 and
+  Figures C.6.a–d/C.7 transcribed from page renders). New public
+  surface: the six Table C.7 threshold-calculation-partition tables
+  (`Layer3PartitionLong`/`Layer3PartitionShort` + dispatchers; note
+  C.7.a = 48 kHz, the reverse of the D.3 suffix order) and six Table
+  C.8 partition→scalefactor-band conversion tables
+  (`Layer3SfbConversion`, 21 long / 12 short bands); the dual-path
+  short-FFT primitives (`MODEL2_LAYER3_SHIFT_LONG`/`_SHORT`,
+  `model2_layer3_hann_window_short` /
+  `model2_layer3_step_a_reconstruct_short` /
+  `model2_layer3_step_b_spectrum_short`); the printed `cw(w)`
+  composition `model2_layer3_cw_compose`; the `conv1`/`conv2` and
+  `NMT = 6,0` / `TMN = 29,0` dB parameter overrides
+  (`model2_layer3_step_h_snr_db`); the Figure C.6.b/C.6.d partition
+  thresholds (`model2_layer3_long_nb` / `model2_layer3_short_nb`);
+  step m) pre-echo control (`model2_layer3_step_m_thr` +
+  `Model2Layer3PreEcho`, `rpelev = 2` / `rpelev2 = 16`); the
+  psychoacoustic entropy `model2_layer3_pe` with the PE > 1800
+  switch, the Figure C.7 state diagram (`layer3_window_state_next`),
+  the Figure C.6.a delayed retrofit (`layer3_retrofit_start`) and the
+  composed `Layer3WindowSwitcher`; the Figure C.6.c reduction
+  (`layer3_partitions_to_sfb` / `layer3_sfb_ratio`); and the
+  integrated per-granule `Model2Layer3State::process` walk (long
+  ratio + 3 short-subblock ratios + PE + attack flag). 14 new unit
+  tests (1038 lib total).
 - psy: Annex D Model 2 §D.2.1 inputs + §D.2.4 steps a)–e) — the
   FFT-side front half of the Model 2 threshold calculation (Phase 2
   step 84), read from the staged ISO PDF printed pp.128–130. New
