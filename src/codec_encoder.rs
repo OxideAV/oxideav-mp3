@@ -42,8 +42,13 @@
 //! * **Mono or stereo (independent channels).** `channels == 1` →
 //!   header `mode = '11'`; `channels == 2` → header `mode = '00'`
 //!   (independent stereo). Each channel of a stereo input is encoded
-//!   independently — there is no joint-stereo MS / intensity coupling
-//!   at the encoder side this round.
+//!   independently on the default [`make_encoder`] path; the
+//!   joint-stereo factories below opt in to coupling.
+//! * **Joint stereo.** [`make_encoder_joint_stereo_ms`] (§2.4.3.4.9.2
+//!   MS, `mode_extension = '10'`), [`make_encoder_joint_stereo_auto`]
+//!   (per-frame MS/LR picker), [`make_encoder_joint_stereo_is`]
+//!   (§2.4.3.4.9.3 intensity, `'01'`), and
+//!   [`make_encoder_joint_stereo_ms_is`] (both methods, `'11'`).
 //! * **MPEG-1 only.** Sample rates 32 / 44.1 / 48 kHz.
 //! * **CBR.** Caller picks a bitrate from the §2.4.2.3 Layer III ladder.
 //! * **Long blocks, fixed-gain or outer-loop.** Same two encoder
@@ -51,8 +56,8 @@
 //!   fixed-gain path, [`make_encoder_with_outer_loop`] the
 //!   distortion-control loop.
 //!
-//! Joint-stereo (MS / intensity) / MPEG-2 LSF / VBR / short-block
-//! switching remain followups.
+//! MPEG-2 LSF / VBR / short-block switching remain followups on the
+//! registry path.
 
 use std::collections::VecDeque;
 
@@ -238,6 +243,52 @@ pub fn make_encoder_joint_stereo_auto_with_threshold(
     let inner = Mp3Encoder::new_joint_stereo_auto(bitrate_kbps, sample_rate)
         .map_err(|e| Error::other(format!("oxideav-mp3: joint-stereo auto build: {e}")))?
         .with_ms_auto_threshold(threshold);
+    Ok(boxed_joint_stereo_core(inner, sample_rate, bitrate_kbps))
+}
+
+/// Build a boxed MPEG-1 Audio Layer III stereo CBR [`Encoder`] in
+/// **joint-stereo intensity** mode (ISO/IEC 11172-3:1993
+/// §2.4.3.4.9.3).
+///
+/// Wraps [`Mp3Encoder::new_joint_stereo_is`]. `params.channels` must
+/// be 2. The emitted stream carries header `mode = '01'` (joint
+/// stereo) with `mode_extension = '01'` (intensity_stereo on,
+/// ms_stereo off) per §2.4.2.3 on every audio frame: long scalefactor
+/// bands at or above `intensity_start_sfb` (`1..=20`) transmit a
+/// combined left-channel magnitude plus a per-band stereo position in
+/// the right channel's scalefactor slot.
+///
+/// # Errors
+///
+/// Returns [`Error::invalid`] when `params.channels != 2` or
+/// `sample_rate` is missing, and [`Error::other`] when the underlying
+/// [`Mp3Encoder::new_joint_stereo_is`] rejects the bitrate / sample
+/// rate / start-band combination.
+pub fn make_encoder_joint_stereo_is(
+    params: &CodecParameters,
+    intensity_start_sfb: usize,
+) -> Result<Box<dyn Encoder>> {
+    let (sample_rate, bitrate_kbps) = validate_joint_stereo_params(params)?;
+    let inner = Mp3Encoder::new_joint_stereo_is(bitrate_kbps, sample_rate, intensity_start_sfb)
+        .map_err(|e| Error::other(format!("oxideav-mp3: joint-stereo intensity build: {e}")))?;
+    Ok(boxed_joint_stereo_core(inner, sample_rate, bitrate_kbps))
+}
+
+/// As [`make_encoder_joint_stereo_is`] but with §2.4.3.4.9.2
+/// **MS-stereo** active below the intensity bound
+/// (`mode_extension = '11'`, both joint methods). Wraps
+/// [`Mp3Encoder::new_joint_stereo_ms_is`].
+///
+/// # Errors
+///
+/// Same as [`make_encoder_joint_stereo_is`].
+pub fn make_encoder_joint_stereo_ms_is(
+    params: &CodecParameters,
+    intensity_start_sfb: usize,
+) -> Result<Box<dyn Encoder>> {
+    let (sample_rate, bitrate_kbps) = validate_joint_stereo_params(params)?;
+    let inner = Mp3Encoder::new_joint_stereo_ms_is(bitrate_kbps, sample_rate, intensity_start_sfb)
+        .map_err(|e| Error::other(format!("oxideav-mp3: joint-stereo MS+intensity build: {e}")))?;
     Ok(boxed_joint_stereo_core(inner, sample_rate, bitrate_kbps))
 }
 
@@ -1119,6 +1170,97 @@ mod tests {
         p.sample_format = Some(SampleFormat::S16);
         p.bit_rate = Some(128_000);
         assert!(make_encoder_joint_stereo_ms(&p).is_err());
+    }
+
+    #[test]
+    fn make_encoder_joint_stereo_is_builds_and_emits_intensity_frames() {
+        // Build the intensity factory, push panned stereo PCM through
+        // send_frame, and check every emitted packet carries
+        // `mode = '01'` (joint stereo) with `mode_extension = '01'`
+        // (intensity only) per §2.4.2.3.
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(2);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(192_000);
+        let mut enc = make_encoder_joint_stereo_is(&p, 8).expect("intensity factory");
+
+        let pcm = sine_s16_stereo(SAMPLES_PER_FRAME_MPEG1 * 3, 440.0, 440.0, 44_100.0, 0.5);
+        let frame = AudioFrame {
+            samples: (SAMPLES_PER_FRAME_MPEG1 * 3) as u32,
+            pts: None,
+            data: vec![pcm],
+        };
+        enc.send_frame(&Frame::Audio(frame)).unwrap();
+        enc.flush().unwrap();
+
+        let mut packets = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        assert!(packets.len() >= 3, "packet count {}", packets.len());
+        for pkt in &packets {
+            assert_eq!(pkt.data[0], 0xFF);
+            assert_eq!(pkt.data[1] & 0xE0, 0xE0);
+            // mode '01' (joint stereo).
+            assert_eq!(pkt.data[3] & 0xC0, 0x40, "expected mode '01'");
+            // mode_extension '01' (intensity only).
+            assert_eq!(pkt.data[3] & 0x30, 0x10, "expected mode_ext '01'");
+        }
+    }
+
+    #[test]
+    fn make_encoder_joint_stereo_ms_is_emits_mode_ext_11() {
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(2);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(192_000);
+        let mut enc = make_encoder_joint_stereo_ms_is(&p, 8).expect("ms+intensity factory");
+
+        let pcm = sine_s16_stereo(SAMPLES_PER_FRAME_MPEG1 * 3, 440.0, 440.0, 44_100.0, 0.5);
+        let frame = AudioFrame {
+            samples: (SAMPLES_PER_FRAME_MPEG1 * 3) as u32,
+            pts: None,
+            data: vec![pcm],
+        };
+        enc.send_frame(&Frame::Audio(frame)).unwrap();
+        enc.flush().unwrap();
+
+        let mut packets = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => packets.push(p),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        assert!(packets.len() >= 3, "packet count {}", packets.len());
+        for pkt in &packets {
+            // mode '01' (joint stereo) + mode_extension '11' (both).
+            assert_eq!(pkt.data[3] & 0xC0, 0x40, "expected mode '01'");
+            assert_eq!(pkt.data[3] & 0x30, 0x30, "expected mode_ext '11'");
+        }
+    }
+
+    #[test]
+    fn make_encoder_joint_stereo_is_rejects_mono_and_bad_start_band() {
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(1);
+        p.sample_format = Some(SampleFormat::S16);
+        p.bit_rate = Some(128_000);
+        assert!(make_encoder_joint_stereo_is(&p, 8).is_err());
+
+        p.channels = Some(2);
+        assert!(make_encoder_joint_stereo_is(&p, 0).is_err());
+        assert!(make_encoder_joint_stereo_is(&p, 21).is_err());
+        assert!(make_encoder_joint_stereo_ms_is(&p, 0).is_err());
+        assert!(make_encoder_joint_stereo_is(&p, 8).is_ok());
     }
 
     #[test]

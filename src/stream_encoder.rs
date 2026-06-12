@@ -44,14 +44,22 @@
 //! # What this module deliberately does **not** do
 //!
 //! No psychoacoustic model, no outer noise-shaping loop, no LSF, no
-//! ID3v2 frontmatter, no short-block / mixed-block window switching,
-//! and no intensity-stereo encode. **Joint-stereo MS** encode is opt-in
+//! ID3v2 frontmatter, no short-block / mixed-block window switching.
+//! **Joint-stereo MS** encode is opt-in
 //! as of round 146 ([`Mp3Encoder::new_joint_stereo_ms`]): the encoder
 //! computes the §2.4.3.4.9.2 forward MS matrix `M = (L+R)/√2`,
 //! `S = (L-R)/√2` on each granule-pair's full post-MDCT spectrum and
 //! emits header `mode = '01'` with `mode_extension = '10'` (ms_stereo
-//! on, intensity_stereo off). The intensity-stereo coupling
-//! (§2.4.3.4.9.3) remains deferred.
+//! on, intensity_stereo off). **Intensity-stereo** encode
+//! (§2.4.3.4.9.3) is opt-in as of round 284
+//! ([`Mp3Encoder::new_joint_stereo_is`] /
+//! [`Mp3Encoder::new_joint_stereo_ms_is`] /
+//! [`Mp3Encoder::new_joint_stereo_auto_is`]): long scalefactor bands at
+//! or above a caller-chosen start band are coupled to a single
+//! magnitude in the left channel plus a per-band stereo position
+//! carried as the right channel's scalefactor, and the header
+//! `mode_extension` low bit is set (`'01'` intensity only, `'11'` MS
+//! below the bound + intensity above it).
 //!
 //! Xing / Info VBR-info frame emission is **opt-in** as of round 142:
 //! call [`Mp3Encoder::enable_xing_info`] before [`Mp3Encoder::finish`]
@@ -75,7 +83,7 @@ use crate::outer_loop::{
     OUTER_LOOP_SCALEFAC_COMPRESS,
 };
 use crate::quantize::quantize;
-use crate::scalefactors::{FrameScaleFactors, ScaleFactors};
+use crate::scalefactors::{FrameScaleFactors, ScaleFactors, LONG_SFB};
 use crate::side_info::{BlockType, GranuleChannel, SideInfo, GRANULES};
 use crate::{make_silent_header, write_header, write_side_info, EncodeError};
 
@@ -135,9 +143,11 @@ pub enum StreamEncodeError {
     /// Caller chose [`ChannelMode::JointStereo`] on a constructor that
     /// does not arm joint-stereo coupling on the encode side. Use
     /// [`Mp3Encoder::new_joint_stereo_ms`] for §2.4.3.4.9.2 MS-stereo
-    /// encode, or use [`ChannelMode::Stereo`] / [`ChannelMode::DualChannel`]
-    /// for independent two-channel content; intensity stereo encode
-    /// (§2.4.3.4.9.3) remains unsupported.
+    /// encode, [`Mp3Encoder::new_joint_stereo_is`] /
+    /// [`Mp3Encoder::new_joint_stereo_ms_is`] for §2.4.3.4.9.3
+    /// intensity-stereo encode, or [`ChannelMode::Stereo`] /
+    /// [`ChannelMode::DualChannel`] for independent two-channel
+    /// content.
     StereoUnsupported,
     /// Caller chose an MPEG-2 LSF sample rate (16 / 22.05 / 24 kHz);
     /// LSF is deferred to a later round.
@@ -165,6 +175,25 @@ pub enum StreamEncodeError {
     /// the outer-loop path — install the outer loop first via
     /// [`Mp3Encoder::new_with_outer_loop`].
     PerBandXminWithoutOuterLoop,
+    /// The intensity-stereo start band passed to
+    /// [`Mp3Encoder::new_joint_stereo_is`] /
+    /// [`Mp3Encoder::new_joint_stereo_ms_is`] /
+    /// [`Mp3Encoder::new_joint_stereo_auto_is`] is out of range. The
+    /// MPEG-1 long-block layout has 21 scalefactor bands (§2.4.2.7
+    /// `scalefac_l[0..21]`); the start band must leave at least one
+    /// normally-coded band below it and one intensity-coded band at or
+    /// above it, i.e. `1 ..= 20`.
+    InvalidIntensityStartSfb {
+        /// The rejected start band.
+        start_sfb: usize,
+    },
+    /// A short-block / mixed-block / auto-block-type toggle was
+    /// requested on an encoder with intensity-stereo coupling armed.
+    /// The intensity encode path is long-block only this round: the
+    /// short-window intensity bound is per window (each window has its
+    /// own zero-part), which needs the per-window `is_pos` derivation
+    /// from `scalefac_s` — deferred to a follow-up.
+    IntensityShortBlocksUnsupported,
 }
 
 impl core::fmt::Display for StreamEncodeError {
@@ -193,6 +222,13 @@ impl core::fmt::Display for StreamEncodeError {
             ),
             StreamEncodeError::PerBandXminWithoutOuterLoop => f.write_str(
                 "set_per_band_xmin requires the outer loop to be enabled first (use Mp3Encoder::new_with_outer_loop)",
+            ),
+            StreamEncodeError::InvalidIntensityStartSfb { start_sfb } => write!(
+                f,
+                "intensity-stereo start band {start_sfb} out of range (must be 1..=20: at least one normal band below the bound and one intensity band at or above it)"
+            ),
+            StreamEncodeError::IntensityShortBlocksUnsupported => f.write_str(
+                "intensity-stereo encode is long-block only this round (short / mixed / auto block-type toggles are unavailable while intensity coupling is armed)",
             ),
         }
     }
@@ -317,10 +353,10 @@ pub struct Mp3Encoder {
     /// `mode = '01'` (joint stereo) with `mode_extension = '10'`
     /// (ms_stereo on, intensity_stereo off). The decoder reverses the
     /// matrix via [`crate::process_stereo`] driven by the
-    /// `mode_extension` bits. Set by [`Mp3Encoder::new_joint_stereo_ms`];
-    /// requires `nch == 2`. Intensity-stereo coupling
-    /// (§2.4.3.4.9.3) is not implemented on the encode side; this flag
-    /// only enables the MS half of joint stereo.
+    /// `mode_extension` bits. Set by [`Mp3Encoder::new_joint_stereo_ms`]
+    /// (MS only, the full spectrum) and
+    /// [`Mp3Encoder::new_joint_stereo_ms_is`] (MS below the intensity
+    /// bound — see [`Self::intensity_start_sfb`]); requires `nch == 2`.
     ms_stereo: bool,
 
     /// When `Some`, the encoder is in **auto MS/LR per-frame** joint mode
@@ -351,6 +387,42 @@ pub struct Mp3Encoder {
     /// than half the energy and the MS rotation would amplify rather
     /// than reduce quantization stress on the side channel.
     ms_auto_threshold: Option<f64>,
+
+    /// When `Some(b)`, §2.4.3.4.9.3 **intensity-stereo** coupling is
+    /// armed: every granule's long scalefactor bands `b..21` (plus the
+    /// partial region above the last band boundary) are rewritten so
+    /// the left channel carries the combined magnitude `L + R`, the
+    /// right channel carries zeros, and the right channel's per-band
+    /// scalefactor doubles as the stereo position
+    ///
+    /// ```text
+    /// is_pos[sfb] = NINT( (12/π) · arctan( √(E_L[sfb] / E_R[sfb]) ) )
+    /// ```
+    ///
+    /// (Annex G.2 c) of ISO/IEC 11172-3:1993; positions `0..=6`, `7` is
+    /// the illegal-position marker). The decoder reverses the coupling
+    /// per §2.4.3.4.9.3: `is_ratio = tan(is_pos·π/12)`,
+    /// `L' = T·is_ratio/(1+is_ratio)`, `R' = T/(1+is_ratio)` with `T`
+    /// the transmitted left-channel value.
+    ///
+    /// All-zero right-channel bands **below** the bound that follow the
+    /// last non-zero right-channel line are transmitted with
+    /// scalefactor `7` (Annex G.2 c): "scalefactor bands of the
+    /// right/difference channel containing only zeros after coding
+    /// which do not belong to the intensity coded part should be
+    /// transmitted with the scalefactor 7 to prevent intensity stereo
+    /// decoding") — the §2.4.3.4.9.1 decode-side bound is derived from
+    /// the zero-part, so without the marker a decoder would treat those
+    /// bands as intensity-coded with a bogus position.
+    ///
+    /// Set by [`Mp3Encoder::new_joint_stereo_is`] (`mode_extension =
+    /// '01'`), [`Mp3Encoder::new_joint_stereo_ms_is`] (`'11'`: MS below
+    /// the bound, intensity above), and
+    /// [`Mp3Encoder::new_joint_stereo_auto_is`] (per-frame `'11'` /
+    /// `'01'` from the MS picker). Long-block only this round (the
+    /// short-window per-window bound is deferred); the block-type
+    /// toggles reject while this is `Some`.
+    intensity_start_sfb: Option<usize>,
 
     /// When `true`, every assembled granule emits a §2.4.2.7 short
     /// block (`window_switching_flag = 1`, `block_type = 2`,
@@ -655,6 +727,7 @@ impl Mp3Encoder {
             crc_enabled: false,
             ms_stereo: false,
             ms_auto_threshold: None,
+            intensity_start_sfb: None,
             force_short_blocks: false,
             force_mixed_blocks: false,
             auto_block_type: None,
@@ -710,6 +783,12 @@ impl Mp3Encoder {
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
+        if enabled && self.intensity_start_sfb.is_some() {
+            // Intensity coupling is long-block only this round: the
+            // short-block intensity bound is per window, which needs a
+            // per-window is_pos derivation from scalefac_s.
+            return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
+        }
         if enabled {
             // Mixed and pure-short are mutually exclusive: a granule is
             // long, short, or mixed. Enabling pure-short clears mixed.
@@ -756,6 +835,11 @@ impl Mp3Encoder {
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
+        if enabled && self.intensity_start_sfb.is_some() {
+            // See `force_short_blocks_for_testing` — the intensity
+            // path is long-block only this round.
+            return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
+        }
         if enabled {
             // Mixed and pure-short are mutually exclusive: a granule is
             // long, short, or mixed. Enabling mixed clears short.
@@ -825,6 +909,12 @@ impl Mp3Encoder {
     /// previous round's [`StreamEncodeError::StereoUnsupported`]
     /// guard was dropped in r163.
     pub fn enable_auto_block_type(&mut self, threshold: f64) -> Result<(), StreamEncodeError> {
+        if self.intensity_start_sfb.is_some() {
+            // Intensity coupling is long-block only this round; the
+            // auto scheduler emits Start / Short / End granules whose
+            // per-window intensity bound is not wired yet.
+            return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
+        }
         // Outer loop is now compatible with auto block-type for every
         // block-type the auto scheduler ever emits:
         //   * Long granules — `outer_loop_search_long`
@@ -1023,9 +1113,11 @@ impl Mp3Encoder {
     ///
     /// MS is applied to the **entire** spectrum (§2.4.3.4.9.2: "When
     /// MS-stereo is enabled but intensity stereo is not, the entire
-    /// spectrum is decoded in MS-stereo"). The intensity-stereo half of
-    /// joint stereo (§2.4.3.4.9.3) remains unimplemented on the encode
-    /// side. Both granules of a frame share the same block type (Long,
+    /// spectrum is decoded in MS-stereo"). For the intensity-stereo
+    /// half of joint stereo (§2.4.3.4.9.3) see
+    /// [`Mp3Encoder::new_joint_stereo_is`] /
+    /// [`Mp3Encoder::new_joint_stereo_ms_is`].
+    /// Both granules of a frame share the same block type (Long,
     /// for this round), satisfying the §2.4.3.4.9 "both channels of a
     /// granule must share the same block type when MS is enabled"
     /// requirement automatically.
@@ -1160,6 +1252,157 @@ impl Mp3Encoder {
             self.ms_auto_threshold = Some(clamped);
         }
         self
+    }
+
+    /// Build a joint-stereo encoder that emits §2.4.3.4.9.3
+    /// **intensity-stereo** frames (`mode = '01'`, `mode_extension =
+    /// '01'`: intensity_stereo on, ms_stereo off).
+    ///
+    /// Long scalefactor bands below `intensity_start_sfb` carry the two
+    /// channels independently (plain L/R). Bands at or above it are
+    /// **intensity-coupled** per Annex G.2 c) of ISO/IEC 11172-3:1993:
+    ///
+    /// * the left channel transmits the combined magnitude
+    ///   `L_i + R_i` over the band,
+    /// * the right channel transmits zeros over the band, and
+    /// * the right channel's scalefactor for the band is replaced by
+    ///   the stereo position
+    ///   `is_pos[sfb] = NINT((12/π)·arctan(√(E_L[sfb]/E_R[sfb])))`
+    ///   (positions `0..=6`; a band with zero right-channel energy maps
+    ///   to the `R → 0` limit `6`; `7` is reserved as the
+    ///   illegal-position marker per §2.4.3.4.9.3).
+    ///
+    /// A conformant decoder derives the intensity bound from the
+    /// zero-part of the right channel (§2.4.3.4.9.1 / §2.4.3.4.9.3) and
+    /// reconstructs `L'_i = T_i·is_ratio/(1+is_ratio)`,
+    /// `R'_i = T_i/(1+is_ratio)` with `is_ratio = tan(is_pos·π/12)` and
+    /// `T` the transmitted left-channel band. All-zero right-channel
+    /// bands below the bound are transmitted with scalefactor `7` so
+    /// they are **not** intensity-decoded (Annex G.2 c) guidance; they
+    /// would otherwise extend the decoder-derived zero-part downward).
+    ///
+    /// The spectrum above the last long band boundary (Table B.8
+    /// `scalefac_l` covers 21 bands; the top lines up to 576 belong to
+    /// no band) carries no scalefactor and therefore no position; those
+    /// lines are coupled into the left channel the same way and decode
+    /// as left-only — the §2.4.3.4.9.3 layout simply has no is_pos slot
+    /// for them.
+    ///
+    /// Long-block only this round: the short-window intensity bound is
+    /// per window (each window has its own zero-part), so the
+    /// block-type toggles ([`Mp3Encoder::force_short_blocks_for_testing`]
+    /// / [`Mp3Encoder::force_mixed_blocks_for_testing`] /
+    /// [`Mp3Encoder::enable_auto_block_type`]) reject while intensity
+    /// coupling is armed.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Mp3Encoder::new`], plus
+    /// [`StreamEncodeError::InvalidIntensityStartSfb`] when
+    /// `intensity_start_sfb` is outside `1..=20`.
+    pub fn new_joint_stereo_is(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+        intensity_start_sfb: usize,
+    ) -> Result<Self, StreamEncodeError> {
+        let mut enc = Self::new(bitrate_kbps, sample_rate_hz, ChannelMode::Stereo)?;
+        enc.arm_intensity(intensity_start_sfb)?;
+        enc.header_template.mode = ChannelMode::JointStereo;
+        enc.header_template.mode_extension = ModeExtension {
+            intensity_stereo: true,
+            ms_stereo: false,
+            raw: 0b01,
+        };
+        Ok(enc)
+    }
+
+    /// Build a joint-stereo encoder that combines §2.4.3.4.9.2
+    /// **MS-stereo** below the intensity bound with §2.4.3.4.9.3
+    /// **intensity stereo** at and above it (`mode = '01'`,
+    /// `mode_extension = '11'`).
+    ///
+    /// Bands below `intensity_start_sfb` are MS-coded: the forward
+    /// rotation `M = (L+R)/√2`, `S = (L−R)/√2` is applied to lines
+    /// `[0, starts[intensity_start_sfb])` only — §2.4.3.4.9.1 scopes
+    /// the MS equations to the scalefactor bands below the intensity
+    /// bound when both methods are enabled. Bands at or above the bound
+    /// take the same intensity coupling as
+    /// [`Mp3Encoder::new_joint_stereo_is`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Mp3Encoder::new_joint_stereo_is`].
+    pub fn new_joint_stereo_ms_is(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+        intensity_start_sfb: usize,
+    ) -> Result<Self, StreamEncodeError> {
+        let mut enc = Self::new(bitrate_kbps, sample_rate_hz, ChannelMode::Stereo)?;
+        enc.arm_intensity(intensity_start_sfb)?;
+        enc.header_template.mode = ChannelMode::JointStereo;
+        enc.header_template.mode_extension = ModeExtension {
+            intensity_stereo: true,
+            ms_stereo: true,
+            raw: 0b11,
+        };
+        enc.ms_stereo = true;
+        Ok(enc)
+    }
+
+    /// Build a joint-stereo encoder with intensity coupling always on
+    /// and the §2.4.3.4.9.2 MS rotation decided per frame by the
+    /// [`Mp3Encoder::new_joint_stereo_auto`] energy picker, evaluated
+    /// over the below-bound lines only (the region MS would apply to).
+    /// Every frame carries `mode = '01'`; the per-frame
+    /// `mode_extension` is `'11'` (MS + intensity) when both granules
+    /// qualify for MS and `'01'` (intensity only) otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Mp3Encoder::new_joint_stereo_is`].
+    pub fn new_joint_stereo_auto_is(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+        intensity_start_sfb: usize,
+    ) -> Result<Self, StreamEncodeError> {
+        let mut enc = Self::new_joint_stereo_auto(bitrate_kbps, sample_rate_hz)?;
+        enc.arm_intensity(intensity_start_sfb)?;
+        // The auto picker rewrites the per-frame mode_extension; start
+        // from the intensity-only pattern so even a hypothetical
+        // pre-picker frame carries the armed coupling.
+        enc.header_template.mode_extension = ModeExtension {
+            intensity_stereo: true,
+            ms_stereo: false,
+            raw: 0b01,
+        };
+        Ok(enc)
+    }
+
+    /// Shared validation + arming for the intensity-stereo
+    /// constructors. `start_sfb` must leave at least one normally-coded
+    /// long band below the bound and one intensity band at or above it.
+    fn arm_intensity(&mut self, start_sfb: usize) -> Result<(), StreamEncodeError> {
+        if !(1..=20).contains(&start_sfb) {
+            return Err(StreamEncodeError::InvalidIntensityStartSfb { start_sfb });
+        }
+        self.intensity_start_sfb = Some(start_sfb);
+        Ok(())
+    }
+
+    /// `true` when §2.4.3.4.9.3 intensity-stereo coupling is armed
+    /// (see [`Mp3Encoder::new_joint_stereo_is`] /
+    /// [`Mp3Encoder::new_joint_stereo_ms_is`] /
+    /// [`Mp3Encoder::new_joint_stereo_auto_is`]).
+    #[must_use]
+    pub fn intensity_stereo_enabled(&self) -> bool {
+        self.intensity_start_sfb.is_some()
+    }
+
+    /// `Some(b)` when intensity-stereo coupling is armed, where `b` is
+    /// the first intensity-coded long scalefactor band.
+    #[must_use]
+    pub fn intensity_start_sfb(&self) -> Option<usize> {
+        self.intensity_start_sfb
     }
 
     /// Opt in to the ISO/IEC 11172-3 §2.4.3.1 CRC-16 frame protection.
@@ -2228,6 +2471,80 @@ impl Mp3Encoder {
             }
         }
 
+        // ---- Pass 1.45: optional §2.4.3.4.9.3 intensity coupling ----
+        //
+        // When intensity-stereo is armed (`intensity_start_sfb =
+        // Some(b)`), every granule's long scalefactor bands `b..21`
+        // (plus the partial top region above the last Table B.8 band
+        // boundary, which has no scalefactor of its own) are coupled:
+        //
+        //   * per band, derive the stereo position from the band
+        //     energies (Annex G.2 c):
+        //       is_pos[sfb] = NINT((12/π)·arctan(√(E_L/E_R)))
+        //   * left channel := L + R (the combined magnitude),
+        //   * right channel := 0 (the §2.4.3.4.9.1 zero-part the
+        //     decoder derives the intensity bound from).
+        //
+        // The positions land on the wire as the right channel's
+        // scalefactors in pass 2. The decoder reconstructs
+        // L' = T·is_ratio/(1+is_ratio), R' = T/(1+is_ratio) with
+        // is_ratio = tan(is_pos·π/12) (§2.4.3.4.9.3 steps 3-5), so the
+        // reconstructed amplitude ratio L'/R' = is_ratio approximates
+        // the original √(E_L/E_R) to the nearest of the 7 grid angles.
+        //
+        // `is_pos_per_gr[gr][sfb]` defaults to the illegal marker 7 so
+        // non-intensity paths and below-bound bands never leak a stale
+        // position.
+        let mut is_pos_per_gr = [[7u8; 21]; GRANULES];
+        // Upper line bound of the MS / independent-LR region: the whole
+        // spectrum without intensity, the intensity start band's first
+        // line with it (§2.4.3.4.9.1: when both methods are enabled the
+        // MS equations apply only to the bands below the intensity
+        // bound).
+        let intensity_active = self.intensity_start_sfb.is_some() && self.nch == 2;
+        let ms_region_hi = match self.intensity_start_sfb {
+            Some(start_sfb) if self.nch == 2 => {
+                long_band_starts_for(self.sample_rate_hz)[start_sfb]
+            }
+            _ => NUM_LINES,
+        };
+        if let Some(start_sfb) = self.intensity_start_sfb {
+            if self.nch == 2 {
+                let starts = long_band_starts_for(self.sample_rate_hz);
+                for (gr, is_pos_bands) in is_pos_per_gr.iter_mut().enumerate() {
+                    let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
+                    let left = &mut left_slice[0];
+                    let right = &mut right_slice[0];
+                    for (sfb, slot) in is_pos_bands.iter_mut().enumerate().skip(start_sfb) {
+                        let lo = starts[sfb];
+                        let hi = starts[sfb + 1];
+                        let mut l_energy = 0.0f64;
+                        let mut r_energy = 0.0f64;
+                        for i in lo..hi {
+                            l_energy += f64::from(left[i]) * f64::from(left[i]);
+                            r_energy += f64::from(right[i]) * f64::from(right[i]);
+                        }
+                        *slot = derive_intensity_position(l_energy, r_energy);
+                        for i in lo..hi {
+                            left[i] += right[i];
+                            right[i] = 0.0;
+                        }
+                    }
+                    // Partial top region above the last band boundary:
+                    // no scalefactor slot exists for these lines
+                    // (Table B.8 `scalefac_l` stops at `starts[21]`),
+                    // so there is no position to transmit — couple the
+                    // magnitude into the left channel anyway so the
+                    // right channel's zero-part reaches the Nyquist
+                    // rate (§2.4.3.4.9.1); the lines decode left-only.
+                    for i in starts[21]..NUM_LINES {
+                        left[i] += right[i];
+                        right[i] = 0.0;
+                    }
+                }
+            }
+        }
+
         // ---- Pass 1.5: optional §2.4.3.4.9.2 forward MS matrix ----
         //
         // For MS-stereo joint mode rewrite each granule's L/R xr pair
@@ -2275,13 +2592,17 @@ impl Mp3Encoder {
                 // the same joint-stereo method" semantics are honoured
                 // for free (the wire mode_extension is a per-frame
                 // field, not a per-granule one).
+                // With intensity armed the sums run over the
+                // below-bound lines only — the region the MS rotation
+                // would actually apply to (above the bound the right
+                // channel is already the coupled zero-part).
                 let mut all_ok = true;
                 for gr in 0..GRANULES {
                     let left = &xr_pre_per_gc[gr][0];
                     let right = &xr_pre_per_gc[gr][1];
                     let mut lr_energy = 0.0f64;
                     let mut side_energy_x2 = 0.0f64;
-                    for i in 0..NUM_LINES {
+                    for i in 0..ms_region_hi {
                         let l = f64::from(left[i]);
                         let r = f64::from(right[i]);
                         lr_energy += l * l + r * r;
@@ -2318,10 +2639,16 @@ impl Mp3Encoder {
                 // Split the per-channel borrow without copying both
                 // arrays: `split_at_mut(1)` gives us `[L]` and `[R]`
                 // as disjoint slices, then we index into them.
+                //
+                // The rotation covers the whole spectrum when MS is
+                // the only joint method, and only the lines below the
+                // intensity bound when intensity is also armed
+                // (§2.4.3.4.9.1: with both methods enabled, the MS
+                // equations apply to the bands below the bound).
                 let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
                 let left = &mut left_slice[0];
                 let right = &mut right_slice[0];
-                for i in 0..NUM_LINES {
+                for i in 0..ms_region_hi {
                     let l = left[i];
                     let r = right[i];
                     left[i] = (l + r) * INV_SQRT2;
@@ -2331,20 +2658,23 @@ impl Mp3Encoder {
         }
         // Reflect the per-frame decision on the carried frame header
         // (only matters for the auto picker; the unconditional
-        // `new_joint_stereo_ms` path keeps the constructor's '10'
-        // header template and the auto path overwrites it here).
+        // `new_joint_stereo_ms` / `new_joint_stereo_ms_is` paths keep
+        // the constructor's '10' / '11' header template and the auto
+        // path overwrites it here). With intensity armed the low
+        // mode_extension bit stays set on both picker outcomes
+        // (§2.4.2.3: '11' = both methods, '01' = intensity only).
         if self.ms_auto_threshold.is_some() && self.nch == 2 {
             frame_mode_extension = if apply_ms_this_frame {
                 ModeExtension {
-                    intensity_stereo: false,
+                    intensity_stereo: intensity_active,
                     ms_stereo: true,
-                    raw: 0b10,
+                    raw: if intensity_active { 0b11 } else { 0b10 },
                 }
             } else {
                 ModeExtension {
-                    intensity_stereo: false,
+                    intensity_stereo: intensity_active,
                     ms_stereo: false,
-                    raw: 0b00,
+                    raw: if intensity_active { 0b01 } else { 0b00 },
                 }
             };
         }
@@ -2444,7 +2774,7 @@ impl Mp3Encoder {
                         | (true, BlockType::Start, false)
                         | (true, BlockType::End, false)
                 );
-                let (sf, initial_gain, scalefac_scale_outer, subblock_gain_outer) =
+                let (mut sf, initial_gain, scalefac_scale_outer, subblock_gain_outer) =
                     match self.outer_loop_threshold {
                         Some(thr) if outer_loop_eligible => {
                             // Outer loop seeds scalefac_compress = 15 so the
@@ -2741,7 +3071,15 @@ impl Mp3Encoder {
                 // side-info — the fallback path's zero scalefactors
                 // round-trip equally with `scalefac_compress = 0`.
                 let ran_outer_loop = self.outer_loop_threshold.is_some() && outer_loop_eligible;
-                let scalefac_compress = if ran_outer_loop {
+                // The right channel of an intensity frame must carry
+                // its per-band stereo positions (`is_pos` ∈ 0..=6 plus
+                // the marker 7) as scalefactors, so its
+                // scalefac_compress needs ≥ 3 bits per band even when
+                // the outer loop (which would pick 15 anyway) is off.
+                // `scalefac_compress = 15` gives `slen1 = 4` /
+                // `slen2 = 3` (§2.4.2.7 table) — every position fits.
+                let intensity_right = intensity_active && ch == 1;
+                let scalefac_compress = if ran_outer_loop || intensity_right {
                     OUTER_LOOP_SCALEFAC_COMPRESS
                 } else {
                     0
@@ -2857,6 +3195,11 @@ impl Mp3Encoder {
                     let total = big_bits + cnt1_bits;
                     let budget_for_part3 = if ran_outer_loop {
                         inner_budget_for_outer as usize
+                    } else if intensity_right {
+                        // Fixed-gain path with the forced
+                        // `scalefac_compress = 15`: part2 claims the
+                        // long-layout 74 bits out of the per-gc budget.
+                        per_gc_bits.saturating_sub(part2_bits_outer)
                     } else {
                         per_gc_bits
                     };
@@ -2864,6 +3207,48 @@ impl Mp3Encoder {
                         break;
                     }
                     global_gain = global_gain.saturating_add(1);
+                }
+                // §2.4.3.4.9.3 wire-up for the right channel of an
+                // intensity frame, applied after the quantizer
+                // converged (the rewritten bands hold only zero lines,
+                // so the scalefactor values cannot perturb `is[]`):
+                //
+                //   * bands at/above the intensity bound carry the
+                //     pass-1.45 `is_pos` positions;
+                //   * all-zero bands *below* the bound that follow the
+                //     last non-zero quantized right-channel line carry
+                //     the marker 7 (Annex G.2 c) — the decode-side
+                //     bound is the band after that last non-zero line
+                //     (§2.4.3.4.9.1), so without the marker those
+                //     bands would be intensity-decoded with whatever
+                //     scalefactor the quantizer left behind.
+                if intensity_right {
+                    let starts = long_band_starts_for(self.sample_rate_hz);
+                    let start_sfb = self.intensity_start_sfb.unwrap_or(LONG_SFB);
+                    let zero_tail_from = match is.iter().rposition(|&v| v != 0) {
+                        // Fully-zero right channel: the zero-part spans
+                        // the whole spectrum and every band below the
+                        // bound takes the marker.
+                        None => 0,
+                        Some(line) => {
+                            // Band holding `line`, plus one (mirrors
+                            // the decoder's bound derivation).
+                            let mut band = LONG_SFB;
+                            for sfb in 0..LONG_SFB {
+                                if line < starts[sfb + 1] {
+                                    band = sfb + 1;
+                                    break;
+                                }
+                            }
+                            band
+                        }
+                    };
+                    for sfb in zero_tail_from..start_sfb {
+                        sf.long[sfb] = 7;
+                    }
+                    for sfb in start_sfb..LONG_SFB {
+                        sf.long[sfb] = is_pos_per_gr[gr][sfb];
+                    }
                 }
                 // Commit per-granule-channel state.
                 let _ = (r0_end, r1_end, t0, t1, t2, count1_b);
@@ -3175,6 +3560,31 @@ fn long_band_starts_for(sample_rate_hz: u32) -> &'static [usize; 22] {
         48_000 | 24_000 | 12_000 => &LONG_BANDS_48,
         _ => &LONG_BANDS_44,
     }
+}
+
+/// Derive the §2.4.3.4.9.3 intensity-stereo position for one
+/// scalefactor band from the per-band channel energies, per Annex
+/// G.2 c) of ISO/IEC 11172-3:1993:
+///
+/// ```text
+/// is_pos = NINT( (12/π) · arctan( √(E_L / E_R) ) )
+/// ```
+///
+/// `arctan` of a non-negative amplitude ratio lies in `[0, π/2)`, so
+/// the rounded position lies in `0..=6`; the decode side then
+/// reproduces the amplitude ratio as `is_ratio = tan(is_pos·π/12)`
+/// (§2.4.3.4.9.3 step 3), quantized to the nearest of the seven grid
+/// angles. A band with zero right-channel energy maps to the
+/// `E_R → 0` limit `6` (all-left); a fully-silent band takes the same
+/// value (any position decodes a zero magnitude to zero). The value 7
+/// is never produced — it is the §2.4.3.4.9.3 illegal-position marker.
+fn derive_intensity_position(l_energy: f64, r_energy: f64) -> u8 {
+    if r_energy <= 0.0 {
+        return 6;
+    }
+    let amplitude_ratio = (l_energy / r_energy).sqrt();
+    let pos = (amplitude_ratio.atan() * 12.0 / std::f64::consts::PI).round();
+    pos.clamp(0.0, 6.0) as u8
 }
 
 /// Choose a three-region big-values subdivision: `(region0_end,
@@ -4134,6 +4544,158 @@ mod tests {
                 f.offset
             );
         }
+    }
+
+    // =====================================================================
+    // §2.4.3.4.9.3 intensity-stereo encode — position derivation +
+    // constructor state + toggle interlocks. End-to-end wire / decode
+    // coverage lives in `tests/joint_stereo_intensity_roundtrip.rs`.
+    // =====================================================================
+
+    /// Annex G.2 c) position grid: spot values of
+    /// `NINT((12/π)·arctan(√(E_L/E_R)))` across the energy-ratio range,
+    /// plus the degenerate-energy conventions.
+    #[test]
+    fn intensity_position_derivation_grid() {
+        // Equal band energies → amplitude ratio 1 → arctan = π/4 →
+        // position 3 (the center of the 0..=6 grid; tan(3π/12) = 1
+        // reproduces the ratio exactly on the decode side).
+        assert_eq!(derive_intensity_position(1.0, 1.0), 3);
+        // Energy ratio 16 → amplitude ratio 4 →
+        // (12/π)·arctan(4) ≈ 5.06 → 5.
+        assert_eq!(derive_intensity_position(16.0, 1.0), 5);
+        // The mirrored band leans right: amplitude ratio 1/4 →
+        // (12/π)·arctan(0.25) ≈ 0.94 → 1.
+        assert_eq!(derive_intensity_position(1.0, 16.0), 1);
+        // Hard-left (zero right-channel energy) → the E_R → 0 limit 6.
+        assert_eq!(derive_intensity_position(1.0, 0.0), 6);
+        // Hard-right (zero left-channel energy) → arctan(0) = 0 → 0.
+        assert_eq!(derive_intensity_position(0.0, 1.0), 0);
+        // Fully-silent band → same convention as the E_R → 0 limit
+        // (any position decodes the zero magnitude to zero).
+        assert_eq!(derive_intensity_position(0.0, 0.0), 6);
+        // Extreme but finite ratios stay on the legal grid (7 is the
+        // §2.4.3.4.9.3 illegal-position marker and is never derived).
+        assert_eq!(derive_intensity_position(1.0e30, 1.0e-30), 6);
+        for &(le, re) in &[
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (3.5, 0.7),
+            (1.0e-20, 1.0e-19),
+            (1.0e30, 2.0),
+        ] {
+            assert!(
+                derive_intensity_position(le, re) <= 6,
+                "({le}, {re}) produced an off-grid position"
+            );
+        }
+    }
+
+    /// The derived position is monotone non-decreasing in the
+    /// left/right energy ratio (more left-leaning bands take larger
+    /// positions, matching the §2.4.3.4.9.3 tan() grid orientation).
+    #[test]
+    fn intensity_position_monotone_in_energy_ratio() {
+        let mut prev = 0u8;
+        for k in -40..=40 {
+            let ratio = 10f64.powf(f64::from(k) / 4.0);
+            let pos = derive_intensity_position(ratio, 1.0);
+            assert!(
+                pos >= prev,
+                "position dropped from {prev} to {pos} at energy ratio {ratio}"
+            );
+            prev = pos;
+        }
+        assert_eq!(prev, 6, "ratio sweep should end hard-left");
+    }
+
+    /// Constructor state: the three intensity constructors arm the
+    /// coupling, carry the §2.4.2.3 mode/mode_extension template bits,
+    /// and validate the start band.
+    #[test]
+    fn intensity_constructors_arm_state_and_template_bits() {
+        let enc = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8).expect("is ctor");
+        assert!(enc.intensity_stereo_enabled());
+        assert_eq!(enc.intensity_start_sfb(), Some(8));
+        assert!(!enc.ms_stereo_enabled());
+        assert!(matches!(enc.header_template.mode, ChannelMode::JointStereo));
+        assert_eq!(enc.header_template.mode_extension.raw, 0b01);
+        assert!(enc.header_template.mode_extension.intensity_stereo);
+        assert!(!enc.header_template.mode_extension.ms_stereo);
+
+        let enc = Mp3Encoder::new_joint_stereo_ms_is(192, 44_100, 11).expect("ms+is ctor");
+        assert!(enc.intensity_stereo_enabled());
+        assert_eq!(enc.intensity_start_sfb(), Some(11));
+        assert!(enc.ms_stereo_enabled());
+        assert_eq!(enc.header_template.mode_extension.raw, 0b11);
+        assert!(enc.header_template.mode_extension.intensity_stereo);
+        assert!(enc.header_template.mode_extension.ms_stereo);
+
+        let enc = Mp3Encoder::new_joint_stereo_auto_is(192, 44_100, 14).expect("auto+is ctor");
+        assert!(enc.intensity_stereo_enabled());
+        assert_eq!(enc.intensity_start_sfb(), Some(14));
+        assert!(!enc.ms_stereo_enabled());
+        assert_eq!(enc.ms_auto_threshold(), Some(0.5));
+        assert_eq!(enc.header_template.mode_extension.raw, 0b01);
+
+        // Plain constructors stay disarmed.
+        let enc = Mp3Encoder::new_joint_stereo_ms(192, 44_100).expect("ms ctor");
+        assert!(!enc.intensity_stereo_enabled());
+        assert_eq!(enc.intensity_start_sfb(), None);
+    }
+
+    /// Start-band validation: at least one normal band below the bound
+    /// and one intensity band at or above it (`1..=20`).
+    #[test]
+    fn intensity_start_sfb_out_of_range_rejected() {
+        for bad in [0usize, 21, 22, 100] {
+            for ctor in [
+                Mp3Encoder::new_joint_stereo_is,
+                Mp3Encoder::new_joint_stereo_ms_is,
+                Mp3Encoder::new_joint_stereo_auto_is,
+            ] {
+                let err = ctor(192, 44_100, bad).expect_err("out-of-range start band");
+                assert!(
+                    matches!(
+                        err,
+                        StreamEncodeError::InvalidIntensityStartSfb { start_sfb } if start_sfb == bad
+                    ),
+                    "expected InvalidIntensityStartSfb for {bad}, got {err:?}"
+                );
+            }
+        }
+        // Boundary values are accepted.
+        assert!(Mp3Encoder::new_joint_stereo_is(192, 44_100, 1).is_ok());
+        assert!(Mp3Encoder::new_joint_stereo_is(192, 44_100, 20).is_ok());
+    }
+
+    /// The block-type toggles reject while intensity coupling is armed
+    /// (the per-window short-block intensity bound is deferred).
+    #[test]
+    fn intensity_rejects_block_type_toggles() {
+        let mut enc = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8).unwrap();
+        assert!(matches!(
+            enc.force_short_blocks_for_testing(true),
+            Err(StreamEncodeError::IntensityShortBlocksUnsupported)
+        ));
+        assert!(matches!(
+            enc.force_mixed_blocks_for_testing(true),
+            Err(StreamEncodeError::IntensityShortBlocksUnsupported)
+        ));
+        assert!(matches!(
+            enc.enable_auto_block_type(10.0),
+            Err(StreamEncodeError::IntensityShortBlocksUnsupported)
+        ));
+        assert!(matches!(
+            enc.enable_auto_block_type_with_mixed(10.0, 4.0),
+            Err(StreamEncodeError::IntensityShortBlocksUnsupported)
+        ));
+        // Disabling a toggle remains a no-op success.
+        assert!(enc.force_short_blocks_for_testing(false).is_ok());
+        assert!(enc.force_mixed_blocks_for_testing(false).is_ok());
+        assert!(!enc.force_short_blocks_enabled());
+        assert!(!enc.auto_block_type_enabled());
     }
 
     // =====================================================================

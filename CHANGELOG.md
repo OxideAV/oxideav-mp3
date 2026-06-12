@@ -6,6 +6,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- encoder: §2.4.3.4.9.3 **intensity-stereo encode** (Phase 2 step 86)
+  — the last encoder "lacks" item. Three opt-in constructors:
+  `Mp3Encoder::new_joint_stereo_is(bitrate, sample_rate, start_sfb)`
+  (`mode_extension = '01'`), `new_joint_stereo_ms_is(…)` (`'11'`:
+  §2.4.3.4.9.2 MS below the intensity bound, intensity above it per
+  the §2.4.3.4.9.1 scoping) and `new_joint_stereo_auto_is(…)`
+  (per-frame MS/LR picker over the below-bound lines, emitting `'11'`
+  / `'01'`). Long scalefactor bands at or above `start_sfb`
+  (`1..=20`, else the new `InvalidIntensityStartSfb` error) couple
+  per Annex G.2 c): per-band position `is_pos[sfb] =
+  NINT((12/π)·arctan(√(E_L/E_R)))` (0..=6; `E_R → 0` and silent
+  bands map to 6), left channel rewritten to the combined `L + R`
+  magnitude, right channel zeroed (the §2.4.3.4.9.1 zero-part). The
+  right channel is forced to `scalefac_compress = 15` so the
+  positions fit its scalefactor slots; all-zero bands between the
+  last non-zero quantized right-channel line and the bound carry the
+  illegal-position marker `7` (Annex G.2 c) so decoders deriving the
+  bound from the zero-part do not intensity-decode them. Long-block
+  only this round: the block-type toggles reject with the new
+  `IntensityShortBlocksUnsupported` error while intensity is armed
+  (per-window short-block `is_pos` is a follow-up). Registry path:
+  `make_encoder_joint_stereo_is` / `make_encoder_joint_stereo_ms_is`.
+  Accessors `intensity_stereo_enabled()` / `intensity_start_sfb()`.
+  Validated by 8 new lib unit tests + 8 integration tests
+  (`tests/joint_stereo_intensity_roundtrip.rs`): wire bits and
+  scalefactor layout, self-decode positional fidelity (reconstructed
+  6 kHz |L|/|R| = 3.733 vs the `tan(5π/12) ≈ 3.732` grid), PSNR
+  parity with independent-stereo / MS-only encodes (R-channel PSNR
+  improves 25.7 → 29.2 dB), auto-picker flips, byte-exact encode
+  determinism + bit-exact re-decode, and black-box cross-decode via
+  the `ffmpeg` and `mpg123` CLI binaries (both reproduce the
+  positional ratio; binaries invoked on the emitted bytes only).
+
 ### Other
 
 - psy: §C.1.5.3.2.1 Layer III adaptation of Model 2 + §D.2.4 step m)

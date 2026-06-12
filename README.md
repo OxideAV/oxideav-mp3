@@ -2373,6 +2373,61 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 86 (r284)** — **§2.4.3.4.9.3 intensity-stereo encode**,
+closing the last encoder "lacks" item. Three opt-in constructors arm
+the coupling on the stream encoder: `Mp3Encoder::new_joint_stereo_is
+(bitrate, sample_rate, start_sfb)` emits `mode = '01'` with
+`mode_extension = '01'` (intensity only),
+`new_joint_stereo_ms_is(…)` emits `'11'` (§2.4.3.4.9.2 MS below the
+intensity bound + intensity above it, per the §2.4.3.4.9.1 scoping),
+and `new_joint_stereo_auto_is(…)` runs the r147 per-frame MS/LR
+energy picker — evaluated over the below-bound lines only — emitting
+`'11'` / `'01'` per frame. Coupling (per Annex G.2 c): for every long
+scalefactor band at or above `start_sfb` (validated `1..=20`), the
+per-band stereo position `is_pos[sfb] =
+NINT((12/π)·arctan(√(E_L/E_R)))` (positions 0..=6; the `E_R → 0`
+limit and fully-silent bands map to 6) is derived from the pre-MS
+L/R band energies, the left channel is rewritten to the combined
+magnitude `L + R`, and the right channel to the all-zero
+§2.4.3.4.9.1 zero-part; the partial top region above the last
+Table B.8 band boundary (no scalefactor slot exists for it) is
+coupled the same way and decodes left-only. Wire-up: the right
+channel of an intensity frame is forced to `scalefac_compress = 15`
+(`slen` 4/3 — every position fits) with the 74-bit part2 cost
+deducted from the fixed-gain path's part3 budget; after the
+quantizer converges, the intensity region's scalefactors are
+overwritten with the positions and every all-zero band between the
+last non-zero quantized right-channel line and the bound gets the
+illegal-position marker `7` (Annex G.2 c) — without it a decoder
+deriving the bound from the zero-part would intensity-decode those
+bands with leftover scalefactors. Long-block only this round: the
+short-window bound is per window (per-window `is_pos` from
+`scalefac_s` deferred), so the force-short / force-mixed /
+auto-block-type toggles reject with the new
+`IntensityShortBlocksUnsupported` error while intensity is armed
+(`InvalidIntensityStartSfb` covers the range check). Registry path:
+`make_encoder_joint_stereo_is` / `make_encoder_joint_stereo_ms_is`
+mirror the direct constructors. Validated by 8 new lib unit tests
+(position grid + monotonicity, constructor state/template bits,
+range rejection, toggle interlocks, two registry factories + reject
+matrix) and 8 integration tests in
+`tests/joint_stereo_intensity_roundtrip.rs`: header + wire bits
+(`'01'`), wire-level scalefactor layout (positions ≤ 6 in the
+region, derived `is_pos = 5` on the 6 kHz probe band, marker `7` on
+the zero tail, zero-part above the bound), a hard-left probe
+(all-21-band marker/position split), self-decode positional
+fidelity (reconstructed 6 kHz |L|/|R| = 3.733 vs the `tan(5π/12) ≈
+3.732` grid angle; below-bound 440 Hz pan preserved) with PSNR at
+parity with the independent-stereo / MS-only encodes of the same
+PCM (R-channel PSNR *improves* 25.7 → 29.2 dB under intensity),
+`'11'` MS+intensity round-trip, the auto picker flipping `'11'` ↔
+`'01'` on correlated vs anti-phase below-bound content, byte-exact
+encode determinism + bit-exact re-decode, and black-box
+cross-decode through `ffmpeg` and `mpg123` CLI binaries (both
+reproduce the 3.728 positional ratio and the below-bound pan; bytes
+only — no external source consulted). Tests: 1046 lib (was 1038;
++8 unit) + 8 integration.
+
 **Phase 2 step 85 (r283)** — **§C.1.5.3.2.1 Layer III adaptation of
 Model 2 + §D.2.4 step m) pre-echo control + §C.1.5.3.2 window
 switching**, closing the "remaining Layer III adaptations" tail left
@@ -4429,8 +4484,7 @@ power ratio, energy threshold, line spread and the
 absolute-threshold floor, all of whose table inputs
 (`minval` / `TMN` from Tables D.3a–c and `absthr` from
 Tables D.4a–c) are now transcribed in-tree — plus the
-steps b)–e) FFT-side inputs),
-intensity-stereo encode (§2.4.3.4.9.3), and
+steps b)–e) FFT-side inputs), and
 LSF / MPEG-2.5 encode (the
 framing layer round-trips MPEG-2.5 headers but the encoder's
 stream-level driver still rejects non-MPEG-1 streams; the

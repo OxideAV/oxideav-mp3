@@ -364,10 +364,17 @@
 //! r159 [`outer_loop::outer_loop_search_mixed`] primitive via the
 //! `gc_template.mixed_block_flag` discriminator.
 //!
-//! The remaining Phase 2 work — the psychoacoustic model (so the
-//! threshold is per-band tonality-aware), scalefactor estimation
-//! (preemphasis amplification, intensity-stereo encode), LSF / VBR
-//! decode, and LSF / true-VBR encode — is still a later round.
+//! Intensity-stereo encode (§2.4.3.4.9.3) landed in round 284:
+//! [`Mp3Encoder::new_joint_stereo_is`] /
+//! [`Mp3Encoder::new_joint_stereo_ms_is`] /
+//! [`Mp3Encoder::new_joint_stereo_auto_is`] couple the long bands at or
+//! above a caller-chosen start band into a combined left-channel
+//! magnitude plus a per-band stereo position carried as the right
+//! channel's scalefactor (Annex G.2 c) derivation), with the
+//! `mode_extension` low bit set on the wire.
+//!
+//! The remaining Phase 2 work — LSF / VBR decode and LSF / true-VBR
+//! encode — is still a later round.
 //!
 //! [`Encoder`]: oxideav_core::Encoder
 //!
@@ -419,9 +426,9 @@ pub use block_type_sm::BlockTypeStateMachine;
 pub use codec_decoder::{make_decoder, register_codecs, Mp3CoreDecoder};
 pub use codec_encoder::{
     make_encoder, make_encoder_joint_stereo_auto, make_encoder_joint_stereo_auto_with_threshold,
-    make_encoder_joint_stereo_ms, make_encoder_with_outer_loop,
-    make_encoder_with_threshold_in_quiet, make_encoder_with_threshold_in_quiet_offset,
-    Mp3CoreEncoder,
+    make_encoder_joint_stereo_is, make_encoder_joint_stereo_ms, make_encoder_joint_stereo_ms_is,
+    make_encoder_with_outer_loop, make_encoder_with_threshold_in_quiet,
+    make_encoder_with_threshold_in_quiet_offset, Mp3CoreEncoder,
 };
 pub use crc::{crc16_bits, crc16_layer3, INITIAL_STATE as CRC_INITIAL_STATE};
 pub use demuxer::{
