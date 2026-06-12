@@ -2373,6 +2373,58 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 83 (r281)** — Annex D Model 2 **§D.2.4 steps h)–l)
+and n)** — the entire back half of the Model 2 threshold
+calculation, from required SNR down to the `SMR_n` output vector
+the coder consumes. Read from the staged ISO PDF (printed
+pp.131–132; the step-i/k/l/n equation blocks were re-read from
+fresh 200-dpi renders of those two pages since they are
+images-only in the text layer). Public surface (all in `psy`,
+matching the step-f/g slice conventions — `Option` on length
+mismatch, scalar core + slice driver): step h) `MODEL2_NMT_DB`
+(= 5,5 dB), `model2_step_h_snr_db` (`SNR_b = maximum(minval_b,
+tb_b·TMN_b + (1−tb_b)·NMT_b)`) + `model2_step_h_snr` reading the
+`minval`/`TMN` columns straight off the r280
+`Model2PartitionEntry` rows; step i) `model2_step_i_bc`
+(`bc_b = 10^(−SNR_b/10)`); step j) `model2_step_j_nb`
+(`nb_b = en_b·bc_b`); step k) `model2_step_k_nb_lines`
+(`nb_ω = nb_b/(ωhigh_b−ωlow_b+1)`, emitting the 1-based line
+domain as a 513-entry vector with pinned energy conservation);
+step l) `model2_absthr_energy` (the spec's
+"converted into the energy domain after considering the FFT
+normalization actually used" as an explicit ±½-lsb-sine
+calibration parameter), `model2_step_l_thr` +
+`model2_step_l_thr_lines` (`thr_ω = max(nb_ω, absthr_ω)`;
+D.4-uncovered lines — the D.4a line-58 gap and the >480/464/428
+tails — pass `nb_ω` through via the documented `absthr_ω = 0`
+convention); step n) `model2_step_n_epart` (`Σ r_ω²` over a Table
+D.5 span), `model2_step_n_npart` (the printed `width_n` split:
+narrow → `Σ thr_ω`, wide → smallest-**positive** argument ×
+line count, with a documented `0` convention when no argument is
+positive), `model2_step_n_smr_db` (`10·log10(epart/npart)`) and
+the `model2_step_n_smr` driver over `coder_partition_d5_spans()`
+(32 SMRs, partitions 1..=32). Step m) (pre-echo) is prose-noted
+as Layer-III-only ("omitted for Layers I and II"). 11 new unit
+tests: step h) TMN↔NMT interpolation endpoints + the `minval`
+floor + the slice form against the first three D.3a rows; step i)
+0/10/20 dB anchors + monotonicity; step j) elementwise product;
+step k) per-line spread on the full D.3a table (single-line
+partition 1, 3-line partition 2, length 513, Σnb_ω = Σnb_b);
+step l) max in both orders + dB→energy anchors + the uncovered-line
+pass-through; step n) epart squares on span 1 (17 inclusive
+lines), npart width split incl. the smallest-positive skip and
+the all-nonpositive `0` convention, the 0/10 dB SMR anchors and
+the 32-entry uniform-input driver; plus an end-to-end h)→l)
+chain over the full 32 kHz tables (uniform `en_b = 1`, `tb_b = 0`)
+pinning `nb_1 = 10^(−0,55)` and the D.4a 58,23 dB floor on line
+1. Tests: 1009 lib (was 998; +11 unit). Remaining Model 2 gap is
+now exactly the FFT-side front half — steps a)–e) (1024-sample
+reconstruction, Hann + FFT + polar, `r̂`/`f̂` prediction, the
+unpredictability measure `c_ω`, and the partitioned `e_b`/`c_b`
+sums). No external implementation consulted; only the staged ISO
+PDF (printed pp.127–132) and the in-tree r279/r280 surfaces were
+read.
+
 **Phase 2 step 82 (r280)** — Annex D Model 2 **Tables D.3a–c**
 (calculation partition table) + **Tables D.4a–c** (absolute threshold
 table), transcribed in full from the staged renders

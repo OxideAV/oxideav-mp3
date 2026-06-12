@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 2 §D.2.4 steps h)–l) and n) — the back half of
+  the Model 2 threshold calculation (Phase 2 step 83), read from the
+  staged ISO PDF printed pp.131–132. New public surface:
+  `MODEL2_NMT_DB`, `model2_step_h_snr_db` / `model2_step_h_snr`
+  (required SNR `maximum(minval_b, tb_b·TMN_b + (1−tb_b)·NMT_b)`
+  over the Table D.3 rows), `model2_step_i_bc`
+  (`bc_b = 10^(−SNR_b/10)`), `model2_step_j_nb` (`nb_b = en_b·bc_b`),
+  `model2_step_k_nb_lines` (per-FFT-line spread
+  `nb_ω = nb_b/(ωhigh_b−ωlow_b+1)`), `model2_absthr_energy` +
+  `model2_step_l_thr` / `model2_step_l_thr_lines`
+  (`thr_ω = max(nb_ω, absthr_ω)` with the documented
+  D.4-uncovered-line pass-through), and `model2_step_n_epart` /
+  `model2_step_n_npart` / `model2_step_n_smr_db` /
+  `model2_step_n_smr` (the `SMR_n` output vector over the 32 Table
+  D.5 coder partitions, with the printed `width_n` narrow/wide
+  split and smallest-positive minimum). 11 new unit tests incl. an
+  end-to-end h)→l) chain over the full 32 kHz tables.
 - psy: Annex D Model 2 Tables D.3a–c (calculation partition table)
   + Tables D.4a–c (absolute threshold table) transcribed in full
   (Phase 2 step 82) from the staged

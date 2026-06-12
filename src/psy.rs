@@ -1754,6 +1754,276 @@ pub fn model2_step_g_tonality(cb: f64) -> f64 {
     (-0.299 - 0.43 * cb.ln()).clamp(0.0, 1.0)
 }
 
+/// §D.2.4 step h) noise-masking-tone value: "`NMT_b = 5,5 dB` for
+/// all `b`. `NMT_b` is the value for noise masking tone (in dB) for
+/// the partition."
+pub const MODEL2_NMT_DB: f64 = 5.5;
+
+/// §D.2.4 step h) — required SNR for one calculation partition:
+///
+/// ```text
+/// SNR_b = maximum(minval_b, tb_b * TMN_b + (1 - tb_b) * NMT_b)
+/// ```
+///
+/// "Where maximum (a,b) is a function returning the least negative
+/// of a or b." `tb` is the step g) tonality index (0 = noise-like,
+/// 1 = tone-like); the second argument interpolates linearly between
+/// the partition's tone-masking-noise offset `TMN_b` (Table D.3
+/// `TMN` column, [`Model2PartitionEntry::tmn_db`]) at `tb = 1` and
+/// the constant noise-masking-tone offset [`MODEL2_NMT_DB`] at
+/// `tb = 0`; `minval_b` (Table D.3 `minval` column,
+/// [`Model2PartitionEntry::minval_db`]) is the per-partition lower
+/// limit "that controls stereo unmasking effects" (step e) item 5).
+/// All quantities are in dB.
+#[inline]
+#[must_use]
+pub fn model2_step_h_snr_db(tb: f64, minval_db: f64, tmn_db: f64) -> f64 {
+    minval_db.max(tb * tmn_db + (1.0 - tb) * MODEL2_NMT_DB)
+}
+
+/// §D.2.4 step h) over all partitions — required SNR per
+/// calculation partition, with `minval_b` / `TMN_b` read from the
+/// Table D.3 rows (pass `model2_partition_table(fs)` as
+/// `partitions`). `tb` carries the step g) tonality index per
+/// partition, in slice order. Returns `None` on length mismatch;
+/// one dB entry per partition otherwise.
+#[must_use]
+pub fn model2_step_h_snr(tb: &[f64], partitions: &[Model2PartitionEntry]) -> Option<Vec<f64>> {
+    if tb.len() != partitions.len() {
+        return None;
+    }
+    Some(
+        tb.iter()
+            .zip(partitions.iter())
+            .map(|(&tb_b, e)| model2_step_h_snr_db(tb_b, e.minval_db, e.tmn_db))
+            .collect(),
+    )
+}
+
+/// §D.2.4 step i) — power ratio `bc_b = 10^(-SNR_b / 10)`.
+///
+/// Converts the step h) required SNR (dB) into the linear energy
+/// ratio applied to the normalized partition energy in step j).
+/// `SNR_b ≥ 0` dB (every Table D.3 `TMN` ≥ 24,5 dB and
+/// `NMT = 5,5 dB`, so the step h) maximum is always positive) maps
+/// to `0 < bc_b ≤ 1`, monotone decreasing in `SNR_b`.
+#[inline]
+#[must_use]
+pub fn model2_step_i_bc(snr_db: f64) -> f64 {
+    (10.0_f64).powf(-snr_db / 10.0)
+}
+
+/// §D.2.4 step j) — actual energy threshold per partition,
+/// `nb_b = en_b * bc_b`.
+///
+/// `en` is the step f) normalized energy ([`model2_step_f_en`]);
+/// `bc` is the step i) power ratio per partition. Returns `None` on
+/// length mismatch.
+#[must_use]
+pub fn model2_step_j_nb(en: &[f64], bc: &[f64]) -> Option<Vec<f64>> {
+    if en.len() != bc.len() {
+        return None;
+    }
+    Some(
+        en.iter()
+            .zip(bc.iter())
+            .map(|(&en_b, &bc_b)| en_b * bc_b)
+            .collect(),
+    )
+}
+
+/// §D.2.4 step k) — spread the threshold energy over FFT lines,
+/// yielding `nb_ω`:
+///
+/// ```text
+/// nb_ω = nb_b / (ωhigh_b - ωlow_b + 1)
+/// ```
+///
+/// where `b` is the calculation partition containing line `ω`. `nb`
+/// carries the step j) per-partition threshold energies in slice
+/// order; `partitions` carries the matching Table D.3 rows (pass
+/// `model2_partition_table(fs)`). The output is indexed by FFT line
+/// with slice index `ω - 1` holding line `ω` (the spec's line domain
+/// is 1-based), and its length is the last partition's `ωhigh` —
+/// with the full Table D.3 slices that is exactly 513, covering the
+/// 1024-point-FFT half-spectrum with no gaps (coverage contiguity is
+/// a pinned transcription property). Energy is conserved:
+/// summing `nb_ω` over a partition's lines recovers `nb_b`.
+///
+/// Returns `None` when the two slices disagree in length or
+/// `partitions` is empty.
+#[must_use]
+pub fn model2_step_k_nb_lines(nb: &[f64], partitions: &[Model2PartitionEntry]) -> Option<Vec<f64>> {
+    if nb.len() != partitions.len() || partitions.is_empty() {
+        return None;
+    }
+    let last_line = partitions.last()?.whigh as usize;
+    let mut out = vec![0.0; last_line];
+    for (&nb_b, e) in nb.iter().zip(partitions.iter()) {
+        let count = f64::from(e.whigh - e.wlow + 1);
+        let nb_w = nb_b / count;
+        for line in e.wlow..=e.whigh {
+            out[line as usize - 1] = nb_w;
+        }
+    }
+    Some(out)
+}
+
+/// Convert a Table D.4 `absthr` dB value to the energy domain.
+///
+/// Step l): "The dB values of `absthr` shown in tables D.4 …
+/// are relative to the level that a sine wave of ±½ lsb has in the
+/// FFT used for threshold calculation. The dB values must be
+/// converted into the energy domain after considering the FFT
+/// normalization actually used." The conversion is therefore
+/// implementation-dependent: `half_lsb_sine_level_db` is the energy
+/// level, in dB under the same convention, that a ±½-lsb sine wave
+/// produces in the caller's FFT — i.e. the table's 0-dB reference
+/// point. The result is `10^((absthr_db + half_lsb_sine_level_db) / 10)`.
+#[inline]
+#[must_use]
+pub fn model2_absthr_energy(absthr_db: f64, half_lsb_sine_level_db: f64) -> f64 {
+    (10.0_f64).powf((absthr_db + half_lsb_sine_level_db) / 10.0)
+}
+
+/// §D.2.4 step l) — final energy threshold of audibility for one
+/// FFT line: `thr_ω = max(nb_ω, absthr_ω)`.
+///
+/// `absthr_w` must already be in the energy domain (see
+/// [`model2_absthr_energy`] for the documented conversion from the
+/// Table D.4 dB prints).
+#[inline]
+#[must_use]
+pub fn model2_step_l_thr(nb_w: f64, absthr_w: f64) -> f64 {
+    nb_w.max(absthr_w)
+}
+
+/// §D.2.4 step l) over the line domain — elementwise
+/// `thr_ω = max(nb_ω, absthr_ω)`. `nb` is the step k) per-line
+/// threshold ([`model2_step_k_nb_lines`] output layout: slice index
+/// `ω - 1` holds line `ω`); `absthr` is the energy-domain absolute
+/// threshold per line in the same layout. Lines the printed Table
+/// D.4 leaves uncovered (the D.4a line-58 gap and every line above
+/// the table's last covered line — [`model2_absthr_for_line`]
+/// returns `None` there) have no absolute-threshold floor; callers
+/// represent that as `absthr_ω = 0` so the maximum passes `nb_ω`
+/// through unchanged. Returns `None` on length mismatch.
+///
+/// Step m) (pre-echo control) follows this step for Layer III only —
+/// "This step is omitted for Layers I and II."
+#[must_use]
+pub fn model2_step_l_thr_lines(nb: &[f64], absthr: &[f64]) -> Option<Vec<f64>> {
+    if nb.len() != absthr.len() {
+        return None;
+    }
+    Some(
+        nb.iter()
+            .zip(absthr.iter())
+            .map(|(&nb_w, &absthr_w)| model2_step_l_thr(nb_w, absthr_w))
+            .collect(),
+    )
+}
+
+/// §D.2.4 step n) — energy in one Table D.5 coder partition
+/// (scalefactor band):
+///
+/// ```text
+/// epart_n = Σ_{ω=ωlow_n}^{ωhigh_n} r_ω²
+/// ```
+///
+/// `r_lines` carries the FFT magnitudes `r_ω` with slice index
+/// `ω - 1` holding line `ω`; `span` is the partition's Table D.5
+/// descriptor ([`coder_partition_d5_span`] /
+/// [`coder_partition_d5_spans`]). Returns `None` when `r_lines` is
+/// too short to cover `ωhigh_n`.
+#[must_use]
+pub fn model2_step_n_epart(r_lines: &[f64], span: CoderPartitionD5Span) -> Option<f64> {
+    let lines = r_lines.get(span.omega_low as usize - 1..span.omega_high as usize)?;
+    Some(lines.iter().map(|&r| r * r).sum())
+}
+
+/// §D.2.4 step n) — noise level in one Table D.5 coder partition.
+///
+/// If `width_n = 1` (psychoacoustically narrow scalefactor band —
+/// "one whose width is less than approximately ⅓ critical band"):
+///
+/// ```text
+/// npart_n = Σ_{ω=ωlow_n}^{ωhigh_n} thr_ω
+/// ```
+///
+/// else (`width_n = 0`, psychoacoustically wide):
+///
+/// ```text
+/// npart_n = minimum(thr_ωlow_n, …, thr_ωhigh_n) * (ωhigh_n - ωlow_n + 1)
+/// ```
+///
+/// "Where, in this case, minimum (a,…,z) is a function returning the
+/// smallest **positive** argument of the arguments a…z." With every
+/// in-domain `thr_ω > 0` (energies floored by the step l) absolute
+/// threshold) the positivity qualifier is a no-op; for the
+/// out-of-domain case where no argument is positive this
+/// implementation returns `npart_n = 0`. `thr_lines` uses the
+/// step k)/l) line layout (slice index `ω - 1` holds line `ω`).
+/// Returns `None` when `thr_lines` is too short to cover `ωhigh_n`.
+#[must_use]
+pub fn model2_step_n_npart(thr_lines: &[f64], span: CoderPartitionD5Span) -> Option<f64> {
+    let lines = thr_lines.get(span.omega_low as usize - 1..span.omega_high as usize)?;
+    Some(if span.width == 1 {
+        lines.iter().sum()
+    } else {
+        let min_pos = lines
+            .iter()
+            .copied()
+            .filter(|&t| t > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        if min_pos.is_finite() {
+            min_pos * lines.len() as f64
+        } else {
+            0.0
+        }
+    })
+}
+
+/// §D.2.4 step n) — the signal-to-mask ratio sent to the coder for
+/// one partition:
+///
+/// ```text
+/// SMR_n = 10 log10(epart_n / npart_n)
+/// ```
+///
+/// Spec domain is positive energies (`epart_n > 0`, `npart_n > 0`);
+/// outside it the IEEE quotient/logarithm conventions apply
+/// unmodified.
+#[inline]
+#[must_use]
+pub fn model2_step_n_smr_db(epart: f64, npart: f64) -> f64 {
+    10.0 * (epart / npart).log10()
+}
+
+/// §D.2.4 step n) over all recoverable Table D.5 coder partitions —
+/// the Model 2 output vector of signal-to-mask ratios `SMR_n` for
+/// `n ∈ 1..=32`, in ascending partition order.
+///
+/// `r_lines` carries the FFT magnitudes `r_ω` and `thr_lines` the
+/// step l) final energy thresholds `thr_ω`, both with slice index
+/// `ω - 1` holding line `ω`. Returns `None` when either slice is too
+/// short to cover the last partition's `ωhigh` (513). Each entry is
+/// `model2_step_n_smr_db(epart_n, npart_n)` over the partition's
+/// inclusive Table D.5 line range (the shared boundary line
+/// `ωhigh_n = ωlow_{n+1}` is read by both adjacent partitions, per
+/// the inclusive-on-both-ends reading of the printed boundary
+/// column).
+#[must_use]
+pub fn model2_step_n_smr(r_lines: &[f64], thr_lines: &[f64]) -> Option<Vec<f64>> {
+    coder_partition_d5_spans()
+        .map(|span| {
+            let epart = model2_step_n_epart(r_lines, span)?;
+            let npart = model2_step_n_npart(thr_lines, span)?;
+            Some(model2_step_n_smr_db(epart, npart))
+        })
+        .collect()
+}
+
 /// One row of Annex D Table D.5 — *Layer I and Layer II coder
 /// partition table*.
 ///
@@ -16103,6 +16373,213 @@ mod tests {
         let t2 = model2_step_g_tonality(0.2);
         let t3 = model2_step_g_tonality(0.45);
         assert!(t1 > t2 && t2 > t3, "{t1} {t2} {t3}");
+    }
+
+    // ----- §D.2.4 steps h)–l) + n) (step 83 / r281) -----
+
+    #[test]
+    fn model2_step_h_interpolates_tmn_to_nmt() {
+        // Fully tonal (tb = 1): the interpolation collapses to TMN.
+        assert_eq!(model2_step_h_snr_db(1.0, 0.0, 24.5), 24.5);
+        // Fully noise-like (tb = 0): collapses to NMT = 5,5 dB.
+        assert_eq!(model2_step_h_snr_db(0.0, 0.0, 24.5), MODEL2_NMT_DB);
+        // Interior tb: linear interpolation, re-derived inline from
+        // the printed step h) formula.
+        for tb in [0.25, 0.5, 0.75] {
+            let expected = tb * 24.5 + (1.0 - tb) * 5.5;
+            let got = model2_step_h_snr_db(tb, 0.0, 24.5);
+            assert!((got - expected).abs() < 1.0e-12, "tb={tb}: {got}");
+        }
+    }
+
+    #[test]
+    fn model2_step_h_minval_is_a_lower_limit() {
+        // Table D.3a row 3 prints minval = 20,0 / TMN = 24,5. At
+        // tb = 0 the interpolated value (5,5 dB) sits below minval,
+        // so the maximum returns minval.
+        assert_eq!(model2_step_h_snr_db(0.0, 20.0, 24.5), 20.0);
+        // At tb = 1 the interpolated value (24,5 dB) exceeds minval.
+        assert_eq!(model2_step_h_snr_db(1.0, 20.0, 24.5), 24.5);
+    }
+
+    #[test]
+    fn model2_step_h_slice_reads_d3_columns() {
+        // Drive the slice form over the first three Table D.3a rows
+        // (minval 0 / 0 / 20, TMN 24,5 throughout) with tb = 0
+        // everywhere: rows 1–2 give NMT = 5,5; row 3's minval floor
+        // gives 20.
+        let partitions = &MODEL2_PARTITION_D3A[..3];
+        let snr = model2_step_h_snr(&[0.0; 3], partitions).unwrap();
+        assert_eq!(snr, vec![5.5, 5.5, 20.0]);
+        // Length mismatch.
+        assert!(model2_step_h_snr(&[0.0; 4], partitions).is_none());
+    }
+
+    #[test]
+    fn model2_step_i_power_ratio() {
+        // bc = 10^(-SNR/10): 0 dB → 1; 10 dB → 0,1; 20 dB → 0,01.
+        assert!((model2_step_i_bc(0.0) - 1.0).abs() < 1.0e-15);
+        assert!((model2_step_i_bc(10.0) - 0.1).abs() < 1.0e-15);
+        assert!((model2_step_i_bc(20.0) - 0.01).abs() < 1.0e-15);
+        // Monotone decreasing in SNR, and within (0, 1] for the
+        // non-negative-SNR spec domain.
+        assert!(model2_step_i_bc(5.5) > model2_step_i_bc(24.5));
+        assert!(model2_step_i_bc(24.5) > 0.0);
+    }
+
+    #[test]
+    fn model2_step_j_threshold_energy() {
+        let nb = model2_step_j_nb(&[2.0, 3.0, 0.5], &[0.1, 0.01, 1.0]).unwrap();
+        assert_eq!(nb, vec![0.2, 0.03, 0.5]);
+        assert!(model2_step_j_nb(&[1.0; 3], &[1.0; 4]).is_none());
+    }
+
+    #[test]
+    fn model2_step_k_spreads_and_conserves_energy() {
+        let partitions = model2_partition_table(AnnexDSamplingRate::Hz32000);
+        let nb: Vec<f64> = (0..partitions.len()).map(|b| 1.0 + b as f64).collect();
+        let lines = model2_step_k_nb_lines(&nb, partitions).unwrap();
+        // The 32 kHz table covers lines 1..=513 exactly.
+        assert_eq!(lines.len(), 513);
+        // Partition 1 (row index 0) is the single line 1: nb_ω = nb_b.
+        assert_eq!(lines[0], nb[0]);
+        // Partition 2 spans lines 2..=4 (3 lines): each gets nb_b/3.
+        for w in 2..=4 {
+            assert!((lines[w - 1] - nb[1] / 3.0).abs() < 1.0e-15, "line {w}");
+        }
+        // Energy conservation: the per-line values sum back to Σ nb_b
+        // (coverage is contiguous and non-overlapping).
+        let total: f64 = lines.iter().sum();
+        let expected: f64 = nb.iter().sum();
+        assert!((total - expected).abs() < 1.0e-9, "{total} vs {expected}");
+        // Length mismatch / empty partitions.
+        assert!(model2_step_k_nb_lines(&nb[..3], partitions).is_none());
+        assert!(model2_step_k_nb_lines(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn model2_step_l_floors_at_absolute_threshold() {
+        // Scalar max in both orders.
+        assert_eq!(model2_step_l_thr(2.0, 1.0), 2.0);
+        assert_eq!(model2_step_l_thr(1.0, 2.0), 2.0);
+        // dB → energy conversion: with the table's 0-dB reference at
+        // calibration level L, absthr_db = 0 maps to 10^(L/10).
+        assert!((model2_absthr_energy(0.0, 0.0) - 1.0).abs() < 1.0e-15);
+        assert!((model2_absthr_energy(10.0, 0.0) - 10.0).abs() < 1.0e-15);
+        assert!((model2_absthr_energy(0.0, 20.0) - 100.0).abs() < 1.0e-12);
+        // Elementwise line form; an uncovered line's absthr_ω = 0
+        // convention passes nb_ω through.
+        let thr = model2_step_l_thr_lines(&[1.0, 0.5, 3.0], &[2.0, 0.0, 1.0]).unwrap();
+        assert_eq!(thr, vec![2.0, 0.5, 3.0]);
+        assert!(model2_step_l_thr_lines(&[1.0; 2], &[1.0; 3]).is_none());
+    }
+
+    #[test]
+    fn model2_step_n_epart_sums_squared_magnitudes() {
+        // Uniform r_ω = 1: epart_n is the partition's inclusive line
+        // count. Span 1 runs ωlow=1..=ωhigh=17 → 17 lines.
+        let r = vec![1.0; 513];
+        let span1 = coder_partition_d5_span(1).unwrap();
+        assert_eq!(model2_step_n_epart(&r, span1).unwrap(), 17.0);
+        // Non-uniform: squares, not magnitudes.
+        let mut r2 = vec![0.0; 513];
+        r2[0] = 3.0; // line 1
+        r2[16] = 2.0; // line 17
+        assert_eq!(model2_step_n_epart(&r2, span1).unwrap(), 13.0);
+        // Slice too short to cover ωhigh.
+        assert!(model2_step_n_epart(&r[..16], span1).is_none());
+    }
+
+    #[test]
+    fn model2_step_n_npart_width_split() {
+        // width = 0 (wide, spans 1..=12): smallest positive × count.
+        let span1 = coder_partition_d5_span(1).unwrap();
+        assert_eq!(span1.width, 0);
+        let mut thr = vec![2.0; 513];
+        thr[4] = 0.5; // line 5, inside span 1
+        let npart = model2_step_n_npart(&thr, span1).unwrap();
+        assert!((npart - 0.5 * 17.0).abs() < 1.0e-12);
+        // The "smallest positive" qualifier skips a zero entry.
+        thr[6] = 0.0; // line 7
+        let npart = model2_step_n_npart(&thr, span1).unwrap();
+        assert!((npart - 0.5 * 17.0).abs() < 1.0e-12);
+        // No positive argument at all → documented 0 convention.
+        let zeros = vec![0.0; 513];
+        assert_eq!(model2_step_n_npart(&zeros, span1).unwrap(), 0.0);
+        // width = 1 (narrow, spans 13..=32): plain sum.
+        let span13 = coder_partition_d5_span(13).unwrap();
+        assert_eq!(span13.width, 1);
+        let thr2 = vec![0.25; 513];
+        let lines = f64::from(span13.omega_high - span13.omega_low + 1);
+        let npart = model2_step_n_npart(&thr2, span13).unwrap();
+        assert!((npart - 0.25 * lines).abs() < 1.0e-12);
+        // Slice too short.
+        assert!(model2_step_n_npart(&thr2[..200], span13).is_none());
+    }
+
+    #[test]
+    fn model2_step_n_smr_full_vector() {
+        // SMR_n = 10 log10(epart/npart): equal energies → 0 dB; a
+        // 10× signal-over-threshold → 10 dB.
+        assert!((model2_step_n_smr_db(1.0, 1.0)).abs() < 1.0e-15);
+        assert!((model2_step_n_smr_db(10.0, 1.0) - 10.0).abs() < 1.0e-12);
+        // Full driver: r_ω = 1 (epart = line count) and thr_ω = 0,1
+        // (npart = 0,1 × line count for both width readings, since
+        // thr is uniform) → SMR_n = 10 dB in every partition.
+        let r = vec![1.0; 513];
+        let thr = vec![0.1; 513];
+        let smr = model2_step_n_smr(&r, &thr).unwrap();
+        assert_eq!(smr.len(), 32);
+        for (n, &s) in smr.iter().enumerate() {
+            assert!((s - 10.0).abs() < 1.0e-9, "n={}: {s}", n + 1);
+        }
+        // Either slice too short to reach ωhigh_32 = 513 → None.
+        assert!(model2_step_n_smr(&r[..512], &thr).is_none());
+        assert!(model2_step_n_smr(&r, &thr[..512]).is_none());
+    }
+
+    #[test]
+    fn model2_steps_h_to_l_chain_to_line_thresholds() {
+        // End-to-end h)→i)→j)→k)→l) over the full 32 kHz tables with
+        // a uniform normalized energy en_b = 1 and tb_b = 0: the
+        // chain must give nb_ω = 10^(-SNR_b/10) / lines_b on every
+        // line of partition b, then floor at the (energy-domain)
+        // absolute threshold.
+        let fs = AnnexDSamplingRate::Hz32000;
+        let partitions = model2_partition_table(fs);
+        let nparts = partitions.len();
+        let tb = vec![0.0; nparts];
+        let snr = model2_step_h_snr(&tb, partitions).unwrap();
+        // Every Table D.3 minval ≤ 20 dB and TMN ≥ 24,5 dB keep the
+        // required SNR within sane dB bounds.
+        assert!(snr.iter().all(|&s| (5.5..=20.0).contains(&s)));
+        let bc: Vec<f64> = snr.iter().map(|&s| model2_step_i_bc(s)).collect();
+        let en = vec![1.0; nparts];
+        let nb = model2_step_j_nb(&en, &bc).unwrap();
+        let nb_lines = model2_step_k_nb_lines(&nb, partitions).unwrap();
+        assert_eq!(nb_lines.len(), 513);
+        // Spot-check partition 1 (single line 1, minval 0, tb 0):
+        // nb_1 = 10^(-0,55) on line 1.
+        let expected = (10.0_f64).powf(-0.55);
+        assert!((nb_lines[0] - expected).abs() < 1.0e-12);
+        // Step l) with the Table D.4a dB prints converted at a 0 dB
+        // calibration level; uncovered lines (58 and 481..=513) get
+        // no floor.
+        let absthr: Vec<f64> = (1..=513)
+            .map(|w| model2_absthr_for_line(fs, w).map_or(0.0, |db| model2_absthr_energy(db, 0.0)))
+            .collect();
+        let thr = model2_step_l_thr_lines(&nb_lines, &absthr).unwrap();
+        // Line 1's D.4a print is 58,23 dB → energy ≈ 10^5,823 — far
+        // above nb_1, so the floor wins there.
+        assert!((thr[0] - (10.0_f64).powf(5.823)).abs() < 1.0e-6 * thr[0]);
+        // Every final threshold is ≥ both inputs.
+        for w in 0..513 {
+            assert!(
+                thr[w] >= nb_lines[w] && thr[w] >= absthr[w],
+                "line {}",
+                w + 1
+            );
+        }
     }
 
     // ----- Tables D.3a–c / D.4a–c transcription (step 82 / r280) -----
