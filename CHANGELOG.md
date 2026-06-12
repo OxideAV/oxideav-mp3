@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- psy: Annex D Model 2 §D.2.1 inputs + §D.2.4 steps a)–e) — the
+  FFT-side front half of the Model 2 threshold calculation (Phase 2
+  step 84), read from the staged ISO PDF printed pp.128–130. New
+  public surface: `MODEL2_FFT_LEN` / `MODEL2_FFT_LINES` /
+  `model2_iblen_in_range` (strict `384<iblen<640`),
+  `model2_step_a_reconstruct` (1 024-sample window reconstruction),
+  `model2_hann_window` (`0,5 − 0,5·cos(2π(i−0,5)/1024)`) +
+  `Model2Polar` + `model2_step_b_spectrum` (window → forward FFT →
+  polar `r_ω`/`f_ω` over the 513-line DC..Nyquist domain),
+  `model2_step_c_predict` / `model2_step_c_predict_polar`
+  (`x̂_ω = 2,0·x_ω(t−1) − x_ω(t−2)`), `model2_step_d_cw` /
+  `model2_step_d_cw_lines` + `MODEL2_CW_ABOVE_LIMIT` (the
+  unpredictability measure with the verbatim 0,3
+  partial-calculation default), `model2_step_e_eb` /
+  `model2_step_e_cb` (partitioned energy / weighted
+  unpredictability), and the `Model2State` threshold-generator
+  state (§D.2.1 zeroed starting point) whose `smr()` walk chains
+  steps a)–l) + n) into the previously landed back half and
+  returns the 32 `SMR_n` Table D.5 outputs per call. 13 new unit
+  tests incl. a value-for-value bridge replay of the full walk
+  against the step primitives and a steady-sine tonality/SMR
+  end-to-end check.
 - psy: Annex D Model 2 §D.2.4 steps h)–l) and n) — the back half of
   the Model 2 threshold calculation (Phase 2 step 83), read from the
   staged ISO PDF printed pp.131–132. New public surface:

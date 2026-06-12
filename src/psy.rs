@@ -1636,6 +1636,392 @@ pub fn model2_sprdngf(i_bark: f64, j_bark: f64) -> f64 {
     }
 }
 
+// =====================================================================
+// Annex D Model 2 — §D.2.1 inputs + §D.2.4 steps a) through e)
+// (Phase 2 step 84 / r282): FFT analysis window + complex spectrum,
+// magnitude/phase prediction, unpredictability measure, and the
+// partition energy/unpredictability sums that feed the step f)
+// spreading convolution already landed above.
+//
+// Spec context (ISO/IEC 11172-3:1993 Annex D, printed pp.128–130 /
+// PDF pp.134–136 of docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf):
+//
+// §D.2.1 "General" — the threshold generation process has three
+// inputs: a) the shift length iblen, "where 384<iblen<640", constant
+// over any particular application; b) "the newest iblen samples of
+// the signal"; c) the sampling rate. One output: "a set of
+// Signal-to-Masking Ratios, SMR_n". And: "Before running the model
+// initially, the array used to hold the preceding FFT source data
+// window and the arrays used to hold r and f should be zeroed to
+// provide a known starting point."
+//
+// §D.2.2 "Comments on notation" — ω indexes the FFT spectral line
+// domain: "An index of 1 corresponds to the DC term and an index of
+// 513 corresponds to the spectral line at the Nyquist frequency."
+//
+// §D.2.4 steps (verbatim formulas):
+//
+//   a) Reconstruct 1 024 samples of the input signal. "iblen new
+//      samples are made available at every call to the threshold
+//      generator. The threshold generator must store 1 024-iblen
+//      samples, and concatenate those samples to accurately
+//      reconstruct 1 024 consecutive samples of the input signal,
+//      s_i, where i represents the index, 1 <= i <= 1 024 of the
+//      current input stream."
+//
+//   b) Calculate the complex spectrum of the input signal.
+//      "First, s_i is windowed by a 1 024 point Hann window, i.e.
+//         sw_i = s_i * (0,5 - 0,5*cos(2π(i - 0,5)/1024)).
+//      Second, a standard forward FFT of sw_i is calculated.
+//      Third, the polar representation of the transform is
+//      calculated. r_ω and f_ω represent the magnitude and phase
+//      components of the transformed sw_i, respectively."
+//
+//   c) Calculate a predicted r and f:
+//         r̂_ω = 2,0·r_ω(t-1) - r_ω(t-2)
+//         f̂_ω = 2,0·f_ω(t-1) - f_ω(t-2)
+//      "where t represents the current block number, t-1 indexes the
+//      previous block's data, and t-2 indexes the data from the
+//      threshold calculation block before that."
+//
+//   d) Calculate the unpredictability measure c_ω:
+//         c_ω = ((r_ω·cos f_ω - r̂_ω·cos f̂_ω)²
+//               + (r_ω·sin f_ω - r̂_ω·sin f̂_ω)²)^0,5
+//               / (r_ω + abs(r̂_ω))
+//
+//   e) Calculate the energy and the weighted unpredictability in the
+//      threshold calculation partitions:
+//         e_b = Σ_{ω=ωlow_b}^{ωhigh_b} r_ω²
+//         c_b = Σ_{ω=ωlow_b}^{ωhigh_b} r_ω²·c_ω
+// =====================================================================
+
+/// §D.2.4 step a) analysis-window length — "Reconstruct 1 024 samples
+/// of the input signal" (and the §D.2.2 line domain ω ∈ 1..=513 is
+/// exactly this transform's half-spectrum).
+pub const MODEL2_FFT_LEN: usize = 1024;
+
+/// Number of FFT spectral lines in the Model 2 line domain — §D.2.2
+/// verbatim: "An index of 1 corresponds to the DC term and an index
+/// of 513 corresponds to the spectral line at the Nyquist frequency."
+pub const MODEL2_FFT_LINES: usize = 513;
+
+/// §D.2.1 input a) shift-length constraint — verbatim "384<iblen<640"
+/// (both bounds strict). `iblen` outside this range requires a
+/// different window and/or transform length per the §D.2.1 prose
+/// ("Use a different length transform … or … a substantially shorter
+/// Hann window"); the standard table set assumes the in-range case.
+#[inline]
+#[must_use]
+pub const fn model2_iblen_in_range(iblen: usize) -> bool {
+    384 < iblen && iblen < 640
+}
+
+/// §D.2.4 step d) default unpredictability above the partial-
+/// calculation limit — verbatim: "By sacrificing performance, this
+/// measure can be calculated on only a lower portion of the frequency
+/// lines. … The c_ω values above this limit should be set to 0,3."
+///
+/// (The same prose bounds the limit: "Calculations should be done
+/// from DC to at least 3 kHz and preferably to 7kHz. An upper limit
+/// of less than 5,5kHz may considerably reduce performance … Best
+/// results will be obtained by calculating c_ω up to 20 kHz.")
+pub const MODEL2_CW_ABOVE_LIMIT: f64 = 0.3;
+
+/// §D.2.4 step a) — reconstruct the 1 024-sample analysis window from
+/// the preceding window and the `iblen` newest input samples.
+///
+/// `prev_window` is the previous call's 1 024 reconstructed samples
+/// (all-zero before the first call, per the §D.2.1 "should be zeroed"
+/// initialization); `new_samples` carries the `iblen` newest samples.
+/// The output concatenates the most recent `1 024 - iblen` samples of
+/// the previous window with the new block, yielding "1 024
+/// consecutive samples of the input signal".
+///
+/// Returns `None` when `prev_window.len() != 1 024` or
+/// `new_samples` is empty or longer than 1 024. The §D.2.1
+/// `384<iblen<640` constraint is the *caller's* application contract
+/// (checkable via [`model2_iblen_in_range`]); the reconstruction
+/// itself is well-defined for any `1 <= iblen <= 1 024` and is not
+/// artificially narrowed here.
+#[must_use]
+pub fn model2_step_a_reconstruct(prev_window: &[f64], new_samples: &[f64]) -> Option<Vec<f64>> {
+    let iblen = new_samples.len();
+    if prev_window.len() != MODEL2_FFT_LEN || iblen == 0 || iblen > MODEL2_FFT_LEN {
+        return None;
+    }
+    let mut out = Vec::with_capacity(MODEL2_FFT_LEN);
+    out.extend_from_slice(&prev_window[iblen..]);
+    out.extend_from_slice(new_samples);
+    Some(out)
+}
+
+/// §D.2.4 step b) Hann window coefficient for the **1-based** sample
+/// index `i` — verbatim `0,5 - 0,5*cos(2π(i - 0,5)/1024)`.
+///
+/// Returns `None` outside the spec domain `1 <= i <= 1 024`. The
+/// half-sample offset `(i - 0,5)` makes the window exactly symmetric
+/// about the block centre (`w(i) = w(1025 - i)`) with no zero-valued
+/// endpoint sample. Unlike the Model 1 Step 1 window
+/// ([`model1_hann_window`]) there is **no** `sqrt(8/3)` power
+/// prefactor — the printed step b) formula is the bare raised cosine,
+/// and the implementation-dependent normalization is absorbed
+/// downstream by the step l) [`model2_absthr_energy`] conversion
+/// ("after considering the FFT normalization actually used").
+#[must_use]
+pub fn model2_hann_window(i: usize) -> Option<f64> {
+    if i == 0 || i > MODEL2_FFT_LEN {
+        return None;
+    }
+    let angle = 2.0 * core::f64::consts::PI * (i as f64 - 0.5) / (MODEL2_FFT_LEN as f64);
+    Some(0.5 - 0.5 * angle.cos())
+}
+
+/// Polar half-spectrum of one Model 2 analysis block — the step b)
+/// `r_ω` (magnitude) and `f_ω` (phase, radians) components for the
+/// §D.2.2 line domain ω ∈ 1..=513, with slice index `ω - 1` holding
+/// line `ω`. Also the carrier for the step c) predicted spectrum
+/// (`r̂_ω` / `f̂_ω`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Model2Polar {
+    /// Magnitude per FFT line (`r_ω`, index `ω - 1`).
+    pub r: Vec<f64>,
+    /// Phase per FFT line in radians (`f_ω`, index `ω - 1`).
+    pub f: Vec<f64>,
+}
+
+impl Model2Polar {
+    /// All-zero polar spectrum over `MODEL2_FFT_LINES` lines — the
+    /// §D.2.1 initial state ("the arrays used to hold r and f should
+    /// be zeroed to provide a known starting point").
+    #[must_use]
+    pub fn zeroed() -> Self {
+        Self {
+            r: vec![0.0; MODEL2_FFT_LINES],
+            f: vec![0.0; MODEL2_FFT_LINES],
+        }
+    }
+}
+
+/// §D.2.4 step b) — complex spectrum of one reconstructed analysis
+/// block, in polar representation.
+///
+/// Applies the three printed sub-steps in order: the 1 024-point Hann
+/// window ([`model2_hann_window`]; `sw_i = s_i · w(i)`), "a standard
+/// forward FFT of sw_i" (unnormalized forward transform
+/// `Σ_l sw_l · e^(-jωl2π/N)`), and the polar conversion
+/// (`r_ω = |X_ω|`, `f_ω = arg X_ω`). The output covers the §D.2.2
+/// line domain ω ∈ 1..=513 (DC through Nyquist).
+///
+/// The spec does not prescribe an FFT normalization; this
+/// implementation applies none, and the step l) absolute-threshold
+/// conversion ([`model2_absthr_energy`]) takes the resulting
+/// reference level as its explicit `half_lsb_sine_level_db`
+/// parameter, per the printed "after considering the FFT
+/// normalization actually used".
+///
+/// Returns `None` unless `s.len() == 1 024` — the step a)
+/// reconstruction ([`model2_step_a_reconstruct`]) is the only
+/// supported producer; no padding or truncation is invented.
+#[must_use]
+pub fn model2_step_b_spectrum(s: &[f64]) -> Option<Model2Polar> {
+    if s.len() != MODEL2_FFT_LEN {
+        return None;
+    }
+    let mut re: Vec<f64> = s
+        .iter()
+        .enumerate()
+        .map(|(l, &sample)| {
+            // 0-based slice index `l` is the spec's 1-based `i = l + 1`,
+            // always in the window's domain, so the accessor cannot
+            // return `None`.
+            model2_hann_window(l + 1).unwrap_or(0.0) * sample
+        })
+        .collect();
+    let mut im = vec![0.0_f64; MODEL2_FFT_LEN];
+    fft_in_place(&mut re, &mut im);
+    let mut r = Vec::with_capacity(MODEL2_FFT_LINES);
+    let mut f = Vec::with_capacity(MODEL2_FFT_LINES);
+    for k in 0..MODEL2_FFT_LINES {
+        r.push(re[k].hypot(im[k]));
+        f.push(im[k].atan2(re[k]));
+    }
+    Some(Model2Polar { r, f })
+}
+
+/// §D.2.4 step c) — linear prediction of one magnitude or phase
+/// component from the preceding two threshold-calculation blocks:
+/// `x̂_ω = 2,0·x_ω(t-1) - x_ω(t-2)`.
+#[inline]
+#[must_use]
+pub fn model2_step_c_predict(prev: f64, prev2: f64) -> f64 {
+    2.0 * prev - prev2
+}
+
+/// §D.2.4 step c) over the polar half-spectrum — the predicted
+/// magnitude `r̂_ω` and phase `f̂_ω` from the previous block (`t-1`)
+/// and the block before that (`t-2`).
+///
+/// Returns `None` when the four input slices do not all share one
+/// length. Phase prediction operates on the principal-value phases
+/// the step b) polar conversion produces; since the step d)
+/// unpredictability measure only consumes `f̂_ω` through `cos`/`sin`,
+/// the `2·f(t-1) - f(t-2)` combination is invariant (mod 2π) to the
+/// principal-value branch cuts.
+#[must_use]
+pub fn model2_step_c_predict_polar(prev: &Model2Polar, prev2: &Model2Polar) -> Option<Model2Polar> {
+    if prev.r.len() != prev.f.len()
+        || prev2.r.len() != prev2.f.len()
+        || prev.r.len() != prev2.r.len()
+    {
+        return None;
+    }
+    let predict = |a: &[f64], b: &[f64]| -> Vec<f64> {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&p1, &p2)| model2_step_c_predict(p1, p2))
+            .collect()
+    };
+    Some(Model2Polar {
+        r: predict(&prev.r, &prev2.r),
+        f: predict(&prev.f, &prev2.f),
+    })
+}
+
+/// §D.2.4 step d) — unpredictability measure for one FFT line:
+///
+/// ```text
+/// c_ω = ((r_ω·cos f_ω - r̂_ω·cos f̂_ω)² + (r_ω·sin f_ω - r̂_ω·sin f̂_ω)²)^0,5
+///       / (r_ω + abs(r̂_ω))
+/// ```
+///
+/// The numerator is the Euclidean distance between the actual and
+/// predicted complex spectral values; the denominator normalizes by
+/// the magnitude sum, bounding `c_ω` to `[0, 1]` over the spec domain
+/// (`r_ω ≥ 0`): a perfectly predicted line gives 0, a zero-magnitude
+/// prediction against a live line (or opposite-phase prediction of
+/// equal magnitude) gives 1. The spec leaves the all-silent
+/// `0/0` case (`r_ω = r̂_ω = 0`) undefined; this implementation
+/// returns `0.0` there (a silent line predicted silent is perfectly
+/// predictable), keeping the downstream step e)/g) chain finite.
+#[inline]
+#[must_use]
+pub fn model2_step_d_cw(r: f64, f: f64, r_hat: f64, f_hat: f64) -> f64 {
+    let den = r + r_hat.abs();
+    if den == 0.0 {
+        return 0.0;
+    }
+    let dre = r * f.cos() - r_hat * f_hat.cos();
+    let dim = r * f.sin() - r_hat * f_hat.sin();
+    dre.hypot(dim) / den
+}
+
+/// §D.2.4 step d) over the line domain — the unpredictability vector
+/// `c_ω` for ω ∈ 1..=lines, with the spec's optional
+/// partial-calculation convention.
+///
+/// `cur` is the step b) spectrum of the current block; `predicted`
+/// the step c) prediction. With `compute_through_line = None` every
+/// line is computed exactly; with `Some(limit)` only lines
+/// `ω <= limit` are computed and every line above the limit is set to
+/// [`MODEL2_CW_ABOVE_LIMIT`] (verbatim: "this measure can be
+/// calculated on only a lower portion of the frequency lines … The
+/// c_ω values above this limit should be set to 0,3"). The prose
+/// bounds the sensible limit in frequency terms — at least 3 kHz,
+/// preferably 7 kHz and up to 20 kHz — which the caller translates to
+/// a line index for its sampling rate.
+///
+/// Returns `None` when the two spectra do not share one line count
+/// (or either is internally inconsistent). Output index `ω - 1` holds
+/// line `ω`.
+#[must_use]
+pub fn model2_step_d_cw_lines(
+    cur: &Model2Polar,
+    predicted: &Model2Polar,
+    compute_through_line: Option<usize>,
+) -> Option<Vec<f64>> {
+    if cur.r.len() != cur.f.len()
+        || predicted.r.len() != predicted.f.len()
+        || cur.r.len() != predicted.r.len()
+    {
+        return None;
+    }
+    Some(
+        (0..cur.r.len())
+            .map(|idx| {
+                let line = idx + 1;
+                match compute_through_line {
+                    Some(limit) if line > limit => MODEL2_CW_ABOVE_LIMIT,
+                    _ => {
+                        model2_step_d_cw(cur.r[idx], cur.f[idx], predicted.r[idx], predicted.f[idx])
+                    }
+                }
+            })
+            .collect(),
+    )
+}
+
+/// §D.2.4 step e) — energy per threshold calculation partition:
+/// `e_b = Σ_{ω=ωlow_b}^{ωhigh_b} r_ω²`.
+///
+/// `r_lines` carries the step b) magnitudes with slice index `ω - 1`
+/// holding line `ω`; `partitions` the Table D.3 rows for the
+/// sampling rate (pass `model2_partition_table(fs)`). Returns `None`
+/// when `partitions` is empty or `r_lines` is too short to cover the
+/// last partition's `ωhigh`. One entry per partition, in table order.
+#[must_use]
+pub fn model2_step_e_eb(r_lines: &[f64], partitions: &[Model2PartitionEntry]) -> Option<Vec<f64>> {
+    if partitions.is_empty() || r_lines.len() < partitions.last()?.whigh as usize {
+        return None;
+    }
+    Some(
+        partitions
+            .iter()
+            .map(|e| {
+                r_lines[e.wlow as usize - 1..e.whigh as usize]
+                    .iter()
+                    .map(|&r| r * r)
+                    .sum()
+            })
+            .collect(),
+    )
+}
+
+/// §D.2.4 step e) — weighted unpredictability per threshold
+/// calculation partition: `c_b = Σ_{ω=ωlow_b}^{ωhigh_b} r_ω²·c_ω`.
+///
+/// `r_lines` / `cw_lines` carry the step b) magnitudes and the step
+/// d) unpredictability in the shared line layout (slice index `ω - 1`
+/// holds line `ω`). Returns `None` when the two line slices disagree
+/// in length, `partitions` is empty, or the slices are too short to
+/// cover the last partition's `ωhigh`. One entry per partition, in
+/// table order.
+#[must_use]
+pub fn model2_step_e_cb(
+    r_lines: &[f64],
+    cw_lines: &[f64],
+    partitions: &[Model2PartitionEntry],
+) -> Option<Vec<f64>> {
+    if r_lines.len() != cw_lines.len()
+        || partitions.is_empty()
+        || r_lines.len() < partitions.last()?.whigh as usize
+    {
+        return None;
+    }
+    Some(
+        partitions
+            .iter()
+            .map(|e| {
+                let span = e.wlow as usize - 1..e.whigh as usize;
+                r_lines[span.clone()]
+                    .iter()
+                    .zip(cw_lines[span].iter())
+                    .map(|(&r, &c)| r * r * c)
+                    .sum()
+            })
+            .collect(),
+    )
+}
+
 /// §D.2.4 step f) — convolve a per-partition quantity with the
 /// §D.2.3 spreading function:
 ///
@@ -2022,6 +2408,142 @@ pub fn model2_step_n_smr(r_lines: &[f64], thr_lines: &[f64]) -> Option<Vec<f64>>
             Some(model2_step_n_smr_db(epart, npart))
         })
         .collect()
+}
+
+/// Persistent state of one Psychoacoustic Model 2 threshold
+/// generator — the §D.2.1 "preceding FFT source data window" plus the
+/// `t-1` / `t-2` polar spectra the step c) predictor consumes
+/// (Phase 2 step 84 / r282).
+///
+/// §D.2.1 (verbatim): "Before running the model initially, the array
+/// used to hold the preceding FFT source data window and the arrays
+/// used to hold r and f should be zeroed to provide a known starting
+/// point." [`Model2State::new`] performs exactly that zeroing; the
+/// first two [`Model2State::smr`] calls therefore predict against
+/// zeroed history (maximally unpredictable, `c_ω = 1` on live lines)
+/// and converge from the third call on, as the spec procedure
+/// dictates.
+///
+/// One state instance corresponds to one "particular application of
+/// the threshold calculation process" — `iblen` and the sampling rate
+/// "must remain constant over any particular application" (§D.2.1
+/// inputs a) and c)); a Layer III encoder needing two shift lengths
+/// runs "two processes, each running with a fixed shift length",
+/// i.e. two independent `Model2State` values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Model2State {
+    /// The preceding 1 024-sample FFT source data window (§D.2.4
+    /// step a) reconstruction output of the previous call; all-zero
+    /// initially).
+    window: Vec<f64>,
+    /// Polar spectrum of the previous block (`t-1`; zeroed initially).
+    prev: Model2Polar,
+    /// Polar spectrum of the block before that (`t-2`; zeroed
+    /// initially).
+    prev2: Model2Polar,
+}
+
+impl Default for Model2State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Model2State {
+    /// Freshly zeroed threshold-generator state, per the §D.2.1
+    /// initialization sentence.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            window: vec![0.0; MODEL2_FFT_LEN],
+            prev: Model2Polar::zeroed(),
+            prev2: Model2Polar::zeroed(),
+        }
+    }
+
+    /// Run one full §D.2.4 threshold calculation — steps a) through
+    /// l) plus n) — over the `iblen` newest input samples, producing
+    /// the Model 2 output ("a set of Signal-to-Masking Ratios,
+    /// SMR_n") for the 32 Table D.5 coder partitions.
+    ///
+    /// * `new_samples` — the §D.2.1 input b) block (`iblen`
+    ///   samples; the §D.2.1 `384<iblen<640` application contract is
+    ///   checkable via [`model2_iblen_in_range`] and the caller keeps
+    ///   `iblen` constant across calls).
+    /// * `fs` — the §D.2.1 input c) sampling rate, selecting the
+    ///   Table D.3 calculation partitions and Table D.4 absolute
+    ///   thresholds.
+    /// * `half_lsb_sine_level_db` — the step l) Table D.4 0-dB
+    ///   reference under this implementation's FFT normalization
+    ///   (see [`model2_absthr_energy`]).
+    /// * `cw_through_line` — the optional step d)
+    ///   partial-calculation limit (see [`model2_step_d_cw_lines`]).
+    ///
+    /// The walk chains the front-half primitives (steps a)–e)) into
+    /// the previously landed back half: f) spreading convolution +
+    /// renormalization, g) tonality, h) required SNR, i) power
+    /// ratio, j) partition threshold, k) line spread, l)
+    /// absolute-threshold floor (Table D.4-uncovered lines have no
+    /// floor and pass `nb_ω` through), and n) the SMR reduction over
+    /// the Table D.5 spans. Step m) (pre-echo control) "is omitted
+    /// for Layers I and II" and is not part of this walk.
+    ///
+    /// On success the state advances (`t-1 → t-2`, current block
+    /// → `t-1`, window replaced) and the 32 `SMR_n` values are
+    /// returned in ascending partition order. Returns `None` —
+    /// leaving the state untouched — when `new_samples` is empty or
+    /// longer than 1 024 (the step a) domain).
+    #[must_use]
+    pub fn smr(
+        &mut self,
+        new_samples: &[f64],
+        fs: AnnexDSamplingRate,
+        half_lsb_sine_level_db: f64,
+        cw_through_line: Option<usize>,
+    ) -> Option<Vec<f64>> {
+        // a) Reconstruct the 1 024-sample analysis window.
+        let window = model2_step_a_reconstruct(&self.window, new_samples)?;
+        // b) Windowed forward FFT, polar representation.
+        let polar = model2_step_b_spectrum(&window)?;
+        // c) Predicted r̂/f̂ from the t-1 / t-2 spectra.
+        let predicted = model2_step_c_predict_polar(&self.prev, &self.prev2)?;
+        // d) Unpredictability measure c_ω.
+        let cw = model2_step_d_cw_lines(&polar, &predicted, cw_through_line)?;
+        // e) Partition energy e_b and weighted unpredictability c_b.
+        let partitions = model2_partition_table(fs);
+        let eb = model2_step_e_eb(&polar.r, partitions)?;
+        let cb_raw = model2_step_e_cb(&polar.r, &cw, partitions)?;
+        // f) Spreading convolution + renormalization.
+        let bval = model2_bval(fs);
+        let ecb = model2_step_f_spread(&eb, &bval)?;
+        let ct = model2_step_f_spread(&cb_raw, &bval)?;
+        let cb = model2_step_f_cb(&ct, &ecb)?;
+        let rnorm = model2_step_f_rnorm(&bval);
+        let en = model2_step_f_en(&ecb, &rnorm)?;
+        // g) Tonality index per partition.
+        let tb: Vec<f64> = cb.iter().map(|&c| model2_step_g_tonality(c)).collect();
+        // h) Required SNR; i) power ratio; j) partition threshold.
+        let snr = model2_step_h_snr(&tb, partitions)?;
+        let bc: Vec<f64> = snr.iter().map(|&s| model2_step_i_bc(s)).collect();
+        let nb = model2_step_j_nb(&en, &bc)?;
+        // k) Spread the threshold energy over the FFT lines.
+        let nb_lines = model2_step_k_nb_lines(&nb, partitions)?;
+        // l) Floor by the Table D.4 absolute threshold (energy
+        // domain); uncovered lines have no floor (absthr_ω = 0).
+        let absthr: Vec<f64> = (1..=nb_lines.len() as u16)
+            .map(|line| {
+                model2_absthr_for_line(fs, line)
+                    .map_or(0.0, |db| model2_absthr_energy(db, half_lsb_sine_level_db))
+            })
+            .collect();
+        let thr = model2_step_l_thr_lines(&nb_lines, &absthr)?;
+        // n) SMR_n over the Table D.5 coder partitions.
+        let smr = model2_step_n_smr(&polar.r, &thr)?;
+        // Advance the state only after the whole walk succeeded.
+        self.prev2 = core::mem::replace(&mut self.prev, polar);
+        self.window = window;
+        Some(smr)
+    }
 }
 
 /// One row of Annex D Table D.5 — *Layer I and Layer II coder
@@ -16894,5 +17416,330 @@ mod tests {
                 .map(|l| (AnnexDSamplingRate::Hz44100, l, 69.13, 68.00)),
         );
         assert_eq!(mismatches, expected);
+    }
+
+    // ----- §D.2.1 + §D.2.4 steps a)–e) front half (Phase 2 step 84) -----
+
+    #[test]
+    fn model2_iblen_range_bounds_are_strict() {
+        // §D.2.1 a) verbatim "384<iblen<640": both bounds excluded.
+        assert!(!model2_iblen_in_range(384));
+        assert!(model2_iblen_in_range(385));
+        assert!(model2_iblen_in_range(576)); // the Layer III granule shift
+        assert!(model2_iblen_in_range(639));
+        assert!(!model2_iblen_in_range(640));
+        assert!(!model2_iblen_in_range(0));
+    }
+
+    #[test]
+    fn model2_step_a_reconstructs_consecutive_samples() {
+        let prev: Vec<f64> = (0..1024).map(f64::from).collect();
+        let new: Vec<f64> = (0..576).map(|i| f64::from(2000 + i)).collect();
+        let out = model2_step_a_reconstruct(&prev, &new).unwrap();
+        assert_eq!(out.len(), MODEL2_FFT_LEN);
+        // The most recent 1024-576 = 448 samples of the previous
+        // window come first…
+        assert_eq!(out[..448], prev[576..]);
+        // …then the iblen new samples.
+        assert_eq!(out[448..], new[..]);
+    }
+
+    #[test]
+    fn model2_step_a_rejects_out_of_domain_lengths() {
+        let prev = vec![0.0; 1024];
+        assert!(model2_step_a_reconstruct(&prev, &[]).is_none());
+        assert!(model2_step_a_reconstruct(&prev, &vec![0.0; 1025]).is_none());
+        assert!(model2_step_a_reconstruct(&vec![0.0; 1023], &vec![0.0; 576]).is_none());
+        // Full-window replacement (iblen = 1024) is within the
+        // primitive's domain even though it is outside the §D.2.1
+        // standard-table range.
+        assert!(model2_step_a_reconstruct(&prev, &vec![1.0; 1024]).is_some());
+    }
+
+    #[test]
+    fn model2_hann_window_domain_symmetry_and_values() {
+        assert!(model2_hann_window(0).is_none());
+        assert!(model2_hann_window(1025).is_none());
+        // Half-sample-offset symmetry: w(i) = w(1025 - i).
+        for i in [1usize, 2, 100, 512] {
+            let a = model2_hann_window(i).unwrap();
+            let b = model2_hann_window(1025 - i).unwrap();
+            assert!(
+                (a - b).abs() < 1.0e-15,
+                "w({i}) = {a} vs w({}) = {b}",
+                1025 - i
+            );
+        }
+        // No zero endpoint (the (i - 0,5) offset keeps w(1) > 0) and
+        // no sample reaches the raised cosine's supremum of 1.
+        let w1 = model2_hann_window(1).unwrap();
+        assert!(w1 > 0.0 && w1 < 1.0e-4);
+        let wmax = (1..=1024)
+            .map(|i| model2_hann_window(i).unwrap())
+            .fold(0.0, f64::max);
+        assert!(wmax < 1.0 && wmax > 0.999_99);
+        // Spot value: w(1) = 0,5 - 0,5·cos(2π·0,5/1024).
+        let expect = 0.5 - 0.5 * (core::f64::consts::PI / 1024.0).cos();
+        assert!((w1 - expect).abs() < 1.0e-15);
+        // Unlike the Model 1 Step 1 window there is no sqrt(8/3)
+        // power prefactor: Σ w(i)² is strictly below N (= what the
+        // unit-power Model 1 window sums to).
+        let power: f64 = (1..=1024)
+            .map(|i| model2_hann_window(i).unwrap().powi(2))
+            .sum();
+        assert!((power - 384.0).abs() < 1.0e-9); // N·3/8 for the bare raised cosine
+    }
+
+    #[test]
+    fn model2_step_b_rejects_wrong_lengths() {
+        assert!(model2_step_b_spectrum(&[]).is_none());
+        assert!(model2_step_b_spectrum(&vec![0.0; 512]).is_none());
+        assert!(model2_step_b_spectrum(&vec![0.0; 1025]).is_none());
+    }
+
+    #[test]
+    fn model2_step_b_dc_block_concentrates_at_line_1() {
+        // A constant block transforms to the window's own sum at the
+        // DC line (ω = 1): Σ w(i) = N/2 = 512 exactly for the bare
+        // raised cosine (the cos terms cancel by half-sample
+        // symmetry).
+        let polar = model2_step_b_spectrum(&vec![1.0; 1024]).unwrap();
+        assert_eq!(polar.r.len(), MODEL2_FFT_LINES);
+        assert_eq!(polar.f.len(), MODEL2_FFT_LINES);
+        assert!((polar.r[0] - 512.0).abs() < 1.0e-9, "r_1 = {}", polar.r[0]);
+        // The Hann window's spectral leakage is confined to ±1 line:
+        // from line 4 on the magnitude is negligible next to DC.
+        for (idx, &r) in polar.r.iter().enumerate().skip(3) {
+            assert!(r < 1.0e-9 * 512.0, "line {}: r = {r}", idx + 1);
+        }
+    }
+
+    #[test]
+    fn model2_step_b_bin_exact_sine_peaks_at_its_line() {
+        // s_i = cos(2π·64·(i-1)/1024) sits exactly on FFT bin 64
+        // (line ω = 65); the windowed magnitude there is N/4 = 256
+        // (half the DC response, the cosine splitting its energy
+        // between ±64).
+        let s: Vec<f64> = (0..1024)
+            .map(|n| (2.0 * core::f64::consts::PI * 64.0 * n as f64 / 1024.0).cos())
+            .collect();
+        let polar = model2_step_b_spectrum(&s).unwrap();
+        assert!(
+            (polar.r[64] - 256.0).abs() < 1.0e-8,
+            "r_65 = {}",
+            polar.r[64]
+        );
+        // Hann leakage: ±1 lines carry half the peak; beyond ±2 lines
+        // nothing.
+        assert!((polar.r[63] - 128.0).abs() < 1.0e-8);
+        assert!((polar.r[65] - 128.0).abs() < 1.0e-8);
+        assert!(polar.r[60] < 1.0e-6);
+        assert!(polar.r[70] < 1.0e-6);
+    }
+
+    #[test]
+    fn model2_step_c_prediction_is_linear_extrapolation() {
+        assert_eq!(model2_step_c_predict(3.0, 1.0), 5.0);
+        assert_eq!(model2_step_c_predict(0.0, 0.0), 0.0);
+        let prev = Model2Polar {
+            r: vec![3.0, 2.0],
+            f: vec![0.5, -0.25],
+        };
+        let prev2 = Model2Polar {
+            r: vec![1.0, 2.0],
+            f: vec![0.25, -0.5],
+        };
+        let p = model2_step_c_predict_polar(&prev, &prev2).unwrap();
+        assert_eq!(p.r, vec![5.0, 2.0]);
+        assert_eq!(p.f, vec![0.75, 0.0]);
+        // Length mismatches are rejected.
+        assert!(model2_step_c_predict_polar(&prev, &Model2Polar::zeroed()).is_none());
+    }
+
+    #[test]
+    fn model2_step_d_cw_endpoints() {
+        // Perfect prediction → 0.
+        assert_eq!(model2_step_d_cw(2.0, 0.7, 2.0, 0.7), 0.0);
+        // Zero-magnitude prediction of a live line → 1.
+        assert!((model2_step_d_cw(5.0, 1.2, 0.0, 0.4) - 1.0).abs() < 1.0e-15);
+        // Opposite-phase, equal-magnitude prediction → 1 (the
+        // measure's maximum).
+        let c = model2_step_d_cw(1.0, 0.0, 1.0, core::f64::consts::PI);
+        assert!((c - 1.0).abs() < 1.0e-15);
+        // All-silent 0/0 convention → 0.
+        assert_eq!(model2_step_d_cw(0.0, 0.0, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn model2_step_d_cw_lines_partial_limit_sets_0_3() {
+        let cur = Model2Polar {
+            r: vec![1.0; 8],
+            f: vec![0.0; 8],
+        };
+        let pred = Model2Polar {
+            r: vec![1.0; 8],
+            f: vec![0.0; 8],
+        };
+        let full = model2_step_d_cw_lines(&cur, &pred, None).unwrap();
+        assert_eq!(full, vec![0.0; 8]);
+        let partial = model2_step_d_cw_lines(&cur, &pred, Some(3)).unwrap();
+        assert_eq!(&partial[..3], &[0.0; 3]);
+        assert_eq!(&partial[3..], &[MODEL2_CW_ABOVE_LIMIT; 5]);
+        // A limit at or past the line count is the full calculation.
+        assert_eq!(model2_step_d_cw_lines(&cur, &pred, Some(8)).unwrap(), full);
+        // Mismatched spectra are rejected.
+        assert!(model2_step_d_cw_lines(&cur, &Model2Polar::zeroed(), None).is_none());
+    }
+
+    #[test]
+    fn model2_step_e_partitions_conserve_energy() {
+        // The Table D.3 partitions tile lines 1..=513, so the e_b sum
+        // over partitions equals the total line energy — at every
+        // sampling rate.
+        let r: Vec<f64> = (0..MODEL2_FFT_LINES)
+            .map(|i| ((i * 37 + 11) % 101) as f64 / 100.0)
+            .collect();
+        let total: f64 = r.iter().map(|&x| x * x).sum();
+        for fs in ALL_RATES {
+            let parts = model2_partition_table(fs);
+            let eb = model2_step_e_eb(&r, parts).unwrap();
+            assert_eq!(eb.len(), parts.len());
+            let sum: f64 = eb.iter().sum();
+            assert!(
+                (sum - total).abs() < 1.0e-9 * total,
+                "{fs:?}: {sum} vs {total}"
+            );
+            // With c_ω ≡ 1 the weighted unpredictability c_b equals e_b.
+            let cb = model2_step_e_cb(&r, &vec![1.0; r.len()], parts).unwrap();
+            for (a, b) in cb.iter().zip(eb.iter()) {
+                assert!((a - b).abs() < 1.0e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn model2_step_e_rejects_short_or_mismatched_slices() {
+        let parts = model2_partition_table(AnnexDSamplingRate::Hz32000);
+        assert!(model2_step_e_eb(&vec![0.0; 512], parts).is_none());
+        assert!(model2_step_e_eb(&[], parts).is_none());
+        assert!(model2_step_e_eb(&vec![0.0; 513], &[]).is_none());
+        assert!(model2_step_e_cb(&vec![0.0; 513], &vec![0.0; 512], parts).is_none());
+        assert!(model2_step_e_cb(&vec![0.0; 512], &vec![0.0; 512], parts).is_none());
+    }
+
+    #[test]
+    fn model2_state_walk_matches_manual_primitive_chain() {
+        // The full Model2State walk reproduces, value for value, a
+        // by-hand chain of the step primitives — pinning the bridge
+        // between the r282 front half and the r279–r281 back half.
+        let fs = AnnexDSamplingRate::Hz44100;
+        let iblen = 576usize;
+        let half_lsb_db = -20.0;
+        let block: Vec<f64> = (0..iblen)
+            .map(|n| (2.0 * core::f64::consts::PI * n as f64 / 32.0).sin() * 0.25)
+            .collect();
+
+        let mut state = Model2State::new();
+        // Warm up two calls so t-1 / t-2 hold real spectra.
+        state.smr(&block, fs, half_lsb_db, None).unwrap();
+        state.smr(&block, fs, half_lsb_db, None).unwrap();
+
+        // Manual replay of call 3 from a mirror of the state's inputs.
+        let mut window = vec![0.0; MODEL2_FFT_LEN];
+        let (mut r1, mut f1) = (vec![0.0; 513], vec![0.0; 513]);
+        let (mut r2, mut f2) = (vec![0.0; 513], vec![0.0; 513]);
+        for _ in 0..2 {
+            window = model2_step_a_reconstruct(&window, &block).unwrap();
+            let p = model2_step_b_spectrum(&window).unwrap();
+            (r2, f2) = (r1, f1);
+            (r1, f1) = (p.r, p.f);
+        }
+        let window3 = model2_step_a_reconstruct(&window, &block).unwrap();
+        let polar = model2_step_b_spectrum(&window3).unwrap();
+        let predicted = model2_step_c_predict_polar(
+            &Model2Polar { r: r1, f: f1 },
+            &Model2Polar { r: r2, f: f2 },
+        )
+        .unwrap();
+        let cw = model2_step_d_cw_lines(&polar, &predicted, None).unwrap();
+        let parts = model2_partition_table(fs);
+        let eb = model2_step_e_eb(&polar.r, parts).unwrap();
+        let cb_raw = model2_step_e_cb(&polar.r, &cw, parts).unwrap();
+        let bval = model2_bval(fs);
+        let ecb = model2_step_f_spread(&eb, &bval).unwrap();
+        let ct = model2_step_f_spread(&cb_raw, &bval).unwrap();
+        let cb = model2_step_f_cb(&ct, &ecb).unwrap();
+        let rnorm = model2_step_f_rnorm(&bval);
+        let en = model2_step_f_en(&ecb, &rnorm).unwrap();
+        let tb: Vec<f64> = cb.iter().map(|&c| model2_step_g_tonality(c)).collect();
+        let snr = model2_step_h_snr(&tb, parts).unwrap();
+        let bc: Vec<f64> = snr.iter().map(|&s| model2_step_i_bc(s)).collect();
+        let nb = model2_step_j_nb(&en, &bc).unwrap();
+        let nb_lines = model2_step_k_nb_lines(&nb, parts).unwrap();
+        let absthr: Vec<f64> = (1..=nb_lines.len() as u16)
+            .map(|line| {
+                model2_absthr_for_line(fs, line)
+                    .map_or(0.0, |db| model2_absthr_energy(db, half_lsb_db))
+            })
+            .collect();
+        let thr = model2_step_l_thr_lines(&nb_lines, &absthr).unwrap();
+        let expect = model2_step_n_smr(&polar.r, &thr).unwrap();
+
+        let got = state.smr(&block, fs, half_lsb_db, None).unwrap();
+        assert_eq!(got, expect);
+    }
+
+    #[test]
+    fn model2_state_steady_sine_is_tonal_and_smr_positive_at_the_tone() {
+        // A bin-exact sinusoid whose period divides the shift length
+        // produces identical spectra every block: from the third call
+        // the step c) prediction is exact, c_ω ≈ 0 at the live lines,
+        // tonality ≈ 1, and the SMR at the tone's coder partition is
+        // strongly positive (signal well above its masking
+        // threshold). iblen = 512 keeps every 1 024-window identical;
+        // bin 64 (line 65, period 16 samples) divides 512.
+        let fs = AnnexDSamplingRate::Hz44100;
+        let mut state = Model2State::new();
+        let mut smr = Vec::new();
+        for call in 0..4 {
+            let base = call * 512;
+            let block: Vec<f64> = (0..512)
+                .map(|n| {
+                    (2.0 * core::f64::consts::PI * 64.0 * (base + n) as f64 / 1024.0).cos() * 1000.0
+                })
+                .collect();
+            smr = state.smr(&block, fs, -96.0, None).unwrap();
+            assert_eq!(smr.len(), 32);
+        }
+        let tone_partition = first_partition_containing_line(65).unwrap();
+        let tone_smr = smr[tone_partition as usize - 1];
+        assert!(
+            tone_smr.is_finite() && tone_smr > 10.0,
+            "SMR at partition {tone_partition} = {tone_smr}"
+        );
+    }
+
+    #[test]
+    fn model2_state_rejects_bad_blocks_and_stays_usable() {
+        let fs = AnnexDSamplingRate::Hz32000;
+        let mut state = Model2State::new();
+        let before = state.clone();
+        assert!(state.smr(&[], fs, 0.0, None).is_none());
+        assert!(state.smr(&vec![0.0; 1025], fs, 0.0, None).is_none());
+        // A failed call leaves the state untouched…
+        assert_eq!(state, before);
+        // …and a silent valid block still walks the whole chain
+        // (SMR_n is outside the spec's positive-energy domain there;
+        // the walk itself must not fail). A silent block over a
+        // zeroed state advances to a bit-identical zeroed state —
+        // the §D.2.1 known starting point is a fixed point of
+        // silence.
+        let out = state.smr(&vec![0.0; 576], fs, 0.0, None).unwrap();
+        assert_eq!(out.len(), 32);
+        assert_eq!(state, before);
+        // A live block does perturb the state.
+        let out = state.smr(&vec![0.5; 576], fs, 0.0, None).unwrap();
+        assert_eq!(out.len(), 32);
+        assert_ne!(state, before);
     }
 }

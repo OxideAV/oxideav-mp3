@@ -2373,6 +2373,57 @@ the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
 
+**Phase 2 step 84 (r282)** — Annex D Model 2 **§D.2.1 inputs +
+§D.2.4 steps a)–e)** — the FFT-side front half of the Model 2
+threshold calculation, completing the §D.2.4 chain end-to-end
+against the r279–r281 back half. Read from the staged ISO PDF
+(printed pp.128–130 / PDF pp.134–136; fresh 150-dpi renders of the
+three prose/equation pages, which are images-only in the text
+layer). Public surface (all in `psy`): `MODEL2_FFT_LEN` (1024) +
+`MODEL2_FFT_LINES` (513, the §D.2.2 DC..Nyquist line domain) +
+`model2_iblen_in_range` (the verbatim strict `384<iblen<640`
+§D.2.1 shift-length constraint); step a)
+`model2_step_a_reconstruct` (keep `1024−iblen` previous samples,
+concatenate the `iblen` newest); step b) `model2_hann_window` (the
+1-based half-sample-offset raised cosine
+`0,5 − 0,5·cos(2π(i−0,5)/1024)` — no Model 1 `sqrt(8/3)` power
+prefactor) + `Model2Polar` + `model2_step_b_spectrum` (window →
+unnormalized forward FFT → polar `r_ω`/`f_ω`, normalization
+absorbed by the step l) `model2_absthr_energy` calibration
+parameter per the printed "after considering the FFT normalization
+actually used"); step c) `model2_step_c_predict` /
+`model2_step_c_predict_polar` (`x̂_ω = 2,0·x_ω(t−1) − x_ω(t−2)`,
+branch-cut-safe through the step d) cos/sin consumption); step d)
+`model2_step_d_cw` / `model2_step_d_cw_lines` (the unpredictability
+measure with documented `0/0 → 0` silent-line convention) +
+`MODEL2_CW_ABOVE_LIMIT` (the verbatim 0,3 partial-calculation
+default above the caller's line limit); step e) `model2_step_e_eb`
+/ `model2_step_e_cb` (`e_b = Σ r_ω²`, `c_b = Σ r_ω²·c_ω` over the
+Table D.3 partitions). Integration: `Model2State` (the §D.2.1
+zeroed "known starting point" — preceding source window + `t−1`/
+`t−2` polar spectra) with a `smr()` full walk chaining a)–l) + n)
+into the existing back-half entry points and returning the 32
+`SMR_n` Table D.5 outputs per call, advancing state only on
+success. 13 new unit tests: strict iblen bounds;
+reconstruction concatenation + domain rejections; window symmetry
+/ no-zero-endpoint / `Σw = 512` DC and `Σw² = 384` power anchors;
+DC-block and bin-exact-sine spectra (`r = 512` / `256` with
+Hann ±1-line leakage at exactly half peak); prediction
+extrapolation; the four `c_ω` endpoints (0 / 1 / opposite-phase 1
+/ silent 0); the 0,3 above-limit fill; partition energy
+conservation `Σe_b = Σr_ω²` at all three rates (+ `c_ω ≡ 1 ⇒
+c_b = e_b`); short/mismatched-slice rejections; a full-walk
+bridge test replaying `Model2State::smr` call 3 value-for-value
+against a by-hand a)→n) primitive chain; a steady bin-exact
+sinusoid driving tonality high with pinned positive SMR at the
+tone's coder partition; and failed-call state-untouched +
+silence-is-a-fixed-point semantics. Tests: 1024 lib (was 1009;
++15). The Model 2 §D.2.4 chain for Layers I/II is now complete;
+the remaining Layer III adaptations (§C.1.5.3.2.1 window
+switching, step m) pre-echo control) stay open. No external
+implementation consulted; only the staged ISO PDF and the in-tree
+r279–r281 surfaces were read.
+
 **Phase 2 step 83 (r281)** — Annex D Model 2 **§D.2.4 steps h)–l)
 and n)** — the entire back half of the Model 2 threshold
 calculation, from required SNR down to the `SMR_n` output vector
