@@ -54,7 +54,7 @@
 //! the noise-shaping iteration, not the primitive — so we leave it out
 //! and document the option for the bit-allocation step that comes next.
 //!
-//! No external implementation was consulted; every constant and
+//! Every constant and
 //! field-routing rule is taken from the ISO/IEC 11172-3:1993 §2.4.3.4.7
 //! text (the same §s the [`crate::requantize`] decoder side cites).
 

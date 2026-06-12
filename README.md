@@ -931,7 +931,7 @@ matching r165's procedure and the operational shape of the
 detector (the encoder's `block_type_per_gc` pre-pass and the
 §C.1.5.2 state machine both begin in `Long` regardless of the
 first granule's classification). Tests: 634 pass (was 629; +5
-from this step). No external implementation consulted — the
+from this step). The
 corpus is the r165 corpus, the sweep is a one-axis extension of
 the r165 sweep, and the metric is the r165 metric.
 
@@ -996,8 +996,7 @@ synthesises a real MPEG-2 LSF header (64 kbps / 22.05 kHz /
 mono) and asserts the r177-style "MPEG-1 only" rejection no
 longer fires — proving the version guard widened correctly
 rather than relaxing into accept-all. Tests: 611 pass total
-(+4 net from r177). No external implementation consulted.
-
+(+4 net from r177). 
 **Phase 2 step 36 (`oxideav_core::Decoder` trait stereo widening)**
 extends `Mp3CoreDecoder` from mono-only to MPEG-1 Layer III mono
 **and** stereo (independent `ChannelMode::Stereo` /
@@ -1518,7 +1517,7 @@ new modules carry the logic:
   silently coerced to their `DEFAULT_*` counterparts on out-of-domain
   input (threshold ≤ 0 or non-finite; leak outside `(0, 1)` or
   non-finite), independently — one bad knob never drags the other to
-  its default. No external implementation was consulted — every
+  its default. Every
   constant and every formula is justified by the clean-room
   reasoning at the top of the module (energy localisation,
   ambient-floor stability, IIR leakage).
@@ -1756,9 +1755,7 @@ cap-would-terminate fixture) plus 4 new integration tests in
 signature on every assembled (gr, ch); `subblock_gain` bounded ≤ 7;
 finite + non-silent PCM roundtrip via the short-aware decode chain;
 Mp3Demuxer accepts the new bitstream). Tests: 547 pass (was 532 at
-r158; +11 unit + 4 integration). No external implementation
-consulted.
-
+r158; +11 unit + 4 integration). 
 **Phase 2 step 30 (§C.1.5.4.3 outer-loop long-family transition-skeleton
 wiring)** widens `outer_loop_search_long` from pure-Long
 (`block_type == Long`, `window_switching_flag == false`) to the full
@@ -1799,9 +1796,7 @@ the click-train fixture carries the `scalefac_compress = 15`
 outer-loop wire signature, confirming the fixed-gain fallback path
 is no longer taken; the resulting bytestream remains
 Mp3Demuxer-acceptable end-to-end). Tests: 554 pass (was 547 at
-r159; +5 unit + 2 integration). No external implementation
-consulted.
-
+r159; +5 unit + 2 integration). 
 **Phase 2 step 31 (§2.4.3.4.10.3 auto-block-type mixed-block
 promotion)** closes the long-standing "auto path can never emit
 Mixed" gap. The §C.1.5.2 LONG → START → SHORT → STOP → LONG
@@ -1860,9 +1855,7 @@ identical PCM emits zero mixed granules; pure-sine stays Long under
 mixed-auto; mixed-auto + outer-loop combination engages
 `outer_loop_search_mixed` end-to-end with `scalefac_compress = 15`
 on every mixed granule and Mp3Demuxer round-trip acceptance). Tests:
-575 pass (was 554 at r160; +14 unit + 7 integration). No external
-implementation consulted.
-
+575 pass (was 554 at r160; +14 unit + 7 integration). 
 **Phase 2 step 35 (`DEFAULT_AMBIENT_LEAK` empirical-corpus
 calibration)** replaces the hand-wave justification for the
 `DEFAULT_AMBIENT_LEAK = 0.5` constant promoted to public API in
@@ -1945,8 +1938,7 @@ threshold and tighten the `<=` in property 2 into a `<` if the
 fast-end saturation collapses. The threshold sweep is itself a
 natural r166+ followup but is out of scope for r165 — the present
 step calibrates one knob in isolation. Tests: 602 pass (was 596;
-+6 from this step). No external implementation consulted.
-
++6 from this step). 
 **Phase 2 step 34 (§2.4.3.4.10 finer attack-detector knobs)** turns
 the encoder-side `attack_detect::AttackDetector`'s IIR adaptation
 rate into a per-instance tunable. Before r164 the detector exposed
@@ -1997,9 +1989,7 @@ then fed an identical 10-granule sequence of loud bursts; the slow
 detector fires at least as many times as the fast detector (and on
 the test construction it fires strictly more, with the fast
 detector adapting within ≈ 2 granules and falling silent). Tests:
-596 pass (was 589; +7 net from this step). No external
-implementation consulted.
-
+596 pass (was 589; +7 net from this step). 
 **Phase 2 step 33 (§2.4.3.4.9 cross-channel-MS block-type
 agreement)** closes the gap step 32 left open by widening the four
 block-type override toggles (`force_short_blocks_for_testing`,
@@ -2120,8 +2110,7 @@ left and a sustained sine on the right and asserts non-Long
 granules in channel 0 but Long-only in channel 1); and 3 in
 `auto_block_type_mixed_roundtrip.rs` (mirrors of the above for
 `enable_auto_block_type_with_mixed`). Tests: 586 pass (was 575 at
-r161; +11 integration). No external implementation consulted.
-
+r161; +11 integration). 
 **Phase 2 step 39 (r194)** — per-band psychoacoustic-threshold
 scaffold (Annex D threshold-in-quiet long-block path). The new
 `psy` module exposes `XminThresholds` — a typed per-band threshold
@@ -2168,8 +2157,7 @@ propagating into the §C.1.5.4.3 decision), API rejection of
 `set_per_band_xmin` without the outer loop enabled, silence
 round-trip, and single-tone 440 Hz self-decode at 65.77 dB. The
 `psy` module adds 9 unit tests. Tests: 649 pass (was 633 baseline;
-+10 unit, +6 integration). No external implementation consulted.
-
++10 unit, +6 integration). 
 **Phase 2 step 41 (r204)** — per-band psychoacoustic-threshold
 plumbing for the **mixed-block** path. Closes the dispatcher gap
 left by r194 (long path) and r197 (pure-short path): the
@@ -2217,9 +2205,7 @@ tests: shim equivalence, huge-threshold iter-1 termination, a tighter
 long band amplifies only that long band, a tighter short cell
 amplifies only that short cell, out-of-range entries are ignored, and
 a long-region skew diverges from the long-region uniform path. Tests:
-671 pass (was 662 baseline; +6 unit, +3 integration). No external
-implementation consulted.
-
+671 pass (was 662 baseline; +6 unit, +3 integration). 
 **Phase 2 step 42 (r207)** — trait-API one-shot threshold-in-quiet
 factory. The r194 / r197 / r204 per-band scaffolds required callers
 to build the encoder via `Mp3Encoder::new_with_outer_loop(…,
@@ -2258,8 +2244,7 @@ the offset reads the per-channel bitrate, not the aggregate), plus
 sine through `send_frame` + `flush` + `receive_packet` and confirms
 the assembled byte stream walks cleanly via `FrameWalker` +
 `parse_header` at the configured 44.1 kHz). Tests: 556 lib (was 547
-baseline; +9 unit). No external implementation consulted.
-
+baseline; +9 unit). 
 **Phase 2 step 43 (r213)** — caller-supplied §D.1 Step 3 dB offset
 path. The Phase 2 step 42 factory `new_with_threshold_in_quiet` (and
 its trait companion) derives the spec's two-branch offset (`−12 dB`
@@ -2299,8 +2284,7 @@ the spec-default constructor at the two anchor offsets;
 sine at `offset_db = -18 dB` through `send_frame` + `flush` +
 `FrameWalker`, plus the `…_rejects_more_than_two_channels` /
 `…_requires_sample_rate` validation guards). Tests: 569 lib (was 556
-baseline; +13 unit). No external implementation consulted.
-
+baseline; +13 unit). 
 **Phase 2 step 44 (r219)** — Annex D Model 1 §D.1 Step 6
 masking-function `vf` + masking-index `av_tm` / `av_nm` + Step 7
 global-threshold summation primitives. The prior threshold-in-quiet
@@ -2368,7 +2352,7 @@ masker → LTg dominates LTq within < 1 dB of the masker's
 own LT; LTg(both) > LTg(either) for two maskers (monotone
 power addition); exact `+10·log10(2) ≈ +3.0103 dB` for two
 equal-power co-located maskers. Tests: 587 lib (was 569
-baseline; +18 unit). No external implementation consulted; only
+baseline; +18 unit). Only
 the textually-transcribed `av` / `vf` / `LTg` equations from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were
 read.
@@ -2425,7 +2409,7 @@ PCM (R-channel PSNR *improves* 25.7 → 29.2 dB under intensity),
 encode determinism + bit-exact re-decode, and black-box
 cross-decode through `ffmpeg` and `mpg123` CLI binaries (both
 reproduce the 3.728 positional ratio and the below-bound pan; bytes
-only — no external source consulted). Tests: 1046 lib (was 1038;
+only). Tests: 1046 lib (was 1038;
 +8 unit) + 8 integration.
 
 **Phase 2 step 85 (r283)** — **§C.1.5.3.2.1 Layer III adaptation of
@@ -2482,8 +2466,7 @@ delayed switcher; partition accumulation/reduction/ratio edge
 cases; short-window symmetry + DC spectrum; impulse spreading at
 ±1 partition; and an end-to-end silence/tone/3-rate
 `Model2Layer3State` walk (silence keeps `en = 0`, `thm > 0`,
-no attack). Tests: 1038 lib (was 1024; +14). No external
-implementation consulted; only the staged ISO PDF and
+no attack). Tests: 1038 lib (was 1024; +14). Only the staged ISO PDF and
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were read.
 
 **Phase 2 step 84 (r282)** — Annex D Model 2 **§D.2.1 inputs +
@@ -2533,8 +2516,7 @@ tone's coder partition; and failed-call state-untouched +
 silence-is-a-fixed-point semantics. Tests: 1024 lib (was 1009;
 +15). The Model 2 §D.2.4 chain for Layers I/II is now complete;
 the remaining Layer III adaptations (§C.1.5.3.2.1 window
-switching, step m) pre-echo control) stay open. No external
-implementation consulted; only the staged ISO PDF and the in-tree
+switching, step m) pre-echo control) stay open. Only the staged ISO PDF and the in-tree
 r279–r281 surfaces were read.
 
 **Phase 2 step 83 (r281)** — Annex D Model 2 **§D.2.4 steps h)–l)
@@ -2585,7 +2567,7 @@ pinning `nb_1 = 10^(−0,55)` and the D.4a 58,23 dB floor on line
 now exactly the FFT-side front half — steps a)–e) (1024-sample
 reconstruction, Hann + FFT + polar, `r̂`/`f̂` prediction, the
 unpredictability measure `c_ω`, and the partitioned `e_b`/`c_b`
-sums). No external implementation consulted; only the staged ISO
+sums). Only the staged ISO
 PDF (printed pp.127–132) and the in-tree r279/r280 surfaces were
 read.
 
@@ -2626,7 +2608,7 @@ cross-table agreement. Tests: 998 lib (was 989; +9 unit). Next Model
 2 steps: h) required SNR per partition (`minval`/`TMN` now in-tree),
 i)–l) power ratio / energy threshold / line spread /
 absolute-threshold floor (D.4 now in-tree), then b)–e) FFT-side
-inputs. No external implementation consulted; only the six staged
+inputs. Only the six staged
 D.3/D.4 renders, the D.1e render (cross-check), and the extracts file
 were read.
 
@@ -2665,7 +2647,7 @@ recovers the `sprdngf` row (on the Table D.3a 20-row `bval` text
 anchor), uniform-energy `en ≈ 1` renormalization identity,
 constant-`c_ω` recovery through `cb`, zero-energy convention,
 tonality clamps at both ends + formula/monotonicity. Tests: 989 lib
-(was 977; +12 unit). No external implementation consulted; only the
+(was 977; +12 unit). Only the
 staged ISO PDF pages (printed 127–132 prose + tables) and the
 extracts/anchor transcriptions in
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` were read.
@@ -2717,7 +2699,7 @@ integrity sweeps above, the seven textual LTq anchors = rows 1–5 / 51
 / 108 of D.1a, round-trip + nearest/tie/bounds cases for the index
 maps, bridge placement + out-of-band/Layer III refusals, a synthetic
 screen-and-decimate end-to-end, and the Steps 1–7 chain). Tests: 977
-lib (was 967; +10 unit). No external implementation consulted; only
+lib (was 967; +10 unit). Only
 the six Table D.1 PNG renders plus the in-repo Tables D.2
 transcription were read.
 
@@ -2782,7 +2764,7 @@ span across all tables, an end-to-end peak-plus-floor run (D.2e band
 normalize → Step 4 pure-tone chain (single above-floor tonal at
 `96 + 10·log10(1,5) ≈ 97,76 dB`, all-residue bands below 0 dB), and
 the silent-spectrum case (no tonal, all `-∞` non-tonal). Tests: 967
-lib (was 950; +17 unit). No external implementation consulted; only
+lib (was 950; +17 unit). Only
 the §D.1 Step 4 prose (printed p.111–112) read directly from
 `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` plus the in-repo Tables
 D.2 transcription in
@@ -2825,7 +2807,7 @@ shared-boundary-cell visibility from both adjacent subbands,
 spectrum, and an end-to-end Step 1 → normalize → Step 2 chain
 (tone at line ω = 101 → partition 7, `Lsb = 96 dB` against a small
 scalefactor, scf-term dominance against a huge one). Tests: 950 lib
-(was 942; +8 unit). No external implementation consulted; only the
+(was 942; +8 unit). Only the
 §D.1 Step 2 prose/formulas (printed p.110–111) read directly from
 `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` plus the in-repo Table
 D.5 transcription.
@@ -2865,8 +2847,7 @@ deterministic broadband blocks at both lengths (≤ 1e−8 dB), silent
 block → all `−∞`, normalization max-pin + delta preservation +
 identity-at-reference + refusal cases, and an end-to-end
 window→FFT→normalize pipeline pinning the tonal peak at exactly
-96 dB. Tests: 942 lib (was 930; +12 unit). No external
-implementation consulted; only the §D.1 Step 1 prose/formulas
+96 dB. Tests: 942 lib (was 930; +12 unit). Only the §D.1 Step 1 prose/formulas
 (printed p.110) read directly from
 `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`.
 
@@ -3022,8 +3003,7 @@ paired-pattern cross-check (matching `width_n` and
 ascending with LTg fan-out equal to one step-59 pass, a −30 dB
 interior-line LTg dip (ω = 300, partition via the step 56 inverse
 lookup) raising exactly one row's SMR by +30 dB with widths and all 31
-other rows unchanged, and idempotence for pure callbacks. No external
-implementation consulted; only the staged ISO/IEC 11172-3:1993 spec
+other rows unchanged, and idempotence for pure callbacks. Only the staged ISO/IEC 11172-3:1993 spec
 PDF (§D.1 Step 9, printed p.115) and the Phase 2 step 70 / step 60
 row-order accessors (and through them the cascade down to the Table
 D.5 transcription in
@@ -3061,7 +3041,7 @@ LTg equal to a directly-counted step-59 pass), the step 69
 bit-identity, a −30 dB interior-line LTg dip (ω = 300, partition via
 the step 56 inverse lookup) raising exactly one row's SMR by +30 dB
 with all 31 other rows unchanged, and idempotence for pure
-callbacks. No external implementation consulted; only the staged
+callbacks. Only the staged
 ISO/IEC 11172-3:1993 spec PDF (§D.1 Steps 2 / 8 / 9, printed
 pp.110/114/115) and the Phase 2 step 59 row-order reducer (and
 through it the cascade down to the Table D.5 transcription in
@@ -3105,7 +3085,7 @@ semantics in both directions, dual callback fan-out (Lsb exactly
 pass), a −30 dB interior-line LTg dip (ω = 300, partition located
 via the step 56 inverse lookup) raising exactly one wide cell's SMR
 by +30 dB with all 31 other cells unchanged, and idempotence for
-pure callbacks. No external implementation consulted; only the
+pure callbacks. Only the
 staged ISO/IEC 11172-3:1993 spec PDF (§D.1 Steps 2 / 8 / 9, printed
 pp.110/114/115) and the Phase 2 step 63 width-gated dB accessor
 (and through it the cascade down to the Table D.5 transcription in
@@ -3145,7 +3125,7 @@ count, verified by a `Cell`-counting callback), `narrow + wide`
 recovering the full row-order sum, block independence (a wide-only
 omega-400 perturbation moves only `wide_total`; a narrow-only
 omega-100 perturbation only `narrow_total`), and idempotence for a
-pure callback. No external implementation consulted; only the Phase
+pure callback. Only the Phase
 2 step 65 width-gated `log2(LTmin_lin_n)` column accessor (and
 through it the cascade down to the Table D.5 transcription in
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
@@ -3197,8 +3177,7 @@ narrow band (cross-block insulation), dip in wide band only
 affects wide band (cross-block insulation), and a recovery test
 that scales `narrow_band ++ wide_band` back to dB by
 `10 · log10(2)` and pins index-by-index against step 59's
-row-order LTmin vector. No external implementation consulted;
-only the Phase 2 step 64 width-gated linear-energy `LTmin_n`
+row-order LTmin vector. Only the Phase 2 step 64 width-gated linear-energy `LTmin_n`
 accessor (and through it the cascade down to the Table D.5
 transcription in
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
@@ -3245,7 +3224,7 @@ narrow band only affects narrow band (cross-block insulation),
 dip in wide band only affects wide band (cross-block insulation),
 and a recovery test that log-maps `narrow_band ++ wide_band` back
 to dB and pins index-by-index against step 59's row-order LTmin
-vector. No external implementation consulted; only the Phase 2
+vector. Only the Phase 2
 step 63 width-gated `LTmin_n` (dB) column accessor (and through
 it the cascade down to the Table D.5 transcription in
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
@@ -3331,8 +3310,7 @@ both columns of the paired output agree with the underlying
 single-column accessors (`coder_partition_d5_ltg_min_row_order`
 and `coder_partition_d5_width_row_order`) under a non-trivial
 affine callback `LTg(ω) = (ω − 256) × 0.5`. Tests: 770 lib (was
-757 baseline; +13 unit). No external implementation consulted;
-only the Phase 2 step 59 row-order LTmin reducer
+757 baseline; +13 unit). Only the Phase 2 step 59 row-order LTmin reducer
 `coder_partition_d5_ltg_min_row_order` and the Phase 2 step 60
 row-order width vector `coder_partition_d5_width_row_order` (and
 through them the Phase 2 step 58 per-partition reducer
@@ -3518,8 +3496,7 @@ reading). Table-wide endpoints are pinned (`out[0] = ωlow_1`,
 `out[31] = ωlow_32`). Finally, a negative-identity
 `LTg(ω) = -ω` callback is verified to return `-ωhigh_n` per row
 (the highest line produces the most-negative reduction).
-Tests: 745 lib (was 734 baseline; +11 unit). No external
-implementation consulted; only the Phase 2 step 58 per-partition
+Tests: 745 lib (was 734 baseline; +11 unit). Only the Phase 2 step 58 per-partition
 reducer `coder_partition_d5_ltg_min` and the Phase 2 step 55
 row-order iterator `coder_partition_d5_spans` (and through them
 the Phase 2 step 44 Step 7 `global_masking_threshold_db` and the
@@ -3607,8 +3584,7 @@ tonal masker at z = 5 Bark, SPL = 60 dB, and a synthetic
 lands) and asserts agreement with the explicit per-line fold —
 exercising the masking-function piecewise branches through the
 reduction without introducing any new spec arithmetic. Tests: 734
-lib (was 724 baseline; +10 unit). No external implementation
-consulted; only the Phase 2 step 57 per-partition iterator
+lib (was 724 baseline; +10 unit). Only the Phase 2 step 57 per-partition iterator
 `coder_partition_d5_omega_iter`, the Phase 2 step 44 Step 7
 `global_masking_threshold_db`, and (transitively) the Table D.5
 transcription in
@@ -3687,7 +3663,7 @@ directly. Finally an end-to-end composition smoke pin
 (ωhigh_n − ωlow_n + 1) / 2` for every recoverable partition —
 pinning the downstream Step 8 partition-threshold reduction's
 composition path directly. Tests: 724 lib (was 712 baseline; +12
-unit). No external implementation consulted; only the Phase 2
+unit). Only the Phase 2
 step 51 accessor `coder_partition_d5_line_range` and its underlying
 Table D.5 transcription in
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
@@ -3757,8 +3733,7 @@ the "lowest partition first" semantics directly — the inverse
 accessor's answer is computed from first principles as the minimum
 `n` across all partitions that contain `ω` under the step 54
 predicate (sweeping every in-band line).
-Tests: 712 lib (was 703 baseline; +9 unit). No external
-implementation consulted; only the Phase 2 step 55 iterator
+Tests: 712 lib (was 703 baseline; +9 unit). Only the Phase 2 step 55 iterator
 `coder_partition_d5_spans` and (through it) the Phase 2 step 53
 descriptor `coder_partition_d5_span` and its underlying Table D.5
 transcription in
@@ -3831,8 +3806,7 @@ to exercise the out-of-band false branch);
 `…_is_clone_and_repeatable` pins the multi-pass walk property the
 downstream reduction relies on — the iterator is cheap to clone
 and yields an identical sequence on each walk.
-Tests: 703 lib (was 696 baseline; +7 unit). No external
-implementation consulted; only the Phase 2 step 53 descriptor
+Tests: 703 lib (was 696 baseline; +7 unit). Only the Phase 2 step 53 descriptor
 `coder_partition_d5_span` and its underlying Table D.5
 transcription in
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
@@ -3912,8 +3886,7 @@ exercise the out-of-band false branch);
 `…_out_of_band_omega_is_false_at_every_in_range_partition` pins
 the predicate's silence on out-of-band `omega` values — `false`
 for `omega ∈ {0, 514, 1024, u16::MAX}` at every in-range `n`.
-Tests: 696 lib (was 689 baseline; +7 unit). No external
-implementation consulted; only the Phase 2 step 53 descriptor
+Tests: 696 lib (was 689 baseline; +7 unit). Only the Phase 2 step 53 descriptor
 and its underlying Table D.5 transcription in
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 §"Table D.5 - Layer I and Layer II coder partition table" were
@@ -4090,8 +4063,7 @@ pins the uniform 17-line inclusive span (open span equals
 `…_partitions_tile_fft_line_band_two_to_513` pins the tiling
 property (every partition's `ωhigh` equals the next partition's
 `ωlow`, the band starts at line 1 and tops out at line 513).
-Tests: 674 lib (was 665 baseline; +9 unit). No external
-implementation consulted; only the column heading
+Tests: 674 lib (was 665 baseline; +9 unit). Only the column heading
 `ωlow_{n+1} / ωhigh_n` from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 §"Table D.5 - Layer I and Layer II coder partition table" was
@@ -4166,8 +4138,7 @@ invented);
 `coder_partition_d5_omega_low_n_plus_1_equals_omega_high_n`
 exercises the table-wide dual-role identity
 `ωlow_{n+1} == ωhigh_n` across every `n ∈ 0..=32`. Tests: 665
-lib (was 655 baseline; +10 unit). No external implementation
-consulted; only the column heading
+lib (was 655 baseline; +10 unit). Only the column heading
 `ωlow_{n+1} / ωhigh_n` from
 `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 §"Table D.5 - Layer I and Layer II coder partition table" was

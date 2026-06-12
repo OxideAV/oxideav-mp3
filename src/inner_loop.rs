@@ -60,8 +60,8 @@
 //! returning the first (smallest) gain whose count fits, rather than a
 //! bisection. See [`search_linear`].
 //!
-//! No external implementation was consulted; every rule is taken from
-//! the ISO/IEC 11172-3:1993 §C.1.5.4 / §2.4.1.7 / §2.4.3.4.7 text.
+//! Every rule is taken from the ISO/IEC 11172-3:1993 §C.1.5.4 /
+//! §2.4.1.7 / §2.4.3.4.7 text.
 
 use crate::frame::MpegVersion;
 use crate::huffman::{

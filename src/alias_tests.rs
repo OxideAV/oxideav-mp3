@@ -1,7 +1,6 @@
 // Unit tests for the §2.4.3.4.10.1 alias-reduction stage. The reference
 // values are computed directly from the spec's butterfly pseudo code and
-// the Table 3-B.9 coefficients (`c[i]`, `cs[i]`, `ca[i]`); no external
-// implementation was consulted.
+// the Table 3-B.9 coefficients (`c[i]`, `cs[i]`, `ca[i]`).
 
 // This file is `include!`d into the `alias` module, so its `use` lines
 // (BlockType, GranuleChannel) and the module items are already in scope.

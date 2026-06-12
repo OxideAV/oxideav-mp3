@@ -87,8 +87,7 @@
 //!
 //! # Clean-room
 //!
-//! No external reference implementation was consulted while writing
-//! this classifier. The §2.4.3.4.10.3 mixed-block geometry is the
+//! The §2.4.3.4.10.3 mixed-block geometry is the
 //! only motivation; the one-tap LP kernel + subframe-energy ratio is
 //! a straightforward clean-room realisation. No table is imported.
 

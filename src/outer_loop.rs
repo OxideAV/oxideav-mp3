@@ -94,8 +94,8 @@
 //!   ever fires (the spec sets only two distinct `scalefac_scale`
 //!   values).
 //!
-//! No external implementation was consulted; every rule is taken from
-//! the §C.1.5.4.3 / §C.1.5.4.3.x text and Figure C.9.b.
+//! Every rule is taken from the §C.1.5.4.3 / §C.1.5.4.3.x text and
+//! Figure C.9.b.
 
 use crate::frame::MpegVersion;
 use crate::inner_loop::{search_bit_budget, search_magnitude_clamp, GAIN_MAX};
@@ -751,7 +751,7 @@ struct InnerInvocation {
 //
 // # Acknowledgement
 //
-// No external implementation was consulted. The per-(sfb, window)
+// The per-(sfb, window)
 // amplification mirror, the bounded subblock_gain escalation triggered
 // on §C.1.5.4.4.2 magnitude-clamp failure, and the `scalefac_scale`
 // halving step are derived from the §C.1.5.4.3 outer-loop pseudocode and
@@ -1265,7 +1265,7 @@ struct InnerShortInvocation {
 //
 // # Acknowledgement
 //
-// No external implementation was consulted. The mixed amplifier is a
+// The mixed amplifier is a
 // straight composition of the two existing primitives' per-band step,
 // with the §C.1.5.4.3.6 cap mapping derived directly from
 // `write_mpeg1_granule_channel`'s mixed branch.

@@ -2,8 +2,7 @@
 // derived from ISO/IEC 11172-3:1993 §2.4.3.4.9 (the MS matrix and the
 // intensity-stereo steps) and ISO/IEC 13818-3:1997 §2.4.3.2 (the LSF
 // intensity-stereo step 4/5 replacement), plus the §2.4.2.3
-// mode_extension table and the Table B.8 band-start indices. No external
-// implementation was consulted.
+// mode_extension table and the Table B.8 band-start indices.
 
 // This file is `include!`d into the `stereo` module, so its `use` lines
 // (ModeExtension, MpegVersion, ScaleFactors, GranuleChannel, BlockType,

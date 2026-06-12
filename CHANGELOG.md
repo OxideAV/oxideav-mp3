@@ -289,8 +289,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   determinism. Only the §C.1.5.2.7 "The new MNR of this subband is
   calculated" loop step and `MNR = SNR − SMR` definition (ISO/IEC
   11172-3:1993 Annex C, printed p.71) and the Phase 2 step 74
-  `bit_allocation_promote_entry` result it consumes are read; no external
-  implementation was consulted.
+  `bit_allocation_promote_entry` result it consumes are read.
 - psy: Annex C §C.1.5.2.7 "Bit allocation" next-higher-entry quantization
   promotion (Phase 2 step 74). Phase 2 step 73 (r272) selected the
   minimal-MNR subband — the one "that has the greatest benefit"; this step
@@ -318,8 +317,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   entry, and determinism. Only the §C.1.5.2.7 "increased by using the next
   higher entry in the relevant table B.2" loop step (ISO/IEC 11172-3:1993
   Annex C, printed p.71) and the Phase 2 step 73
-  `coder_partition_d5_min_mnr` selection it consumes are read; no external
-  implementation was consulted.
+  `coder_partition_d5_min_mnr` selection it consumes are read.
 - psy: Annex C §C.1.5.2.7 "Bit allocation" minimal-MNR subband selection
   (Phase 2 step 73). Phase 2 step 72 (r271) landed the per-partition
   `MNR_n = SNR_n − SMR_n` row-order vector; this step performs the first
@@ -377,8 +375,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   "subband with the greatest benefit" = unique minimum-MNR argmin under
   a −30 dB interior-line LTg dip, SNR fan-out once-per-partition
   ascending, sign semantics in both directions (needs-bits vs already-
-  protected), and idempotence for pure callbacks. No external
-  implementation consulted; only the staged ISO/IEC 11172-3:1993 spec
+  protected), and idempotence for pure callbacks.
+  Only only the staged ISO/IEC 11172-3:1993 spec
   PDF (Annex C §C.1.5.2.7, printed p.73; §D.1 Step 9, printed p.115)
   and the Phase 2 step 71 row-order accessor (and through it the Table
   D.5 transcription in
@@ -415,8 +413,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   ascending with LTg fan-out equal to one step-59 pass, a −30 dB
   interior-line LTg dip (ω = 300) raising exactly one row's SMR by
   +30 dB with widths and all 31 other rows unchanged, and idempotence
-  for pure callbacks. No external implementation consulted; only the
-  staged ISO/IEC 11172-3:1993 spec PDF (§D.1 Step 9, printed p.115)
+  for pure callbacks.1 Step 9, printed p.115)
   and the Phase 2 step 70 / step 60 row-order accessors (and through
   them the Table D.5 transcription in
   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) are read.
@@ -699,8 +696,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Step 63 keeps the Phase 2 chain on the row-order paired vector —
   Steps 1-5 (FFT / SPL / tonality classifier) and the Layer III
   §D.2 / Model 2 calc-partition replacement remain blocked on the
-  Table D.1 / D.3 PNG-only transcription gap. No external
-  implementation read; all truth from
+  Table D.1 / D.3 PNG-only transcription gap. All truth from
   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` §"Table
   D.5 - Layer I and Layer II coder partition table".
 
@@ -746,8 +742,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   added. Step 62 keeps the Phase 2 chain on the row-order paired
   vector — Steps 1-5 (FFT / SPL / tonality classifier) and the
   Layer III §D.2 / Model 2 calc-partition replacement remain blocked
-  on the Table D.1 / D.3 PNG-only transcription gap. No external
-  implementation read; all truth from
+  on the Table D.1 / D.3 PNG-only transcription gap. All truth from
   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` §"Table
   D.5 - Layer I and Layer II coder partition table".
 
@@ -785,11 +780,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   pure callback, single-dip on a strict-interior line affects only
   the target partition's ltmin_db with widths untouched, and
   strict-composition pairing with step 59 + step 60 across every
-  row. No external implementation consulted; only the Phase 2 step
-  59 row-order LTmin reducer `coder_partition_d5_ltg_min_row_order`
-  and the Phase 2 step 60 row-order width vector
-  `coder_partition_d5_width_row_order` (and through them the Phase
-  2 step 58 / 52 underlying accessors and the Table D.5
+  row.5
   transcription in
   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) were
   read.
@@ -823,10 +814,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   verbatim 32-element constant, table-wide endpoint pin
   (`out[0] = 0`, `out[31] = 1`), upper-block-count sum pin (Σ = 20),
   idempotence across back-to-back calls, non-decreasing monotonicity,
-  and ascending-partition iteration order. No external implementation
-  consulted; only the Phase 2 step 52 per-partition `width_n`
-  accessor and the Phase 2 step 55 row-order iterator (and through
-  them the Table D.5 transcription in
+  and ascending-partition iteration order.5 transcription in
   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`) were read.
 
 - psy: Annex D Model 1 §D.1 Step 8 row-order LTmin vector over
@@ -898,8 +886,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
   §"Table D.5 - Layer I and Layer II coder partition table") are
   consulted; the row-order broadcast reading is the spec's per
-  Annex D Step 8 (informative Model 1 reduction); no external
-  implementation was read.
+  Annex D Step 8 (informative Model 1 reduction).
 
 - psy: Annex D Model 1 §D.1 Step 8 per-partition `LTg` minimum
   reduction (Phase 2 step 58). Phase 2 step 44 (r219) landed Step 7's
@@ -1195,7 +1182,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Provenance: only the `width_n` column from
   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
   §"Table D.5 - Layer I and Layer II coder partition table" is
-  consulted; no external reference implementation read.
+  consulted.
 - psy: Annex D Table D.5 partition FFT-line range accessor (Phase 2
   step 51). Compose the Phase 2 step 50 dual-role accessors into a
   single per-partition span accessor. New free function
@@ -1226,7 +1213,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   heading `ωlow_{n+1} / ωhigh_n` from
   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
   §"Table D.5 - Layer I and Layer II coder partition table" is
-  consulted; no external reference implementation read.
+  consulted.
 - psy: Annex D Table D.5 dual-role boundary accessors (Phase 2
   step 50). Surface the `ωlow_{n+1} / ωhigh_n` column heading's two
   spec roles as named accessors so callers no longer have to apply
@@ -1262,7 +1249,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `ωlow_{n+1} / ωhigh_n` from
   `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
   §"Table D.5 - Layer I and Layer II coder partition table" is
-  consulted; no external reference implementation read.
+  consulted.
 - psy: Annex D Table D.5 Layer I / Layer II coder partition table
   (Phase 2 step 49). The 33-row partition table is transcribed
   verbatim from the staged
@@ -1631,10 +1618,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   contains the default, spans the documented bounds).
   Tests: 634 pass (was 629; +5 from this step). cargo clippy
   --all-targets --no-deps -- -D warnings clean; cargo fmt --check
-  clean. No external implementation consulted (the corpus, the
-  sweep, and the metric are all derived from the
-  `attack_detect` module's own clean-room reasoning, extending the
-  r165 calibration along the threshold axis).
+  clean.
   `DEFAULT_ATTACK_THRESHOLD`'s doc-comment is updated with the
   argmin + asymmetric endpoint property; the constant value
   `10.0` is unchanged — the calibration validates the existing
@@ -1733,7 +1717,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   constructs an MPEG-2 LSF header (64 kbps / 22.05 kHz) and pins
   that the r177-style `"MPEG-1 only"` rejection no longer fires
   for LSF traffic. 611 tests pass total (+4 net from r177's
-  baseline). No external implementation consulted.
+  baseline).
 - **`oxideav_core::Decoder` trait stereo widening** (Phase 2 step 36,
   r177). Extends `Mp3CoreDecoder` from mono-only to MPEG-1 Layer III
   mono **and** stereo (independent `ChannelMode::Stereo` /
@@ -1766,7 +1750,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the wrapper, planar `AudioFrame` invariants, and registry-built
   decoder end-to-end) plus 1 net new unit test on `make_decoder`'s
   channel-count validation. 619 tests pass total (was 615; +4
-  integration). No external implementation consulted.
+  integration).
 - **`DEFAULT_AMBIENT_LEAK` empirical-corpus calibration** (Phase 2
   step 35, r165). Replaces the hand-wave justification for the
   r164-promoted `DEFAULT_AMBIENT_LEAK = 0.5` constant with a
@@ -1889,7 +1873,6 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   engages the shared scheduler when an attack hits either channel,
   not just both). All emit valid `Mp3Demuxer`-acceptable bitstreams.
   Tests: 589 pass (was 586 at r162; +3 net = +8 new − 5 rewrites).
-  No external implementation consulted.
 
 - **§2.4.3.4.9 independent-stereo widening of the block-type override
   toggles** (Phase 2 step 32, r162). Narrows the long-standing
@@ -2003,7 +1986,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `outer_loop_search_mixed` end-to-end with `scalefac_compress = 15`
   on every mixed granule and Mp3Demuxer round-trip acceptance). All
   Mp3 tests now: **575 pass** (was 554 at r160; +14 unit + 7
-  integration). No external implementation consulted.
+  integration).
 
 - **§C.1.5.4.3 outer-loop long-family transition-skeleton wiring**
   (Phase 2 step 30, r160). `outer_loop_search_long` widens from
@@ -2110,8 +2093,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   every (gr, ch), subblock_gain field bounded ≤ 7, finite + non-silent
   PCM roundtrip via the short-aware decode chain, and Mp3Demuxer
   acceptance of the new bitstream). Tests: 547 pass (was 532 at r158;
-  +11 unit + 4 integration). No external implementation consulted;
-  every rule is derived from §C.1.5.4.3 / §2.4.2.7 / §2.4.3.4.7.1 of
+  +11 unit + 4 integration).1.5.4.3 / §2.4.2.7 / §2.4.3.4.7.1 of
   ISO/IEC 11172-3:1993 and from this crate's own r144 / r157
   primitives. No `[package] version` bump.
 
@@ -2180,9 +2162,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   covering termination paths, per-cell amplification isolation,
   `subblock_gain` escalation on extreme amplitudes, quiet-input
   invariance, preflag invariant, and the `scalefac_scale`
-  escalation branch on a cap-would-terminate fixture. No external
-  implementation consulted.
-
+  escalation branch on a cap-would-terminate fixture. 
 - **Signal-driven auto block-type dispatch** (Phase 2 step 26).
   Replaces the global force-toggles with a per-granule decision
   driven by content. Two new modules carry the logic:
@@ -2193,9 +2173,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     the granule as carrying an attack iff the loudest subframe
     exceeds `threshold ×` the running ambient (an exponentially
     smoothed `min`-floor of recent subframe energies with leakage
-    `0.5`). Default ratio `10.0`; module docs explain tuning. No
-    external reference was consulted — every constant is justified
-    by the clean-room reasoning in the module's preamble.
+    `0.5`). Default ratio `10.0`; module docs explain tuning. Every
+    constant is justified by the clean-room reasoning in the
+    module's preamble.
   - `block_type_sm` — the §C.1.5.2
     `LONG → START → SHORT → STOP → LONG` transition state machine
     that turns the per-granule attack flags into geometrically

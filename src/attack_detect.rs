@@ -76,8 +76,7 @@
 //! detector over-aggressive (almost any modulated signal trips). The
 //! default in [`AttackDetector::new`] is `10.0`.
 //!
-//! No external reference implementation was consulted while writing
-//! this heuristic. Every constant and every formula in this module
+//! Every constant and every formula in this module
 //! is justified by the clean-room reasoning above (energy
 //! localisation, threshold semantics, IIR-leakage stability).
 
@@ -190,8 +189,7 @@ pub const DEFAULT_ATTACK_THRESHOLD: f64 = 10.0;
 ///   `ambient ← leak · min_k E_k + (1 − leak) · ambient`.
 ///   Default [`DEFAULT_AMBIENT_LEAK`] (`0.5`).
 ///
-/// No external reference implementation was consulted while choosing
-/// either knob's semantics. The ratio-of-energies threshold and the
+/// The ratio-of-energies threshold and the
 /// IIR-leakage adaptation are both consequences of the clean-room
 /// reasoning at the top of this module (energy localisation +
 /// adapt-to-floor).
@@ -848,8 +846,7 @@ mod tests {
     // with the new threshold and tighten the `<=` in property (2) into
     // a `<` if the asymmetry collapses.
     //
-    // No external implementation was consulted while building this
-    // corpus. Every signal is synthesised in-test from a closed-form
+    // Every signal in this corpus is synthesised in-test from a closed-form
     // expression; the "expected fire-count" for each is derived from
     // the signal's construction and the module-doc heuristic
     // (transient = localised energy burst vs ambient floor).
@@ -1351,8 +1348,7 @@ mod tests {
     // counterpart to the leak pin of the same name. Five new tests
     // total.
     //
-    // No external implementation was consulted while building this
-    // calibration. The threshold sweep, the metric, and the corpus
+    // The threshold sweep, the metric, and the corpus of this calibration
     // are all derived from this module's own clean-room reasoning.
 
     /// Candidate attack-threshold values for the empirical sweep. The

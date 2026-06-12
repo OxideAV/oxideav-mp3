@@ -19,8 +19,7 @@
 //!    flip the wire `mode_extension` mid-stream — proving the
 //!    decision is genuinely per-frame, not encoder-wide.
 //!
-//! All asserts use only the crate's own primitives. No external
-//! decoder, no external library source.
+//! All asserts use only the crate's own primitives.
 
 use std::f32::consts::PI;
 

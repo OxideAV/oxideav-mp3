@@ -28,7 +28,7 @@
 //!    between `'11'` and `'01'` with the below-bound correlation.
 //! 6. **Black-box cross-decode** — when `ffmpeg` and/or `mpg123` are on
 //!    `PATH`, the emitted intensity stream is decoded by invoking the
-//!    binary (its bytes only; no external source is ever consulted) and
+//!    binary (its bytes only) and
 //!    the recovered PCM must preserve the left-leaning stereo image.
 
 use std::f32::consts::PI;

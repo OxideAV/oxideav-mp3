@@ -3355,7 +3355,7 @@ pub fn coder_partition_d5_omega_iter(n: u16) -> Option<core::ops::RangeInclusive
 /// the Step 7 `LTg(ω)` reading (Phase 2 step 44 /
 /// [`global_masking_threshold_db`]) are consulted. The minimum-
 /// reduction reading is the spec's per Annex D Step 8 (informative
-/// Model 1 reduction); no external implementation was read.
+/// Model 1 reduction).
 #[inline]
 #[must_use]
 pub fn coder_partition_d5_ltg_min<F>(n: u16, ltg_per_line: F) -> Option<f64>
@@ -3488,8 +3488,7 @@ where
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.5 - Layer I and Layer II coder partition table") are
 /// consulted. The row-order broadcast reading is the spec's per
-/// Annex D Step 8 (informative Model 1 reduction); no external
-/// implementation was read.
+/// Annex D Step 8 (informative Model 1 reduction).
 #[must_use]
 pub fn coder_partition_d5_ltg_min_row_order<F>(ltg_per_line: F) -> [f64; 32]
 where
@@ -3630,7 +3629,7 @@ where
 /// §"Table D.5 - Layer I and Layer II coder partition table") are
 /// consulted. The row-order broadcast reading is the spec's per
 /// Annex D Step 8 (informative Model 1 reduction) row-by-row
-/// presentation; no external implementation was read.
+/// presentation.
 #[must_use]
 pub fn coder_partition_d5_width_row_order() -> [u16; 32] {
     let mut out = [0u16; 32];
@@ -3793,8 +3792,7 @@ pub struct CoderPartitionD5Reduction {
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.5 - Layer I and Layer II coder partition table") are
 /// consulted. The paired-row-order reading is the spec's per Annex D
-/// Step 8 (informative Model 1 reduction) row-by-row presentation;
-/// no external implementation was read.
+/// Step 8 (informative Model 1 reduction) row-by-row presentation.
 #[must_use]
 pub fn coder_partition_d5_reduction_row_order<F>(ltg_per_line: F) -> [CoderPartitionD5Reduction; 32]
 where
@@ -3966,7 +3964,7 @@ pub struct CoderPartitionD5ReductionByWidth {
 /// consulted. The width-gated split reading is the spec's per the
 /// Table D.5 `width_n` column's role as a per-row Layer I / Layer II
 /// bit-allocation branch flag (Annex D informative Model 1
-/// reduction); no external implementation was read.
+/// reduction).
 #[must_use]
 pub fn coder_partition_d5_reduction_row_order_by_width<F>(
     ltg_per_line: F,
@@ -4141,8 +4139,7 @@ pub struct CoderPartitionD5LtminDbByWidth {
 /// consulted. The width-gated column-projection reading is the
 /// spec's per the Table D.5 `width_n` column's role as a per-row
 /// Layer I / Layer II bit-allocation branch flag (Annex D
-/// informative Model 1 reduction); no external implementation was
-/// read.
+/// informative Model 1 reduction).
 #[must_use]
 pub fn coder_partition_d5_ltmin_db_row_order_by_width<F>(
     ltg_per_line: F,
@@ -4501,7 +4498,7 @@ pub struct CoderPartitionD5LtminLog2ByWidth {
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.5 - Layer I and Layer II coder partition table") is
 /// consulted. The `f64::log2` primitive is the in-tree standard
-/// library call; no external implementation was read.
+/// library call.
 #[must_use]
 pub fn coder_partition_d5_ltmin_log2_row_order_by_width<F>(
     ltg_per_line: F,
@@ -4639,8 +4636,7 @@ where
 /// accessor, and the underlying Table D.5 transcription in
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.5 - Layer I and Layer II coder partition table") is
-/// consulted. The reduction is plain `f64` addition; no external
-/// implementation was read.
+/// consulted. The reduction is plain `f64` addition.
 #[must_use]
 pub fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total<F>(ltg_per_line: F) -> f64
 where
@@ -4790,8 +4786,7 @@ where
 /// accessor, and the underlying Table D.5 transcription in
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.5 - Layer I and Layer II coder partition table") is
-/// consulted. The reduction is plain `f64` addition; no external
-/// implementation was read.
+/// consulted. The reduction is plain `f64` addition.
 #[must_use]
 pub fn coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total<F>(ltg_per_line: F) -> f64
 where
@@ -4932,8 +4927,7 @@ where
 /// accessor, and the underlying Table D.5 transcription in
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.5 - Layer I and Layer II coder partition table") is
-/// consulted. The reduction is plain `f64` addition; no external
-/// implementation was read.
+/// consulted. The reduction is plain `f64` addition.
 #[must_use]
 pub fn coder_partition_d5_ltmin_log2_paired_bit_budget_totals<F>(ltg_per_line: F) -> (f64, f64)
 where
@@ -5377,8 +5371,7 @@ pub struct CoderPartitionD5Smr {
 /// §"Table D.5 - Layer I and Layer II coder partition table") are
 /// consulted. The
 /// paired-row-order reading is the spec's per Annex D §D.1 Step 9
-/// (informative Model 1) row-by-row presentation; no external
-/// implementation was read.
+/// (informative Model 1) row-by-row presentation.
 #[must_use]
 pub fn coder_partition_d5_smr_row_order<L, F>(
     lsb_per_partition: L,
@@ -5551,8 +5544,7 @@ pub struct CoderPartitionD5Mnr {
 /// ISO/IEC 11172-3:1993 Annex C §C.1.5.2.7 "Bit allocation" printed
 /// p.73 in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` are consulted.
 /// The Table C.5 `SNR_n` term is caller-injected (the table is behind
-/// the numeric-table transcription gap); no external implementation
-/// was read.
+/// the numeric-table transcription gap).
 #[must_use]
 pub fn coder_partition_d5_mnr_row_order<S, L, F>(
     snr_per_partition: S,
@@ -5758,8 +5750,7 @@ pub struct BitAllocPromotion {
 /// p.71) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`, and the
 /// Phase 2 step 73 [`coder_partition_d5_min_mnr`] selection it consumes,
 /// are read. The Table B.2 column length is caller-injected (the table
-/// is behind the numeric-table transcription gap); no external
-/// implementation was consulted.
+/// is behind the numeric-table transcription gap).
 #[must_use]
 pub fn bit_allocation_promote_entry(
     subband: u16,
@@ -5869,8 +5860,7 @@ pub struct CoderPartitionD5RecomputedMnr {
 /// `MNR = SNR − SMR` definition from the same clause, and the Phase 2
 /// step 74 [`bit_allocation_promote_entry`] result it consumes are read.
 /// The Table C.5 `SNR_n` term is caller-injected (the table is behind the
-/// numeric-table transcription gap); no external implementation was
-/// consulted.
+/// numeric-table transcription gap).
 #[must_use]
 pub fn bit_allocation_recompute_mnr<S>(
     promotion: BitAllocPromotion,
@@ -6012,8 +6002,7 @@ pub struct BitAllocOverhead {
 /// p.74) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`, and the
 /// Phase 2 step 74 [`bit_allocation_promote_entry`] result it follows,
 /// are read. The Table B.2 / B.4 per-entry bit costs are caller-injected
-/// (behind the numeric-table transcription gap); no external
-/// implementation was consulted.
+/// (behind the numeric-table transcription gap).
 #[must_use]
 pub fn bit_allocation_budget_update(
     prev: BitAllocBudget,
@@ -6081,8 +6070,7 @@ pub fn bit_allocation_budget_update(
 /// ISO/IEC 11172-3:1993 Annex C §C.1.5.2.7 "Bit allocation" (printed
 /// p.74) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read. The
 /// worst-case one-loop increase is caller-supplied (its per-entry bit
-/// costs are behind the numeric-table transcription gap); no external
-/// implementation was consulted.
+/// costs are behind the numeric-table transcription gap).
 #[must_use]
 pub fn bit_allocation_should_iterate(adb: u32, max_possible_increase: u32) -> bool {
     adb >= max_possible_increase
@@ -6135,8 +6123,7 @@ pub const MODEL1_SPL_REFERENCE_DB: f64 = 96.0;
 /// Provenance: only the Step 1 "Hann window, h(i)" formula line
 /// transcribed above from ISO/IEC 11172-3:1993 Annex D §D.1 Step 1
 /// "FFT Analysis" (printed p.110) in
-/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read; no external
-/// implementation was consulted.
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[must_use]
 pub fn model1_hann_window(i: usize, n: usize) -> Option<f64> {
     if n == 0 || i >= n {
@@ -6239,7 +6226,7 @@ fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
 /// technical-data lines, and the `k = 0...N/2` index range transcribed
 /// from ISO/IEC 11172-3:1993 Annex D §D.1 Step 1 "FFT Analysis"
 /// (printed p.110) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`
-/// are read; no external implementation was consulted.
+/// are read.
 #[must_use]
 pub fn model1_power_density_spectrum(s: &[f64]) -> Option<Vec<f64>> {
     let n = s.len();
@@ -6289,7 +6276,7 @@ pub fn model1_power_density_spectrum(s: &[f64]) -> Option<Vec<f64>> {
 /// Provenance: only the Step 1 normalization sentence quoted above
 /// from ISO/IEC 11172-3:1993 Annex D §D.1 Step 1 "FFT Analysis"
 /// (printed p.110) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`
-/// is read; no external implementation was consulted.
+/// is read.
 #[must_use]
 pub fn model1_normalize_to_96db_spl(x: &mut [f64]) -> Option<f64> {
     let max = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -6399,8 +6386,7 @@ pub fn model1_step2_lsb_db(x_subband_db: f64, scf_max: f64) -> f64 {
 ///
 /// Provenance: only the Step 2 alternative-method `Xspl(n)` formula
 /// transcribed from ISO/IEC 11172-3:1993 Annex D §D.1 Step 2 (printed
-/// p.111) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read;
-/// no external implementation was consulted.
+/// p.111) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[must_use]
 pub fn model1_step2_xspl_db(lines_db: &[f64]) -> f64 {
     let linear_sum: f64 = lines_db.iter().map(|&db| 10.0_f64.powf(db / 10.0)).sum();
@@ -6601,8 +6587,7 @@ const MODEL1_STEP4_J_TOP_LAYER2: [i32; 22] = [
 ///
 /// Provenance: only the Step 4(b) `j` listing transcribed above from
 /// ISO/IEC 11172-3:1993 Annex D §D.1 Step 4 (printed p.112) in
-/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read; no external
-/// implementation was consulted.
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[must_use]
 pub fn model1_step4_tonal_check_offsets(
     layer: crate::frame::Layer,
@@ -6641,8 +6626,7 @@ pub fn model1_step4_tonal_check_offsets(
 ///
 /// Provenance: only the Step 4(a) labelling rule quoted above from
 /// ISO/IEC 11172-3:1993 Annex D §D.1 Step 4 (printed p.112) in
-/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read; no external
-/// implementation was consulted.
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[inline]
 #[must_use]
 pub fn model1_step4_is_local_maximum(x: &[f64], k: usize) -> Option<bool> {
@@ -6715,8 +6699,7 @@ pub fn model1_step4_is_tonal(x: &[f64], layer: crate::frame::Layer, k: usize) ->
 ///
 /// Provenance: only the Step 4(b) `X_tm(k)` formula quoted above from
 /// ISO/IEC 11172-3:1993 Annex D §D.1 Step 4 (printed p.112) in
-/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read; no external
-/// implementation was consulted.
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[inline]
 #[must_use]
 pub fn model1_step4_tonal_spl_db(x: &[f64], k: usize) -> Option<f64> {
@@ -6776,8 +6759,7 @@ pub struct Model1Step4Component {
 /// in-place residue write-back).
 ///
 /// Provenance: only the §D.1 Step 4 operations (a)/(b) text (printed
-/// p.112) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read;
-/// no external implementation was consulted.
+/// p.112) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[must_use]
 pub fn model1_step4_extract_tonal(
     x: &mut [f64],
@@ -6851,8 +6833,7 @@ pub struct Model1Step4BandSpan {
 /// Provenance: the Tables D.2a–f rows already transcribed in
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` plus the
 /// §D.1 Step 4(c) prose (printed p.112) in
-/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`; no external
-/// implementation was consulted.
+/// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`.
 #[must_use]
 pub fn model1_step4_band_line_spans(
     layer: crate::frame::Layer,
@@ -6908,8 +6889,7 @@ pub fn model1_step4_band_line_spans(
 ///
 /// Provenance: only the §D.1 Step 4(c) prose (printed p.112) in
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` plus the in-repo
-/// Tables D.2 transcription are read; no external implementation was
-/// consulted.
+/// Tables D.2 transcription are read.
 #[must_use]
 pub fn model1_step4_non_tonal_components(
     x: &[f64],
@@ -6954,8 +6934,7 @@ pub fn model1_step4_non_tonal_components(
 ///
 /// **Determinism.** Pure function of the input spectrum.
 ///
-/// Provenance: composition of the Step 4 primitives above; no
-/// additional spec material and no external implementation consulted.
+/// Provenance: composition of the Step 4 primitives above.
 #[must_use]
 pub fn model1_step4_components(
     x: &[f64],
@@ -7047,7 +7026,7 @@ pub fn model1_step4_components(
 //
 // Provenance: only the six PNG renders named above plus the §D.1
 // Step 5 prose (printed p.112) already quoted on the Step 5
-// primitives; no external implementation was consulted.
+// primitives.
 // =====================================================================
 
 /// One row of Annex D Table D.1 (frequencies, critical band rates and
@@ -8085,8 +8064,7 @@ pub fn model1_step5_components(
 // clamp at 68,00 dB.
 //
 // Provenance: only the six staged PNG renders named above (and the
-// docs extracts file for column semantics); no external
-// implementation was consulted.
+// docs extracts file for column semantics).
 // =====================================================================
 
 /// One row of Annex D Table D.3 (calculation partition table). The

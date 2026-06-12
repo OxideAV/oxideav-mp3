@@ -72,8 +72,7 @@
 //! lookahead buffer could reduce these misses but materially
 //! complicates the encoder's latency contract.
 //!
-//! No external reference implementation was consulted while writing
-//! this state machine. The geometry constraints are all derived from
+//! The geometry constraints of this state machine are all derived from
 //! §2.4.3.4.10.3's window shapes plus the overlap-add identity of
 //! §2.4.3.4.10.4.
 

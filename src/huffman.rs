@@ -8,8 +8,7 @@
 //! **Table 3-B.7** (p.54–60) and the scalefactor-band boundaries of
 //! **Table 3-B.8** (p.62–64). Every numeric value in this file was
 //! transcribed by hand from those pages of the ISO/IEC 11172-3:1993
-//! PDF (rendered with `pdftoppm`); no external implementation was
-//! consulted.
+//! PDF (rendered with `pdftoppm`).
 //!
 //! # The three partitions
 //!

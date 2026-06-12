@@ -98,7 +98,7 @@ fn imdct_n12_impulse_closed_form() {
 #[test]
 fn imdct_n36_all_ones_reference_values() {
     // X[k] = 1 for k=0..18, n = 36. Pre-computed by direct evaluation of
-    // the §2.4.3.4.10.2 sum (no external reference): x[0] ≈ -0.67817085,
+    // the §2.4.3.4.10.2 sum: x[0] ≈ -0.67817085,
     // x[18] ≈ -0.74009362.
     let xk = [1.0f64; 18];
     let out = imdct(&xk, 36);

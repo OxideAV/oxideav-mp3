@@ -2,7 +2,7 @@
 // filterbank. Every reference value is derived directly from the spec
 // formulas of §2.4.3.2.2 (the `N[i,k]` matrixing coefficient formula),
 // Figure A.2 (the per-step pseudo code), and Annex B Table B.3 (the
-// `D[i]` window coefficients). No external implementation was consulted.
+// `D[i]` window coefficients).
 
 // This file is `include!`d into the `synth` module, so the public items
 // (SynthState, synth_row, synth_granule, n_coefficient, D_TABLE,

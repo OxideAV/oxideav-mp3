@@ -11,7 +11,7 @@
 //! file was transcribed by hand from ISO/IEC 11172-3:1993 §2.4.3.4.7.1
 //! (the requantization formula, PDF p.34–35), Table B.6 (the preemphasis
 //! `pretab`, PDF p.53), and Table B.8 (the scalefactor-band start
-//! indices, PDF p.62–64); no external implementation was consulted.
+//! indices, PDF p.62–64).
 //!
 //! # The two formulas (§2.4.3.4.7.1)
 //!
