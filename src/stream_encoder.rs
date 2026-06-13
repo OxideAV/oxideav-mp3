@@ -628,6 +628,35 @@ pub struct Mp3Encoder {
     /// Default `None`; the encoder behaves as in every previous
     /// round (every granule emits a long block).
     auto_block_type: Option<AutoBlockTypeConfig>,
+
+    /// When `Some`, the encoder runs the §C.1.5.3.2.1 Layer III
+    /// Model 2 psychoacoustic analysis **per granule, automatically**
+    /// inside the encode loop and installs the resulting signal-
+    /// dependent `xmin(sb)` vector before each granule's outer-loop
+    /// search — the running-state generalisation of the one-shot
+    /// [`Self::set_per_band_xmin_from_model2`] convenience.
+    ///
+    /// One [`crate::psy::Model2Layer3State`] per channel (vector
+    /// length `nch`), each threaded across the granules of the whole
+    /// stream so the §D.2.1 FFT-history requirement ("the model needs
+    /// a known starting point and runs continuously") is honoured: a
+    /// channel's state carries the previous granule's spectrum into
+    /// the next granule's unpredictability prediction, exactly as the
+    /// spec's continuous analysis demands.
+    ///
+    /// Set by [`Self::enable_model2_psychoacoustics`]. Mutually
+    /// exclusive at API time with a caller-installed static
+    /// [`Self::per_band_xmin`] (enabling clears it, and
+    /// [`Self::set_per_band_xmin`] clears this). Restricted to the
+    /// three staged Annex D Model 2 sampling rates (32 / 44.1 /
+    /// 48 kHz) and to 576-sample granules — guaranteed by the
+    /// constructor guard, so the per-granule analysis below never
+    /// observes an unsupported rate.
+    ///
+    /// Default `None`: the encoder uses whatever static threshold the
+    /// outer-loop / per-band setters installed (or the uniform
+    /// scalar), byte-for-byte as in every previous round.
+    model2_psy: Option<Vec<crate::psy::Model2Layer3State>>,
 }
 
 /// Per-channel auto-block-type state for [`Mp3Encoder`]. Holds the
@@ -773,6 +802,7 @@ impl Mp3Encoder {
             force_short_blocks: false,
             force_mixed_blocks: false,
             auto_block_type: None,
+            model2_psy: None,
         })
     }
 
@@ -1810,6 +1840,11 @@ impl Mp3Encoder {
         if self.outer_loop_threshold.is_none() {
             return Err(StreamEncodeError::PerBandXminWithoutOuterLoop);
         }
+        // A static per-band threshold and the per-granule Model 2
+        // analysis are mutually exclusive (the latter overwrites
+        // `per_band_xmin` on every granule); installing a static
+        // vector turns the automatic analysis off.
+        self.model2_psy = None;
         self.per_band_xmin = Some(xmin);
         Ok(())
     }
@@ -1819,6 +1854,74 @@ impl Mp3Encoder {
     #[must_use]
     pub fn per_band_xmin_enabled(&self) -> bool {
         self.per_band_xmin.is_some()
+    }
+
+    /// Enable **automatic per-granule §C.1.5.3.2.1 Model 2
+    /// psychoacoustics** for the whole stream: every granule's PCM is
+    /// run through the Model 2 analysis chain and the resulting
+    /// signal-dependent `xmin(sb)` vector is installed before that
+    /// granule's outer-loop search — no caller bookkeeping per
+    /// granule.
+    ///
+    /// This is the running-state generalisation of the one-shot
+    /// [`Self::set_per_band_xmin_from_model2`]: instead of the caller
+    /// owning a [`crate::psy::Model2Layer3State`] and calling
+    /// `process` + install before each `push_samples`, the encoder
+    /// owns one state **per channel** (threaded across every granule
+    /// of the stream for the §D.2.1 continuous-FFT-history
+    /// requirement) and drives the analysis inside the encode loop.
+    ///
+    /// Each granule's threshold is the Figure C.6.c/d `thm(sb)`
+    /// mapped to the outer loop's `xmin(sb)` exactly as
+    /// [`crate::psy::XminThresholds::from_layer3_granule`] specifies
+    /// (per-band ratios preserved, geometric-mean offset anchored to
+    /// the encoder's outer-loop threshold). On a fully silent granule
+    /// the analysis yields the uniform default, so a quiet passage
+    /// converges identically to the threshold-in-quiet path.
+    ///
+    /// Mutually exclusive with a caller-installed static per-band
+    /// threshold: enabling this clears any vector previously set via
+    /// [`Self::set_per_band_xmin`], and a later
+    /// [`Self::set_per_band_xmin`] turns this off.
+    ///
+    /// # Errors
+    ///
+    /// * [`StreamEncodeError::PerBandXminWithoutOuterLoop`] — the
+    ///   encoder was built without the outer loop (use
+    ///   [`Mp3Encoder::new_with_outer_loop`]); the Model 2 threshold
+    ///   has nowhere to feed.
+    /// * [`StreamEncodeError::Model2AnalysisUnsupported`] — the
+    ///   encoder's sampling rate is not one of the three staged
+    ///   Annex D Model 2 rates (32 / 44.1 / 48 kHz). The MPEG-2.5 and
+    ///   MPEG-2 LSF rates lack staged calculation-partition tables and
+    ///   are rejected here rather than guessed.
+    pub fn enable_model2_psychoacoustics(&mut self) -> Result<(), StreamEncodeError> {
+        if self.outer_loop_threshold.is_none() {
+            return Err(StreamEncodeError::PerBandXminWithoutOuterLoop);
+        }
+        let rate = crate::psy::AnnexDSamplingRate::from_hz(self.sample_rate_hz).ok_or(
+            StreamEncodeError::Model2AnalysisUnsupported {
+                sample_rate_hz: self.sample_rate_hz,
+            },
+        )?;
+        // One continuous-history state per channel; independent so an
+        // independent-stereo (or MS-stereo) pair never shares an FFT
+        // history across channels.
+        let states = (0..self.nch)
+            .map(|_| crate::psy::Model2Layer3State::new(rate))
+            .collect::<Vec<_>>();
+        // Mutually exclusive with a static per-band vector.
+        self.per_band_xmin = None;
+        self.model2_psy = Some(states);
+        Ok(())
+    }
+
+    /// `true` when [`Self::enable_model2_psychoacoustics`] has armed
+    /// the automatic per-granule Model 2 analysis — used by
+    /// integration tests / observability.
+    #[must_use]
+    pub fn model2_psychoacoustics_enabled(&self) -> bool {
+        self.model2_psy.is_some()
     }
 
     /// Run one granule of PCM through the §C.1.5.3.2.1 **Model 2**
@@ -2115,6 +2218,18 @@ impl Mp3Encoder {
             .map(|_| (0..self.nch).map(|_| [0.0f32; NUM_LINES]).collect())
             .collect();
 
+        // Per-(gr, ch) automatic Model 2 psychoacoustic threshold,
+        // populated in Pass 1 below when
+        // [`Self::enable_model2_psychoacoustics`] is armed. `None`
+        // entries (every entry, when the mode is off) leave Pass 2 on
+        // whatever static `self.per_band_xmin` / uniform-scalar path
+        // it would otherwise take. The granule order matters: the
+        // §D.2.1 FFT history must advance granule-by-granule in stream
+        // order, so the analysis runs in the Pass 1 loop (gr outer,
+        // ch inner) rather than lazily in Pass 2.
+        let mut model2_xmin_per_gc: [[Option<crate::psy::XminThresholds>; 2]; GRANULES] =
+            Default::default();
+
         // ---- Pre-pass: per-(gr, ch) block type ----
         //
         // The per-granule block type is the §C.1.5.2 transition state
@@ -2355,6 +2470,29 @@ impl Mp3Encoder {
                     &per_ch_frame_pcm[ch][gr * SAMPLES_PER_GRANULE..(gr + 1) * SAMPLES_PER_GRANULE];
                 let mut pcm_arr = [0.0f32; SAMPLES_PER_GRANULE];
                 pcm_arr.copy_from_slice(gr_pcm);
+
+                // Automatic per-granule §C.1.5.3.2.1 Model 2
+                // psychoacoustics: run this granule's PCM through the
+                // channel's continuous-history Model 2 state and stash
+                // the resulting signal-dependent `xmin(sb)` for Pass 2
+                // to install before the granule's outer-loop search.
+                //
+                // The state MUST advance once per granule in stream
+                // order (the §D.2.1 FFT history feeds the next
+                // granule's prediction), so the analysis runs here in
+                // the (gr outer, ch inner) Pass 1 walk — never lazily.
+                // `process` returns `None` only on a granule-length
+                // mismatch, which cannot occur (`pcm_arr` is exactly
+                // `SAMPLES_PER_GRANULE`); a residual `None` simply
+                // leaves the entry unset and Pass 2 falls back to the
+                // static threshold rather than panicking.
+                if let Some(states) = self.model2_psy.as_mut() {
+                    let granule_f64: Vec<f64> = pcm_arr.iter().map(|&s| f64::from(s)).collect();
+                    if let Some(out) = states[ch].process(&granule_f64) {
+                        model2_xmin_per_gc[gr][ch] =
+                            Some(crate::psy::XminThresholds::from_layer3_granule(&out));
+                    }
+                }
 
                 // Polyphase analysis filterbank → 32×18 subband-time.
                 let subband_time = analyze_granule(&pcm_arr, &mut self.analysis_state[ch]);
@@ -2885,6 +3023,22 @@ impl Mp3Encoder {
         for gr in 0..ngr {
             for ch in 0..self.nch {
                 let xr_pre = xr_pre_per_gc[gr][ch];
+
+                // Automatic Model 2 path: install this granule's
+                // signal-dependent `xmin(sb)` (computed in Pass 1)
+                // before the outer-loop dispatch reads
+                // `self.per_band_xmin`. The static-threshold and
+                // automatic-Model-2 paths are mutually exclusive, so
+                // when the mode is armed `self.per_band_xmin` starts
+                // `None` and is rewritten per granule here; the
+                // unchanged outer-loop dispatch below picks it up via
+                // the existing `self.per_band_xmin` read. When the
+                // mode is off, `model2_xmin_per_gc[gr][ch]` is `None`
+                // and `self.per_band_xmin` is left exactly as the
+                // static setters configured it.
+                if let Some(xmin) = model2_xmin_per_gc[gr][ch].take() {
+                    self.per_band_xmin = Some(xmin);
+                }
 
                 // Pick the smallest global_gain + scalefactor configuration.
                 // Two paths:
@@ -5378,6 +5532,138 @@ mod tests {
         assert!(x.long.iter().all(|&v| v.is_finite() && v > 0.0));
         // Signal-dependent: not every band carries the identical value a
         // uniform fill would.
+        let first = x.long[0];
+        assert!(
+            x.long
+                .iter()
+                .any(|&v| (v - first).abs() > 1e-6 * first.max(1.0)),
+            "expected a spectrally-shaped threshold, got a flat vector"
+        );
+    }
+
+    #[test]
+    fn auto_model2_requires_outer_loop() {
+        // Without the outer loop there is nowhere to feed the Model 2
+        // threshold → the enable call is rejected.
+        let mut enc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        assert!(!enc.model2_psychoacoustics_enabled());
+        assert!(matches!(
+            enc.enable_model2_psychoacoustics(),
+            Err(StreamEncodeError::PerBandXminWithoutOuterLoop)
+        ));
+        assert!(!enc.model2_psychoacoustics_enabled());
+    }
+
+    #[test]
+    fn auto_model2_rejects_unsupported_rate() {
+        // An LSF rate (22.05 kHz) has no staged Annex D Model 2
+        // calculation-partition tables → rejected with the offending
+        // rate carried, leaving the mode disarmed.
+        let mut lsf =
+            Mp3Encoder::new_with_outer_loop(64, 22_050, ChannelMode::SingleChannel, 1.0e6).unwrap();
+        assert!(matches!(
+            lsf.enable_model2_psychoacoustics(),
+            Err(StreamEncodeError::Model2AnalysisUnsupported {
+                sample_rate_hz: 22_050
+            })
+        ));
+        assert!(!lsf.model2_psychoacoustics_enabled());
+    }
+
+    #[test]
+    fn auto_model2_and_static_xmin_are_mutually_exclusive() {
+        // Arming the automatic mode clears any static per-band vector,
+        // and installing a static vector turns the automatic mode off.
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.set_per_band_xmin(crate::psy::XminThresholds::uniform(1.0e6))
+            .unwrap();
+        assert!(enc.per_band_xmin_enabled());
+        enc.enable_model2_psychoacoustics().unwrap();
+        assert!(enc.model2_psychoacoustics_enabled());
+        // The static vector was cleared (the per-granule analysis will
+        // repopulate it inside the encode loop).
+        assert!(!enc.per_band_xmin_enabled());
+        // Re-installing a static vector disarms the automatic mode.
+        enc.set_per_band_xmin(crate::psy::XminThresholds::uniform(1.0e6))
+            .unwrap();
+        assert!(enc.per_band_xmin_enabled());
+        assert!(!enc.model2_psychoacoustics_enabled());
+    }
+
+    #[test]
+    fn auto_model2_end_to_end_encodes_decodable_frames() {
+        // A live tone pushed through an encoder with the automatic
+        // per-granule Model 2 mode armed produces a well-formed MP3
+        // stream: every frame parses, and the per-granule analysis
+        // leaves a signal-dependent per-band threshold installed
+        // (the last granule's `xmin`) after the run.
+        use crate::frame::{parse_header, FrameWalker};
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        // Four frames of a 1 kHz tone (eight granules of FFT history).
+        let total = SAMPLES_PER_FRAME_MPEG1 * 4;
+        let pcm: Vec<i16> = (0..total)
+            .map(|i| {
+                let t = i as f64 / 44_100.0;
+                (8000.0 * (2.0 * core::f64::consts::PI * 1000.0 * t).sin()) as i16
+            })
+            .collect();
+        enc.push_samples(&pcm).unwrap();
+        // Capture the per-band-enabled flag BEFORE `finish` consumes
+        // the encoder: the per-granule analysis installs a real
+        // threshold during the encode loop above.
+        assert!(
+            enc.per_band_xmin_enabled(),
+            "automatic Model 2 mode should leave a per-granule xmin installed after encoding"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        let bytes = enc.finish(&mut out).unwrap();
+        assert!(bytes > 0);
+        assert_eq!(out.len(), bytes);
+        // Every emitted frame parses with a valid header.
+        let frames: Vec<_> = FrameWalker::new(&out).collect();
+        assert!(
+            frames.len() >= 4,
+            "expected >= 4 frames, got {}",
+            frames.len()
+        );
+        for f in &frames {
+            let hdr = parse_header(&f.data[..4]).expect("valid header");
+            assert_eq!(hdr.sample_rate_hz, 44_100);
+        }
+    }
+
+    #[test]
+    fn auto_model2_threshold_is_spectrally_shaped_not_flat() {
+        // The automatic mode installs a spectrally-shaped (non-flat)
+        // threshold derived from the actual signal — the whole point
+        // of running Model 2 over the uniform-bowl path. Drive enough
+        // granules to prime the FFT history, then inspect the
+        // installed vector.
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        let total = SAMPLES_PER_FRAME_MPEG1 * 3;
+        let pcm: Vec<i16> = (0..total)
+            .map(|i| {
+                let t = i as f64 / 44_100.0;
+                // Two tones so the threshold has structure across bands.
+                let s = 0.4 * (2.0 * core::f64::consts::PI * 1000.0 * t).sin()
+                    + 0.3 * (2.0 * core::f64::consts::PI * 6000.0 * t).sin();
+                (8000.0 * s) as i16
+            })
+            .collect();
+        enc.push_samples(&pcm).unwrap();
+        let x = enc
+            .per_band_xmin
+            .as_ref()
+            .expect("a per-granule threshold should be installed");
+        assert!(x.long.iter().all(|&v| v.is_finite() && v > 0.0));
         let first = x.long[0];
         assert!(
             x.long

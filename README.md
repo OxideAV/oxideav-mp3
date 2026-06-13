@@ -890,6 +890,38 @@ encoder still emits only fixed-`bitrate_index` frames, and demuxer
 free-format framing (deriving the constant length from the first
 syncword interval) remains a follow-up.
 
+**Round 293 (Phase 2 step 90 — automatic per-granule Model 2
+psychoacoustics in the encode loop).** Step 89 (r288) wired the
+§C.1.5.3.2.1 Layer III Model 2 masking threshold `thm(sb)` into the
+outer loop, but only through a one-shot convenience
+(`set_per_band_xmin_from_model2`): the caller had to own a
+`Model2Layer3State`, call `process` on each granule, and install the
+result before every `push_samples`. This round makes the analysis a
+running encoder mode. `enable_model2_psychoacoustics()` arms one
+`Model2Layer3State` **per channel** (each threaded across every
+granule of the stream so the §D.2.1 continuous-FFT-history requirement
+holds — a channel's previous-granule spectrum feeds the next granule's
+unpredictability prediction), and the encode loop drives it
+automatically: Pass 1 runs each granule's 576-sample PCM through the
+channel's Model 2 state and stashes the resulting signal-dependent
+`xmin(sb)` (Figure C.6.c/d `thm(sb)` mapped via
+`XminThresholds::from_layer3_granule`, per-band ratios preserved with
+the geometric-mean offset anchored to the outer-loop threshold); Pass 2
+installs that granule's threshold before the existing outer-loop
+dispatch reads `per_band_xmin`. The mode is mutually exclusive with a
+caller-installed static per-band vector (arming clears it; a later
+`set_per_band_xmin` disarms the mode), requires the outer loop, and is
+restricted to the three staged Annex D rates (32 / 44.1 / 48 kHz) — an
+LSF / MPEG-2.5 rate is rejected with `Model2AnalysisUnsupported`
+(those rates lack staged calculation-partition tables; still a
+documented gap). 5 new unit tests: the outer-loop / unsupported-rate
+guards, static-vs-automatic mutual exclusion, an end-to-end tone encode
+whose frames all parse and which leaves a per-granule threshold
+installed, and a two-tone run asserting the installed threshold is
+spectrally shaped (not the flat uniform bowl). Truth from
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` (Annex D
+Model 2 §D.2 / §C.1.5.3.2.1); no new tables required.
+
 **Phase 2 step 38 (`DEFAULT_ATTACK_THRESHOLD` empirical-corpus
 calibration)** closes the dual of the r165 leak calibration on the
 encoder-side `attack_detect::AttackDetector`. r165 pinned
