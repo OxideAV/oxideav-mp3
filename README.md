@@ -4640,6 +4640,33 @@ zero findings.
 Run a target with `cargo +nightly fuzz run decode` (or `granule`)
 from the crate root.
 
+## Benchmarks
+
+Criterion benchmarks for the Layer III **decode** hot path live under
+`benches/`; the ranked hotspot map is in
+[`BENCHMARKS.md`](./BENCHMARKS.md). They synthesise their input PCM
+in-bench and round-trip it through the crate's own `Mp3Encoder` (no
+committed fixtures), then time only the decode side.
+
+- **`decode`** — whole-stream decode of a pre-encoded mono stream,
+  timed both through the registered `Mp3CoreDecoder` trait object and
+  through the bare per-stage chain (the two are within measurement
+  noise — trait dispatch + `AudioFrame` packing add nothing measurable
+  over the DSP).
+- **`decode_stages`** — isolates each stage (side-info parse,
+  scalefactors, Huffman big-values/count1, requantize, alias, IMDCT,
+  synthesis filterbank) over one captured 20-frame / 40-granule batch.
+
+The ranking is dominated by the back-end DSP: the **synthesis
+filterbank (~62 %)** and the **IMDCT (~31 %)** together account for
+~93 % of decode time; the entire bitstream-parse / entropy /
+requantization front half (Huffman, requantize, scalefactors, alias,
+side-info) sums to under 7 %. This round added the harness and the
+ranking only — decoded PCM is unchanged.
+
+Run with `cargo bench -p oxideav-mp3 --bench decode` (or
+`decode_stages`).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

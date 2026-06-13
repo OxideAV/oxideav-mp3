@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- decode: **Criterion benchmark harness + ranked hotspot map for the
+  Layer III decode path** (r290, depth-mode BENCH). Two self-contained
+  benches under `benches/` (no committed fixtures — input PCM is
+  synthesised in-bench and round-tripped through the crate's own
+  `Mp3Encoder`): `decode` times the whole-stream decode of a
+  pre-encoded mono stream both through the registered `Mp3CoreDecoder`
+  trait object and through the bare per-stage chain (the two are within
+  measurement noise); `decode_stages` isolates each decode stage
+  (side-info parse, scalefactors, Huffman big-values/count1,
+  requantize, alias, IMDCT, synthesis filterbank) over one captured
+  20-frame / 40-granule batch. The ranking (recorded in `BENCHMARKS.md`)
+  is dominated by the back-end DSP: the synthesis filterbank (~62 %) and
+  the IMDCT (~31 %) together account for ~93 % of decode time, with the
+  entire entropy / requantization front half under 7 %. No behaviour
+  change — decoded PCM is byte-identical.
+
 - decode: **libFuzzer hardening of the Layer III decode path** (r289,
   depth-mode FUZZ lane). A new `fuzz/` cargo-fuzz harness adds two
   targets exercising panic-freedom against malformed bitstreams:

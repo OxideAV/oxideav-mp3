@@ -15,3 +15,27 @@ categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# Round 290 (depth-mode benchmarks): Criterion drives the two decode
+# bench harnesses (`decode`, `decode_stages`). Pinned to the same 0.5
+# line the other OxideAV crates with benches use (flac, vp8, prores,
+# cinepak, tta, …). Each bench is self-contained — every input PCM is
+# synthesised in-bench from a deterministic source and run through the
+# crate's own production `Mp3Encoder`, so no fixture file is committed.
+criterion = "0.5"
+
+# `decode` times the whole Layer III decode of a pre-encoded stream two
+# ways: through the registered `Mp3CoreDecoder` trait object and through
+# the bare per-stage chain.
+[[bench]]
+name = "decode"
+harness = false
+
+# `decode_stages` isolates each decode stage (side-info parse,
+# scalefactors, Huffman big-values/count1, requantize, alias, IMDCT,
+# synthesis filterbank) over the same captured granule batch so the
+# ranked hotspot map in BENCHMARKS.md can attribute time per stage.
+[[bench]]
+name = "decode_stages"
+harness = false
