@@ -208,6 +208,18 @@ pub enum StreamEncodeError {
     /// own zero-part), which needs the per-window `is_pos` derivation
     /// from `scalefac_s` — deferred to a follow-up.
     IntensityShortBlocksUnsupported,
+    /// [`Mp3Encoder::set_per_band_xmin_from_model2`] was called with a
+    /// granule whose length is not `SAMPLES_PER_GRANULE` (576), or on an
+    /// encoder whose sample rate is not one of the three Annex D Model 2
+    /// rates (32 / 44.1 / 48 kHz). The §C.1.5.3.2.1 Model 2 analysis
+    /// is built on Annex D Tables D.3 / D.4 / C.7 / C.8, which the docs
+    /// stage only for those three rates; the carried value is the
+    /// offending sample rate (0 signals a granule-length mismatch).
+    Model2AnalysisUnsupported {
+        /// The encoder sample rate that has no staged Model 2 tables, or
+        /// `0` when the failure was a granule-length mismatch.
+        sample_rate_hz: u32,
+    },
 }
 
 impl core::fmt::Display for StreamEncodeError {
@@ -245,6 +257,18 @@ impl core::fmt::Display for StreamEncodeError {
             StreamEncodeError::IntensityShortBlocksUnsupported => f.write_str(
                 "intensity-stereo encode is long-block only this round (short / mixed / auto block-type toggles are unavailable while intensity coupling is armed)",
             ),
+            StreamEncodeError::Model2AnalysisUnsupported { sample_rate_hz } => {
+                if *sample_rate_hz == 0 {
+                    f.write_str(
+                        "set_per_band_xmin_from_model2 requires a 576-sample granule",
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Model 2 analysis is staged only for 32 / 44.1 / 48 kHz (got {sample_rate_hz} Hz)"
+                    )
+                }
+            }
         }
     }
 }
@@ -1795,6 +1819,70 @@ impl Mp3Encoder {
     #[must_use]
     pub fn per_band_xmin_enabled(&self) -> bool {
         self.per_band_xmin.is_some()
+    }
+
+    /// Run one granule of PCM through the §C.1.5.3.2.1 **Model 2**
+    /// psychoacoustic analysis and install the resulting per-band
+    /// masking threshold as the outer loop's `xmin(sb)`.
+    ///
+    /// This is the end-to-end perceptual path: the granule's signal-
+    /// dependent masking threshold (Figure C.6.c/d `thm(sb)`, via
+    /// [`crate::psy::Model2Layer3State::process`] →
+    /// [`crate::psy::XminThresholds::from_layer3_granule`]) replaces the
+    /// signal-independent threshold-in-quiet bowl the outer loop would
+    /// otherwise use. The outer loop then amplifies a band whose
+    /// content is *masked* (high `thm`) less aggressively than a band
+    /// whose content is *audible* (low `thm`), spending bits where the
+    /// ear can hear the noise.
+    ///
+    /// The caller owns the [`crate::psy::Model2Layer3State`] and threads
+    /// it across granules, because the Model 2 unpredictability measure
+    /// is computed from the two preceding analysis blocks (§D.2.1: the
+    /// FFT history "must remain constant over any particular
+    /// application" and starts from a known zeroed state). Pass the same
+    /// `state` for every granule of a channel, in time order; use one
+    /// state per channel. The state's construction-time sample rate
+    /// must match the encoder's.
+    ///
+    /// `granule` is exactly [`SAMPLES_PER_GRANULE`] (576) samples in
+    /// `[-1.0, 1.0]`, the same domain the encoder's analysis filterbank
+    /// consumes.
+    ///
+    /// # Errors
+    ///
+    /// * [`StreamEncodeError::PerBandXminWithoutOuterLoop`] — the
+    ///   encoder has no outer loop (use
+    ///   [`Mp3Encoder::new_with_outer_loop`]).
+    /// * [`StreamEncodeError::Model2AnalysisUnsupported`] — `granule` is
+    ///   not 576 samples (carried `sample_rate_hz == 0`), or the
+    ///   encoder's rate is not a staged Model 2 rate (32 / 44.1 /
+    ///   48 kHz; the LSF / MPEG-2.5 rates have no staged Annex D Model 2
+    ///   tables).
+    pub fn set_per_band_xmin_from_model2(
+        &mut self,
+        state: &mut crate::psy::Model2Layer3State,
+        granule: &[f64],
+    ) -> Result<(), StreamEncodeError> {
+        if self.outer_loop_threshold.is_none() {
+            return Err(StreamEncodeError::PerBandXminWithoutOuterLoop);
+        }
+        if granule.len() != SAMPLES_PER_GRANULE {
+            return Err(StreamEncodeError::Model2AnalysisUnsupported { sample_rate_hz: 0 });
+        }
+        if crate::psy::AnnexDSamplingRate::from_hz(self.sample_rate_hz).is_none() {
+            return Err(StreamEncodeError::Model2AnalysisUnsupported {
+                sample_rate_hz: self.sample_rate_hz,
+            });
+        }
+        // The analysis returns `None` only on a granule-length mismatch,
+        // already screened above; treat any residual `None` as the same
+        // length error rather than panicking.
+        let out = state
+            .process(granule)
+            .ok_or(StreamEncodeError::Model2AnalysisUnsupported { sample_rate_hz: 0 })?;
+        let xmin = crate::psy::XminThresholds::from_layer3_granule(&out);
+        self.per_band_xmin = Some(xmin);
+        Ok(())
     }
 
     /// Push PCM samples (`i16`). For mono encoders the input is a
@@ -5222,5 +5310,80 @@ mod tests {
                 xl.long[sfb],
             );
         }
+    }
+
+    #[test]
+    fn model2_xmin_requires_outer_loop() {
+        // No outer loop → the per-band install is rejected.
+        let mut enc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        let mut state = crate::psy::Model2Layer3State::new(crate::psy::AnnexDSamplingRate::Hz44100);
+        let g = vec![0.0_f64; SAMPLES_PER_GRANULE];
+        assert!(matches!(
+            enc.set_per_band_xmin_from_model2(&mut state, &g),
+            Err(StreamEncodeError::PerBandXminWithoutOuterLoop)
+        ));
+    }
+
+    #[test]
+    fn model2_xmin_rejects_bad_granule_and_unsupported_rate() {
+        // Wrong granule length → length error (sample_rate_hz == 0).
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        let mut state = crate::psy::Model2Layer3State::new(crate::psy::AnnexDSamplingRate::Hz44100);
+        assert!(matches!(
+            enc.set_per_band_xmin_from_model2(&mut state, &vec![0.0_f64; 575]),
+            Err(StreamEncodeError::Model2AnalysisUnsupported { sample_rate_hz: 0 })
+        ));
+        // An LSF rate (22.05 kHz) has no staged Model 2 tables → rejected
+        // with the offending rate carried.
+        let mut lsf =
+            Mp3Encoder::new_with_outer_loop(64, 22_050, ChannelMode::SingleChannel, 1.0e6).unwrap();
+        let mut st32 = crate::psy::Model2Layer3State::new(crate::psy::AnnexDSamplingRate::Hz32000);
+        assert!(matches!(
+            lsf.set_per_band_xmin_from_model2(&mut st32, &vec![0.0_f64; SAMPLES_PER_GRANULE]),
+            Err(StreamEncodeError::Model2AnalysisUnsupported {
+                sample_rate_hz: 22_050
+            })
+        ));
+    }
+
+    #[test]
+    fn model2_xmin_installs_signal_dependent_threshold() {
+        // A live tone granule produces a per-band threshold the outer
+        // loop will consume; the install flips per_band_xmin_enabled and
+        // the long vector is signal-dependent (not the flat uniform
+        // fill the encoder shipped with).
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        assert!(!enc.per_band_xmin_enabled());
+        let mut state = crate::psy::Model2Layer3State::new(crate::psy::AnnexDSamplingRate::Hz44100);
+        // Prime the FFT history then install on a later granule so the
+        // unpredictability measure has real predecessors.
+        let tone = |n: usize| -> Vec<f64> {
+            (0..SAMPLES_PER_GRANULE)
+                .map(|i| {
+                    let t = (n * SAMPLES_PER_GRANULE + i) as f64;
+                    0.5 * (2.0 * core::f64::consts::PI * 1000.0 * t / 44_100.0).sin()
+                })
+                .collect()
+        };
+        for n in 0..3 {
+            enc.set_per_band_xmin_from_model2(&mut state, &tone(n))
+                .unwrap();
+        }
+        assert!(enc.per_band_xmin_enabled());
+        let x = enc.per_band_xmin.as_ref().unwrap();
+        assert!(x.long.iter().all(|&v| v.is_finite() && v > 0.0));
+        // Signal-dependent: not every band carries the identical value a
+        // uniform fill would.
+        let first = x.long[0];
+        assert!(
+            x.long
+                .iter()
+                .any(|&v| (v - first).abs() > 1e-6 * first.max(1.0)),
+            "expected a spectrally-shaped threshold, got a flat vector"
+        );
     }
 }

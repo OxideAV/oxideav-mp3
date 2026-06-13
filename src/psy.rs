@@ -388,6 +388,133 @@ impl XminThresholds {
             mixed_short,
         }
     }
+
+    /// Construct a per-band outer-loop threshold vector from one
+    /// granule of the §C.1.5.3.2.1 **Model 2** psychoacoustic analysis
+    /// ([`Model2Layer3State::process`] output).
+    ///
+    /// This is the wire that finally feeds the Layer III psychoacoustic
+    /// model into the encoder's distortion-control loop. Every prior
+    /// round produced the analysis half — the FFT chain, the Figure
+    /// C.6.b partition threshold, the Figure C.6.c/d conversion to
+    /// scalefactor bands — but the outer loop still drove its
+    /// `xmin(sb)` from the threshold-in-quiet bowl
+    /// ([`Self::threshold_in_quiet`]) only, i.e. a *signal-independent*
+    /// floor. The Model 2 `thm(sb)` is the *signal-dependent* masking
+    /// threshold: §C.1.5.4 defines `xmin(sb)` as exactly this quantity
+    /// ("the allowed distortion … the masking threshold of the
+    /// scalefactor band"), so the granule's `thm` / `thm_short` arrays
+    /// are the outer loop's `xmin(sb)` directly.
+    ///
+    /// * `granule.thm` (21 long bands) → [`Self::long`].
+    /// * `granule.thm_short[w][sfb]` (3 windows × 12 bands) →
+    ///   [`Self::short`]`[sfb][w]`.
+    /// * Mixed: [`Self::mixed_long`]`[0..8]` from the long `thm` (the
+    ///   only long-coded bands of a mixed block) and
+    ///   [`Self::mixed_short`]`[3..12]` from the short `thm_short`.
+    ///
+    /// **Scale.** The outer loop reads only the *relative* per-band
+    /// ordering of `xmin` (a band with a smaller `xmin` demands a
+    /// higher SNR and so attracts amplification first); the absolute
+    /// magnitude only sets where convergence starts. The Model 2 `thm`
+    /// is a raw FFT-power-spectrum energy whose absolute scale depends
+    /// on the analysis window's normalization, which is unrelated to
+    /// the `db_to_xfsf_energy` calibration the uniform / LTq paths use.
+    /// To keep the loop's starting dynamics in the same dex as those
+    /// paths, the whole `thm` field is rescaled by a single positive
+    /// factor that maps the granule's geometric-mean threshold to
+    /// [`DEFAULT_OUTER_LOOP_THRESHOLD`]. A single multiplicative
+    /// rescale preserves every per-band ratio exactly, so the
+    /// perceptual ordering Model 2 produced is untouched — only the
+    /// common offset is calibrated.
+    ///
+    /// Non-positive `thm` entries (an all-zero / silent band) cannot be
+    /// log-averaged and are excluded from the geometric mean; after the
+    /// rescale they are floored to the rescaled minimum positive
+    /// threshold so a silent band never reads `xmin = 0` (which the
+    /// outer loop would treat as "infinite SNR required"). When the
+    /// granule carries no positive threshold at all (a fully silent
+    /// granule), the result is [`Self::uniform`] at the default scale.
+    #[must_use]
+    pub fn from_layer3_granule(granule: &Model2Layer3Granule) -> Self {
+        // Collect every positive threshold across the long + short
+        // deliverables for the geometric-mean normalization anchor.
+        let mut log_sum = 0.0_f64;
+        let mut log_count = 0_usize;
+        let mut min_positive = f64::INFINITY;
+        let mut accumulate = |v: f64| {
+            if v > 0.0 {
+                log_sum += v.ln();
+                log_count += 1;
+                if v < min_positive {
+                    min_positive = v;
+                }
+            }
+        };
+        for &v in &granule.thm {
+            accumulate(v);
+        }
+        for win in &granule.thm_short {
+            for &v in win {
+                accumulate(v);
+            }
+        }
+
+        // Fully silent granule — no positive threshold to anchor on.
+        if log_count == 0 {
+            return Self::uniform(DEFAULT_OUTER_LOOP_THRESHOLD);
+        }
+
+        // Geometric mean of the positive thresholds, and the
+        // single rescale that maps it to DEFAULT_OUTER_LOOP_THRESHOLD.
+        let geo_mean = (log_sum / log_count as f64).exp();
+        let scale = DEFAULT_OUTER_LOOP_THRESHOLD / geo_mean;
+        // Floor for silent (non-positive) bands after rescaling: the
+        // smallest rescaled positive threshold, so a quiet band asks
+        // for at least as much SNR as the quietest real band, never
+        // `xmin = 0`.
+        let floor = min_positive * scale;
+        let map = |v: f64| if v > 0.0 { v * scale } else { floor };
+
+        // Long bands (21).
+        let mut long = [floor; LONG_SFB];
+        for (sfb, slot) in long.iter_mut().enumerate() {
+            if let Some(&v) = granule.thm.get(sfb) {
+                *slot = map(v);
+            }
+        }
+
+        // Short bands (12 × 3 windows): granule.thm_short[w][sfb] →
+        // short[sfb][w].
+        let mut short = [[floor; SHORT_WINDOWS]; SHORT_SFB];
+        for (w, win) in granule.thm_short.iter().enumerate() {
+            if w >= SHORT_WINDOWS {
+                break;
+            }
+            for (sfb, &v) in win.iter().enumerate() {
+                if sfb < SHORT_SFB {
+                    short[sfb][w] = map(v);
+                }
+            }
+        }
+
+        // Mixed-block long region: first 8 long bands (the only
+        // long-coded bands of a mixed block). Bands 8..21 keep the same
+        // long values for consistent out-of-range inspection.
+        let mixed_long = long;
+        // Mixed-block short region: short bands 3..12 (a mixed block
+        // absorbs short sfb 0..=2 into the long-window portion). The
+        // whole short matrix is reused; the mixed primitive reads only
+        // `[3, 12)`.
+        let mixed_short = short;
+
+        Self {
+            long,
+            short,
+            mixed_long,
+            mixed_short,
+        }
+    }
 }
 
 /// Mapping from `dB`-domain threshold-in-quiet to the outer loop's
@@ -10113,6 +10240,12 @@ pub struct Model2Layer3Granule {
     pub thm: Vec<f64>,
     /// Figure C.6.c `ratio(sb) = thm(sb)/en(sb)` (21 bands).
     pub ratio: Vec<f64>,
+    /// Figure C.6.d short-path `thm(sb)` per subblock — the
+    /// scalefactor-band threshold of audibility for each of the 3
+    /// short windows (3 × 12 bands). Companion to [`Self::thm`] for the
+    /// short path; the per-band masking threshold the outer loop reads
+    /// as `xmin(sb)` (see [`XminThresholds::from_layer3_granule`]).
+    pub thm_short: [Vec<f64>; 3],
     /// Figure C.6.d short-path `ratio(sb)` per subblock (3 × 12
     /// bands; "subblock = 0 … subblock < 3").
     pub ratio_short: [Vec<f64>; 3],
@@ -10251,6 +10384,7 @@ impl Model2Layer3State {
         let swidths = layer3_partition_widths_short(self.fs);
         let sconv = layer3_sfb_conversion_short(self.fs);
         let mut ratio_short: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut thm_short: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for (k, r_s) in short_r.iter().enumerate() {
             let eb_s = layer3_partition_eb(r_s, &swidths)?;
             let ecbb_s = model2_layer3_spread_partitions(&eb_s);
@@ -10264,6 +10398,7 @@ impl Model2Layer3State {
             let en_s = layer3_partitions_to_sfb(&eb_s, sconv)?;
             let thm_s = layer3_partitions_to_sfb(&thr_s, sconv)?;
             ratio_short[k] = layer3_sfb_ratio(&thm_s, &en_s)?;
+            thm_short[k] = thm_s;
         }
         // Commit the FFT histories only after the whole walk
         // succeeded (the pre-echo history advanced inside step()).
@@ -10278,6 +10413,7 @@ impl Model2Layer3State {
             en,
             thm,
             ratio,
+            thm_short,
             ratio_short,
         })
     }
@@ -19638,6 +19774,12 @@ mod tests {
         for r in &out.ratio_short {
             assert_eq!(r.len(), LAYER3_SFB_CONV_SHORT_BANDS);
         }
+        for t in &out.thm_short {
+            assert_eq!(t.len(), LAYER3_SFB_CONV_SHORT_BANDS);
+            // Even on silence the short threshold floor (Table C.7
+            // `qthr`) keeps every band strictly positive.
+            assert!(t.iter().all(|&v| v.is_finite() && v > 0.0));
+        }
         assert!(out.pe.is_finite());
         assert!(!out.attack);
         assert!(out.en.iter().all(|&e| e == 0.0));
@@ -19677,5 +19819,128 @@ mod tests {
             assert!(out.pe.is_finite());
             assert_eq!(out.ratio.len(), LAYER3_SFB_CONV_LONG_BANDS);
         }
+    }
+
+    #[test]
+    fn xmin_from_layer3_granule_preserves_ordering_and_scale() {
+        // Build a granule whose long thresholds span several decades so
+        // the rescale + ordering preservation is observable.
+        let thm: Vec<f64> = (0..LONG_SFB).map(|i| 10.0_f64.powi(i as i32 % 7)).collect();
+        let thm_short_one: Vec<f64> = (0..SHORT_SFB)
+            .map(|i| 10.0_f64.powi(i as i32 % 5))
+            .collect();
+        let granule = Model2Layer3Granule {
+            pe: 0.0,
+            attack: false,
+            en: vec![1.0; LONG_SFB],
+            thm: thm.clone(),
+            ratio: vec![1.0; LONG_SFB],
+            thm_short: [
+                thm_short_one.clone(),
+                thm_short_one.clone(),
+                thm_short_one.clone(),
+            ],
+            ratio_short: [
+                vec![1.0; SHORT_SFB],
+                vec![1.0; SHORT_SFB],
+                vec![1.0; SHORT_SFB],
+            ],
+        };
+        let x = XminThresholds::from_layer3_granule(&granule);
+        // Every band fully populated and strictly positive.
+        assert!(x.long.iter().all(|&v| v.is_finite() && v > 0.0));
+        for row in &x.short {
+            assert!(row.iter().all(|&v| v.is_finite() && v > 0.0));
+        }
+        // A single multiplicative rescale preserves every pairwise ratio
+        // from the source `thm`: long[i]/long[j] == thm[i]/thm[j].
+        for i in 0..LONG_SFB {
+            for j in 0..LONG_SFB {
+                let lhs = x.long[i] / x.long[j];
+                let rhs = thm[i] / thm[j];
+                assert!(
+                    (lhs - rhs).abs() <= 1e-9 * rhs.max(1.0),
+                    "ratio mismatch at ({i},{j}): {lhs} vs {rhs}"
+                );
+            }
+        }
+        // thm_short[w][sfb] lands at short[sfb][w].
+        for w in 0..SHORT_WINDOWS {
+            for sfb in 0..SHORT_SFB {
+                let lhs = x.short[sfb][w] / x.short[0][w];
+                let rhs = thm_short_one[sfb] / thm_short_one[0];
+                assert!((lhs - rhs).abs() <= 1e-9 * rhs.max(1.0));
+            }
+        }
+        // The geometric mean of the rescaled values sits at the
+        // calibrated default (within FP): the single rescale maps the
+        // source geo-mean to DEFAULT_OUTER_LOOP_THRESHOLD.
+        let mut all: Vec<f64> = thm.clone();
+        for _ in 0..SHORT_WINDOWS {
+            all.extend_from_slice(&thm_short_one);
+        }
+        let src_geo = (all.iter().map(|v| v.ln()).sum::<f64>() / all.len() as f64).exp();
+        let scale = DEFAULT_OUTER_LOOP_THRESHOLD / src_geo;
+        assert!((x.long[0] - thm[0] * scale).abs() <= 1e-3 * (thm[0] * scale).max(1.0));
+        // Mixed regions mirror the long / short fills.
+        assert_eq!(x.mixed_long, x.long);
+        assert_eq!(x.mixed_short, x.short);
+    }
+
+    #[test]
+    fn xmin_from_layer3_granule_handles_silence_and_zero_bands() {
+        // A fully silent granule (all thresholds zero) → uniform default.
+        let silent = Model2Layer3Granule {
+            pe: 0.0,
+            attack: false,
+            en: vec![0.0; LONG_SFB],
+            thm: vec![0.0; LONG_SFB],
+            ratio: vec![0.0; LONG_SFB],
+            thm_short: [
+                vec![0.0; SHORT_SFB],
+                vec![0.0; SHORT_SFB],
+                vec![0.0; SHORT_SFB],
+            ],
+            ratio_short: [
+                vec![0.0; SHORT_SFB],
+                vec![0.0; SHORT_SFB],
+                vec![0.0; SHORT_SFB],
+            ],
+        };
+        let x = XminThresholds::from_layer3_granule(&silent);
+        let u = XminThresholds::uniform(DEFAULT_OUTER_LOOP_THRESHOLD);
+        assert_eq!(x.long, u.long);
+        assert_eq!(x.short, u.short);
+        assert_eq!(x.mixed_long, u.mixed_long);
+        assert_eq!(x.mixed_short, u.mixed_short);
+
+        // A granule with one zero band among positive bands: the zero
+        // band is floored to the smallest rescaled positive threshold,
+        // never to 0 (which the outer loop reads as "infinite SNR").
+        let mut thm = vec![100.0; LONG_SFB];
+        thm[5] = 0.0;
+        let mixed = Model2Layer3Granule {
+            pe: 0.0,
+            attack: false,
+            en: vec![1.0; LONG_SFB],
+            thm,
+            ratio: vec![1.0; LONG_SFB],
+            thm_short: [
+                vec![100.0; SHORT_SFB],
+                vec![100.0; SHORT_SFB],
+                vec![100.0; SHORT_SFB],
+            ],
+            ratio_short: [
+                vec![1.0; SHORT_SFB],
+                vec![1.0; SHORT_SFB],
+                vec![1.0; SHORT_SFB],
+            ],
+        };
+        let x = XminThresholds::from_layer3_granule(&mixed);
+        assert!(x.long[5] > 0.0);
+        // The floor equals the rescaled minimum positive threshold —
+        // here every positive band is 100.0, so the floor equals every
+        // other rescaled band.
+        assert!((x.long[5] - x.long[0]).abs() <= 1e-6 * x.long[0]);
     }
 }

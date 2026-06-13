@@ -4552,17 +4552,44 @@ steady-state normalized RMS error, and
 `tests/lsf_encoder_roundtrip.rs` (10 tests) round-trips the
 LSF / MPEG-2.5 rates at 56–88 dB self-decode PSNR with
 black-box `ffmpeg` / `mpg123` cross-decodes recovering the
-exact test tones at every MPEG-2 rate — it
+exact test tones at every MPEG-2 rate
++ r288 **Model 2 psychoacoustic threshold wired into the outer
+loop** (Phase 2 step 89). The §C.1.5.3.2.1 Layer III analysis
+chain — already producing the Figure C.6.c/d per-scalefactor-band
+masking threshold `thm(sb)` through `psy::Model2Layer3State::
+process` — now feeds the encoder's distortion-control loop.
+`XminThresholds::from_layer3_granule` maps a granule's per-band
+threshold (long `thm[21]` + the new short `thm_short[3][12]`
+field) into the outer-loop `xmin(sb)` vector, preserving every
+per-band ratio exactly: a single multiplicative rescale anchors
+the granule's geometric-mean threshold to
+`DEFAULT_OUTER_LOOP_THRESHOLD`, so the loop's convergence
+dynamics stay in the same dex as the LTq / uniform paths while
+the perceptual ordering Model 2 produced is untouched. Silent
+bands floor to the smallest rescaled positive threshold (never
+`xmin = 0`); a fully silent granule yields the uniform default.
+`Mp3Encoder::set_per_band_xmin_from_model2(state, granule)` is
+the end-to-end convenience — one 576-sample granule through a
+caller-owned `Model2Layer3State` (threaded across granules for
+the §D.2.1 FFT-history requirement, one per channel) installs the
+*signal-dependent* masking threshold in place of the
+*signal-independent* threshold-in-quiet bowl. Restricted to the
+three staged Annex D Model 2 rates (32 / 44.1 / 48 kHz); other
+rates and non-576 granules return the new
+`StreamEncodeError::Model2AnalysisUnsupported`. 5 new unit tests
+cover ratio preservation, the geometric-mean scale anchor, the
+silent / zero-band floor, the outer-loop / rate / granule guards,
+and an end-to-end install producing a spectrally-shaped (not
+flat) threshold — it
 still lacks
-the rest of
-Annex D Model 2 (steps h)–l) — required SNR per partition,
-power ratio, energy threshold, line spread and the
-absolute-threshold floor, all of whose table inputs
-(`minval` / `TMN` from Tables D.3a–c and `absthr` from
-Tables D.4a–c) are now transcribed in-tree — plus the
-steps b)–e) FFT-side inputs),
-LSF auto block-type (the §C.1.5.2 scheduler walk is still
-two-granule shaped), and
+the §C.1.5.3.2 driver that runs Model 2 *automatically* inside
+`push_samples` per granule (the threshold is installed via the
+explicit `set_per_band_xmin_from_model2` entry point this round;
+auto-wiring it into the per-granule encode walk — including the
+MS-vs-independent channel split and the auto-block-type lookahead
+— is the follow-up),
+LSF / MPEG-2.5 Model 2 (the Annex D Tables D.3 / D.4 / C.7 / C.8
+are staged only for 32 / 44.1 / 48 kHz), and
 externally-valid MPEG-2.5 encode (the encoder emits
 self-consistent MPEG-2.5 streams this crate's decoder
 round-trips, but the MPEG-2.5-specific scalefactor-band tables

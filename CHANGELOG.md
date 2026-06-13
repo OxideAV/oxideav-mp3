@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **Model 2 psychoacoustic threshold wired into the outer loop**
+  (r288, Phase 2 step 89) — the §C.1.5.3.2.1 Layer III analysis chain
+  (already producing the Figure C.6.c/d `thm(sb)` masking threshold via
+  `crate::psy::Model2Layer3State::process`) is now consumable as the
+  outer loop's `xmin(sb)`. `XminThresholds::from_layer3_granule` maps a
+  granule's per-band masking threshold (long `thm[21]` + the new short
+  `thm_short[3][12]`) into the per-band outer-loop threshold vector,
+  preserving every per-band ratio exactly (a single multiplicative
+  rescale anchors the granule's geometric-mean threshold to
+  `DEFAULT_OUTER_LOOP_THRESHOLD`, keeping the loop's convergence dynamics
+  in the same dex as the LTq / uniform paths). Silent (non-positive)
+  bands are floored to the smallest rescaled positive threshold so a
+  quiet band never reads `xmin = 0`; a fully silent granule yields the
+  uniform default. `Mp3Encoder::set_per_band_xmin_from_model2(state,
+  granule)` is the end-to-end convenience: it runs one 576-sample
+  granule through a caller-owned `Model2Layer3State` (threaded across
+  granules for the §D.2.1 FFT-history requirement, one per channel) and
+  installs the result, replacing the *signal-independent*
+  threshold-in-quiet bowl with the *signal-dependent* masking threshold.
+  Restricted to the three staged Annex D Model 2 rates (32 / 44.1 /
+  48 kHz); other rates and non-576 granules return the new
+  `StreamEncodeError::Model2AnalysisUnsupported`. `Model2Layer3Granule`
+  gains a `thm_short` field carrying the short-path per-band threshold
+  (previously only the `ratio_short` quotient was exposed). Five new unit
+  tests cover ratio preservation, the geometric-mean scale anchor, the
+  silent / zero-band floor, the outer-loop guard, the rate / granule
+  guards, and an end-to-end install producing a spectrally-shaped (not
+  flat) threshold.
 - encoder: **LSF (MPEG-2 / MPEG-2.5) auto block-type** (r287, Phase 2
   step 88) — `Mp3Encoder::enable_auto_block_type` /
   `enable_auto_block_type_with_mixed` now accept the LSF sample rates
