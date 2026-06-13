@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- decode: **Free-format (`bitrate_index == 0`) frame decode through the
+  `oxideav_core::Decoder` trait** (r292). The trait wiring previously
+  rejected any free-format frame because `Mp3FrameHeader::frame_len`
+  yields `None` for such a header (the ISO/IEC 11172-3 §2.4.2.3 length
+  formula requires a fixed `bitrate_index ∈ 1..=14`). Since each inbound
+  `Packet.data` already holds exactly one complete frame, `decode_packet`
+  now uses the packet length as the authoritative free-format frame
+  length, rejecting only a payload-less bare 4-byte sync. The downstream
+  decode is driven by `part2_3_length` from the side-info and never by
+  the advertised bitrate, so a free-format frame decodes through the
+  identical chain. New `tests/decoder_trait_free_format_roundtrip.rs`
+  (4 tests) proves byte-exact equality between a free-format stream and
+  its CBR origin (mono + stereo), plus header-property and bare-sync
+  rejection checks.
+
 - decode: **Criterion benchmark harness + ranked hotspot map for the
   Layer III decode path** (r290, depth-mode BENCH). Two self-contained
   benches under `benches/` (no committed fixtures — input PCM is

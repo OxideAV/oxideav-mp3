@@ -863,6 +863,33 @@ match), and 250 ms of sine yields the expected count of
 is validated in r177 by `tests/decoder_trait_stereo_roundtrip.rs`
 (see "Phase 2 step 36" below).
 
+**Round 292 (free-format decode through the `Decoder` trait).** The
+trait wiring previously rejected any **free-format** frame
+(`bitrate_index == 0`, ISO/IEC 11172-3 §2.4.2.3) outright, because
+`Mp3FrameHeader::frame_len` returns `None` for such a header — the
+§2.4.2.3 length formula needs a fixed `bitrate_index ∈ 1..=14`. A
+free-format encoder instead picks a constant frame length the
+bitstream itself never encodes, and the framing layer recovers it as
+the distance from one syncword to the next. Since the trait contract
+is that each `Packet.data` already holds exactly one complete MP3
+frame, the authoritative free-format length is simply the packet
+length: `decode_packet` now derives `frame_len` from `bytes.len()`
+when the header yields none (rejecting only a bare 4-byte sync with no
+main-data slot). The entire downstream decode (side-info → Huffman →
+requantize → IMDCT → synthesis) is driven by `part2_3_length` from the
+side-info and never by the advertised bitrate, so a free-format frame
+decodes through the identical chain. Validated by
+`tests/decoder_trait_free_format_roundtrip.rs` (4 tests): a CBR stream
+is sliced into per-frame packets, each frame's `bitrate_index` is
+rewritten to `0` (changing no other byte — the field lives in the high
+nibble of header byte 2), and the resulting free-format stream decodes
+**byte-exact identical** to the original CBR PCM, for both mono and
+stereo; plus header-property and bare-sync-rejection checks. This
+closes the long-standing decode-side free-format "lacks" item; the
+encoder still emits only fixed-`bitrate_index` frames, and demuxer
+free-format framing (deriving the constant length from the first
+syncword interval) remains a follow-up.
+
 **Phase 2 step 38 (`DEFAULT_ATTACK_THRESHOLD` empirical-corpus
 calibration)** closes the dual of the r165 leak calibration on the
 encoder-side `attack_detect::AttackDetector`. r165 pinned

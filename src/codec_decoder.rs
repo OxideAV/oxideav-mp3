@@ -230,15 +230,41 @@ impl Mp3CoreDecoder {
                 "oxideav-mp3: unsupported channel count {nch} (expected 1 or 2)"
             )));
         }
-        let frame_len = hdr.frame_len().ok_or_else(|| {
-            Error::unsupported("oxideav-mp3: free-format frames not supported in trait wiring")
-        })?;
-        if bytes.len() < frame_len {
-            return Err(Error::invalid(format!(
-                "oxideav-mp3: packet len {} < header-implied frame len {frame_len}",
+        // §2.4.1.3 frame length. For a fixed-bitrate header (`bitrate_index
+        // ∈ 1..=14`) the length is derivable from the §2.4.2.3 formula and
+        // we bounds-check the packet against it. For a **free-format**
+        // header (`bitrate_index == 0`, §2.4.2.3) the standard does not
+        // give a closed-form length: the encoder picked a constant
+        // frame length the bitstream itself doesn't encode, and the
+        // framer (demuxer / caller) recovers it as the distance from one
+        // syncword to the next. The trait contract is that `packet.data`
+        // is exactly one complete MP3 frame, so for free format the
+        // authoritative length is simply the packet length. The whole
+        // downstream decode (side-info → Huffman → requantize → IMDCT →
+        // synthesis) is driven by `part2_3_length` from the side-info,
+        // never by the bitrate, so a free-format frame decodes through the
+        // identical chain once we know where its main-data slot ends.
+        let frame_len = match hdr.frame_len() {
+            Some(l) => {
+                if bytes.len() < l {
+                    return Err(Error::invalid(format!(
+                        "oxideav-mp3: packet len {} < header-implied frame len {l}",
+                        bytes.len()
+                    )));
+                }
+                l
+            }
+            None => {
+                // Free format (`bitrate_index == 0`): the packet itself is
+                // the frame. A 4-byte sync alone carries no audio.
+                if bytes.len() <= 4 {
+                    return Err(Error::invalid(
+                        "oxideav-mp3: free-format frame has no main-data slot",
+                    ));
+                }
                 bytes.len()
-            )));
-        }
+            }
+        };
 
         // Skip the optional 2-byte CRC slot that follows the 4-byte
         // header when `crc_protected` is set.
