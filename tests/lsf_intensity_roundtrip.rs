@@ -15,8 +15,7 @@
 //! the decoder tests for.
 //!
 //! Every test encodes synthetic stereo PCM and decodes the result with
-//! the crate's **own** decode primitives only — no external library is
-//! invoked.
+//! the crate's own decode primitives.
 
 use std::f32::consts::PI;
 
