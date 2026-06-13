@@ -1,0 +1,81 @@
+# cargo-fuzz manifest for the oxideav-mp3 Layer III DECODE attacker
+# surface.
+#
+# Round 289 depth-mode lane. The decoder is bit-exact at 100%; the
+# only remaining feature gap (MPEG-2.5 8 / 11.025 / 12 kHz
+# scalefactor-band tables) is docs-blocked. The remaining depth-mode
+# lane without coverage is libFuzzer on the Layer III decode path.
+#
+# Spec basis for the targets: ISO/IEC 11172-3 §2.4.1.7 (side
+# information), §2.4.2.7 (Huffman code-bit decoding of big_values +
+# count1), §2.4.3.4 (requantisation, alias reduction, IMDCT, synthesis
+# polyphase filterbank). The harness drives the registered `Decoder`
+# trait object plus the per-granule decode primitives
+# (`parse_side_info`, `decode_scalefactors`, `decode_huffman`,
+# `requantize`, `alias_reduce`, `imdct_granule`, `synth_granule`) with
+# attacker-supplied bytes; the contract under test is panic-freedom on
+# every entry, irrespective of input shape.
+
+[package]
+name = "oxideav-mp3-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-mp3]
+path = ".."
+
+# Self-contained workspace so the umbrella's `crates/*` member glob
+# (one level deep — this manifest is two levels deep and would not
+# match anyway) cannot pull this package in.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Target 1 — `decode`. Drives attacker-controlled bytes through
+# `Decoder::send_packet` on a freshly registered MP3 decoder. The
+# input is split into a sequence of variable-length packets so the
+# cross-packet bit-reservoir state machine (`main_data_begin`
+# lookback, reservoir assembly, IMDCT / synthesis overlap carry-over)
+# is exercised across a mixed sequence of frames. Each packet is built
+# with a structurally-valid 4-byte header (so the deep decode chain is
+# actually reached) whose every field is attacker-chosen, then padded
+# with attacker bytes for the CRC / side-info / main-data slot. Also
+# exercises `flush()`, `reset()`, and a forced double-flush so the
+# post-flush `Eof` path is covered.
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+
+# Target 2 — `granule`. Structured adversarial fuzzer for the
+# per-granule decode primitives below the trait surface. Constructs a
+# structurally-valid header + side-info block, then drives the deep
+# chain directly: `parse_side_info` → `decode_scalefactors` →
+# `decode_huffman` (big_values region split + count1 quad decode) →
+# `requantize` (power-3/4 dequant, scalefactor application) →
+# `alias_reduce` → `imdct_granule` (long / short / mixed window
+# overlap-add) → `synth_granule` (32-band polyphase filterbank). These
+# primitives are reached by the trait target only once the reservoir
+# lookback is satisfiable; this target feeds them attacker bytes
+# directly so the deep dequant / overlap math is stressed on every
+# iteration regardless of reservoir state.
+[[bin]]
+name = "granule"
+path = "fuzz_targets/granule.rs"
+test = false
+doc = false

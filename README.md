@@ -4605,6 +4605,41 @@ for that long region, so this crate follows the literal text and does
 not alias-reduce mixed blocks. A clarifying note in §2.4.3.4.10.1 on the
 mixed-block long region would remove the ambiguity.
 
+## Fuzzing
+
+A [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) / libFuzzer
+harness under `fuzz/` hardens the Layer III **decode** path against
+malformed bitstreams. It carries two targets:
+
+- **`decode`** — drives attacker bytes through the registered
+  `Decoder` trait (`send_packet` / `receive_frame` / `flush` /
+  `reset`) across a multi-packet stream, so the cross-packet bit
+  reservoir (`main_data_begin` lookback, §2.4.3.4) plus the IMDCT and
+  synthesis overlap carry-over are exercised, not just a cold-start
+  frame. Each crafted packet carries a structurally-valid 4-byte
+  header (so the deep chain past frame-sync is actually reached) whose
+  every field is attacker-chosen, with the CRC / side-info / main-data
+  slot filled from attacker bytes; raw-byte packets cover the
+  short-frame and bad-sync rejections.
+- **`granule`** — drives the per-granule decode primitives directly
+  below the trait surface (`parse_side_info` → `decode_scalefactors` →
+  `decode_huffman` big_values/count1 → `requantize` → `alias_reduce` →
+  `imdct_granule` → `synth_granule`), since those are reached through
+  the trait only once the reservoir lookback is satisfiable. The
+  side-info parse yields real attacker-controlled `GranuleChannel`
+  parameters (`part2_3_length`, `big_values`, `block_type`,
+  `region*_count`, `table_select`, `subblock_gain`, …) feeding the
+  dequant / window-overlap / filterbank math on every iteration.
+
+The contract under test is panic-freedom: every entry returns a value
+or an `Err`, never panicking, overflowing in a debug build, or
+indexing out of bounds. Round 289 ran both targets for 180 s each
+(≈759k iterations on `granule`, ≈335k on `decode`, ≈1.09M total) with
+zero findings.
+
+Run a target with `cargo +nightly fuzz run decode` (or `granule`)
+from the crate root.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

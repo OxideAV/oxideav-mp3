@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- decode: **libFuzzer hardening of the Layer III decode path** (r289,
+  depth-mode FUZZ lane). A new `fuzz/` cargo-fuzz harness adds two
+  targets exercising panic-freedom against malformed bitstreams:
+  `decode` drives the registered `Decoder` trait
+  (send/receive/flush/reset) with crafted multi-packet streams (valid
+  4-byte header + attacker-controlled CRC / side-info / main-data
+  slot), reaching side-info parse, Huffman big_values/count1 decode,
+  the bit-reservoir `main_data_begin` lookback, and the IMDCT /
+  synthesis overlap carry-over; `granule` drives the per-granule
+  primitives directly (`parse_side_info` → `decode_scalefactors` →
+  `decode_huffman` → `requantize` → `alias_reduce` → `imdct_granule`
+  → `synth_granule`) with attacker-controlled granule parameters. Both
+  ran 180 s each (≈1.09M total iterations) with zero findings; no
+  decode-path defects were surfaced.
+
 - encoder: **Model 2 psychoacoustic threshold wired into the outer loop**
   (r288, Phase 2 step 89) — the §C.1.5.3.2.1 Layer III analysis chain
   (already producing the Figure C.6.c/d `thm(sb)` masking threshold via
