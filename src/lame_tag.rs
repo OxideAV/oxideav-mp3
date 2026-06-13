@@ -17,10 +17,9 @@
 //! *Mp3 Info Tag revision 1 Specifications*
 //! (<http://gabriel.mp3-tech.org/mp3infotag.html>, fetched 2026-05-29,
 //! `sha256 e9be52a7…dd36d7`). The staged doc is independent format
-//! documentation, not LAME source — per `CLEANROOM-MANUAL §6/§10`
-//! that is the correct provenance for the Xing / Info / LAME-tag byte
-//! layout. No LAME, FFmpeg, mpg123 or other implementation source was
-//! consulted.
+//! documentation — per `CLEANROOM-MANUAL §6/§10` that is the correct
+//! provenance for the Xing / Info / LAME-tag byte layout. No external
+//! implementation source was consulted.
 //!
 //! # Layout (offsets relative to the Xing / Info magic byte)
 //!

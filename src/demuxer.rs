@@ -1524,7 +1524,7 @@ mod tests {
     }
 
     /// A carrier frame whose encoder string is something other than
-    /// "LAME" (e.g. "Lavc" — common ffmpeg-side emitter) yields a
+    /// "LAME" (e.g. "Lavc" — a common third-party encoder tag) yields a
     /// Xing tag but no LAME tag.
     #[test]
     fn non_lame_encoder_yields_no_lame_tag() {
