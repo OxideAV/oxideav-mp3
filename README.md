@@ -2452,6 +2452,45 @@ and MPEG-2.5 at 11.025 kHz). `tests/lsf_encoder_roundtrip.rs`'s
 constructors now build on LSF; only auto block-type still rejects.
 Tests: 1047 lib (was 1046; +1 unit) + 6 integration.
 
+**Phase 2 step 88 (r287)** — **LSF (MPEG-2 / MPEG-2.5) auto block-type**
+(§C.1.5.2 over ISO/IEC 13818-3 §2.4.3.2), lifting the last
+`LsfUnsupported` rejection — `Mp3Encoder::enable_auto_block_type` /
+`enable_auto_block_type_with_mixed` now accept the LSF rates (16 /
+22.05 / 24 kHz) and MPEG-2.5 rates (8 / 11.025 / 12 kHz). The
+`attack_detect` / `block_type_sm` / `mixed_classifier` modules are
+unchanged; the only edit is in `assemble_frame_with_lookahead`, whose
+auto-path frame walk was hard-shaped to the MPEG-1 two-granule
+geometry (classify gr0, gr1, lookahead; step the scheduler twice). It
+is now generalised over `ngr ∈ {1, 2}`: the walk builds, per channel,
+an attack flag for each of the frame's `ngr` granules plus one
+lookahead granule (the next frame's leading granule held in
+`per_ch_lookahead_pcm`, already version-agnostic in `push_samples` /
+`finish`), then steps the scheduler `ngr` times — granule `g` is fed
+`(attack[g], attack[g + 1])` so its §C.1.5.2 companion is the
+following granule's flag (the lookahead for the frame's last granule).
+On LSF (`ngr == 1`, one 576-sample granule per frame) this is a single
+step with the next frame's granule as the lookahead; on MPEG-1
+(`ngr == 2`) it reproduces the prior two-step walk byte-for-byte. The
+lookahead granule is peeked non-destructively (the detector is cloned
+so the zero-padded or borrowed next-frame PCM never perturbs the
+ambient estimate; an empty lookahead at end-of-stream feeds
+`next_attack = false` so the burst closes with a `Stop`). The
+§2.4.3.4.10.3 window-switching geometry is version-invariant — only
+the per-frame granule count differs — so no spec table changes are
+needed. Independent stereo runs a per-channel detector + scheduler;
+MS-stereo (§2.4.3.4.9) OR-folds the per-channel flags into a single
+shared (channel-0) scheduler and mirrors its emission across both
+channels of the granule, exactly as on MPEG-1. Validated by a new
+`tests/lsf_auto_block_type_roundtrip.rs` (5 integration tests):
+steady-sine stays Long; click-train engages Short and self-decodes;
+the mixed-promotion variant; independent-stereo per-channel sequences;
+and MS-stereo per-granule block-type / `window_switching_flag`
+agreement. `tests/lsf_encoder_roundtrip.rs`'s
+`lsf_rejects_unported_features` split into `lsf_auto_block_type_accepted`
++ `lsf_intensity_constructors_build`. Tests: 1047 lib + 6 new
+integration (auto-block-type LSF) — no LSF feature now returns
+`LsfUnsupported` on a supported channel layout.
+
 **Phase 2 step 85 (r283)** — **§C.1.5.3.2.1 Layer III adaptation of
 Model 2 + §D.2.4 step m) pre-echo control + §C.1.5.3.2 window
 switching**, closing the "remaining Layer III adaptations" tail left

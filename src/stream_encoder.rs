@@ -947,15 +947,20 @@ impl Mp3Encoder {
     /// Returns `Ok` for every channel layout this round; the
     /// previous round's [`StreamEncodeError::StereoUnsupported`]
     /// guard was dropped in r163.
-    /// [`StreamEncodeError::LsfUnsupported`] on an LSF (MPEG-2 /
-    /// MPEG-2.5) encoder: the §C.1.5.2 scheduler walk in
-    /// `assemble_frame_with_lookahead` steps the per-channel state
-    /// machine twice per frame (the MPEG-1 two-granule geometry); the
-    /// one-granule LSF restructure of that walk is deferred.
+    ///
+    /// As of r287 the auto block-type scheduler is **version-agnostic**:
+    /// the §C.1.5.2 walk in `assemble_frame_with_lookahead` steps the
+    /// per-channel state machine `granules_per_frame()` times — twice
+    /// per frame on MPEG-1 (the two-granule geometry) and once per frame
+    /// on LSF (MPEG-2 16 / 22.05 / 24 kHz and MPEG-2.5 8 / 11.025 /
+    /// 12 kHz, where ISO/IEC 13818-3 frames carry a single 576-sample
+    /// granule). The §2.4.3.4.10.3 window-switching geometry and the
+    /// per-granule attack/lookahead model are identical across versions;
+    /// only the granule count per frame differs, so the LSF walk reuses
+    /// the same detector + scheduler + mixed-classifier wiring with one
+    /// scheduler step per frame and the next frame's single granule as
+    /// the §C.1.5.2 lookahead.
     pub fn enable_auto_block_type(&mut self, threshold: f64) -> Result<(), StreamEncodeError> {
-        if self.version.is_lsf() {
-            return Err(StreamEncodeError::LsfUnsupported);
-        }
         if self.intensity_start_sfb.is_some() {
             // Intensity coupling is long-block only this round; the
             // auto scheduler emits Start / Short / End granules whose
@@ -2058,177 +2063,203 @@ impl Mp3Encoder {
         // `enable_auto_block_type`).
         let mut mixed_per_gc: [[bool; 2]; GRANULES] = [[false; 2]; GRANULES];
         let ms_agreement_active = self.ms_joint_stereo_active() && self.nch == 2;
-        let block_type_per_gc: [[BlockType; 2]; GRANULES] =
-            if let Some(ref mut cfg) = self.auto_block_type {
-                // Auto path: classify each of the 2 frame granules + 1
-                // lookahead granule per channel, then feed the scheduler.
-                //
-                // Two channel-coupling regimes (r163):
-                //
-                // * **Independent** (mono, `ChannelMode::Stereo`,
-                //   `ChannelMode::DualChannel`): each channel runs an
-                //   independent detector + scheduler. The per-channel
-                //   §C.1.5.2 transition states never need to match —
-                //   §2.4.1.7 / §2.4.2.7 carry side-info per channel
-                //   verbatim. The matrix `block_type_per_gc[gr][ch]`
-                //   can hold a different value for each channel.
-                //
-                // * **MS-stereo** (`new_joint_stereo_ms` or
-                //   `new_joint_stereo_auto`, the
-                //   `ms_agreement_active` branch): §2.4.3.4.9 requires
-                //   both channels of a granule to share the same
-                //   `block_type` / `window_switching_flag` /
-                //   `mixed_block_flag`, because the §2.4.3.4.9.2 MS
-                //   matrix `M = (L+R)/√2`, `S = (L-R)/√2` rotates L/R
-                //   before quantize and the decoder needs both halves
-                //   to share window geometry. The per-channel attack
-                //   detectors are still run (each channel keeps a
-                //   coherent ambient estimate so a quiet channel
-                //   doesn't drag the loud channel's threshold around),
-                //   but their per-granule attack flags are folded via
-                //   logical OR into the channel-0 scheduler and the
-                //   channel-0 scheduler's emission is mirrored across
-                //   both channels of the granule. The channel-1
-                //   scheduler is bypassed — it stays at default and
-                //   carries no state. If either channel demands a
-                //   Short, the granule emits Short on both; same for
-                //   the mixed-block-flag promotion. This is the
-                //   "safe upper envelope" agreement: it accepts more
-                //   short bursts than a per-channel sequence would
-                //   (each channel sees the other's transients) but
-                //   never under-resolves a real transient on either
-                //   side, and produces a self-consistent §C.1.5.2
-                //   sequence across the shared scheduler. Symmetric in
-                //   L↔R: an attack on either channel triggers the
-                //   transition for both.
-                let mut out: [[BlockType; 2]; GRANULES] = [[BlockType::Long; 2]; GRANULES];
-                if ms_agreement_active {
-                    // Per-channel attack-flag computation. Each channel's
-                    // detector still classifies its own PCM so the
-                    // ambient estimate stays meaningful for that
-                    // channel (a sudden L burst doesn't get hidden by
-                    // R's running ambient).
-                    let mut a0 = false;
-                    let mut a1 = false;
-                    let mut a2 = false;
-                    let mut m0 = false;
-                    let mut m1 = false;
-                    for ch in 0..self.nch {
-                        let mut pcm_g0 = [0.0f32; SAMPLES_PER_GRANULE];
-                        let mut pcm_g1 = [0.0f32; SAMPLES_PER_GRANULE];
-                        let mut pcm_g2 = [0.0f32; SAMPLES_PER_GRANULE];
-                        pcm_g0.copy_from_slice(&per_ch_frame_pcm[ch][0..SAMPLES_PER_GRANULE]);
-                        pcm_g1.copy_from_slice(
-                            &per_ch_frame_pcm[ch][SAMPLES_PER_GRANULE..2 * SAMPLES_PER_GRANULE],
-                        );
-                        let look = &per_ch_lookahead_pcm[ch];
-                        if !look.is_empty() {
-                            let n = look.len().min(SAMPLES_PER_GRANULE);
-                            pcm_g2[..n].copy_from_slice(&look[..n]);
-                        }
-                        // OR the per-channel classifications so the
-                        // shared scheduler sees a transient on either
-                        // side. Always advance the detector on both
-                        // granules to keep its ambient state coherent.
-                        a0 |= cfg.detector[ch].classify(&pcm_g0);
-                        a1 |= cfg.detector[ch].classify(&pcm_g1);
-                        let lookahead_present = !look.is_empty();
-                        if lookahead_present {
-                            let mut det_peek = cfg.detector[ch].clone();
-                            a2 |= det_peek.classify(&pcm_g2);
-                        }
-                        if let Some(ref mut classifiers) = cfg.mixed_classifier {
-                            m0 |= classifiers[ch].classify_mixed(&pcm_g0);
-                            m1 |= classifiers[ch].classify_mixed(&pcm_g1);
-                        }
-                    }
-                    // Single shared scheduler (we use channel-0's
-                    // slot; channel-1's scheduler is left at default
-                    // and carries no state in the MS-stereo regime).
-                    let (bt0, mixed0) = cfg.scheduler[0].step_with_mixed(a0, a1, m0);
-                    let (bt1, mixed1) = cfg.scheduler[0].step_with_mixed(a1, a2, m1);
-                    out[0][0] = bt0;
-                    out[0][1] = bt0;
-                    out[1][0] = bt1;
-                    out[1][1] = bt1;
-                    mixed_per_gc[0][0] = mixed0;
-                    mixed_per_gc[0][1] = mixed0;
-                    mixed_per_gc[1][0] = mixed1;
-                    mixed_per_gc[1][1] = mixed1;
+        let block_type_per_gc: [[BlockType; 2]; GRANULES] = if let Some(ref mut cfg) =
+            self.auto_block_type
+        {
+            // Auto path: classify each of the 2 frame granules + 1
+            // lookahead granule per channel, then feed the scheduler.
+            //
+            // Two channel-coupling regimes (r163):
+            //
+            // * **Independent** (mono, `ChannelMode::Stereo`,
+            //   `ChannelMode::DualChannel`): each channel runs an
+            //   independent detector + scheduler. The per-channel
+            //   §C.1.5.2 transition states never need to match —
+            //   §2.4.1.7 / §2.4.2.7 carry side-info per channel
+            //   verbatim. The matrix `block_type_per_gc[gr][ch]`
+            //   can hold a different value for each channel.
+            //
+            // * **MS-stereo** (`new_joint_stereo_ms` or
+            //   `new_joint_stereo_auto`, the
+            //   `ms_agreement_active` branch): §2.4.3.4.9 requires
+            //   both channels of a granule to share the same
+            //   `block_type` / `window_switching_flag` /
+            //   `mixed_block_flag`, because the §2.4.3.4.9.2 MS
+            //   matrix `M = (L+R)/√2`, `S = (L-R)/√2` rotates L/R
+            //   before quantize and the decoder needs both halves
+            //   to share window geometry. The per-channel attack
+            //   detectors are still run (each channel keeps a
+            //   coherent ambient estimate so a quiet channel
+            //   doesn't drag the loud channel's threshold around),
+            //   but their per-granule attack flags are folded via
+            //   logical OR into the channel-0 scheduler and the
+            //   channel-0 scheduler's emission is mirrored across
+            //   both channels of the granule. The channel-1
+            //   scheduler is bypassed — it stays at default and
+            //   carries no state. If either channel demands a
+            //   Short, the granule emits Short on both; same for
+            //   the mixed-block-flag promotion. This is the
+            //   "safe upper envelope" agreement: it accepts more
+            //   short bursts than a per-channel sequence would
+            //   (each channel sees the other's transients) but
+            //   never under-resolves a real transient on either
+            //   side, and produces a self-consistent §C.1.5.2
+            //   sequence across the shared scheduler. Symmetric in
+            //   L↔R: an attack on either channel triggers the
+            //   transition for both.
+            let mut out: [[BlockType; 2]; GRANULES] = [[BlockType::Long; 2]; GRANULES];
+            // Generalised over `ngr ∈ {1, 2}`: the §C.1.5.2 walk
+            // builds, per channel, an attack flag for each of this
+            // frame's `ngr` granules plus one lookahead granule
+            // (the next frame's leading granule), then steps the
+            // scheduler `ngr` times — granule `g` is fed
+            // `(attack[g], attack[g + 1])` so its companion is the
+            // following granule's flag (the lookahead for the last
+            // granule of the frame). On MPEG-1 (`ngr == 2`) this
+            // reproduces the prior two-step walk verbatim; on LSF
+            // (`ngr == 1`, ISO/IEC 13818-3 single 576-sample
+            // granule) it steps once with the next frame's granule
+            // as the §C.1.5.2 lookahead. The window-switching
+            // geometry of §2.4.3.4.10.3 is identical across
+            // versions — only the per-frame granule count differs.
+            //
+            // Helper: extract one granule's PCM (`g` in
+            // `0..ngr` indexes into `per_ch_frame_pcm`; `g == ngr`
+            // is the lookahead granule held in
+            // `per_ch_lookahead_pcm`). Returns the 576-sample slab
+            // plus whether real (non-padded) lookahead PCM exists.
+            let grab_granule = |frame: &[Vec<f32>],
+                                look: &[Vec<f32>],
+                                ch: usize,
+                                g: usize|
+             -> ([f32; SAMPLES_PER_GRANULE], bool) {
+                let mut slab = [0.0f32; SAMPLES_PER_GRANULE];
+                if g < ngr {
+                    slab.copy_from_slice(
+                        &frame[ch][g * SAMPLES_PER_GRANULE..(g + 1) * SAMPLES_PER_GRANULE],
+                    );
+                    (slab, true)
                 } else {
-                    for ch in 0..self.nch {
-                        // 3 attack flags: gr0, gr1, lookahead (gr2 of the
-                        // virtual three-granule window). Lookahead is empty
-                        // at end-of-stream — treat that as "no attack ahead".
-                        let mut pcm_g0 = [0.0f32; SAMPLES_PER_GRANULE];
-                        let mut pcm_g1 = [0.0f32; SAMPLES_PER_GRANULE];
-                        let mut pcm_g2 = [0.0f32; SAMPLES_PER_GRANULE];
-                        pcm_g0.copy_from_slice(&per_ch_frame_pcm[ch][0..SAMPLES_PER_GRANULE]);
-                        pcm_g1.copy_from_slice(
-                            &per_ch_frame_pcm[ch][SAMPLES_PER_GRANULE..2 * SAMPLES_PER_GRANULE],
-                        );
-                        let look = &per_ch_lookahead_pcm[ch];
-                        if !look.is_empty() {
-                            let n = look.len().min(SAMPLES_PER_GRANULE);
-                            pcm_g2[..n].copy_from_slice(&look[..n]);
-                        }
-                        let a0 = cfg.detector[ch].classify(&pcm_g0);
-                        let a1 = cfg.detector[ch].classify(&pcm_g1);
-                        let lookahead_present = !look.is_empty();
-                        // Lookahead PCM may itself be empty (end-of-stream)
-                        // or all-zero (zero-padded tail-flush). In either
-                        // case we feed the scheduler `next_attack = false`
-                        // so the burst geometry closes cleanly with a Stop.
-                        // We do NOT classify a zero-padded buffer because
-                        // that would inject a spurious silent-floor sample
-                        // into the detector's ambient estimate; instead we
-                        // peek non-destructively by cloning the detector and
-                        // discard the resulting state.
-                        let a2 = if lookahead_present {
-                            let mut det_peek = cfg.detector[ch].clone();
-                            det_peek.classify(&pcm_g2)
-                        } else {
-                            false
-                        };
-                        // Optional mixed-vs-pure-short classification per
-                        // granule. The classifier is stateful (its one-tap
-                        // LP carries the previous granule's last sample
-                        // across boundaries), so we always advance it on
-                        // both granules to keep the seed continuous —
-                        // independent of whether the emission ends up
-                        // Short or not. The flag is consumed only when
-                        // the scheduler returns Short below; the
-                        // classifier itself doesn't know what the scheduler
-                        // will decide. The §2.4.2.7 mixed_block_flag is
-                        // valid only on Short emissions, which the
-                        // `step_with_mixed` contract enforces.
-                        let (m0, m1) = if let Some(ref mut classifiers) = cfg.mixed_classifier {
-                            let mm0 = classifiers[ch].classify_mixed(&pcm_g0);
-                            let mm1 = classifiers[ch].classify_mixed(&pcm_g1);
-                            (mm0, mm1)
-                        } else {
-                            (false, false)
-                        };
-                        // Feed the scheduler in granule-major order.
-                        let (bt0, mixed0) = cfg.scheduler[ch].step_with_mixed(a0, a1, m0);
-                        let (bt1, mixed1) = cfg.scheduler[ch].step_with_mixed(a1, a2, m1);
-                        out[0][ch] = bt0;
-                        out[1][ch] = bt1;
-                        mixed_per_gc[0][ch] = mixed0;
-                        mixed_per_gc[1][ch] = mixed1;
+                    let lk = &look[ch];
+                    if lk.is_empty() {
+                        (slab, false)
+                    } else {
+                        let n = lk.len().min(SAMPLES_PER_GRANULE);
+                        slab[..n].copy_from_slice(&lk[..n]);
+                        (slab, true)
                     }
                 }
-                out
-            } else if self.force_short_blocks {
-                [[BlockType::Short; 2]; GRANULES]
-            } else if self.force_mixed_blocks {
-                // Mixed is still `block_type == Short` on the wire (the
-                // mixed_block_flag selects long-region carve-out
-                // separately).
-                [[BlockType::Short; 2]; GRANULES]
-            } else {
-                [[BlockType::Long; 2]; GRANULES]
             };
+            if ms_agreement_active {
+                // Per-channel attack-flag computation. Each channel's
+                // detector still classifies its own PCM so the
+                // ambient estimate stays meaningful for that
+                // channel (a sudden L burst doesn't get hidden by
+                // R's running ambient). The per-channel flags are
+                // OR-folded into a single shared (channel-0)
+                // scheduler so both channels of a granule share
+                // window geometry, as §2.4.3.4.9 requires.
+                //
+                // `attack[g]` / `mixed[g]` for `g` in `0..=ngr`:
+                // the last entry is the lookahead granule.
+                let mut attack = [false; GRANULES + 1];
+                let mut mixed = [false; GRANULES + 1];
+                for ch in 0..self.nch {
+                    for g in 0..ngr {
+                        let (slab, _present) =
+                            grab_granule(per_ch_frame_pcm, per_ch_lookahead_pcm, ch, g);
+                        attack[g] |= cfg.detector[ch].classify(&slab);
+                        if let Some(ref mut classifiers) = cfg.mixed_classifier {
+                            mixed[g] |= classifiers[ch].classify_mixed(&slab);
+                        }
+                    }
+                    // Lookahead granule (`g == ngr`): peek
+                    // non-destructively (clone the detector) so the
+                    // zero-padded or borrowed next-frame PCM never
+                    // perturbs the ambient estimate. Empty lookahead
+                    // (end-of-stream) → `next_attack = false`.
+                    let (slab, present) =
+                        grab_granule(per_ch_frame_pcm, per_ch_lookahead_pcm, ch, ngr);
+                    if present {
+                        let mut det_peek = cfg.detector[ch].clone();
+                        attack[ngr] |= det_peek.classify(&slab);
+                    }
+                }
+                // Single shared scheduler (channel-0's slot;
+                // channel-1's scheduler is left at default and
+                // carries no state in the MS-stereo regime). Mirror
+                // each emission across both channels of the granule.
+                for g in 0..ngr {
+                    let (bt, mx) =
+                        cfg.scheduler[0].step_with_mixed(attack[g], attack[g + 1], mixed[g]);
+                    out[g][0] = bt;
+                    out[g][1] = bt;
+                    mixed_per_gc[g][0] = mx;
+                    mixed_per_gc[g][1] = mx;
+                }
+            } else {
+                for ch in 0..self.nch {
+                    // `ngr + 1` attack flags: one per frame granule
+                    // plus the lookahead granule. Lookahead is empty
+                    // at end-of-stream — treated as "no attack
+                    // ahead" so the burst geometry closes with a
+                    // Stop. We do NOT classify a zero-padded
+                    // lookahead buffer with the live detector
+                    // because that would inject a spurious
+                    // silent-floor sample into the ambient estimate;
+                    // instead we peek non-destructively via a
+                    // detector clone and discard the result.
+                    let mut attack = [false; GRANULES + 1];
+                    // Optional mixed-vs-pure-short classification per
+                    // granule. The classifier is stateful (its
+                    // one-tap LP carries the previous granule's last
+                    // sample across boundaries), so we always advance
+                    // it on every frame granule to keep the seed
+                    // continuous — independent of whether the
+                    // emission ends up Short. The flag is consumed
+                    // only when the scheduler returns Short; the
+                    // §2.4.2.7 mixed_block_flag is valid only on
+                    // Short emissions, which `step_with_mixed`
+                    // enforces.
+                    let mut mixed = [false; GRANULES + 1];
+                    for g in 0..ngr {
+                        let (slab, _present) =
+                            grab_granule(per_ch_frame_pcm, per_ch_lookahead_pcm, ch, g);
+                        attack[g] = cfg.detector[ch].classify(&slab);
+                        if let Some(ref mut classifiers) = cfg.mixed_classifier {
+                            mixed[g] = classifiers[ch].classify_mixed(&slab);
+                        }
+                    }
+                    let (slab, present) =
+                        grab_granule(per_ch_frame_pcm, per_ch_lookahead_pcm, ch, ngr);
+                    attack[ngr] = if present {
+                        let mut det_peek = cfg.detector[ch].clone();
+                        det_peek.classify(&slab)
+                    } else {
+                        false
+                    };
+                    // Feed the scheduler in granule-major order;
+                    // granule `g`'s companion is granule `g + 1`'s
+                    // attack flag (the lookahead for the last one).
+                    for g in 0..ngr {
+                        let (bt, mx) =
+                            cfg.scheduler[ch].step_with_mixed(attack[g], attack[g + 1], mixed[g]);
+                        out[g][ch] = bt;
+                        mixed_per_gc[g][ch] = mx;
+                    }
+                }
+            }
+            out
+        } else if self.force_short_blocks {
+            [[BlockType::Short; 2]; GRANULES]
+        } else if self.force_mixed_blocks {
+            // Mixed is still `block_type == Short` on the wire (the
+            // mixed_block_flag selects long-region carve-out
+            // separately).
+            [[BlockType::Short; 2]; GRANULES]
+        } else {
+            [[BlockType::Long; 2]; GRANULES]
+        };
 
         for gr in 0..ngr {
             for ch in 0..self.nch {

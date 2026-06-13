@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **LSF (MPEG-2 / MPEG-2.5) auto block-type** (r287, Phase 2
+  step 88) — `Mp3Encoder::enable_auto_block_type` /
+  `enable_auto_block_type_with_mixed` now accept the LSF sample rates
+  (16 / 22.05 / 24 kHz) and the MPEG-2.5 rates (8 / 11.025 / 12 kHz)
+  instead of returning `LsfUnsupported`. The §C.1.5.2 transition state
+  machine and the [`crate::attack_detect`] / [`crate::mixed_classifier`]
+  wiring are unchanged; only the frame walk in
+  `assemble_frame_with_lookahead` was generalised over `ngr ∈ {1, 2}`.
+  Per ISO/IEC 13818-3 §2.4.3.2 an LSF frame carries **one** 576-sample
+  granule, so the walk now builds, per channel, an attack flag for each
+  of the frame's `ngr` granules plus one lookahead granule (the next
+  frame's leading granule) and steps the scheduler `ngr` times: granule
+  `g` is fed `(attack[g], attack[g + 1])` so its §C.1.5.2 companion is
+  the following granule's flag — a single step per LSF frame, two per
+  MPEG-1 frame (reproducing the prior two-granule walk byte-for-byte).
+  The §2.4.3.4.10.3 window-switching geometry is version-invariant; only
+  the per-frame granule count differs. Independent stereo runs a
+  per-channel detector + scheduler; MS-stereo (§2.4.3.4.9) OR-folds the
+  per-channel flags into a single shared scheduler so both channels of a
+  granule share window geometry. Validated by a new
+  `tests/lsf_auto_block_type_roundtrip.rs` (5 tests): steady-sine stays
+  Long; click-train engages Short and self-decodes; the mixed-promotion
+  variant; independent-stereo per-channel sequences; and MS-stereo
+  per-granule block-type agreement. The legacy
+  `tests/lsf_encoder_roundtrip.rs::lsf_rejects_unported_features`
+  rejection test became `lsf_auto_block_type_accepted` +
+  `lsf_intensity_constructors_build`.
 - encoder: **LSF (MPEG-2 / MPEG-2.5) intensity-stereo encode** (r286,
   Phase 2 step 87) — `Mp3Encoder::new_joint_stereo_is` /
   `new_joint_stereo_ms_is` / `new_joint_stereo_auto_is` (and their
@@ -51,8 +78,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   (`crc16_layer3_lsf`: header bits 16..31 + the full 72 / 136-bit
   LSF side info), and the Xing/Info carrier. Intensity stereo (the
   §2.4.3.2 `int_scalefac_compress` right-channel format) landed in
-  r286; the auto block-type scheduler still rejects with
-  `LsfUnsupported`.
+  r286; the §C.1.5.2 auto block-type scheduler landed in r287.
   Validated by `tests/lsf_encoder_roundtrip.rs` (10 tests): own-decoder
   round-trips at 56–88 dB PSNR across the LSF / MPEG-2.5 rates,
   framing + ladder assertions, CRC wire verification, VBR index
