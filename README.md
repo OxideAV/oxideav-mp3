@@ -2419,6 +2419,39 @@ reproduce the 3.728 positional ratio and the below-bound pan; bytes
 only). Tests: 1046 lib (was 1038;
 +8 unit) + 8 integration.
 
+**Phase 2 step 87 (r286)** — **LSF (MPEG-2 / MPEG-2.5) intensity-stereo
+encode** (ISO/IEC 13818-3 §2.4.3.2), lifting the r285
+`LsfUnsupported` rejection on the three intensity constructors. The
+coupling geometry is shared with the MPEG-1 path (left := L+R, right
+:= the §2.4.3.4.9.1 zero-part, per-band positions in the right
+channel's scalefactor slots, the illegal-position marker on the
+below-bound zero tail), but the wire format differs: the LSF
+intensity-right channel writes the new
+`INTENSITY_SCALEFAC_COMPRESS_LSF = 258` — `258 >> 1 = 129 < 180` ⇒
+the §2.4.3.2 right-channel partition `slen = (3, 3, 3, 0)` /
+`nr_of_sfb = (7, 7, 7, 0)` (3 bits on every one of the 21 long
+bands), `258 % 2 = 0` ⇒ `intensity_scale = 0`. 3 bits is the
+smallest width holding positions `0..=6` plus the marker, and makes
+`7` the *maximum* value (hence the illegal-position marker the
+decoder tests for, per §13818-3 "the maximum value for intensity
+position will indicate an illegal intensity position"). Positions
+are derived on the §2.4.3.2 power-law `i0 = 2^(-1/4)` ladder
+(`derive_intensity_position_lsf` picks the closest decoded amplitude
+ratio `kl/kr ∈ {1, i0, 1/i0, i0², 1/i0², i0³, 1/i0³}` in log space)
+rather than the MPEG-1 `tan` grid — matching the decoder's §2.4.3.2
+step-4/5 reconstruction. Long-block only (LSF is single-granule; the
+short-window per-window bound stays deferred behind the same
+`IntensityShortBlocksUnsupported` interlock). Validated by a new LSF
+grid + degenerate-energy + range unit test and 6 integration tests
+in `tests/lsf_intensity_roundtrip.rs` (constructor arming, wire
+layout asserting `scalefac_compress = 258` + the (3,3,3,0)/(7,7,7,0)
+partition, self-decode round-trip at ≈ 20.5 dB left-channel PSNR,
+encode/decode determinism, the `'11'` MS+intensity combined mode,
+and MPEG-2.5 at 11.025 kHz). `tests/lsf_encoder_roundtrip.rs`'s
+`lsf_rejects_unported_features` rewritten: the intensity
+constructors now build on LSF; only auto block-type still rejects.
+Tests: 1047 lib (was 1046; +1 unit) + 6 integration.
+
 **Phase 2 step 85 (r283)** — **§C.1.5.3.2.1 Layer III adaptation of
 Model 2 + §D.2.4 step m) pre-echo control + §C.1.5.3.2 window
 switching**, closing the "remaining Layer III adaptations" tail left
@@ -4489,9 +4522,6 @@ absolute-threshold floor, all of whose table inputs
 (`minval` / `TMN` from Tables D.3a–c and `absthr` from
 Tables D.4a–c) are now transcribed in-tree — plus the
 steps b)–e) FFT-side inputs),
-LSF intensity-stereo encode (the 13818-3 §2.4.3.2
-`int_scalefac_compress` right-channel format; intensity
-constructors reject LSF rates with `LsfUnsupported`),
 LSF auto block-type (the §C.1.5.2 scheduler walk is still
 two-granule shaped), and
 externally-valid MPEG-2.5 encode (the encoder emits

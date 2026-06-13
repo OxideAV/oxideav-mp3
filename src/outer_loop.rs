@@ -138,6 +138,32 @@ pub const OUTER_LOOP_SCALEFAC_COMPRESS: u16 = 15;
 /// accounting applies unchanged; only the on-wire field value differs.
 pub const OUTER_LOOP_SCALEFAC_COMPRESS_LSF: u16 = 399;
 
+/// The `scalefac_compress` the encoder writes for the **right channel
+/// of an LSF intensity-stereo frame** (`mode_extension` `'01'` / `'11'`,
+/// `ch == 1`). Per ISO/IEC 13818-3 §2.4.3.2 the right channel routes
+/// through `int_scalefac_compress = scalefac_compress >> 1` with its own
+/// partition tables and an `intensity_scale = scalefac_compress % 2`
+/// selector:
+///
+/// * `258 >> 1 = 129 < 180`, so `slen1 = 129/36 = 3`,
+///   `slen2 = (129%36)/6 = 3`, `slen3 = (129%36)%6 = 3`, `slen4 = 0`
+///   over the long-block partition `nr_of_sfb = (7, 7, 7, 0)` — i.e.
+///   **3 bits on every one of the 21 long bands**.
+/// * `258 % 2 = 0`, so `intensity_scale = 0` (the §2.4.3.2 basic
+///   factor `i0 = 2^(-1/4)`).
+///
+/// 3 bits per band is the smallest width that holds every transmitted
+/// intensity position `0..=6` **and** the illegal-position marker `7`
+/// (§13818-3: "the maximum value for intensity position will indicate
+/// an illegal intensity position"); with `slen = 3` that maximum is
+/// exactly `7`, so the decoder's `is_pos == 7` illegal test fires on
+/// the right bands. Part2 then costs `21·3 = 63` bits (the long
+/// `OUTER_LOOP_SCALEFAC_COMPRESS_LSF` 74-bit bound conservatively
+/// covers it). Long-block only: the encoder rejects short / mixed /
+/// auto block-type while intensity is armed, so only this long
+/// partition is ever emitted.
+pub const INTENSITY_SCALEFAC_COMPRESS_LSF: u16 = 258;
+
 /// The per-band scalefactor upper limit for long-block `sfb` per
 /// §C.1.5.4.3.6.
 #[must_use]

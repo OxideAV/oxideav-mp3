@@ -80,7 +80,8 @@ use crate::main_data::{
 use crate::mdct::{forward_overlap, mdct, window_long_family_analysis, MdctState, LONG_N};
 use crate::outer_loop::{
     outer_loop_search_long, outer_loop_search_mixed, outer_loop_search_short,
-    OUTER_LOOP_SCALEFAC_COMPRESS, OUTER_LOOP_SCALEFAC_COMPRESS_LSF,
+    INTENSITY_SCALEFAC_COMPRESS_LSF, OUTER_LOOP_SCALEFAC_COMPRESS,
+    OUTER_LOOP_SCALEFAC_COMPRESS_LSF,
 };
 use crate::quantize::quantize;
 use crate::scalefactors::{FrameScaleFactors, ScaleFactors, LONG_SFB};
@@ -159,12 +160,11 @@ pub enum StreamEncodeError {
     StereoUnsupported,
     /// An LSF (MPEG-2 16 / 22.05 / 24 kHz or MPEG-2.5 8 / 11.025 /
     /// 12 kHz) encoder was asked for a feature whose LSF wire format
-    /// is not implemented yet: intensity-stereo coupling (the
-    /// 13818-3 §2.4.3.2 `int_scalefac_compress` right-channel format)
-    /// or the §C.1.5.2 auto block-type scheduler (whose frame walk is
-    /// still two-granule shaped). Core LSF encode — CBR / VBR, mono /
-    /// stereo / dual-channel, MS joint stereo, forced block types,
-    /// outer loop, CRC, Xing — is supported as of r285.
+    /// is not implemented yet: the §C.1.5.2 auto block-type scheduler
+    /// (whose frame walk is still two-granule shaped). Core LSF encode
+    /// — CBR / VBR, mono / stereo / dual-channel, MS joint stereo,
+    /// §2.4.3.2 intensity stereo (r286), forced block types, outer
+    /// loop, CRC, Xing — is supported.
     LsfUnsupported,
     /// VBR configuration is malformed: `min_kbps` / `max_kbps` are not
     /// both on the §2.4.2.3 ladder, are reversed, or `max_kbps`
@@ -222,7 +222,7 @@ impl core::fmt::Display for StreamEncodeError {
             ),
             StreamEncodeError::LsfUnsupported => f.write_str(
                 "feature not yet ported to the LSF (MPEG-2 / MPEG-2.5) wire format \
-                 (intensity stereo and auto block-type remain MPEG-1 only)",
+                 (auto block-type remains MPEG-1 only)",
             ),
             StreamEncodeError::InvalidVbrConfig => {
                 f.write_str("VBR config: min/max kbps off-ladder or out of range")
@@ -1335,6 +1335,17 @@ impl Mp3Encoder {
     /// as left-only — the §2.4.3.4.9.3 layout simply has no is_pos slot
     /// for them.
     ///
+    /// On an **LSF** (MPEG-2 / MPEG-2.5) rate the same coupling geometry
+    /// applies, but the right channel is written in the ISO/IEC 13818-3
+    /// §2.4.3.2 format: `scalefac_compress = 258` selects the
+    /// right-channel partition `int_scalefac_compress = 129 < 180` ⇒
+    /// `slen = (3, 3, 3, 0)` / `nr_of_sfb = (7, 7, 7, 0)` (3 bits on
+    /// every one of the 21 long bands; `7` is the max value, hence the
+    /// illegal-position marker) with `intensity_scale = 0`. The decoder
+    /// reconstructs through the §2.4.3.2 power-law `i0 = 2^(-1/4)`
+    /// ladder (`kl`/`kr` step-4/5 replacement) rather than the MPEG-1
+    /// `tan` grid, so the encoder derives the positions on that ladder.
+    ///
     /// Long-block only this round: the short-window intensity bound is
     /// per window (each window has its own zero-part), so the
     /// block-type toggles ([`Mp3Encoder::force_short_blocks_for_testing`]
@@ -1429,17 +1440,18 @@ impl Mp3Encoder {
     /// constructors. `start_sfb` must leave at least one normally-coded
     /// long band below the bound and one intensity band at or above it.
     fn arm_intensity(&mut self, start_sfb: usize) -> Result<(), StreamEncodeError> {
-        // LSF intensity stereo is a different wire format altogether:
-        // ISO/IEC 13818-3 §2.4.3.2 routes the right channel through
-        // `int_scalefac_compress = scalefac_compress >> 1` with its own
-        // partition tables, an `intensity_scale` selector, and a
-        // slen-dependent illegal-position marker (not the fixed 7).
-        // The encoder's intensity path emits the MPEG-1 §2.4.3.4.9.3
-        // format only, so the LSF versions reject intensity arming
-        // until the LSF intensity encode lands.
-        if self.version.is_lsf() {
-            return Err(StreamEncodeError::LsfUnsupported);
-        }
+        // Both MPEG-1 (ISO/IEC 11172-3 §2.4.3.4.9.3) and LSF (ISO/IEC
+        // 13818-3 §2.4.3.2) intensity stereo are supported. The two
+        // share the coupling geometry (left := L+R, right := zero-part,
+        // positions in the right channel's scalefactor slots) but differ
+        // on the wire: the LSF right channel routes its 9-bit
+        // `scalefac_compress` through `int_scalefac_compress =
+        // scalefac_compress >> 1` with its own partition tables, an
+        // `intensity_scale = scalefac_compress % 2` selector, and a
+        // power-law `i0` reconstruction ladder (§2.4.3.2 step 4/5
+        // replacement) rather than the MPEG-1 `tan` grid. Pass 2 picks
+        // the version-appropriate `scalefac_compress` and position
+        // derivation below.
         if !(1..=20).contains(&start_sfb) {
             return Err(StreamEncodeError::InvalidIntensityStartSfb { start_sfb });
         }
@@ -2591,7 +2603,11 @@ impl Mp3Encoder {
                             l_energy += f64::from(left[i]) * f64::from(left[i]);
                             r_energy += f64::from(right[i]) * f64::from(right[i]);
                         }
-                        *slot = derive_intensity_position(l_energy, r_energy);
+                        *slot = if self.version.is_lsf() {
+                            derive_intensity_position_lsf(l_energy, r_energy)
+                        } else {
+                            derive_intensity_position(l_energy, r_energy)
+                        };
                         for i in lo..hi {
                             left[i] += right[i];
                             right[i] = 0.0;
@@ -3164,7 +3180,18 @@ impl Mp3Encoder {
                 } else {
                     OUTER_LOOP_SCALEFAC_COMPRESS
                 };
-                let scalefac_compress = if ran_outer_loop || intensity_right {
+                // The LSF intensity-stereo right channel takes the
+                // §2.4.3.2 `int_scalefac_compress` partition value, not
+                // the non-intensity LSF outer-loop value: its
+                // scalefactor slots carry intensity positions read back
+                // through the right-channel-only partition tables (and
+                // the slen-3 width makes `7` the illegal-position
+                // marker the decoder tests for). MPEG-1 intensity-right
+                // keeps the 4-bit `scalefac_compress = 15` (slen1=4,
+                // slen2=3) layout — positions fit at ≥ 3 bits per band.
+                let scalefac_compress = if intensity_right && self.version.is_lsf() {
+                    INTENSITY_SCALEFAC_COMPRESS_LSF
+                } else if ran_outer_loop || intensity_right {
                     outer_sfc
                 } else {
                     0
@@ -3704,6 +3731,65 @@ fn derive_intensity_position(l_energy: f64, r_energy: f64) -> u8 {
     let amplitude_ratio = (l_energy / r_energy).sqrt();
     let pos = (amplitude_ratio.atan() * 12.0 / std::f64::consts::PI).round();
     pos.clamp(0.0, 6.0) as u8
+}
+
+/// Derive the **LSF** (ISO/IEC 13818-3 §2.4.3.2) intensity-stereo
+/// position for one band from the per-band channel energies.
+///
+/// LSF replaces the MPEG-1 `tan` grid (steps 3-5 of §2.4.3.4.9.3) with
+/// the §2.4.3.2 step-4/5 power-law ladder: the decoder reconstructs the
+/// transmitted magnitude `T = L_i + R_i` (the encoder couples
+/// `left := L+R`, `right := 0`) as `L' = T·kl`, `R' = T·kr` with
+///
+/// ```text
+/// i0 = 2^(-1/4)              (intensity_scale == 0, this encoder's choice)
+/// is_pos == 0   -> kl = 1,            kr = 1
+/// is_pos odd    -> kl = i0^((p+1)/2), kr = 1
+/// is_pos even>0 -> kl = 1,            kr = i0^(p/2)
+/// ```
+///
+/// so the decoded amplitude ratio `L'/R' = kl/kr` lands on the
+/// non-uniform grid `{1, i0, 1/i0, i0², 1/i0², i0³, 1/i0³}` for
+/// `p = 0..=6`. This routine picks the `p` whose decoded ratio is
+/// closest **in log space** to the original amplitude ratio
+/// `√(E_L/E_R)`, which is the natural distance for a geometric grid
+/// (equal multiplicative error above and below). `7` is never produced
+/// — it is the §13818-3 illegal-position marker (the maximum value for
+/// the `slen = 3` partition this encoder writes).
+fn derive_intensity_position_lsf(l_energy: f64, r_energy: f64) -> u8 {
+    // i0 = 2^(-1/4); ln(grid ratio) for p = 0..=6 is a multiple of
+    // ln(i0): p odd contributes -((p+1)/2)·ln(i0⁻¹) on the left,
+    // p even>0 contributes +(p/2)·ln(i0⁻¹) on the right. With
+    // a = ln(i0⁻¹) = (1/4)·ln 2 > 0 the grid log-ratios are:
+    //   p: 0    1    2    3    4    5    6
+    //   ln(L'/R')/a: 0   -1   +1   -2   +2   -3   +3
+    const A: f64 = std::f64::consts::LN_2 * 0.25; // ln(i0^-1)
+                                                  // Original target in the same log units. Guard the degenerate
+                                                  // energies: a silent right channel pans fully left (largest grid
+                                                  // ratio, p = 6); a silent left channel pans fully right (p = 5,
+                                                  // the smallest grid ratio i0³). A fully-silent band decodes to
+                                                  // zero under any position, so its value is immaterial — fall into
+                                                  // the r_energy <= 0 branch (p = 6) by convention.
+    if r_energy <= 0.0 {
+        return 6;
+    }
+    if l_energy <= 0.0 {
+        return 5;
+    }
+    // target_units = ln(√(E_L/E_R)) / a = ln(E_L/E_R) / (2a).
+    let target_units = (l_energy / r_energy).ln() / (2.0 * A);
+    // Grid log-ratios in units of `a`, indexed by position 0..=6.
+    const GRID_UNITS: [f64; 7] = [0.0, -1.0, 1.0, -2.0, 2.0, -3.0, 3.0];
+    let mut best = 0u8;
+    let mut best_err = f64::INFINITY;
+    for (p, &g) in GRID_UNITS.iter().enumerate() {
+        let err = (g - target_units).abs();
+        if err < best_err {
+            best_err = err;
+            best = p as u8;
+        }
+    }
+    best
 }
 
 /// Choose a three-region big-values subdivision: `(region0_end,
@@ -4750,6 +4836,48 @@ mod tests {
             prev = pos;
         }
         assert_eq!(prev, 6, "ratio sweep should end hard-left");
+    }
+
+    /// The LSF (§2.4.3.2) position derivation lands on the §2.4.3.2
+    /// power-law `i0 = 2^(-1/4)` ladder, not the MPEG-1 `tan` grid. The
+    /// decoded amplitude ratio `L'/R' = kl/kr` for `p = 0..=6` is
+    /// `{1, i0, 1/i0, i0², 1/i0², i0³, 1/i0³}`. Each test ratio is set
+    /// exactly on a grid point so the closest-in-log-space pick is
+    /// unambiguous.
+    #[test]
+    fn intensity_position_derivation_grid_lsf() {
+        // i0 = 2^(-1/4) ≈ 0.840896. The energy ratio E_L/E_R is the
+        // square of the amplitude ratio.
+        let i0 = 2f64.powf(-0.25);
+        // p, amplitude-ratio target (L'/R').
+        let cases: [(u8, f64); 7] = [
+            (0, 1.0),
+            (1, i0),       // odd: kl = i0
+            (2, 1.0 / i0), // even: kr = i0
+            (3, i0 * i0),  // odd: kl = i0²
+            (4, 1.0 / (i0 * i0)),
+            (5, i0 * i0 * i0), // odd: kl = i0³
+            (6, 1.0 / (i0 * i0 * i0)),
+        ];
+        for (p, amp_ratio) in cases {
+            let e_l = amp_ratio * amp_ratio;
+            let e_r = 1.0;
+            assert_eq!(
+                derive_intensity_position_lsf(e_l, e_r),
+                p,
+                "amplitude ratio {amp_ratio} should map to LSF position {p}"
+            );
+        }
+        // Degenerate energies: silent right ⇒ hard-left p=6; silent
+        // left ⇒ hard-right p=5 (the smallest grid ratio i0³).
+        assert_eq!(derive_intensity_position_lsf(1.0, 0.0), 6);
+        assert_eq!(derive_intensity_position_lsf(0.0, 1.0), 5);
+        // Every output is a valid (non-marker) position.
+        for k in -40..=40 {
+            let e_l = 10f64.powf(f64::from(k) / 4.0);
+            let pos = derive_intensity_position_lsf(e_l, 1.0);
+            assert!(pos <= 6, "LSF position {pos} out of range");
+        }
     }
 
     /// Constructor state: the three intensity constructors arm the

@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **LSF (MPEG-2 / MPEG-2.5) intensity-stereo encode** (r286,
+  Phase 2 step 87) — `Mp3Encoder::new_joint_stereo_is` /
+  `new_joint_stereo_ms_is` / `new_joint_stereo_auto_is` (and their
+  registry factories) now build on the LSF / MPEG-2.5 sample rates
+  instead of returning `LsfUnsupported`. Per ISO/IEC 13818-3 §2.4.3.2
+  the intensity-right channel is written with the new
+  `outer_loop::INTENSITY_SCALEFAC_COMPRESS_LSF = 258`: `258 >> 1 = 129
+  < 180` selects the §2.4.3.2 right-channel partition `slen =
+  (3, 3, 3, 0)` / `nr_of_sfb = (7, 7, 7, 0)` (3 bits on every one of
+  the 21 long bands), and `258 % 2 = 0` ⇒ `intensity_scale = 0`. 3
+  bits is the smallest width holding the positions `0..=6` plus the
+  illegal-position marker, and makes `7` the maximum value — the
+  marker the decoder tests for. Positions are derived on the §2.4.3.2
+  power-law `i0 = 2^(-1/4)` reconstruction ladder
+  (`derive_intensity_position_lsf`) rather than the MPEG-1 `tan` grid.
+  Long-block only (LSF is single-granule; the per-window short-block
+  bound stays behind the `IntensityShortBlocksUnsupported` interlock).
+  Validated by a new LSF position-grid unit test and
+  `tests/lsf_intensity_roundtrip.rs` (6 tests): constructor arming,
+  the `scalefac_compress = 258` + (3,3,3,0)/(7,7,7,0) wire layout,
+  ≈ 20.5 dB left-channel self-decode PSNR, encode/decode determinism,
+  the `'11'` MS+intensity combined mode, and MPEG-2.5 at 11.025 kHz.
 - encoder: **MPEG-2 LSF + MPEG-2.5 encode support** (r285, Phase 2
   step 87) — `Mp3Encoder::new` (and the registry `make_encoder` path)
   now accepts the LSF sample rates 16 / 22.05 / 24 kHz and the
@@ -28,8 +50,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the sub-500 `scalefac_compress` ranges cannot carry the flag), CRC
   (`crc16_layer3_lsf`: header bits 16..31 + the full 72 / 136-bit
   LSF side info), and the Xing/Info carrier. Intensity stereo (the
-  §2.4.3.2 `int_scalefac_compress` right-channel format) and the
-  auto block-type scheduler reject with `LsfUnsupported`.
+  §2.4.3.2 `int_scalefac_compress` right-channel format) landed in
+  r286; the auto block-type scheduler still rejects with
+  `LsfUnsupported`.
   Validated by `tests/lsf_encoder_roundtrip.rs` (10 tests): own-decoder
   round-trips at 56–88 dB PSNR across the LSF / MPEG-2.5 rates,
   framing + ladder assertions, CRC wire verification, VBR index

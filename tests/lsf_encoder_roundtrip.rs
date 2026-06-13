@@ -453,22 +453,15 @@ fn lsf_vbr_picks_indices_on_lsf_ladder() {
 #[test]
 fn lsf_rejects_unported_features() {
     const SR: u32 = 22_050;
-    // Intensity stereo: the 13818-3 §2.4.3.2 int_scalefac_compress
-    // right-channel format is not implemented.
-    assert!(matches!(
-        Mp3Encoder::new_joint_stereo_is(64, SR, 7),
-        Err(StreamEncodeError::LsfUnsupported)
-    ));
-    assert!(matches!(
-        Mp3Encoder::new_joint_stereo_ms_is(64, SR, 7),
-        Err(StreamEncodeError::LsfUnsupported)
-    ));
-    assert!(matches!(
-        Mp3Encoder::new_joint_stereo_auto_is(64, SR, 7),
-        Err(StreamEncodeError::LsfUnsupported)
-    ));
+    // Intensity stereo on LSF is supported as of r286 (the 13818-3
+    // §2.4.3.2 `int_scalefac_compress` right-channel format lands in
+    // `tests/lsf_intensity_roundtrip.rs`); the three intensity
+    // constructors now build cleanly on an LSF rate.
+    assert!(Mp3Encoder::new_joint_stereo_is(64, SR, 7).is_ok());
+    assert!(Mp3Encoder::new_joint_stereo_ms_is(64, SR, 7).is_ok());
+    assert!(Mp3Encoder::new_joint_stereo_auto_is(64, SR, 7).is_ok());
     // Auto block-type: the §C.1.5.2 scheduler walk is still
-    // two-granule shaped.
+    // two-granule shaped, so it remains LSF-unsupported.
     let mut enc = Mp3Encoder::new(64, SR, ChannelMode::SingleChannel).unwrap();
     assert!(matches!(
         enc.enable_auto_block_type(2.0),
