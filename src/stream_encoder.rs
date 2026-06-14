@@ -719,6 +719,27 @@ pub struct Mp3Encoder {
     /// energy-detector auto path, the force toggles, or the all-long
     /// default, byte-for-byte as in every previous round.
     model2_block_type: Option<Vec<crate::block_type_sm::BlockTypeStateMachine>>,
+    /// §C.1.5.3 scalefactor-selection-information (scfsi) reuse.
+    ///
+    /// When `true`, the MPEG-1 two-granule assembler examines each
+    /// channel's pair of granules after quantization and, for every
+    /// long-block scfsi_band group whose granule-1 scalefactors are
+    /// byte-identical to granule 0's, sets `scfsi[ch][group] = 1` so
+    /// those scalefactors are transmitted once (in granule 0) instead
+    /// of twice. The decoder reuses granule 0's values verbatim for
+    /// the marked groups (ISO/IEC 11172-3 §2.4.2.7 / decode notes
+    /// p.??), so the reconstructed scalefactors — and therefore every
+    /// decoded sample — are bit-identical; only the part2 scalefactor
+    /// bits of granule 1 shrink.
+    ///
+    /// Default `false`: every emitted frame carries `scfsi = 0`
+    /// throughout, byte-for-byte as in every previous round. Armed via
+    /// [`Self::enable_scfsi_reuse`]. The optimisation never fires on
+    /// LSF (MPEG-2 / MPEG-2.5 have no scfsi field and one granule) nor
+    /// on any channel whose either granule is a short block (§2.4.2.7:
+    /// "if short windows are switched on … then scfsi is always 0 for
+    /// this frame").
+    scfsi_reuse: bool,
 }
 
 /// The §C.1.5.3.2.1 Layer III window-switching deliverable for one
@@ -887,6 +908,7 @@ impl Mp3Encoder {
             model2_psy: None,
             last_model2_switch: None,
             model2_block_type: None,
+            scfsi_reuse: false,
         })
     }
 
@@ -2114,6 +2136,46 @@ impl Mp3Encoder {
     #[must_use]
     pub fn model2_psychoacoustics_enabled(&self) -> bool {
         self.model2_psy.is_some()
+    }
+
+    /// Arm §C.1.5.3 scalefactor-selection-information (scfsi) reuse.
+    ///
+    /// MPEG-1 Layer III carries **two** granules per frame, each with
+    /// its own block of part2 scalefactors. The §2.4.2.7 `scfsi[ch]`
+    /// field lets a frame transmit a long-block scfsi_band group's
+    /// scalefactors **once** — in granule 0 — and declare them valid
+    /// for granule 1, when the two granules happen to share identical
+    /// scalefactors in that group. This is a lossless main-data
+    /// saving: the decoder reuses granule 0's values verbatim for the
+    /// marked groups, so every reconstructed sample is bit-identical;
+    /// only granule 1's part2 length shrinks.
+    ///
+    /// With this armed, the assembler computes, for each channel,
+    /// `scfsi[ch][g] = 1` for every one of the four §2.4.2.7
+    /// scfsi_band groups
+    /// (`{0..5}`, `{6..10}`, `{11..15}`, `{16..20}`) whose granule-1
+    /// scalefactors equal granule 0's across every band in the group —
+    /// **only** when both granules of that channel are long blocks
+    /// (`block_type != 2`). Per §2.4.2.7 ("if short windows are
+    /// switched on, i.e. `block_type == 2` for one of the granules,
+    /// then scfsi is always 0 for this frame"), a channel with a short
+    /// granule keeps `scfsi[ch] = 0` and transmits both granules in
+    /// full.
+    ///
+    /// Default off: without this call every emitted frame carries
+    /// `scfsi = 0` throughout, byte-for-byte as in every previous
+    /// round. The flag is a no-op on LSF (MPEG-2 / MPEG-2.5) frames,
+    /// which have a single granule and no scfsi field.
+    pub fn enable_scfsi_reuse(&mut self) {
+        self.scfsi_reuse = true;
+    }
+
+    /// `true` when [`Self::enable_scfsi_reuse`] has armed §C.1.5.3
+    /// scalefactor-selection-information reuse — used by integration
+    /// tests / observability.
+    #[must_use]
+    pub fn scfsi_reuse_enabled(&self) -> bool {
+        self.scfsi_reuse
     }
 
     /// The §C.1.5.3.2.1 window-switching decision the automatic Model 2
@@ -4092,6 +4154,26 @@ impl Mp3Encoder {
             }
         }
 
+        // ---- §C.1.5.3 scfsi reuse (MPEG-1, two granules only) ----
+        //
+        // Detect, per channel, every long-block scfsi_band group whose
+        // granule-1 scalefactors already equal granule 0's, and mark it
+        // for reuse. The §2.4.2.7 write path skips a reused group in
+        // granule 1; the decoder reproduces granule 0's values there,
+        // so the reconstructed scalefactors are bit-identical and only
+        // the part2 bit count shrinks. Default-off: untouched
+        // (`scfsi == 0` everywhere) unless `enable_scfsi_reuse` armed.
+        if self.scfsi_reuse && !self.version.is_lsf() && ngr == 2 {
+            for ch in 0..self.nch {
+                side_info.scfsi[ch] = compute_scfsi_reuse(
+                    &side_info.granules[0][ch],
+                    &side_info.granules[1][ch],
+                    &scalefactors.granules[0][ch],
+                    &scalefactors.granules[1][ch],
+                );
+            }
+        }
+
         // ---- Main-data assembly ----
         let mut header = self.header_template;
         header.padding = false; // initial; reservoir step decides
@@ -4618,6 +4700,51 @@ fn single_table_bits_from_zero(is: &[i32; NUM_LINES], end: usize, table_idx: u8)
 /// A default long-block granule-channel record: window_switching off,
 /// all selectors zero, region0_count clamped to a single region
 /// covering every long band.
+/// §C.1.5.3 scalefactor-selection-information for one channel of an
+/// MPEG-1 two-granule frame.
+///
+/// Returns the four-element `scfsi[ch]` array: `scfsi[g] == true` marks
+/// scfsi_band group `g` for reuse, i.e. granule 0's scalefactors in
+/// that group are declared valid for granule 1 and are not retransmitted
+/// in granule 1's part2.
+///
+/// The four §2.4.2.7 scfsi_band groups span scalefactor bands
+/// `{0..=5}`, `{6..=10}`, `{11..=15}`, `{16..=20}` (Table 3-B.8). A
+/// group is eligible iff:
+///
+/// * **Both granules are long blocks** (`block_type != Short`). Per
+///   §2.4.2.7 ("if short windows are switched on … then scfsi is always
+///   0 for this frame"), a channel with a short granule in the frame
+///   keeps every `scfsi[g] == 0`; this guard makes a single short
+///   granule disqualify all four groups for the channel.
+/// * **The granule-1 scalefactors equal granule 0's across every band
+///   in the group.** The decoder reuses granule 0's `scalefac_l` values
+///   verbatim for a marked group, so reuse is lossless only when the
+///   two granules already agree there.
+///
+/// When either granule is short this returns `[false; 4]`.
+fn compute_scfsi_reuse(
+    gc0: &GranuleChannel,
+    gc1: &GranuleChannel,
+    sf0: &ScaleFactors,
+    sf1: &ScaleFactors,
+) -> [bool; 4] {
+    // A window-switched short block (block_type == 2) in either granule
+    // forbids scfsi for the whole channel (§2.4.2.7). Mixed blocks are
+    // also block_type == 2, so this single test covers both.
+    if gc0.block_type == BlockType::Short || gc1.block_type == BlockType::Short {
+        return [false; 4];
+    }
+    // scfsi_band groups (§2.4.2.7, Table 3-B.8), as half-open ranges
+    // over the 21 long scalefactor bands.
+    const GROUPS: [(usize, usize); 4] = [(0, 6), (6, 11), (11, 16), (16, 21)];
+    let mut scfsi = [false; 4];
+    for (g, &(lo, hi)) in GROUPS.iter().enumerate() {
+        scfsi[g] = (lo..hi).all(|sfb| sf0.long[sfb] == sf1.long[sfb]);
+    }
+    scfsi
+}
+
 fn default_long_gc() -> GranuleChannel {
     GranuleChannel {
         part2_3_length: 0,
@@ -6557,5 +6684,85 @@ mod tests {
             si.granules[0][0].block_type, expect_gr0,
             "gr0 emitted block type must equal scheduler step(attack[0], attack[1])"
         );
+    }
+
+    // ---- §C.1.5.3 scfsi reuse detection ----
+
+    fn sf_with_long(vals: [u8; 21]) -> ScaleFactors {
+        let mut sf = ScaleFactors::default();
+        sf.long[..21].copy_from_slice(&vals);
+        sf
+    }
+
+    #[test]
+    fn scfsi_all_groups_reuse_when_granules_identical() {
+        // Two long granules with byte-identical scalefactors: every one
+        // of the four scfsi_band groups is eligible for reuse.
+        let gc = default_long_gc();
+        let vals: [u8; 21] = core::array::from_fn(|i| (i % 8) as u8);
+        let sf0 = sf_with_long(vals);
+        let sf1 = sf_with_long(vals);
+        assert_eq!(
+            compute_scfsi_reuse(&gc, &gc, &sf0, &sf1),
+            [true, true, true, true]
+        );
+    }
+
+    #[test]
+    fn scfsi_no_reuse_when_all_bands_differ() {
+        let gc = default_long_gc();
+        let sf0 = sf_with_long([0; 21]);
+        let sf1 = sf_with_long([1; 21]);
+        assert_eq!(
+            compute_scfsi_reuse(&gc, &gc, &sf0, &sf1),
+            [false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn scfsi_per_group_independence() {
+        // Make groups 0 and 2 agree, groups 1 and 3 differ. Group
+        // ranges: {0..6}, {6..11}, {11..16}, {16..21}.
+        let gc = default_long_gc();
+        let a = [3u8; 21];
+        let mut b = [3u8; 21];
+        // Group 1 (band 6..11): perturb one band in granule 1.
+        b[7] = 5;
+        // Group 3 (band 16..21): perturb one band in granule 1.
+        b[20] = 1;
+        let sf0 = sf_with_long(a);
+        let sf1 = sf_with_long(b);
+        assert_eq!(
+            compute_scfsi_reuse(&gc, &gc, &sf0, &sf1),
+            [true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn scfsi_disabled_when_either_granule_short() {
+        // §2.4.2.7: a short block (block_type == 2) in either granule
+        // forces scfsi to 0 for the whole channel, even when the
+        // (long-array) scalefactors happen to be identical.
+        let vals = [2u8; 21];
+        let sf0 = sf_with_long(vals);
+        let sf1 = sf_with_long(vals);
+        let long = default_long_gc();
+        let short = default_short_gc();
+        assert_eq!(short.block_type, BlockType::Short);
+        // gr0 short.
+        assert_eq!(compute_scfsi_reuse(&short, &long, &sf0, &sf1), [false; 4]);
+        // gr1 short.
+        assert_eq!(compute_scfsi_reuse(&long, &short, &sf0, &sf1), [false; 4]);
+        // both short.
+        assert_eq!(compute_scfsi_reuse(&short, &short, &sf0, &sf1), [false; 4]);
+    }
+
+    #[test]
+    fn scfsi_reuse_disabled_by_default_armed_by_toggle() {
+        let enc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        assert!(!enc.scfsi_reuse_enabled());
+        let mut enc = enc;
+        enc.enable_scfsi_reuse();
+        assert!(enc.scfsi_reuse_enabled());
     }
 }

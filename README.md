@@ -863,6 +863,37 @@ match), and 250 ms of sine yields the expected count of
 is validated in r177 by `tests/decoder_trait_stereo_roundtrip.rs`
 (see "Phase 2 step 36" below).
 
+**Round 296 (§C.1.5.3 scalefactor-selection-information / scfsi
+reuse).** MPEG-1 Layer III carries two granules per frame, each with
+its own part2 scalefactor block; the §2.4.2.7 `scfsi[ch]` field lets a
+frame send a long-block scfsi_band group's scalefactors **once** (in
+granule 0) and declare them valid for granule 1 when the two granules
+already agree there. The decode path has always honoured this on read;
+the encoder previously emitted `scfsi = 0` on every frame. New
+`Mp3Encoder::enable_scfsi_reuse()` arms a post-quantization pass that
+sets `scfsi[ch][g] = 1` for each of the four scfsi_band groups (bands
+`{0..=5}`, `{6..=10}`, `{11..=15}`, `{16..=20}`, Table 3-B.8) whose
+granule-1 scalefactors are byte-identical to granule 0's across the
+whole group — **only** when both granules of the channel are long
+blocks. Per §2.4.2.7 ("if short windows are switched on … then scfsi is
+always 0 for this frame"), a short granule disqualifies all four groups
+for that channel. The §2.4.2.7 write path already skips a reused group
+in granule 1 and the decoder reproduces granule 0's values verbatim, so
+the optimisation is lossless by construction: every reconstructed sample
+is bit-identical, only granule 1's part2 scalefactor bits shrink.
+Default off (byte-for-byte the historical `scfsi = 0` output);
+`scfsi_reuse_enabled()` inspects the flag; the toggle is a no-op on LSF
+(MPEG-2 / MPEG-2.5 have one granule and no scfsi field). Five lib tests
+(all-group reuse / no reuse / per-group independence /
+short-granule-disqualification / default-off-armed-by-toggle) plus a new
+`tests/scfsi_reuse_roundtrip.rs` (5 tests): disarmed sets no scfsi, the
+armed fixed-gain encode sets reuse on long-block frames, armed-vs-
+disarmed decode is bit-identical on both the fixed-gain and outer-loop
+paths, and the armed outer-loop encode strictly shrinks granule-1's
+summed part2_3 budget without growing the CBR stream. It still lacks
+auto-arming inside `push_samples` (the reuse is opt-in via the explicit
+toggle this round).
+
 **Round 295 (Phase 2 step 92 — §C.1.5.3.2.1 Model-2-driven auto
 block-type path).** r294 captured the per-granule Model 2 `pe > 1800`
 window-switching decision; this round wires it into an actual
