@@ -1,19 +1,21 @@
 //! Layer III **outer (distortion-control) iteration loop** — the noise
 //! shaping loop of ISO/IEC 11172-3:1993 Annex C §C.1.5.4.3 (informational).
 //! This wraps the §C.1.5.4.4 inner loop (the
-//! [`crate::inner_loop::search_bit_budget`] global-gain search) in the
-//! per-scalefactor-band amplification iteration the spec's outer loop
-//! performs.
+//! [`crate::inner_loop::search_bit_budget_band_aligned`] global-gain
+//! search) in the per-scalefactor-band amplification iteration the spec's
+//! outer loop performs.
 //!
 //! # Scope (Phase 2 step 11)
 //!
 //! Given a target magnitude spectrum `xr[576]` and a per-band noise
 //! threshold vector `xmin[21]` (long-block only this round), iterate:
 //!
-//! 1. Run the inner loop ([`crate::inner_loop::search_bit_budget`]) over
+//! 1. Run the inner loop
+//!    ([`crate::inner_loop::search_bit_budget_band_aligned`]) over
 //!    `xr` + current scalefactor configuration to pick the smallest
 //!    `global_gain` whose §C.1.5.4.4.5 + §C.1.5.4.4.8 Huffman count fits
-//!    the per-granule-channel bit budget.
+//!    the per-granule-channel bit budget — measured against the
+//!    §C.1.5.4.4.6 band-aligned SUBDIVIDE partition the encoder emits.
 //! 2. Compute the per-band actual distortion `xfsf[sb]` (§C.1.5.4.3.3):
 //!    `xfsf(sb) = Σᵢ (|xr(i)| − ix(i)^(4/3) · 2^((qquant+quantanf)/4))² /
 //!    bandwidth(sb)` summed over the lines of band `sb`. In our
@@ -98,7 +100,7 @@
 //! Figure C.9.b.
 
 use crate::frame::MpegVersion;
-use crate::inner_loop::{search_bit_budget, search_magnitude_clamp, GAIN_MAX};
+use crate::inner_loop::{search_bit_budget_band_aligned, search_magnitude_clamp, GAIN_MAX};
 use crate::quantize::quantize;
 use crate::requantize::{long_band_starts, requantize, short_band_starts, NUM_LINES};
 use crate::scalefactors::{ScaleFactors, LONG_SFB, SHORT_SFB, SHORT_WINDOWS};
@@ -671,7 +673,11 @@ pub fn outer_loop_search_long_per_band(
 
 /// Per-iteration helper: build a fully-populated `GranuleChannel`
 /// (template + outer-loop's chosen `scalefac_compress`) and pick the
-/// smallest `global_gain` that BOTH (a) fits the inner-loop bit budget
+/// smallest `global_gain` that BOTH (a) fits the inner-loop bit budget —
+/// gated on the **band-aligned** §C.1.5.4.4.6 SUBDIVIDE bit count
+/// ([`search_bit_budget_band_aligned`]), so the gain is measured against
+/// the wire-representable partition the encoder actually emits rather than
+/// the pair-thirds heuristic's possibly mid-band split —
 /// AND (b) keeps `max|is| ≤ 8191` (the §2.4.1.7 big-values cap that
 /// [`search_magnitude_clamp`] enforces). Without (b) the encoder's
 /// downstream `clamp_above` would silently truncate magnitudes, leaving
@@ -690,7 +696,8 @@ fn run_inner(
     gc.scalefac_compress = OUTER_LOOP_SCALEFAC_COMPRESS;
     gc.preflag = false;
     gc.scalefac_scale = scalefac_scale;
-    let res_budget = search_bit_budget(xr, &gc, sf, sample_rate_hz, version, per_gc_bit_budget);
+    let res_budget =
+        search_bit_budget_band_aligned(xr, &gc, sf, sample_rate_hz, version, per_gc_bit_budget);
     let res_clamp = search_magnitude_clamp(xr, &gc, sf, sample_rate_hz, version);
     let gg = res_budget.global_gain.max(res_clamp.global_gain);
     // Re-quantize at the combined-constraint gain so the returned `is[]`
@@ -1219,7 +1226,8 @@ fn run_inner_short(
     gc.preflag = false;
     gc.scalefac_scale = scalefac_scale;
     gc.subblock_gain = subblock_gain;
-    let res_budget = search_bit_budget(xr, &gc, sf, sample_rate_hz, version, per_gc_bit_budget);
+    let res_budget =
+        search_bit_budget_band_aligned(xr, &gc, sf, sample_rate_hz, version, per_gc_bit_budget);
     let res_clamp = search_magnitude_clamp(xr, &gc, sf, sample_rate_hz, version);
     let gg = res_budget.global_gain.max(res_clamp.global_gain);
     let mut gc_final = gc;
@@ -2056,6 +2064,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn outer_loop_long_gain_fits_band_aligned_wire_partition() {
+        // r300: the long-block outer loop now gates `global_gain` on the
+        // §C.1.5.4.4.6 *band-aligned* SUBDIVIDE bit count
+        // (`search_bit_budget_band_aligned`) rather than the pair-thirds
+        // heuristic, so the chosen gain is measured against the partition
+        // the encoder actually emits on the wire (region ends snapped to
+        // long-block scalefactor-band edges, `region0_count` /
+        // `region1_count` within the 4-bit / 3-bit field widths the decoder
+        // can reconstruct). This pins the property: re-counting the
+        // returned `is[]` through `exact_bit_count_band_aligned` at the
+        // final gain fits the per-granule budget.
+        let mut xr = [0.0f32; NUM_LINES];
+        for (i, v) in xr.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.021).sin() * 250.0 + ((i as f32) * 0.004).cos() * 120.0;
+        }
+        let gc = long_template();
+        let budget = 1800u64;
+        // Threshold low enough to force several amplification cycles, so
+        // the loop exercises the inner-loop gain search repeatedly.
+        let res = outer_loop_search_long(&xr, &gc, 44_100, MpegVersion::Mpeg1, budget, 1.0e-9, 64);
+
+        // Reconstruct the granule-channel the loop settled on and re-count
+        // its big-values Huffman cost against the band-aligned (wire)
+        // partition the encoder will write.
+        let mut gc_final = gc;
+        gc_final.global_gain = res.global_gain;
+        gc_final.scalefac_scale = res.scalefac_scale;
+        gc_final.preflag = res.preflag;
+        let count = crate::inner_loop::exact_bit_count_band_aligned(
+            &res.is,
+            &gc_final,
+            44_100,
+            MpegVersion::Mpeg1,
+        )
+        .expect("chosen is[] must be codable");
+        assert!(
+            count.bits as u64 <= budget,
+            "band-aligned wire count {} exceeds budget {budget}",
+            count.bits
+        );
+        // The chosen split must be wire-representable: `region0_count` ≤ 15
+        // (4-bit field) and `region1_count` ≤ 7 (3-bit field), and the
+        // region boundaries must fall on long-block band edges.
+        let big_pairs = count.split.big_pairs;
+        let sb = crate::inner_loop::subdivide_bands(44_100, MpegVersion::Mpeg1, big_pairs);
+        assert!(
+            sb.region0_count <= 15,
+            "region0_count overflows 4-bit field"
+        );
+        assert!(sb.region1_count <= 7, "region1_count overflows 3-bit field");
+        assert_eq!(
+            count.region_ends, sb.region_ends,
+            "outer-loop bit count must use the band-aligned region ends",
+        );
     }
 
     #[test]

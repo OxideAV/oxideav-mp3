@@ -893,6 +893,37 @@ band-aligned-vs-default self-consistency on a long block, and
 short-block fallback equivalence). Spec read: SUBDIVIDE text on PDF
 page 104 (§C.1.5.4.4.6).
 
+**Round 300 (§C.1.5.4.4 band-aligned bit-budget search wired into the
+outer (distortion-control) loop).** r299 swapped the fixed-gain CBR path
+to `search_bit_budget_band_aligned` but explicitly left the §C.1.5.4.3
+outer-loop branches on the default `search_bit_budget` (the documented
+followup). So the noise-shaping loop kept choosing `global_gain` against
+the pair-thirds [`inner_loop::subdivide`] heuristic, whose region
+boundaries can land mid-band — a part2_3 length the decoder's
+`region_boundaries` cannot reconstruct and the encoder never emits — even
+though the gain it returns is the one the outer loop carries into the
+emitted granule. This round swaps **both** per-iteration inner-loop
+helpers to the band-aligned search: `run_inner` (long / Start / End
+blocks) and `run_inner_short` (short / mixed blocks). For long-family
+blocks the gain is now gated on the §C.1.5.4.4.6 SUBDIVIDE snapped to
+scalefactor-band edges ([`inner_loop::subdivide_bands`], region ends
+clamped to the 4-bit / 3-bit `region0_count` / `region1_count` field
+widths the decoder reproduces) — the same wire partition r299 made the
+CBR fixed-gain path use, now matched on the distortion-control path too.
+Short / mixed blocks share the two-subregion blocksplit path, so for
+those the new gating is bit-identical to the old (the band-aligned count
+falls back to the block-type-steered pair split there). The magnitude
+clamp (`search_magnitude_clamp`), the §C.1.5.4.3 amplification / preflag /
+scalefac_scale escalation, and the VBR clamp-only choice are all
+untouched. One new lib test
+(`outer_loop_long_gain_fits_band_aligned_wire_partition`): the chosen
+`is[]` re-counted via `exact_bit_count_band_aligned` at the final gain
+fits the per-granule budget and uses the band-aligned region ends. Lib
+suite 1085 → 1086; the full encoder roundtrip + PSNR suite stays green
+(every existing self-decode test reconstructs bit-exactly through the
+changed path). Spec read: §C.1.5.4.3 outer loop + §C.1.5.4.4 / .4.6 inner
+loop on PDF pages 100-104.
+
 **Round 299 (§C.1.5.4.4 band-aligned bit-budget search wired into the CBR
 encode path).** r298 added `search_bit_budget_band_aligned` as an opt-in
 primitive but the fixed-gain CBR encode path still picked `global_gain`

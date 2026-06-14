@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§C.1.5.4.4 band-aligned bit-budget search wired into the
+  outer (distortion-control) loop** (r300). r299 swapped the fixed-gain
+  CBR path to `search_bit_budget_band_aligned` but left the §C.1.5.4.3
+  outer-loop branches on the default `search_bit_budget`, so the noise-
+  shaping loop kept measuring `global_gain` against the pair-thirds
+  `subdivide` heuristic — a part2_3 length whose region boundaries can
+  land mid-band, i.e. a partition the decoder's `region_boundaries`
+  cannot reconstruct and the encoder never emits. Both per-iteration
+  inner-loop helpers (`run_inner` for long / Start / End blocks and
+  `run_inner_short` for short / mixed blocks) now call
+  `search_bit_budget_band_aligned`, so the gain the outer loop settles on
+  fits the band-aligned wire partition the encoder actually writes. For
+  long-family blocks the gain is now measured against the §C.1.5.4.4.6
+  SUBDIVIDE snapped to scalefactor-band edges (`region0_count` /
+  `region1_count` within the 4-bit / 3-bit field widths); short / mixed
+  blocks share the two-subregion blocksplit path, so for those the new
+  gating is bit-identical to the old. One new lib test
+  (`outer_loop_long_gain_fits_band_aligned_wire_partition`): the chosen
+  `is[]` re-counted via `exact_bit_count_band_aligned` at the final gain
+  fits the per-granule budget and uses the band-aligned region ends. Lib
+  suite 1085 → 1086; full roundtrip / PSNR suite stays green (every self-
+  decode test reconstructs bit-exactly). Spec read: §C.1.5.4.3 outer loop
+  + §C.1.5.4.4 / .4.6 inner loop, PDF pages 100-104.
 - encoder: **§C.1.5.4.4 band-aligned bit-budget search wired into the CBR
   encode path** (r299). The fixed-gain CBR inner loop now chooses
   `global_gain` with `search_bit_budget_band_aligned` (r298) instead of
