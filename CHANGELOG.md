@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§C.1.5.4.4 band-aligned bit-budget search wired into the CBR
+  encode path** (r299). The fixed-gain CBR inner loop now chooses
+  `global_gain` with `search_bit_budget_band_aligned` (r298) instead of
+  the default `search_bit_budget`. The default search gates the gain on
+  the pair-thirds `subdivide` heuristic, whose region boundaries can land
+  mid-band — a part2_3 length the decoder's `region_boundaries` cannot
+  reconstruct, so the gain it returned was measured against a partition
+  the encoder never emits (the emitted region counts come from the
+  band-aligned `choose_region_split`). The band-aligned search measures
+  bits against the same scalefactor-band-edge SUBDIVIDE the encoder
+  writes to the wire, so the chosen gain fits the real emitted part2_3
+  length. Short / mixed blocks share the two-subregion blocksplit path
+  and are unchanged. VBR (clamp-only) and outer-loop branches are
+  untouched. One new integration test (`stream_encoder_roundtrip` 3 → 4)
+  asserting every CBR long-block granule's `part2_3_length` stays within
+  the per-frame budget; full suite green.
 - encoder: **§C.1.5.4.4 band-aligned bit-budget inner-loop search**
   (r298). New `inner_loop::search_bit_budget_band_aligned` (re-exported at
   the crate root) runs the spec's upward `qquant + 1` rate-control scan

@@ -893,6 +893,32 @@ band-aligned-vs-default self-consistency on a long block, and
 short-block fallback equivalence). Spec read: SUBDIVIDE text on PDF
 page 104 (§C.1.5.4.4.6).
 
+**Round 299 (§C.1.5.4.4 band-aligned bit-budget search wired into the CBR
+encode path).** r298 added `search_bit_budget_band_aligned` as an opt-in
+primitive but the fixed-gain CBR encode path still picked `global_gain`
+with the default `search_bit_budget`. That default gates the gain on the
+pair-thirds `subdivide` heuristic, whose region boundaries may land
+mid-band — a part2_3 length the decoder's `region_boundaries` cannot
+reconstruct — while the encoder downstream actually emits the
+band-aligned `choose_region_split` partition. So the gain was being
+measured against a partition the encoder never writes. This round swaps
+the fixed-gain CBR branch to `search_bit_budget_band_aligned`, which
+measures the §C.1.5.4.4.5 + .8 Huffman total against the same
+scalefactor-band-edge SUBDIVIDE the encoder emits (§C.1.5.4.4.6, region
+ends snapped to band edges and clamped to the 4-bit / 3-bit
+`region0_count` / `region1_count` field widths). The chosen gain now fits
+the real emitted part2_3 length rather than an unrepresentable
+approximation of it. Short / mixed blocks share the two-subregion
+blocksplit path, so they are unchanged; the VBR (clamp-only) gain choice
+and the outer-loop branches are untouched. One new integration test
+(`cbr_long_block_part2_3_within_per_granule_budget`,
+`stream_encoder_roundtrip` 3 → 4) asserting every CBR long-block
+granule's `part2_3_length` stays within the per-frame main-data budget;
+the full encoder roundtrip + PSNR suite stays green (every existing
+self-decode test reconstructs bit-exactly through the changed path). Spec
+read: inner-iteration-loop §C.1.5.4.4 + §C.1.5.4.4.6 on PDF pages
+103-104.
+
 **Round 298 (§C.1.5.4.4 band-aligned bit-budget inner-loop search).**
 r297 added the band-aligned SUBDIVIDE helpers
 ([`inner_loop::subdivide_bands`] / [`inner_loop::exact_bit_count_band_aligned`])

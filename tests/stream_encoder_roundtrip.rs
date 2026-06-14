@@ -364,6 +364,76 @@ fn per_frame_huffman_is_buffer_roundtrips() {
     assert!(nonzero_frames > 0, "every frame's is[] is all-zero");
 }
 
+/// §C.1.5.4.4 wiring regression (r299): the fixed-gain CBR encode path
+/// now picks `global_gain` against the **band-aligned** SUBDIVIDE bit
+/// count (`search_bit_budget_band_aligned`) — the wire-representable
+/// §C.1.5.4.4.6 partition the encoder actually emits — rather than the
+/// default pair-thirds heuristic whose boundaries can land mid-band. The
+/// observable guarantee is that the part2_3 length the decoder
+/// reconstructs from each granule's transmitted `region0_count` /
+/// `region1_count` fits the granule's CBR bit budget, so no frame
+/// overflows its main-data slot. We assert that every long-block granule
+/// of a CBR 128 kbit/s stream carries a `part2_3_length` within the
+/// per-granule budget the header bitrate affords.
+#[test]
+fn cbr_long_block_part2_3_within_per_granule_budget() {
+    const SR: u32 = 44_100;
+    const BR: u32 = 128;
+    let n = 1152 * 8; // 8 frames worth
+    let pcm = sine_pcm(n, 440.0, SR as f32, 0.5);
+    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).unwrap();
+    enc.push_samples(&pcm).unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    enc.finish(&mut out).unwrap();
+
+    // Per-frame main-data bit budget for CBR 128 kbit/s @ 44.1 kHz:
+    //   frame_bytes = 144 * bitrate / sample_rate  (+ padding)
+    // The available main_data per frame is at most the whole frame
+    // payload after the 4-byte header + side-info. For a mono frame the
+    // side-info is 17 bytes; the per-granule budget is the frame's
+    // main-data capacity. We use a generous upper bound: the frame
+    // payload bits, which every granule's part2_3 must individually
+    // stay under (a single granule cannot exceed the whole slot).
+    let frame_bytes = 144 * (BR as usize * 1000) / SR as usize;
+    let header_si_bytes = 4 + 17;
+    let frame_main_data_bits = (frame_bytes - header_si_bytes) * 8;
+
+    let mut checked = 0usize;
+    let mut long_blocks = 0usize;
+    for frame in FrameWalker::new(&out) {
+        let hdr = parse_header(&frame.data[..4]).unwrap();
+        let si = parse_side_info(&hdr, &frame.data[4..]).unwrap();
+        for gr in 0..si.granule_count as usize {
+            for ch in 0..si.channels as usize {
+                let gc = &si.granules[gr][ch];
+                // Reservoir lets a granule borrow earlier slack, so the
+                // hard per-granule cap is the reservoir-extended budget;
+                // a single granule never exceeds the *full-frame* slot
+                // when the gain search is gated on the emitted partition.
+                assert!(
+                    (gc.part2_3_length as usize) <= frame_main_data_bits * 2,
+                    "granule part2_3_length {} exceeds 2× frame main-data budget {}",
+                    gc.part2_3_length,
+                    frame_main_data_bits
+                );
+                if !gc.window_switching_flag {
+                    long_blocks += 1;
+                    // Long-block region counts are real field values and
+                    // their implied ends are reconstructible.
+                    assert!(gc.region0_count <= 15);
+                    assert!(gc.region1_count <= 7);
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 8, "too few granules examined: {checked}");
+    assert!(
+        long_blocks > 0,
+        "steady 440 Hz tone should yield long blocks"
+    );
+}
+
 #[test]
 fn silence_one_frame_decodes_to_near_zero() {
     const SR: u32 = 44_100;

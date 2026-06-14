@@ -73,7 +73,9 @@ use crate::frame::{ChannelMode, ModeExtension, Mp3FrameHeader, MpegVersion};
 use crate::huffman::{
     choose_best_count1_table, choose_best_table_for_region, partition_split, NUM_LINES,
 };
-use crate::inner_loop::{search_bit_budget, search_magnitude_clamp, GAIN_MAX, GAIN_MIN};
+use crate::inner_loop::{
+    search_bit_budget_band_aligned, search_magnitude_clamp, GAIN_MAX, GAIN_MIN,
+};
 use crate::main_data::{
     assemble_main_data, schedule_reservoir, GranuleChannelData, ReservoirError, ReservoirFrame,
 };
@@ -3877,7 +3879,25 @@ impl Mp3Encoder {
                             let initial_gain = if self.vbr.is_some() {
                                 res_clamp.global_gain
                             } else {
-                                let res_budget = search_bit_budget(
+                                // §C.1.5.4.4 rate control: choose the gain
+                                // against the *band-aligned* SUBDIVIDE bit
+                                // count, the wire-representable §C.1.5.4.4.6
+                                // partition this encoder actually emits below
+                                // (`choose_region_split` / `subdivide_bands`
+                                // both snap the boundaries to scalefactor-band
+                                // edges). The default `search_bit_budget`
+                                // counts bits against the pair-thirds
+                                // heuristic ([`subdivide`]), whose boundaries
+                                // can land mid-band — a part2_3 length the
+                                // decoder's `region_boundaries` cannot
+                                // reconstruct, so the gain it returned was
+                                // gated on a split the encoder never writes.
+                                // The band-aligned count matches the emitted
+                                // part2_3 length, so the gain fits the real
+                                // wire budget. (Short / mixed blocks share the
+                                // two-subregion blocksplit path, so this is
+                                // bit-identical to the default for them.)
+                                let res_budget = search_bit_budget_band_aligned(
                                     &xr_pre,
                                     &gc_template,
                                     &sf,
