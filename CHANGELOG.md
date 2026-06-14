@@ -28,6 +28,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§2.4.3.4.9.2 MS + short-block + intensity stereo** (r305).
+  The force-short toggle (`force_short_blocks_for_testing(true)`) is now
+  accepted on the unconditional MS + intensity encoder
+  (`new_joint_stereo_ms_is`); it was previously rejected with
+  `IntensityShortBlocksUnsupported` because the below-bound MS rotation
+  needed the §2.4.3.4.8 interleaved short layout. The MS matrix now
+  applies per window below each window's short intensity bound — bands
+  `0..short_start` across all three windows, which in the interleaved
+  layout is the contiguous run `0..3·short_starts[short_start]` (the
+  reorder is a permutation of that line set) — the exact inverse of the
+  decoder's per-window `process_short`. Intensity (above the bound) and
+  MS (below it) touch disjoint line sets. Frames carry `mode = '01'`,
+  `mode_extension = '11'`. The MS-*auto* + short + intensity path stays
+  rejected (its energy-fraction picker still reads the long-block bound
+  line). New integration suite `tests/ms_short_intensity_roundtrip.rs`
+  (5 tests): `'11'` header + pure-short side info, right-channel
+  positions in range, a spec-order self-decode with the below-bound
+  440 Hz MS pan reconstructing at 1.40 and the hard-left 8 kHz intensity
+  tone left-leaning, byte-deterministic encode, and the MS-auto
+  rejection guard. The `intensity_rejects_block_type_toggles` unit test
+  now asserts MS + short force-short acceptance + the narrowed MS-auto
+  rejection.
+
 - encoder: **§2.4.3.4.9.3 short-block intensity stereo** (r303). The
   force-short toggle (`force_short_blocks_for_testing(true)`) is now
   accepted on an intensity-only encoder (`new_joint_stereo_is`); it was

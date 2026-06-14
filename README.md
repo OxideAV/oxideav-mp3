@@ -923,6 +923,42 @@ the spec-correct side). Spec read: ISO/IEC 11172-3 §2.4.3.4.8 (short
 reorder), §2.4.3.4.9 (stereo runs after reorder), §2.4.3.4.10
 (IMDCT consumes subband-ordered lines).
 
+**Round 305 (§2.4.3.4.9.2 MS + short-block + intensity stereo, per-window
+bound).** r303 wired the per-window short intensity bound for the
+intensity-*only* force-short path; the combination with the §2.4.3.4.9.2
+MS matrix stayed rejected (`IntensityShortBlocksUnsupported`) because the
+below-bound MS rotation has to follow the §2.4.3.4.8 interleaved short
+layout rather than the single contiguous line range the long-block path
+uses. r305 lifts that rejection on the **unconditional MS** path
+(`new_joint_stereo_ms_is` + `force_short_blocks_for_testing(true)`). The
+intensity coupling (Pass 1.45) is unchanged — it folds `L += R; R = 0`
+over `short_start..12` for every window. The MS rotation (Pass 1.5) now
+branches on the short-intensity case: instead of rotating
+`0..ms_region_hi` it rotates the below-bound region, bands
+`0..short_start` across all three windows. Because every window of those
+bands is rotated and MS is a per-line operation, that line set is exactly
+the contiguous run `0..3·short_starts[short_start]` (the reorder is a
+permutation of it), so the rotation reduces to a contiguous loop while
+remaining the exact inverse of the decoder's per-window `process_short`:
+it MS-decodes the bands below each window's derived bound (the right
+channel's side signal keeps that bound at `short_start`) and
+intensity-decodes the rest (ISO/IEC 13818-3 §2.4.3.2). Intensity and MS
+touch disjoint line sets, so applying intensity first then MS never
+double-rotates a line. Frames carry `mode = '01'`, `mode_extension =
+'11'`. The MS-*auto* + short + intensity path stays rejected: its
+side-energy picker still evaluates over the long-block bound line, not
+the per-window short region. Validated by a new integration suite
+(`ms_short_intensity_roundtrip`, 5 tests): `'11'` header + pure-short
+side info, right-channel positions in range, a spec-order self-decode in
+which the below-bound 440 Hz MS pan reconstructs at its true 1.40 ratio
+and the hard-left 8 kHz intensity tone reconstructs strongly
+left-leaning, byte-deterministic encode, and the MS-auto rejection guard.
+The rejection unit test (`intensity_rejects_block_type_toggles`) now
+asserts MS + short force-short acceptance and the narrowed MS-auto
+rejection. Spec read: ISO/IEC 11172-3 §2.4.3.4.8 (short reorder) /
+§2.4.3.4.9.2 (MS matrix) / §2.4.3.4.9.3 (coupling); ISO/IEC 13818-3
+§2.4.3.2 (per-window bound).
+
 **Round 303 (§2.4.3.4.9.3 short-block intensity stereo, per-window
 bound).** Every intensity constructor before this round was long-block
 only: arming intensity (`new_joint_stereo_is`) rejected the force-short
@@ -2796,9 +2832,11 @@ short-window bound is per window (per-window `is_pos` from
 `scalefac_s`), so the force-short / force-mixed / auto-block-type
 toggles rejected with the new `IntensityShortBlocksUnsupported` error
 while intensity was armed (`InvalidIntensityStartSfb` covers the range
-check). **Round 303 lifted the force-short rejection** — the
-intensity-only force-short path now writes per-window positions on
-`scalefac_s[sfb][win]`; see the Round 303 entry below. Registry path:
+check). **Round 303 lifted the force-short rejection** for the
+intensity-only path (per-window positions on `scalefac_s[sfb][win]`) and
+**Round 305 lifted it for the unconditional MS + intensity path** (the
+§2.4.3.4.9.2 matrix now rotates per window below the short bound); see the
+Round 305 / Round 303 entries below. Registry path:
 `make_encoder_joint_stereo_is` / `make_encoder_joint_stereo_ms_is`
 mirror the direct constructors. Validated by 8 new lib unit tests
 (position grid + monotonicity, constructor state/template bits,
