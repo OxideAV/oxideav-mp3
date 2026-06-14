@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§2.4.3.4.9.3 short-block intensity stereo** (r303). The
+  force-short toggle (`force_short_blocks_for_testing(true)`) is now
+  accepted on an intensity-only encoder (`new_joint_stereo_is`); it was
+  previously rejected with `IntensityShortBlocksUnsupported`. Each
+  granule's 12 short bands × 3 windows are intensity-coupled with a
+  **per-window** bound (ISO/IEC 13818-3 §2.4.3.2): positions are derived
+  from each window's L/R band energies (Annex G.2 c) and written to the
+  right channel's `scalefac_s[sfb][win]` slots (with the illegal marker
+  `7` on each window's all-zero bands above its own last non-zero
+  quantized line). The right channel carries `scalefac_compress = 15`
+  (126-bit short part2). Mixed / auto-scheduled short granules and the
+  MS + short + intensity combination remain rejected with
+  `IntensityShortBlocksUnsupported`. New integration suite
+  `tests/short_block_intensity_roundtrip.rs` (4 tests); the
+  `intensity_rejects_block_type_toggles` unit test now asserts
+  force-short acceptance plus the narrowed rejections.
 - encoder: **§2.4.3.4.9.3 adaptive per-granule intensity bound** (r302).
   New `Mp3Encoder::new_joint_stereo_auto_is_adaptive(bitrate,
   sample_rate, intensity_start_floor)` treats the intensity start band as

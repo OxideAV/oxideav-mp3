@@ -1019,10 +1019,15 @@ impl Mp3Encoder {
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
-        if enabled && self.intensity_start_sfb.is_some() {
-            // Intensity coupling is long-block only this round: the
-            // short-block intensity bound is per window, which needs a
-            // per-window is_pos derivation from scalefac_s.
+        if enabled
+            && self.intensity_start_sfb.is_some()
+            && (self.ms_stereo || self.ms_auto_threshold.is_some())
+        {
+            // Force-short intensity coupling (r303) is wired for the
+            // intensity-only path (`new_joint_stereo_is`). The MS matrix
+            // below the per-window short bound still needs the §2.4.3.4.8
+            // interleaved layout, so MS + short + intensity stays
+            // rejected for now.
             return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
         }
         if enabled {
@@ -3450,6 +3455,14 @@ impl Mp3Encoder {
         // non-intensity paths and below-bound bands never leak a stale
         // position.
         let mut is_pos_per_gr = [[7u8; 21]; GRANULES];
+        // Short-block per-window intensity positions, parallel to
+        // `is_pos_per_gr` but indexed `[gr][sfb][win]` over the 12 short
+        // scalefactor bands × 3 windows (ISO/IEC 11172-3 §2.4.3.4.9.3 +
+        // 13818-3 §2.4.3.2: the intensity bound is derived per window).
+        // Defaults to the illegal marker `7`; only force-short
+        // intensity granules populate it. Carried into Pass 2 where it
+        // lands on the right channel's `scalefac_s[sfb][win]` slots.
+        let mut is_pos_short_per_gr = [[[7u8; 3]; 12]; GRANULES];
         // Per-granule flag: did intensity coupling actually fire for
         // this granule? Always `true` for the fixed-bound modes (every
         // granule couples `start_sfb..21`); per-granule for the adaptive
@@ -3470,8 +3483,80 @@ impl Mp3Encoder {
             }
             _ => NUM_LINES,
         };
+        // Force-short intensity granules use the §2.4.3.4.9.3 +
+        // 13818-3 §2.4.3.2 *per-window* short-block bound instead of the
+        // long-block band walk: the bound is derived independently for
+        // each of the three windows, and the positions land on
+        // `scalefac_s[sfb][win]` in Pass 2. The force-short toggle puts
+        // every (gr, ch) on the short path, so the whole frame takes the
+        // short coupling here; the long branch below covers all other
+        // intensity modes (the long-block / adaptive paths from r284 /
+        // r302). Mixed and auto-scheduled short granules keep their
+        // r303 `IntensityShortBlocksUnsupported` rejection.
+        let short_intensity = self.force_short_blocks;
         if let Some(start_sfb) = self.intensity_start_sfb {
-            if self.nch == 2 {
+            if self.nch == 2 && short_intensity {
+                let short_starts = short_band_starts_for(self.sample_rate_hz);
+                for gr in 0..ngr {
+                    let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
+                    let left = &mut left_slice[0];
+                    let right = &mut right_slice[0];
+                    // Map the long-block `intensity_start_sfb` (1..=20,
+                    // the public API's only knob) onto a short-block
+                    // start band by frequency: the short band whose first
+                    // line is at or beyond the long start line. This
+                    // keeps the one user-facing bound consistent across
+                    // block types without a second API surface.
+                    let long_starts = long_band_starts_for(self.sample_rate_hz);
+                    let start_line = long_starts[start_sfb];
+                    let short_start = (0..12)
+                        .find(|&sfb| short_starts[sfb] >= start_line)
+                        .unwrap_or(12);
+                    // Force-short always couples (every granule shares the
+                    // short geometry); the per-window zero-part below the
+                    // bound is what makes the decoder's per-window bound
+                    // derivation land where intended.
+                    intensity_coupled_per_gr[gr] = short_start < 12;
+                    for sfb in short_start..12 {
+                        let s = short_starts[sfb];
+                        let w = short_starts[sfb + 1] - short_starts[sfb];
+                        let base = 3 * s;
+                        for win in 0..3 {
+                            let mut l_energy = 0.0f64;
+                            let mut r_energy = 0.0f64;
+                            // Native bitstream layout (post-reorder):
+                            // band `sfb` window `win` occupies the
+                            // contiguous run `base + win·w .. base +
+                            // (win+1)·w`. Coupling is a per-line
+                            // operation, so deriving the position and
+                            // folding the magnitude over this run yields
+                            // exactly the spectrum the decoder rebuilds
+                            // from `scalefac_s[sfb][win]` after its
+                            // §2.4.3.4.8 reorder.
+                            let win_base = base + win * w;
+                            for k in 0..w {
+                                let i = win_base + k;
+                                if i < NUM_LINES {
+                                    l_energy += f64::from(left[i]) * f64::from(left[i]);
+                                    r_energy += f64::from(right[i]) * f64::from(right[i]);
+                                }
+                            }
+                            is_pos_short_per_gr[gr][sfb][win] = if self.version.is_lsf() {
+                                derive_intensity_position_lsf(l_energy, r_energy)
+                            } else {
+                                derive_intensity_position(l_energy, r_energy)
+                            };
+                            for k in 0..w {
+                                let i = win_base + k;
+                                if i < NUM_LINES {
+                                    left[i] += right[i];
+                                    right[i] = 0.0;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if self.nch == 2 {
                 let starts = long_band_starts_for(self.sample_rate_hz);
                 for (gr, is_pos_bands) in is_pos_per_gr.iter_mut().enumerate().take(ngr) {
                     let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
@@ -4309,7 +4394,51 @@ impl Mp3Encoder {
                 //     (§2.4.3.4.9.1), so without the marker those
                 //     bands would be intensity-decoded with whatever
                 //     scalefactor the quantizer left behind.
-                if intensity_right {
+                if intensity_right && short_intensity {
+                    // Short-block right channel: positions and markers go
+                    // on `scalefac_s[sfb][win]`, derived independently per
+                    // window. The decoder's per-window bound
+                    // (§2.4.3.4.8 reorder, then 13818-3 §2.4.3.2) is the
+                    // short band one past that window's last non-zero
+                    // quantized right line, so each window's all-zero
+                    // bands above its own last non-zero line — and below
+                    // the coupled start — take the illegal marker 7 to
+                    // keep them out of the intensity reconstruction.
+                    let short_starts = short_band_starts_for(self.sample_rate_hz);
+                    let long_starts = long_band_starts_for(self.sample_rate_hz);
+                    let start_sfb = self.intensity_start_sfb.unwrap_or(LONG_SFB);
+                    let start_line = long_starts[start_sfb];
+                    let short_start = (0..12)
+                        .find(|&sfb| short_starts[sfb] >= start_line)
+                        .unwrap_or(12);
+                    for win in 0..3 {
+                        // Per-window last non-zero quantized line, in
+                        // native bitstream layout (band `sfb` window `win`
+                        // line `k` at `3·s + win·w + k`).
+                        let mut last_nz_sfb: Option<usize> = None;
+                        for sfb in 0..12 {
+                            let s = short_starts[sfb];
+                            let w = short_starts[sfb + 1] - short_starts[sfb];
+                            let win_base = 3 * s + win * w;
+                            for k in 0..w {
+                                let i = win_base + k;
+                                if i < NUM_LINES && is[i] != 0 {
+                                    last_nz_sfb = Some(sfb);
+                                }
+                            }
+                        }
+                        let zero_tail_from = match last_nz_sfb {
+                            None => 0,
+                            Some(sfb) => sfb + 1,
+                        };
+                        for sfb in zero_tail_from..short_start.min(12) {
+                            sf.short[sfb][win] = 7;
+                        }
+                        for sfb in short_start..12 {
+                            sf.short[sfb][win] = is_pos_short_per_gr[gr][sfb][win];
+                        }
+                    }
+                } else if intensity_right {
                     let starts = long_band_starts_for(self.sample_rate_hz);
                     let start_sfb = self.intensity_start_sfb.unwrap_or(LONG_SFB);
                     let zero_tail_from = match is.iter().rposition(|&v| v != 0) {
@@ -4677,6 +4806,25 @@ fn long_band_starts_for(sample_rate_hz: u32) -> &'static [usize; 22] {
         _ => MpegVersion::Mpeg1,
     };
     crate::requantize::long_band_starts(sample_rate_hz, version)
+}
+
+/// Table B.8 §2.4.3.4.8 short-block scalefactor-band boundaries
+/// (per-window subband widths) for `sample_rate_hz`, mapping the wire
+/// sample-rate to its MPEG version exactly as [`long_band_starts_for`].
+/// Each `starts[sfb]` is the per-window first frequency line of short
+/// band `sfb`; the native bitstream layout interleaves the three windows
+/// of one band so band `sfb` window `win` line `k` lands at
+/// `3·starts[sfb] + win·width + k` (`width = starts[sfb+1] -
+/// starts[sfb]`), which is the same line index the requantizer fills and
+/// — after the §2.4.3.4.8 reorder — the decoder's per-window stereo stage
+/// addresses as `3·starts[sfb] + 3·k + win`.
+fn short_band_starts_for(sample_rate_hz: u32) -> &'static [usize; 13] {
+    let version = match sample_rate_hz {
+        16_000 | 22_050 | 24_000 => MpegVersion::Mpeg2,
+        8_000 | 11_025 | 12_000 => MpegVersion::Mpeg25,
+        _ => MpegVersion::Mpeg1,
+    };
+    crate::requantize::short_band_starts(sample_rate_hz, version)
 }
 
 /// Pick the per-granule §2.4.3.4.9.3 intensity-stereo bound for the
@@ -6127,15 +6275,23 @@ mod tests {
         assert!(Mp3Encoder::new_joint_stereo_is(192, 44_100, 20).is_ok());
     }
 
-    /// The block-type toggles reject while intensity coupling is armed
-    /// (the per-window short-block intensity bound is deferred).
+    /// Block-type toggle acceptance while intensity coupling is armed.
+    /// r303 wired the §2.4.3.4.9.3 *per-window* short-block intensity
+    /// bound, so force-short on the intensity-only path
+    /// ([`Mp3Encoder::new_joint_stereo_is`]) now succeeds. The mixed and
+    /// auto-scheduled short paths (whose per-window bound geometry isn't
+    /// wired yet) and the MS + short + intensity combination (whose MS
+    /// rotation still needs the interleaved short layout) stay rejected.
     #[test]
     fn intensity_rejects_block_type_toggles() {
+        // Force-short on the intensity-only path is accepted (r303).
         let mut enc = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8).unwrap();
-        assert!(matches!(
-            enc.force_short_blocks_for_testing(true),
-            Err(StreamEncodeError::IntensityShortBlocksUnsupported)
-        ));
+        assert!(enc.force_short_blocks_for_testing(true).is_ok());
+        assert!(enc.force_short_blocks_enabled());
+
+        // Mixed + intensity and the auto-scheduled short paths remain
+        // unsupported.
+        let mut enc = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8).unwrap();
         assert!(matches!(
             enc.force_mixed_blocks_for_testing(true),
             Err(StreamEncodeError::IntensityShortBlocksUnsupported)
@@ -6148,6 +6304,15 @@ mod tests {
             enc.enable_auto_block_type_with_mixed(10.0, 4.0),
             Err(StreamEncodeError::IntensityShortBlocksUnsupported)
         ));
+
+        // MS + short + intensity stays rejected (the below-bound MS
+        // rotation still needs the §2.4.3.4.8 interleaved short layout).
+        let mut ms_enc = Mp3Encoder::new_joint_stereo_ms_is(192, 44_100, 8).unwrap();
+        assert!(matches!(
+            ms_enc.force_short_blocks_for_testing(true),
+            Err(StreamEncodeError::IntensityShortBlocksUnsupported)
+        ));
+
         // Disabling a toggle remains a no-op success.
         assert!(enc.force_short_blocks_for_testing(false).is_ok());
         assert!(enc.force_mixed_blocks_for_testing(false).is_ok());

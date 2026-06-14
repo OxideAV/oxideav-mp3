@@ -893,6 +893,42 @@ band-aligned-vs-default self-consistency on a long block, and
 short-block fallback equivalence). Spec read: SUBDIVIDE text on PDF
 page 104 (§C.1.5.4.4.6).
 
+**Round 303 (§2.4.3.4.9.3 short-block intensity stereo, per-window
+bound).** Every intensity constructor before this round was long-block
+only: arming intensity (`new_joint_stereo_is`) rejected the force-short
+toggle with `IntensityShortBlocksUnsupported`, because the short-block
+bound is derived **per window** (ISO/IEC 13818-3 §2.4.3.2: "the
+calculation of the intensity bound is applied to the values of each short
+window") and the positions ride the right channel's `scalefac_s[sfb][win]`
+slots rather than `scalefac_l`. r303 wires that path:
+`force_short_blocks_for_testing(true)` is now accepted on an
+intensity-only encoder. Pass 1.45 maps the public `intensity_start_sfb`
+(a long-band index) onto a short start band by frequency, then walks the
+12 short bands × 3 windows of every granule — deriving each window's
+position from its own L/R band energies (Annex G.2 c) /
+`derive_intensity_position[_lsf]`) and folding `L += R; R = 0` over that
+window's lines in the native `[sfb][win][k]` interleave (coupling is
+per-line and the §2.4.3.4.8 reorder is a permutation within the band, so
+the operation is layout-invariant against the decoder's per-window
+reconstruction). Pass 2 writes `scalefac_s[sfb][win]` with the derived
+positions at/above the start band and the Annex G.2 c) illegal marker `7`
+on each window's all-zero bands above its own last non-zero quantized
+line, so the decoder's per-window zero-part bound lands exactly where
+intended. The right channel takes `scalefac_compress = 15` (slen1 = 4,
+slen2 = 3 ⇒ 126-bit short part2 — every position fits). Mixed and
+auto-scheduled short granules, and the MS + short + intensity combination
+(whose below-bound MS rotation still needs the interleaved short layout),
+keep their rejection. Validated by a new integration suite
+(`short_block_intensity_roundtrip`, 4 tests): intensity-only short header
++ pure-short side info, per-window positions in range, a hard-left 8 kHz
+tone reconstructing left-leaning through a spec-order self-decode
+(huffman → requantize → **reorder** → process_stereo → alias → imdct →
+synth) with the below-bound 440 Hz pan preserved, and byte-deterministic
+encode. The rejection unit test (`intensity_rejects_block_type_toggles`)
+now asserts force-short acceptance + the narrowed rejections. Spec read:
+ISO/IEC 11172-3 §2.4.3.4.8 (short reorder) / §2.4.3.4.9.3 (coupling) +
+Annex G.2 c); ISO/IEC 13818-3 §2.4.3.2 (per-window bound).
+
 **Round 302 (§2.4.3.4.9.3 adaptive per-granule intensity bound).** Every
 joint-stereo intensity constructor so far fixes the coupling start band
 at construction (`new_joint_stereo_is(_ms / _auto)` couple
@@ -2725,12 +2761,14 @@ overwritten with the positions and every all-zero band between the
 last non-zero quantized right-channel line and the bound gets the
 illegal-position marker `7` (Annex G.2 c) — without it a decoder
 deriving the bound from the zero-part would intensity-decode those
-bands with leftover scalefactors. Long-block only this round: the
+bands with leftover scalefactors. Long-block only **this** round: the
 short-window bound is per window (per-window `is_pos` from
-`scalefac_s` deferred), so the force-short / force-mixed /
-auto-block-type toggles reject with the new
-`IntensityShortBlocksUnsupported` error while intensity is armed
-(`InvalidIntensityStartSfb` covers the range check). Registry path:
+`scalefac_s`), so the force-short / force-mixed / auto-block-type
+toggles rejected with the new `IntensityShortBlocksUnsupported` error
+while intensity was armed (`InvalidIntensityStartSfb` covers the range
+check). **Round 303 lifted the force-short rejection** — the
+intensity-only force-short path now writes per-window positions on
+`scalefac_s[sfb][win]`; see the Round 303 entry below. Registry path:
 `make_encoder_joint_stereo_is` / `make_encoder_joint_stereo_ms_is`
 mirror the direct constructors. Validated by 8 new lib unit tests
 (position grid + monotonicity, constructor state/template bits,
