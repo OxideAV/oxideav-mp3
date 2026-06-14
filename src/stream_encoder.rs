@@ -476,6 +476,31 @@ pub struct Mp3Encoder {
     /// toggles reject while this is `Some`.
     intensity_start_sfb: Option<usize>,
 
+    /// `Some(t)` when the per-granule **adaptive intensity-bound**
+    /// chooser is armed (constructor
+    /// [`Mp3Encoder::new_joint_stereo_auto_is_adaptive`]). When set,
+    /// [`Self::intensity_start_sfb`] is treated as a *floor* — the
+    /// lowest band the encoder is allowed to couple — and the actual
+    /// coupling start band is chosen per granule as the lowest band
+    /// `b >= floor` such that **every** band in `b..21` carries little
+    /// right-channel stereo information relative to the combined
+    /// magnitude, i.e. its side-energy fraction
+    /// `E_S / (E_L + E_R) = Σ(L−R)² / (2·Σ(L²+R²)) <= t`. A band that
+    /// still carries real stereo content (fraction above `t`) raises
+    /// the bound so it (and everything below it) stays independently
+    /// coded. With no qualifying tail the granule is coded with no
+    /// intensity coupling at all (effective bound = 21).
+    ///
+    /// The decoder derives the intensity bound implicitly from the
+    /// position of the right channel's last non-zero line
+    /// (§2.4.3.4.9.1), so the per-granule bound varies freely on the
+    /// wire with no syntax change: a higher chosen bound simply means
+    /// the right channel's zero-part starts higher. ISO/IEC 11172-3
+    /// fixes only the wire syntax; the energy heuristic mirrors the
+    /// §2.4.3.4.9.2 MS picker ([`Self::ms_auto_threshold`]) and is a
+    /// clean-room encoder choice using no psychoacoustic input.
+    intensity_auto_threshold: Option<f64>,
+
     /// When `true`, every assembled granule emits a §2.4.2.7 short
     /// block (`window_switching_flag = 1`, `block_type = 2`,
     /// `mixed_block_flag = 0`): three independent 12-point MDCTs per
@@ -913,6 +938,7 @@ impl Mp3Encoder {
             ms_stereo: false,
             ms_auto_threshold: None,
             intensity_start_sfb: None,
+            intensity_auto_threshold: None,
             force_short_blocks: false,
             force_mixed_blocks: false,
             auto_block_type: None,
@@ -1707,6 +1733,93 @@ impl Mp3Encoder {
             raw: 0b01,
         };
         Ok(enc)
+    }
+
+    /// Build a joint-stereo encoder whose §2.4.3.4.9.3 **intensity
+    /// bound is chosen per granule** from the signal, rather than fixed
+    /// at construction.
+    ///
+    /// `intensity_start_floor` is the *lowest* long scalefactor band the
+    /// encoder is permitted to intensity-couple (it must satisfy the
+    /// same `1..=20` range as [`Mp3Encoder::new_joint_stereo_is`]).
+    /// Bands below the floor are always coded independently. For each
+    /// granule the chooser scans the bands `floor..21` and couples only
+    /// the **contiguous high tail** whose every band carries little
+    /// right-channel stereo information, measured by the same
+    /// side-energy fraction the §2.4.3.4.9.2 MS picker uses:
+    ///
+    /// ```text
+    /// E_S / (E_L + E_R) = Σ(L − R)² / (2·Σ(L² + R²))   over the band
+    /// ```
+    ///
+    /// The effective start band is the lowest `b >= floor` such that
+    /// every band in `b..21` has fraction `<= threshold` (default
+    /// `0.25`). A band that still carries real stereo content (fraction
+    /// above the threshold) pushes the bound up so that band — and
+    /// everything below it — stays independently coded. If no high tail
+    /// qualifies, the granule emits **no** intensity coupling at all
+    /// (its right channel keeps full spectral data).
+    ///
+    /// The decoder derives the intensity bound implicitly from the
+    /// right channel's last non-zero line (§2.4.3.4.9.1), so a
+    /// per-granule bound needs no wire-syntax change: a higher bound
+    /// just means the right channel's zero-part begins higher up. The
+    /// frame header carries `mode = '01'` with `mode_extension = '01'`
+    /// (intensity on, MS off) on every frame; a granule that couples
+    /// nothing still rides under that header but transmits a full
+    /// right channel, which the decoder reconstructs as ordinary
+    /// stereo (its derived bound lands at band 21).
+    ///
+    /// Like the MS picker, ISO/IEC 11172-3 does **not** prescribe how
+    /// to pick the bound — §2.4.2.3 fixes only the `mode_extension`
+    /// syntax. This is a clean-room encoder heuristic using no
+    /// psychoacoustic input and no external implementation as a
+    /// reference.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Mp3Encoder::new_joint_stereo_is`].
+    pub fn new_joint_stereo_auto_is_adaptive(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+        intensity_start_floor: usize,
+    ) -> Result<Self, StreamEncodeError> {
+        let mut enc = Self::new(bitrate_kbps, sample_rate_hz, ChannelMode::Stereo)?;
+        enc.arm_intensity(intensity_start_floor)?;
+        enc.intensity_auto_threshold = Some(0.25);
+        enc.header_template.mode = ChannelMode::JointStereo;
+        enc.header_template.mode_extension = ModeExtension {
+            intensity_stereo: true,
+            ms_stereo: false,
+            raw: 0b01,
+        };
+        Ok(enc)
+    }
+
+    /// `Some(t)` when the per-granule adaptive intensity-bound chooser
+    /// is armed (see [`Mp3Encoder::new_joint_stereo_auto_is_adaptive`]),
+    /// where `t` is the upper bound on a band's side-energy fraction at
+    /// which it qualifies to join the intensity-coupled high tail.
+    #[must_use]
+    pub fn intensity_auto_threshold(&self) -> Option<f64> {
+        self.intensity_auto_threshold
+    }
+
+    /// Override the side-energy fraction threshold used by the adaptive
+    /// intensity-bound chooser (see
+    /// [`Mp3Encoder::new_joint_stereo_auto_is_adaptive`]).
+    ///
+    /// `threshold` is the upper bound on a band's `E_S / (E_L + E_R)`
+    /// at which it may join the intensity-coupled high tail. Values
+    /// outside `[0.0, 1.0]` are clamped to that range. Calling this on
+    /// an encoder that was **not** constructed via
+    /// [`Mp3Encoder::new_joint_stereo_auto_is_adaptive`] is a no-op.
+    #[must_use]
+    pub fn with_intensity_auto_threshold(mut self, threshold: f64) -> Self {
+        if self.intensity_auto_threshold.is_some() {
+            self.intensity_auto_threshold = Some(threshold.clamp(0.0, 1.0));
+        }
+        self
     }
 
     /// Shared validation + arming for the intensity-stereo
@@ -3337,6 +3450,14 @@ impl Mp3Encoder {
         // non-intensity paths and below-bound bands never leak a stale
         // position.
         let mut is_pos_per_gr = [[7u8; 21]; GRANULES];
+        // Per-granule flag: did intensity coupling actually fire for
+        // this granule? Always `true` for the fixed-bound modes (every
+        // granule couples `start_sfb..21`); per-granule for the adaptive
+        // chooser, where a granule whose effective bound reaches 21
+        // couples nothing and must therefore write its right channel as
+        // an ordinary (non-intensity) channel. Indexed by granule;
+        // entries beyond `ngr` stay `false` and are never read.
+        let mut intensity_coupled_per_gr = [false; GRANULES];
         // Upper line bound of the MS / independent-LR region: the whole
         // spectrum without intensity, the intensity start band's first
         // line with it (§2.4.3.4.9.1: when both methods are enabled the
@@ -3356,7 +3477,22 @@ impl Mp3Encoder {
                     let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
                     let left = &mut left_slice[0];
                     let right = &mut right_slice[0];
-                    for (sfb, slot) in is_pos_bands.iter_mut().enumerate().skip(start_sfb) {
+                    // Per-granule effective start band. Fixed-bound modes
+                    // couple `start_sfb..21` verbatim; the adaptive mode
+                    // (`intensity_auto_threshold`) raises the bound to the
+                    // lowest band whose contiguous high tail all carries
+                    // little right-channel stereo information. `eff_start
+                    // == 21` ⇒ this granule couples nothing (it keeps a
+                    // full right channel and decodes as ordinary stereo).
+                    let eff_start = match self.intensity_auto_threshold {
+                        Some(t) => choose_intensity_bound(left, right, starts, start_sfb, t),
+                        None => start_sfb,
+                    };
+                    // A granule whose adaptive bound reaches 21 couples
+                    // nothing: its right channel keeps full spectral data
+                    // and pass 2 must write it as an ordinary channel.
+                    intensity_coupled_per_gr[gr] = eff_start < 21;
+                    for (sfb, slot) in is_pos_bands.iter_mut().enumerate().skip(eff_start) {
                         let lo = starts[sfb];
                         let hi = starts[sfb + 1];
                         let mut l_energy = 0.0f64;
@@ -3382,9 +3518,19 @@ impl Mp3Encoder {
                     // magnitude into the left channel anyway so the
                     // right channel's zero-part reaches the Nyquist
                     // rate (§2.4.3.4.9.1); the lines decode left-only.
-                    for i in starts[21]..NUM_LINES {
-                        left[i] += right[i];
-                        right[i] = 0.0;
+                    //
+                    // Skip the top region when the adaptive chooser
+                    // coupled nothing (`eff_start == 21`): zeroing only
+                    // the top lines while the rest of the right channel
+                    // stays full would create a spurious left-only tail.
+                    // A coupled-nothing granule must keep a complete
+                    // right channel so the decoder's derived bound lands
+                    // at band 21 and reconstructs plain stereo.
+                    if eff_start < 21 {
+                        for i in starts[21]..NUM_LINES {
+                            left[i] += right[i];
+                            right[i] = 0.0;
+                        }
                     }
                 }
             }
@@ -3961,7 +4107,11 @@ impl Mp3Encoder {
                 // the outer loop (which would pick 15 anyway) is off.
                 // `scalefac_compress = 15` gives `slen1 = 4` /
                 // `slen2 = 3` (§2.4.2.7 table) — every position fits.
-                let intensity_right = intensity_active && ch == 1;
+                // `intensity_active` gates the mode globally;
+                // `intensity_coupled_per_gr[gr]` gates it per granule for
+                // the adaptive chooser (a granule that coupled nothing
+                // writes a normal right channel, not is_pos markers).
+                let intensity_right = intensity_active && ch == 1 && intensity_coupled_per_gr[gr];
                 // LSF carries a 9-bit scalefac_compress with the
                 // §2.4.3.2 (13818-3) slen derivation. The LSF
                 // outer-loop value 399 decodes to slen (4, 4, 3, 3)
@@ -4527,6 +4677,71 @@ fn long_band_starts_for(sample_rate_hz: u32) -> &'static [usize; 22] {
         _ => MpegVersion::Mpeg1,
     };
     crate::requantize::long_band_starts(sample_rate_hz, version)
+}
+
+/// Pick the per-granule §2.4.3.4.9.3 intensity-stereo bound for the
+/// adaptive joint-stereo mode
+/// ([`Mp3Encoder::new_joint_stereo_auto_is_adaptive`]).
+///
+/// Returns the lowest long scalefactor band `b` with
+/// `floor <= b <= 21` such that **every** band in `b..21` carries
+/// little right-channel stereo information, measured by the side-energy
+/// fraction
+///
+/// ```text
+/// E_S / (E_L + E_R) = Σ(L − R)² / (2·Σ(L² + R²))   over the band
+/// ```
+///
+/// being at or below `threshold`. The chooser walks the bands from the
+/// top (band 20) down to `floor`: it extends the coupled tail downward
+/// while each band qualifies and stops at the first band that does not
+/// (that band, and everything below it, stays independently coded). A
+/// fully-silent band (`E_L + E_R == 0`) has no stereo information and
+/// always qualifies. The return value equals `21` when not even the top
+/// band qualifies — i.e. the granule is coded with no intensity
+/// coupling at all.
+///
+/// The criterion mirrors the §2.4.3.4.9.2 MS picker
+/// ([`Mp3Encoder::ms_auto_threshold`]): a band whose side-energy is a
+/// small fraction of the total is one where the two channels are nearly
+/// equal in magnitude, so replacing the right channel with a single
+/// stereo-position scalar loses little. ISO/IEC 11172-3 fixes only the
+/// wire syntax of the bound (the right channel's zero-part); the
+/// threshold is a clean-room encoder heuristic.
+fn choose_intensity_bound(
+    left: &[f32; NUM_LINES],
+    right: &[f32; NUM_LINES],
+    starts: &[usize; 22],
+    floor: usize,
+    threshold: f64,
+) -> usize {
+    let mut bound = 21usize;
+    for sfb in (floor..21).rev() {
+        let lo = starts[sfb];
+        let hi = starts[sfb + 1];
+        let mut total = 0.0f64;
+        let mut side = 0.0f64;
+        for i in lo..hi {
+            let l = f64::from(left[i]);
+            let r = f64::from(right[i]);
+            total += l * l + r * r;
+            let d = l - r;
+            side += d * d;
+        }
+        // E_S / (E_L + E_R) = Σ(L−R)² / (2·Σ(L²+R²)). A silent band
+        // (total == 0) carries no stereo information ⇒ qualifies.
+        let qualifies = if total <= 0.0 {
+            true
+        } else {
+            side / (2.0 * total) <= threshold
+        };
+        if qualifies {
+            bound = sfb;
+        } else {
+            break;
+        }
+    }
+    bound
 }
 
 /// Derive the §2.4.3.4.9.3 intensity-stereo position for one
@@ -5779,6 +5994,112 @@ mod tests {
         let enc = Mp3Encoder::new_joint_stereo_ms(192, 44_100).expect("ms ctor");
         assert!(!enc.intensity_stereo_enabled());
         assert_eq!(enc.intensity_start_sfb(), None);
+    }
+
+    /// The adaptive-bound constructor arms the intensity coupling, sets
+    /// the default side-energy threshold, carries the intensity-only
+    /// `mode_extension` template bits, and treats its `start` argument
+    /// as the coupling *floor*. `with_intensity_auto_threshold` clamps
+    /// to `[0, 1]` and is a no-op on a non-adaptive encoder.
+    #[test]
+    fn intensity_auto_adaptive_constructor_state() {
+        let enc =
+            Mp3Encoder::new_joint_stereo_auto_is_adaptive(192, 44_100, 7).expect("adaptive ctor");
+        assert!(enc.intensity_stereo_enabled());
+        assert_eq!(enc.intensity_start_sfb(), Some(7));
+        assert_eq!(enc.intensity_auto_threshold(), Some(0.25));
+        assert!(!enc.ms_stereo_enabled());
+        assert!(matches!(enc.header_template.mode, ChannelMode::JointStereo));
+        assert_eq!(enc.header_template.mode_extension.raw, 0b01);
+        assert!(enc.header_template.mode_extension.intensity_stereo);
+        assert!(!enc.header_template.mode_extension.ms_stereo);
+
+        // Same `1..=20` floor validation as the fixed-bound ctors.
+        assert!(matches!(
+            Mp3Encoder::new_joint_stereo_auto_is_adaptive(192, 44_100, 0),
+            Err(StreamEncodeError::InvalidIntensityStartSfb { start_sfb: 0 })
+        ));
+        assert!(matches!(
+            Mp3Encoder::new_joint_stereo_auto_is_adaptive(192, 44_100, 21),
+            Err(StreamEncodeError::InvalidIntensityStartSfb { start_sfb: 21 })
+        ));
+
+        // Threshold override clamps; no-op on a fixed-bound encoder.
+        let enc = enc.with_intensity_auto_threshold(2.0);
+        assert_eq!(enc.intensity_auto_threshold(), Some(1.0));
+        let enc = enc.with_intensity_auto_threshold(-1.0);
+        assert_eq!(enc.intensity_auto_threshold(), Some(0.0));
+        let fixed = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8)
+            .expect("fixed ctor")
+            .with_intensity_auto_threshold(0.1);
+        assert_eq!(fixed.intensity_auto_threshold(), None);
+    }
+
+    /// `choose_intensity_bound` returns the lowest band whose contiguous
+    /// high tail all has side-energy fraction `E_S/(E_L+E_R) <= t`,
+    /// honours the floor, and returns 21 (couple nothing) when not even
+    /// the top band qualifies.
+    #[test]
+    fn choose_intensity_bound_picks_low_stereo_tail() {
+        let starts = long_band_starts_for(44_100);
+        let floor = 7usize;
+        let t = 0.25f64;
+
+        // (a) Everything from the floor up is near-mono (L == R ⇒ side
+        // energy 0): the whole tail qualifies, bound == floor.
+        let mut l = [0.0f32; NUM_LINES];
+        let mut r = [0.0f32; NUM_LINES];
+        for i in starts[floor]..NUM_LINES {
+            l[i] = 1.0;
+            r[i] = 1.0;
+        }
+        assert_eq!(choose_intensity_bound(&l, &r, starts, floor, t), floor);
+
+        // (b) A single mid band (say band 14) carries strong stereo
+        // information (L = -R ⇒ side fraction 1.0 > t): it and
+        // everything below it stay independent, so the bound is the band
+        // just above it.
+        let mut l = [0.0f32; NUM_LINES];
+        let mut r = [0.0f32; NUM_LINES];
+        for i in starts[floor]..NUM_LINES {
+            l[i] = 1.0;
+            r[i] = 1.0;
+        }
+        for i in starts[14]..starts[15] {
+            l[i] = 1.0;
+            r[i] = -1.0;
+        }
+        assert_eq!(choose_intensity_bound(&l, &r, starts, floor, t), 15);
+
+        // (c) The top band itself carries stereo information ⇒ no tail
+        // qualifies ⇒ couple nothing (bound 21).
+        let mut l = [0.0f32; NUM_LINES];
+        let mut r = [0.0f32; NUM_LINES];
+        for i in starts[floor]..NUM_LINES {
+            l[i] = 1.0;
+            r[i] = 1.0;
+        }
+        for i in starts[20]..starts[21] {
+            l[i] = 1.0;
+            r[i] = -1.0;
+        }
+        assert_eq!(choose_intensity_bound(&l, &r, starts, floor, t), 21);
+
+        // (d) A fully-silent tail (no energy at all) carries no stereo
+        // information and qualifies down to the floor.
+        let l = [0.0f32; NUM_LINES];
+        let r = [0.0f32; NUM_LINES];
+        assert_eq!(choose_intensity_bound(&l, &r, starts, floor, t), floor);
+
+        // (e) Bands below the floor never participate even when the
+        // signal there is pure mono.
+        let mut l = [0.0f32; NUM_LINES];
+        let mut r = [0.0f32; NUM_LINES];
+        for i in 0..NUM_LINES {
+            l[i] = 1.0;
+            r[i] = 1.0;
+        }
+        assert_eq!(choose_intensity_bound(&l, &r, starts, floor, t), floor);
     }
 
     /// Start-band validation: at least one normal band below the bound

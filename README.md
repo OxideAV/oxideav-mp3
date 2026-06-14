@@ -893,6 +893,46 @@ band-aligned-vs-default self-consistency on a long block, and
 short-block fallback equivalence). Spec read: SUBDIVIDE text on PDF
 page 104 (§C.1.5.4.4.6).
 
+**Round 302 (§2.4.3.4.9.3 adaptive per-granule intensity bound).** Every
+joint-stereo intensity constructor so far fixes the coupling start band
+at construction (`new_joint_stereo_is(_ms / _auto)` couple
+`start_sfb..21` on *every* granule). r302 adds
+`Mp3Encoder::new_joint_stereo_auto_is_adaptive(bitrate, sample_rate,
+intensity_start_floor)`, which treats the start band as a **floor** and
+picks the actual bound per granule from the post-MDCT spectrum: the
+chooser ([`stream_encoder::choose_intensity_bound`]) walks bands from
+the top down to the floor and couples only the **contiguous high tail**
+whose every band carries little right-channel stereo information,
+measured by the same side-energy fraction the §2.4.3.4.9.2 MS picker
+uses — `E_S/(E_L+E_R) = Σ(L−R)² / (2·Σ(L²+R²)) ≤ threshold` (default
+`0.25`, `with_intensity_auto_threshold` overrides, clamped to `[0,1]`).
+A band that still carries real stereo content raises the bound so it —
+and everything below it — stays independently coded; with no qualifying
+tail the granule couples **nothing** (effective bound 21) and keeps a
+full right channel. The bound is implicit on the wire (§2.4.3.4.9.1: the
+decoder derives it from the right channel's last non-zero line), so the
+per-granule bound varies with no syntax change; the header stays
+`mode='01'` / `mode_extension='01'`. This also fixed a latent bug: the
+pass-2 `intensity_right` flag was gated only on the global
+`intensity_active`, so a granule that coupled nothing would still have
+written its right channel as is_pos markers; it is now also gated on a
+new per-granule `intensity_coupled_per_gr[gr]` (a coupled-nothing
+granule writes an ordinary right channel and the top partial-region
+coupling is skipped). Validated by two lib tests
+(`intensity_auto_adaptive_constructor_state`,
+`choose_intensity_bound_picks_low_stereo_tail` — floor honoured,
+mid-band stereo raises the bound, top-band stereo couples nothing,
+silent/below-floor cases) and a self-decode integration test
+(`adaptive_intensity_bound_couples_low_stereo_high_tail`): a near-mono
+6 kHz tail couples (right channel reconstructed balanced), an anti-phase
+6 kHz tail stays independent (right channel keeps its real tone), the
+below-bound 440 Hz pan survives both, and the encode is byte-deterministic.
+Lib suite 1086 → 1088 (+2); intensity integration suite 8 → 9. The
+heuristic is a clean-room encoder choice — ISO/IEC 11172-3 fixes only
+the `mode_extension` syntax (§2.4.2.3), not how to pick the bound. Spec
+read: ISO/IEC 11172-3 §2.4.3.4.9.1/.9.3 (intensity bound + coupling),
+Annex G.2 c) (position derivation).
+
 **Round 301 (§C.1.5.3 scfsi reuse auto-armed inside `push_samples`).**
 r296 added `Mp3Encoder::enable_scfsi_reuse()` as an opt-in
 post-quantization pass; this round flips it on by default. Because the

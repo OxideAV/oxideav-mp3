@@ -842,3 +842,126 @@ fn external_decoders_accept_intensity_stream() {
         eprintln!("neither ffmpeg nor mpg123 on PATH; skipping black-box cross-decode");
     }
 }
+
+/// Stereo PCM where the below-bound 440 Hz tone is panned (true L/R
+/// information) and the intensity-region 6 kHz tone has the requested
+/// high-band stereo character: `mono` ⇒ identical on both channels (low
+/// side-energy fraction, so the adaptive chooser couples the high tail),
+/// otherwise anti-phase `L = -R` (side-energy fraction ≈ 1, so the
+/// chooser leaves it independent).
+fn adaptive_probe_pcm(n: usize, high_mono: bool) -> Vec<i16> {
+    let two_pi = 2.0 * PI;
+    let scale = f32::from(i16::MAX);
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f32 / SR as f32;
+        let low = (two_pi * LOW_HZ * t).sin();
+        let high = (two_pi * HIGH_HZ * t).sin();
+        // Below-bound pan kept identical to the fixed-bound tests.
+        let l_low = low * LOW_PAN.0;
+        let r_low = low * LOW_PAN.1;
+        let (l_high, r_high) = if high_mono {
+            (high * 0.3, high * 0.3)
+        } else {
+            (high * 0.3, -high * 0.3)
+        };
+        let l = (l_low + l_high) * scale;
+        let r = (r_low + r_high) * scale;
+        out.push(l.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16);
+        out.push(r.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16);
+    }
+    out
+}
+
+/// Adaptive intensity bound (round 302). With a near-mono high tail the
+/// per-granule chooser couples the high bands: the right channel's
+/// 6 kHz energy is reconstructed from the transmitted left magnitude
+/// and the §2.4.3.4.9.3 stereo position, so its decoded amplitude
+/// approaches the left channel's. With an anti-phase high tail the
+/// chooser raises the bound (couples nothing up there), so the right
+/// channel keeps its real, opposite-phase 6 kHz tone. In both cases the
+/// below-bound 440 Hz pan must survive, the bytes must be deterministic,
+/// and every frame stays under one `mode = '01'` / `mode_extension =
+/// '01'` header.
+#[test]
+fn adaptive_intensity_bound_couples_low_stereo_high_tail() {
+    let n = SR as usize;
+
+    // --- near-mono high tail: high band qualifies and is coupled ---
+    let pcm_mono = adaptive_probe_pcm(n, true);
+    let mut enc =
+        Mp3Encoder::new_joint_stereo_auto_is_adaptive(BR, SR, START_SFB).expect("adaptive encoder");
+    assert!(enc.intensity_stereo_enabled());
+    assert_eq!(enc.intensity_auto_threshold(), Some(0.25));
+    enc.push_samples(&pcm_mono).expect("push mono-tail");
+    let mut out_mono = Vec::new();
+    enc.finish(&mut out_mono).expect("finish mono-tail");
+
+    // Determinism: encoding the same PCM twice is byte-identical.
+    let mut enc2 =
+        Mp3Encoder::new_joint_stereo_auto_is_adaptive(BR, SR, START_SFB).expect("adaptive encoder");
+    enc2.push_samples(&pcm_mono).expect("push mono-tail 2");
+    let mut out_mono2 = Vec::new();
+    enc2.finish(&mut out_mono2).expect("finish mono-tail 2");
+    assert_eq!(out_mono, out_mono2, "adaptive encode is not deterministic");
+
+    for frame in FrameWalker::new(&out_mono) {
+        let hdr = parse_header(&frame.data[..4]).expect("header parse");
+        assert!(matches!(hdr.mode, ChannelMode::JointStereo));
+        assert_eq!(
+            hdr.mode_extension.raw, 0b01,
+            "expected intensity-only header"
+        );
+    }
+
+    let (recon_l, recon_r) = decode_mp3_stereo(&out_mono);
+    let head = 4 * 1152 + 1057;
+    assert!(recon_l.len() > head + 8192);
+    let seg_l = &recon_l[head..head + 8192];
+    let seg_r = &recon_r[head..head + 8192];
+    // Coupled high band: the reconstructed right-channel 6 kHz energy is
+    // driven by the transmitted left magnitude and the derived stereo
+    // position, so it is non-trivial (the band is *not* a zero-part on
+    // the right after decode) and the channels are close in level (a
+    // near-mono original → is_pos ≈ 3 → balanced reconstruction).
+    let hi_l = goertzel_power(seg_l, HIGH_HZ);
+    let hi_r = goertzel_power(seg_r, HIGH_HZ);
+    assert!(
+        hi_r > 0.0 && hi_l > 0.0,
+        "high tone vanished after coupling"
+    );
+    let coupled_ratio = (hi_l / hi_r).sqrt();
+    assert!(
+        (0.4..=2.5).contains(&coupled_ratio),
+        "coupled near-mono high tone should reconstruct roughly balanced, got {coupled_ratio}"
+    );
+    // Below-bound 440 Hz pan preserved (true L/R, untouched by coupling).
+    let low_ratio = (goertzel_power(seg_l, LOW_HZ) / goertzel_power(seg_r, LOW_HZ)).sqrt();
+    assert!(
+        (1.15..=1.7).contains(&low_ratio),
+        "below-bound pan drifted under adaptive coupling: {low_ratio}"
+    );
+
+    // --- anti-phase high tail: chooser leaves it independent ---
+    let pcm_anti = adaptive_probe_pcm(n, false);
+    let mut enc =
+        Mp3Encoder::new_joint_stereo_auto_is_adaptive(BR, SR, START_SFB).expect("adaptive encoder");
+    enc.push_samples(&pcm_anti).expect("push anti-tail");
+    let mut out_anti = Vec::new();
+    enc.finish(&mut out_anti).expect("finish anti-tail");
+
+    let (recon_l_a, recon_r_a) = decode_mp3_stereo(&out_anti);
+    let seg_l_a = &recon_l_a[head..head + 8192];
+    let seg_r_a = &recon_r_a[head..head + 8192];
+    // Not coupled: the right channel keeps its real anti-phase 6 kHz
+    // tone, so both channels carry comparable high-tone energy (an
+    // intensity-coupled band would have zeroed the right channel and
+    // forced a left-leaning reconstruction instead).
+    let hi_l_a = goertzel_power(seg_l_a, HIGH_HZ);
+    let hi_r_a = goertzel_power(seg_r_a, HIGH_HZ);
+    let anti_ratio = (hi_l_a / hi_r_a).sqrt();
+    assert!(
+        (0.5..=2.0).contains(&anti_ratio),
+        "anti-phase high tone should stay independent (balanced level), got {anti_ratio}"
+    );
+}

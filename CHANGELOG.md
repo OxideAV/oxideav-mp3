@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§2.4.3.4.9.3 adaptive per-granule intensity bound** (r302).
+  New `Mp3Encoder::new_joint_stereo_auto_is_adaptive(bitrate,
+  sample_rate, intensity_start_floor)` treats the intensity start band as
+  a *floor* and chooses the coupling bound per granule from the post-MDCT
+  spectrum, rather than coupling `start_sfb..21` on every granule like the
+  fixed-bound constructors. The chooser couples only the contiguous high
+  tail whose every band has side-energy fraction
+  `E_S/(E_L+E_R) = Σ(L−R)²/(2·Σ(L²+R²)) <= threshold` (default `0.25`,
+  overridable via `with_intensity_auto_threshold`, clamped to `[0,1]`); a
+  band that still carries real stereo content raises the bound, and a
+  granule with no qualifying tail couples nothing (keeps a full right
+  channel). The bound is implicit on the wire (§2.4.3.4.9.1), so the
+  header stays `mode='01'` / `mode_extension='01'` and no syntax changes.
+  Accessor `intensity_auto_threshold()` reports the armed threshold.
+
+### Fixed
+
+- encoder: the pass-2 intensity-right scalefactor path was gated only on
+  the global intensity-armed flag, so an intensity granule that coupled
+  no bands would still have written its right channel as is_pos markers
+  instead of ordinary scalefactors. It is now gated per granule; a
+  coupled-nothing granule writes a normal right channel. Previously only
+  reachable via the new adaptive constructor (the fixed-bound modes
+  always couple at least one band), so no emitted stream changes for
+  pre-r302 encoder configurations.
+
 - encoder: **§C.1.5.3 scfsi reuse auto-armed inside `push_samples`**
   (r301). r296 added `Mp3Encoder::enable_scfsi_reuse()` as an opt-in
   post-quantization pass that marks, per channel, every long-block
