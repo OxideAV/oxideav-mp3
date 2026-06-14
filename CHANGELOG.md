@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§C.1.5.3.2.1 Model-2-driven auto block-type path** (r295,
+  Phase 2 step 92). r294 captured the per-granule Model 2 `pe > 1800`
+  window-switching decision; this round wires it into an actual
+  block-type driver. New `Mp3Encoder::enable_auto_block_type_model2()`
+  arms a mode where the per-granule §C.1.5.2 attack flag fed into the
+  `LONG → START → SHORT → STOP → LONG` scheduler is the spec-canonical
+  Model 2 psychoacoustic-entropy decision (`pe > 1800`) rather than the
+  energy-detector subframe-energy ratio of
+  `enable_auto_block_type`. The transition geometry (one
+  `BlockTypeStateMachine` per channel), independent/MS-stereo coupling,
+  and the lookahead-granule anticipation all mirror the energy path; only
+  the attack signal differs. The mode requires
+  `enable_model2_psychoacoustics` (it reuses the same per-channel Model 2
+  states) and runs the analysis in the block-type pre-pass, **caching the
+  `Model2Layer3Granule` output so Pass 1 reuses it for the outer-loop
+  `xmin(sb)`** — the §D.2.1 FFT history advances exactly once per granule,
+  never twice. The lookahead granule is peeked from a cloned state so the
+  borrowed next-frame PCM never perturbs the committed history. Mutually
+  exclusive with the energy-detector auto path and the force toggles
+  (arming any clears the others); disarming Model 2 (via
+  `set_per_band_xmin`) disarms this too. Inspect with
+  `auto_block_type_model2_enabled()`; turn off with
+  `disable_auto_block_type_model2()`. New error
+  `StreamEncodeError::Model2BlockTypeWithoutModel2` when armed without
+  Model 2. Eight new lib tests: the require-Model-2 / mutual-exclusion /
+  disarm-on-Model-2-disarm API paths, steady-tone-stays-long,
+  valid-§C.1.5.2-sequence emission, per-band-`xmin`-still-installed, and
+  two end-to-end correspondence tests proving the emitted block types
+  equal the §C.1.5.2 scheduler walk over the captured `pe > 1800` attacks
+  (single-frame and multi-frame, scheduler state carried across frame
+  boundaries). Truth from
+  `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` (§C.1.5.3.2.1
+  spreading function) and the staged ISO PDF §C.1.5.2 / §C.1.5.3.2
+  window-switching prose; no new tables required. No emitted bytes change
+  unless the new mode is explicitly armed.
+
 - encoder: **Captured §C.1.5.3.2.1 Model 2 window-switching decision per
   granule** (r294, Phase 2 step 91). The automatic Model 2 mode
   (`enable_model2_psychoacoustics`) already runs each granule's PCM

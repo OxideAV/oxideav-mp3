@@ -863,6 +863,37 @@ match), and 250 ms of sine yields the expected count of
 is validated in r177 by `tests/decoder_trait_stereo_roundtrip.rs`
 (see "Phase 2 step 36" below).
 
+**Round 295 (Phase 2 step 92 — §C.1.5.3.2.1 Model-2-driven auto
+block-type path).** r294 captured the per-granule Model 2 `pe > 1800`
+window-switching decision; this round wires it into an actual
+block-type driver. The new `Mp3Encoder::enable_auto_block_type_model2()`
+arms a mode where the per-granule §C.1.5.2 attack flag fed into the
+`LONG → START → SHORT → STOP → LONG` scheduler is the spec-canonical
+Model 2 psychoacoustic-entropy decision (`pe > 1800`) instead of the
+energy-detector subframe-energy ratio used by
+`enable_auto_block_type`. The transition geometry (one
+`BlockTypeStateMachine` per channel), the independent / MS-stereo
+OR-fold coupling, and the lookahead-granule anticipation all mirror the
+energy path — only the attack signal differs. The mode requires
+`enable_model2_psychoacoustics` (it reuses the same per-channel Model 2
+states): the analysis runs once in the block-type pre-pass and its full
+`Model2Layer3Granule` output is **cached so Pass 1 reuses it for the
+outer-loop `xmin(sb)`** — the §D.2.1 FFT history advances exactly once
+per granule, never twice. The lookahead granule is peeked from a cloned
+state so the borrowed next-frame PCM never perturbs the committed
+history. Mutually exclusive with the energy-detector auto path and the
+force toggles (arming any clears the others); disarming Model 2 (via
+`set_per_band_xmin`) disarms this too. Inspect with
+`auto_block_type_model2_enabled()`, turn off with
+`disable_auto_block_type_model2()`; armed without Model 2 yields the new
+`StreamEncodeError::Model2BlockTypeWithoutModel2`. Eight new lib tests
+cover the API guards, steady-tone-stays-long, valid-§C.1.5.2-sequence
+emission, per-band-`xmin`-still-installed, and two end-to-end
+correspondence tests proving the emitted block types equal the §C.1.5.2
+scheduler walk over the captured `pe > 1800` attacks (single-frame and
+multi-frame, scheduler state carried across frame boundaries). **No
+emitted bytes change** unless the new mode is explicitly armed.
+
 **Round 292 (free-format decode through the `Decoder` trait).** The
 trait wiring previously rejected any **free-format** frame
 (`bitrate_index == 0`, ISO/IEC 11172-3 §2.4.2.3) outright, because

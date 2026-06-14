@@ -220,6 +220,14 @@ pub enum StreamEncodeError {
         /// `0` when the failure was a granule-length mismatch.
         sample_rate_hz: u32,
     },
+    /// [`Mp3Encoder::enable_auto_block_type_model2`] was called on an
+    /// encoder that does not have the §C.1.5.3.2.1 automatic Model 2
+    /// psychoacoustics armed. The Model-2-driven block-type path reuses
+    /// the Model 2 per-granule `pe > 1800` decision as its attack
+    /// signal, so [`Mp3Encoder::enable_model2_psychoacoustics`] must be
+    /// enabled first (which in turn fixes the sampling rate to one of
+    /// the three staged Annex D Model 2 rates).
+    Model2BlockTypeWithoutModel2,
 }
 
 impl core::fmt::Display for StreamEncodeError {
@@ -269,6 +277,9 @@ impl core::fmt::Display for StreamEncodeError {
                     )
                 }
             }
+            StreamEncodeError::Model2BlockTypeWithoutModel2 => f.write_str(
+                "enable_auto_block_type_model2 requires enable_model2_psychoacoustics to be armed first (the block-type path reuses the Model 2 pe > 1800 decision)",
+            ),
         }
     }
 }
@@ -680,6 +691,34 @@ pub struct Mp3Encoder {
     /// start of every `push_samples`/`flush` frame assembly so the
     /// accessor always reflects exactly the last emitted frame.
     last_model2_switch: Option<[[Option<Model2WindowSwitch>; 2]; GRANULES]>,
+
+    /// Per-channel §C.1.5.2 block-type schedulers driven by the
+    /// §C.1.5.3.2.1 **Model 2** `pe > 1800` window-switching decision,
+    /// when [`Self::enable_auto_block_type_model2`] is armed.
+    ///
+    /// This is the Model-2-driven counterpart of the energy-detector
+    /// [`Self::auto_block_type`] path: instead of an
+    /// [`crate::attack_detect::AttackDetector`] classifying each
+    /// granule from subframe energy, the per-granule attack flag is the
+    /// spec-canonical §C.1.5.3.2.1 psychoacoustic-entropy decision
+    /// (`pe > 1800`) that the armed Model 2 analysis already computes
+    /// while deriving the per-band `xmin(sb)` threshold. The same
+    /// per-channel [`crate::block_type_sm::BlockTypeStateMachine`]
+    /// translates those flags into the §C.1.5.2
+    /// `LONG → START → SHORT → STOP → LONG` transition geometry, so the
+    /// emitted window sequence is identical in shape to the energy
+    /// path — only the attack signal differs.
+    ///
+    /// Requires [`Self::enable_model2_psychoacoustics`] (this mode
+    /// shares its per-channel Model 2 states; the analysis runs once
+    /// per granule and its output feeds **both** the block-type
+    /// decision and the outer-loop threshold). Mutually exclusive with
+    /// the energy-detector auto path and the force toggles.
+    ///
+    /// Default `None`: the emitted block type is governed by the
+    /// energy-detector auto path, the force toggles, or the all-long
+    /// default, byte-for-byte as in every previous round.
+    model2_block_type: Option<Vec<crate::block_type_sm::BlockTypeStateMachine>>,
 }
 
 /// The §C.1.5.3.2.1 Layer III window-switching deliverable for one
@@ -847,6 +886,7 @@ impl Mp3Encoder {
             auto_block_type: None,
             model2_psy: None,
             last_model2_switch: None,
+            model2_block_type: None,
         })
     }
 
@@ -931,8 +971,10 @@ impl Mp3Encoder {
             // long, short, or mixed. Enabling pure-short clears mixed.
             self.force_mixed_blocks = false;
             // Force-toggles and auto block-type are mutually
-            // exclusive: enabling a force-toggle clears auto.
+            // exclusive: enabling a force-toggle clears auto (both the
+            // energy-detector and the Model-2-driven paths).
             self.auto_block_type = None;
+            self.model2_block_type = None;
         }
         self.force_short_blocks = enabled;
         Ok(())
@@ -982,8 +1024,10 @@ impl Mp3Encoder {
             // long, short, or mixed. Enabling mixed clears short.
             self.force_short_blocks = false;
             // Force-toggles and auto block-type are mutually
-            // exclusive: enabling a force-toggle clears auto.
+            // exclusive: enabling a force-toggle clears auto (both the
+            // energy-detector and the Model-2-driven paths).
             self.auto_block_type = None;
+            self.model2_block_type = None;
         }
         self.force_mixed_blocks = enabled;
         Ok(())
@@ -1078,9 +1122,11 @@ impl Mp3Encoder {
         // Mixed granules are unreachable from the auto scheduler this
         // round (no Mixed transition in §C.1.5.2's
         // `LONG → START → SHORT → STOP` path).
-        // Mutually exclusive with the force-toggles; clear them.
+        // Mutually exclusive with the force-toggles and the
+        // Model-2-driven block-type path; clear them.
         self.force_short_blocks = false;
         self.force_mixed_blocks = false;
+        self.model2_block_type = None;
         let detector: Vec<_> = (0..self.nch)
             .map(|_| crate::attack_detect::AttackDetector::with_threshold(threshold))
             .collect();
@@ -1227,6 +1273,97 @@ impl Mp3Encoder {
     /// when auto was not enabled.
     pub fn disable_auto_block_type(&mut self) {
         self.auto_block_type = None;
+    }
+
+    /// Enable **§C.1.5.3.2.1 Model-2-driven auto block-type** dispatch.
+    ///
+    /// This is the spec-canonical counterpart of the energy-detector
+    /// [`Self::enable_auto_block_type`]: the per-granule attack signal
+    /// fed into the §C.1.5.2 `LONG → START → SHORT → STOP → LONG`
+    /// scheduler is the **Model 2** window-switching decision —
+    /// `pe > 1800`, where `pe` is the §C.1.5.3.2.1 psychoacoustic
+    /// entropy of the long path — rather than a PCM-domain
+    /// subframe-energy ratio. The transition geometry (a
+    /// [`crate::block_type_sm::BlockTypeStateMachine`] per channel) is
+    /// the same as the energy path; only the attack signal differs.
+    ///
+    /// The Model 2 analysis that yields `pe`/`attack` for the
+    /// block-type decision is the *same* per-channel
+    /// [`crate::psy::Model2Layer3State`] walk that
+    /// [`Self::enable_model2_psychoacoustics`] arms to derive the
+    /// per-band `xmin(sb)` outer-loop threshold. To keep the §D.2.1
+    /// continuous-FFT-history advancing exactly once per granule, this
+    /// mode runs the walk in the encode-loop pre-pass and **reuses the
+    /// captured output** for the granule's outer-loop threshold — the
+    /// analysis is never run twice for the same granule. The lookahead
+    /// granule (the §C.1.5.2 `next_attack` anticipation) is evaluated
+    /// non-destructively by cloning the channel state, so the borrowed
+    /// next-frame PCM never perturbs the committed FFT history.
+    ///
+    /// Channel coupling mirrors the energy path:
+    ///
+    /// * **Independent** (mono / `Stereo` / `DualChannel`): one
+    ///   scheduler per channel, each picking its own §C.1.5.2
+    ///   transition state (§2.4.1.7 / §2.4.2.7 carry per-channel
+    ///   side-info verbatim).
+    /// * **MS-stereo** (`new_joint_stereo_ms` / `new_joint_stereo_auto`):
+    ///   the per-channel `pe > 1800` flags are OR-folded into a single
+    ///   shared scheduler whose emission is mirrored across both
+    ///   channels of the granule, so the §2.4.3.4.9 "both channels of
+    ///   an MS-stereo granule share the same `block_type` /
+    ///   `window_switching_flag`" agreement holds by construction.
+    ///
+    /// Mutually exclusive with the energy-detector
+    /// [`Self::enable_auto_block_type`] path and the force toggles —
+    /// enabling this clears them, and enabling any of them clears this.
+    ///
+    /// # Errors
+    ///
+    /// * [`StreamEncodeError::Model2BlockTypeWithoutModel2`] — the
+    ///   automatic Model 2 psychoacoustics are not armed. Call
+    ///   [`Self::enable_model2_psychoacoustics`] first; that
+    ///   constructor also fixes the sampling rate to one of the three
+    ///   staged Annex D Model 2 rates (32 / 44.1 / 48 kHz, all MPEG-1
+    ///   two-granule frames).
+    /// * [`StreamEncodeError::IntensityShortBlocksUnsupported`] —
+    ///   intensity-stereo coupling is armed; the intensity encode path
+    ///   is long-block only this round (same restriction the
+    ///   energy-detector path carries).
+    pub fn enable_auto_block_type_model2(&mut self) -> Result<(), StreamEncodeError> {
+        if self.model2_psy.is_none() {
+            return Err(StreamEncodeError::Model2BlockTypeWithoutModel2);
+        }
+        if self.intensity_start_sfb.is_some() {
+            // Intensity coupling is long-block only this round; the
+            // scheduler emits Start / Short / End granules whose
+            // per-window intensity bound is not wired yet.
+            return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
+        }
+        // Mutually exclusive with the force-toggles and the
+        // energy-detector auto path; clear them.
+        self.force_short_blocks = false;
+        self.force_mixed_blocks = false;
+        self.auto_block_type = None;
+        let scheduler: Vec<_> = (0..self.nch)
+            .map(|_| crate::block_type_sm::BlockTypeStateMachine::new())
+            .collect();
+        self.model2_block_type = Some(scheduler);
+        Ok(())
+    }
+
+    /// `true` when [`Self::enable_auto_block_type_model2`] is in
+    /// effect.
+    #[must_use]
+    pub fn auto_block_type_model2_enabled(&self) -> bool {
+        self.model2_block_type.is_some()
+    }
+
+    /// Disable the [`Self::enable_auto_block_type_model2`] dispatch
+    /// (returns the encoder to the all-long default path; the Model 2
+    /// per-band threshold path stays armed). No-op when the
+    /// Model-2-driven block-type mode was not enabled.
+    pub fn disable_auto_block_type_model2(&mut self) {
+        self.model2_block_type = None;
     }
 
     /// Build a joint-stereo encoder that emits §2.4.3.4.9.2 **MS-stereo**
@@ -1891,6 +2028,12 @@ impl Mp3Encoder {
         // window-switching decision no longer reflects an active mode.
         self.model2_psy = None;
         self.last_model2_switch = None;
+        // The Model-2-driven block-type path sources its attack signal
+        // from the now-disarmed Model 2 analysis; disarm it too so the
+        // encoder never tries to drive block types from an inactive
+        // model (it would otherwise emit all-long with no attack
+        // source, but clearing makes the state coherent).
+        self.model2_block_type = None;
         self.per_band_xmin = Some(xmin);
         Ok(())
     }
@@ -2108,8 +2251,10 @@ impl Mp3Encoder {
         // the frame it's currently encoding so the §C.1.5.2
         // `Long → Start` decision can anticipate the next granule's
         // attack flag. Hold one extra granule in `pending_pcm` to
-        // satisfy that.
-        let lookahead_pad = if self.auto_block_type.is_some() {
+        // satisfy that. The Model-2-driven block-type path
+        // (`enable_auto_block_type_model2`) has the same one-granule
+        // §C.1.5.2 lookahead requirement, so it pads identically.
+        let lookahead_pad = if self.auto_block_type.is_some() || self.model2_block_type.is_some() {
             SAMPLES_PER_GRANULE
         } else {
             0
@@ -2163,7 +2308,10 @@ impl Mp3Encoder {
         // a zero-padded "no attack ahead" lookahead for the very last
         // frame.
         let nch = self.nch;
-        let auto_on = self.auto_block_type.is_some();
+        // Both the energy-detector and the Model-2-driven block-type
+        // paths hold back a §C.1.5.2 lookahead granule, so the
+        // tail-flush must reconstruct it for either.
+        let auto_on = self.auto_block_type.is_some() || self.model2_block_type.is_some();
         let frame_samples = self.samples_per_frame();
         loop {
             let any_pending = self.pending_pcm.iter().any(|b| !b.is_empty());
@@ -2323,6 +2471,23 @@ impl Mp3Encoder {
         let mut model2_switch_per_gc: [[Option<Model2WindowSwitch>; 2]; GRANULES] =
             Default::default();
 
+        // When the §C.1.5.3.2.1 **Model-2-driven block-type** mode
+        // (`enable_auto_block_type_model2`) is armed, the block-type
+        // pre-pass below runs each frame granule's PCM through the
+        // channel's continuous-history Model 2 state to obtain the
+        // `pe > 1800` window-switching attack flag. That same walk
+        // produces the full [`crate::psy::Model2Layer3Granule`] the
+        // Pass-1 xmin derivation needs. To keep the §D.2.1 FFT history
+        // advancing exactly once per granule, the pre-pass caches each
+        // granule's output here and Pass 1 reuses it (the
+        // `model2_psy.process` call in Pass 1 is skipped for any
+        // (gr, ch) already populated). Empty (every cell `None`) unless
+        // the Model-2-driven block-type mode is armed; the lookahead
+        // granule is peeked non-destructively (cloned state) and is
+        // never cached, so it never feeds an xmin.
+        let mut model2_granule_per_gc: [[Option<crate::psy::Model2Layer3Granule>; 2]; GRANULES] =
+            Default::default();
+
         // ---- Pre-pass: per-(gr, ch) block type ----
         //
         // The per-granule block type is the §C.1.5.2 transition state
@@ -2359,9 +2524,133 @@ impl Mp3Encoder {
         // `enable_auto_block_type`).
         let mut mixed_per_gc: [[bool; 2]; GRANULES] = [[false; 2]; GRANULES];
         let ms_agreement_active = self.ms_joint_stereo_active() && self.nch == 2;
-        let block_type_per_gc: [[BlockType; 2]; GRANULES] = if let Some(ref mut cfg) =
-            self.auto_block_type
+        let block_type_per_gc: [[BlockType; 2]; GRANULES] = if let Some(schedulers) =
+            self.model2_block_type.as_mut()
         {
+            // ---- §C.1.5.3.2.1 Model-2-driven block-type path ----
+            //
+            // The per-granule attack flag is the spec-canonical Model 2
+            // window-switching decision `pe > 1800` (the
+            // §C.1.5.3.2.1 psychoacoustic-entropy threshold), not the
+            // energy-detector ratio. The walk that yields it is the
+            // *same* per-channel continuous-history Model 2 state that
+            // `enable_model2_psychoacoustics` armed; its full
+            // `Model2Layer3Granule` output is cached into
+            // `model2_granule_per_gc` so Pass 1 reuses it for xmin
+            // (the §D.2.1 FFT history thus advances exactly once per
+            // granule — never twice).
+            //
+            // The frame granules advance the committed state; the
+            // lookahead granule (the §C.1.5.2 `next_attack`
+            // anticipation) is peeked by cloning the channel state so
+            // the borrowed next-frame PCM never perturbs the FFT
+            // history. The §C.1.5.2 transition geometry and the two
+            // channel-coupling regimes (independent / MS-stereo OR-fold)
+            // mirror the energy-detector path exactly.
+            //
+            // `schedulers` (the per-channel block-type state machines)
+            // is bound by the `if let` above. The Model 2 states live in
+            // a separate field, borrowed disjointly here. `model2_psy`
+            // is always `Some` in this arm: the mode arms
+            // `model2_block_type` only after
+            // `enable_model2_psychoacoustics` set `model2_psy`, and
+            // disarming `model2_psy` (via `set_per_band_xmin`) clears
+            // `model2_block_type` too.
+            let states = self
+                .model2_psy
+                .as_mut()
+                .expect("model2_block_type implies model2_psy is armed");
+            let mut out: [[BlockType; 2]; GRANULES] = [[BlockType::Long; 2]; GRANULES];
+
+            // Helper: extract one granule's PCM as an f64 vector.
+            // `g < ngr` indexes the frame PCM; `g == ngr` is the
+            // lookahead granule. Returns the 576-sample vector plus
+            // whether real (non-padded) lookahead PCM exists.
+            let grab_granule_f64 =
+                |frame: &[Vec<f32>], look: &[Vec<f32>], ch: usize, g: usize| -> (Vec<f64>, bool) {
+                    if g < ngr {
+                        let slice =
+                            &frame[ch][g * SAMPLES_PER_GRANULE..(g + 1) * SAMPLES_PER_GRANULE];
+                        (slice.iter().map(|&s| f64::from(s)).collect(), true)
+                    } else {
+                        let lk = &look[ch];
+                        if lk.is_empty() {
+                            (vec![0.0f64; SAMPLES_PER_GRANULE], false)
+                        } else {
+                            let mut slab = vec![0.0f64; SAMPLES_PER_GRANULE];
+                            let n = lk.len().min(SAMPLES_PER_GRANULE);
+                            for (dst, &src) in slab.iter_mut().zip(&lk[..n]) {
+                                *dst = f64::from(src);
+                            }
+                            (slab, true)
+                        }
+                    }
+                };
+
+            // Compute, per channel, the `pe > 1800` attack flag for
+            // each of the frame's `ngr` granules (advancing the
+            // committed state and caching the granule output) plus the
+            // lookahead granule (non-destructive clone peek).
+            //
+            // `attack[ch][g]` for `g` in `0..=ngr`: the last entry is
+            // the lookahead. A `process` that returns `None`
+            // (granule-length mismatch — unreachable here) leaves the
+            // flag `false` and the cache `None`, so Pass 1 falls back
+            // to the static threshold for that cell.
+            let mut attack: [[bool; GRANULES + 1]; 2] = [[false; GRANULES + 1]; 2];
+            for ch in 0..self.nch {
+                for g in 0..ngr {
+                    let (granule_f64, _present) =
+                        grab_granule_f64(per_ch_frame_pcm, per_ch_lookahead_pcm, ch, g);
+                    if let Some(gran) = states[ch].process(&granule_f64) {
+                        attack[ch][g] = gran.attack;
+                        model2_switch_per_gc[g][ch] = Some(Model2WindowSwitch {
+                            pe: gran.pe,
+                            attack: gran.attack,
+                        });
+                        model2_xmin_per_gc[g][ch] =
+                            Some(crate::psy::XminThresholds::from_layer3_granule(&gran));
+                        model2_granule_per_gc[g][ch] = Some(gran);
+                    }
+                }
+                // Lookahead granule: peek without committing FFT
+                // history. Empty lookahead (end-of-stream) → no attack
+                // ahead, so the burst geometry closes with a Stop.
+                let (granule_f64, present) =
+                    grab_granule_f64(per_ch_frame_pcm, per_ch_lookahead_pcm, ch, ngr);
+                if present {
+                    let mut peek = states[ch].clone();
+                    if let Some(gran) = peek.process(&granule_f64) {
+                        attack[ch][ngr] = gran.attack;
+                    }
+                }
+            }
+
+            if ms_agreement_active {
+                // OR-fold the per-channel `pe > 1800` flags into the
+                // channel-0 scheduler (§2.4.3.4.9 cross-channel
+                // agreement) and mirror its emission across both
+                // channels of each granule. The channel-1 scheduler
+                // stays at default and carries no state.
+                for g in 0..ngr {
+                    let folded_cur = attack[0][g] || attack[1][g];
+                    let folded_next = attack[0][g + 1] || attack[1][g + 1];
+                    let bt = schedulers[0].step(folded_cur, folded_next);
+                    out[g][0] = bt;
+                    out[g][1] = bt;
+                }
+            } else {
+                // Independent: one scheduler per channel; granule `g`'s
+                // companion is granule `g + 1`'s flag (the lookahead
+                // for the last frame granule).
+                for ch in 0..self.nch {
+                    for g in 0..ngr {
+                        out[g][ch] = schedulers[ch].step(attack[ch][g], attack[ch][g + 1]);
+                    }
+                }
+            }
+            out
+        } else if let Some(ref mut cfg) = self.auto_block_type {
             // Auto path: classify each of the 2 frame granules + 1
             // lookahead granule per channel, then feed the scheduler.
             //
@@ -2579,18 +2868,30 @@ impl Mp3Encoder {
                 // `SAMPLES_PER_GRANULE`); a residual `None` simply
                 // leaves the entry unset and Pass 2 falls back to the
                 // static threshold rather than panicking.
-                if let Some(states) = self.model2_psy.as_mut() {
-                    let granule_f64: Vec<f64> = pcm_arr.iter().map(|&s| f64::from(s)).collect();
-                    if let Some(out) = states[ch].process(&granule_f64) {
-                        // Retain the §C.1.5.3.2.1 window-switching
-                        // deliverable alongside the xmin threshold — the
-                        // analysis computed both in one walk.
-                        model2_switch_per_gc[gr][ch] = Some(Model2WindowSwitch {
-                            pe: out.pe,
-                            attack: out.attack,
-                        });
-                        model2_xmin_per_gc[gr][ch] =
-                            Some(crate::psy::XminThresholds::from_layer3_granule(&out));
+                //
+                // When the §C.1.5.3.2.1 Model-2-driven block-type mode
+                // is armed the block-type pre-pass already advanced this
+                // channel's Model 2 state for this granule and cached
+                // the output in `model2_granule_per_gc[gr][ch]` (the xmin
+                // / switch matrices were filled there too). Re-running
+                // `process` here would advance the §D.2.1 FFT history a
+                // second time, so we reuse the cached granule instead and
+                // skip the call entirely for any (gr, ch) the pre-pass
+                // populated.
+                if model2_granule_per_gc[gr][ch].is_none() {
+                    if let Some(states) = self.model2_psy.as_mut() {
+                        let granule_f64: Vec<f64> = pcm_arr.iter().map(|&s| f64::from(s)).collect();
+                        if let Some(out) = states[ch].process(&granule_f64) {
+                            // Retain the §C.1.5.3.2.1 window-switching
+                            // deliverable alongside the xmin threshold — the
+                            // analysis computed both in one walk.
+                            model2_switch_per_gc[gr][ch] = Some(Model2WindowSwitch {
+                                pe: out.pe,
+                                attack: out.attack,
+                            });
+                            model2_xmin_per_gc[gr][ch] =
+                                Some(crate::psy::XminThresholds::from_layer3_granule(&out));
+                        }
                     }
                 }
 
@@ -2664,7 +2965,13 @@ impl Mp3Encoder {
                 // 3` is applied inside
                 // [`crate::short_block::forward_short_mdct_subband`].
                 let mut xr = [0.0f32; NUM_LINES];
-                let auto_bt_active = self.auto_block_type.is_some();
+                // Both the energy-detector and the §C.1.5.3.2.1
+                // Model-2-driven auto paths populate `block_type_per_gc`
+                // with the full §C.1.5.2 sequence (Long / Start / Short /
+                // End), so the per-granule MDCT dispatch below must take
+                // the auto branch for either.
+                let auto_bt_active =
+                    self.auto_block_type.is_some() || self.model2_block_type.is_some();
                 let auto_bt = block_type_per_gc[gr][ch];
                 if auto_bt_active {
                     // Auto block-type dispatch. The §C.1.5.2 sequence
@@ -3157,33 +3464,37 @@ impl Mp3Encoder {
                 //     top of the inner loop, with non-zero per-band
                 //     scalefactor amplification driven by the uniform
                 //     `xmin[sb]` threshold.
-                let gc_template = if self.auto_block_type.is_some() {
-                    // Auto block-type: pick the side-info skeleton
-                    // that matches the per-(gr, ch) chosen block type
-                    // from the pre-pass above. Long stays on the
-                    // default-long skeleton; Start/End take the
-                    // long-family transition skeleton; Short takes
-                    // either the pure-short skeleton or the mixed
-                    // skeleton based on `mixed_per_gc[gr][ch]` from
-                    // the mixed classifier (r161:
-                    // `enable_auto_block_type_with_mixed`). Pre-r161
-                    // auto paths always have `mixed_per_gc` false →
-                    // pure-short, preserving prior behaviour.
-                    match block_type_per_gc[gr][ch] {
-                        BlockType::Long => default_long_gc(),
-                        BlockType::Start | BlockType::End => {
-                            default_transition_gc(block_type_per_gc[gr][ch])
+                let gc_template =
+                    if self.auto_block_type.is_some() || self.model2_block_type.is_some() {
+                        // Auto block-type (energy-detector or
+                        // §C.1.5.3.2.1 Model-2-driven): pick the side-info
+                        // skeleton that matches the per-(gr, ch) chosen
+                        // block type from the pre-pass above. Long stays on
+                        // the default-long skeleton; Start/End take the
+                        // long-family transition skeleton; Short takes
+                        // either the pure-short skeleton or the mixed
+                        // skeleton based on `mixed_per_gc[gr][ch]` from
+                        // the mixed classifier (r161:
+                        // `enable_auto_block_type_with_mixed`). The
+                        // Model-2-driven path never promotes to mixed (it
+                        // wires no mixed classifier), so `mixed_per_gc` is
+                        // always false there → pure-short. Pre-r161 energy
+                        // auto paths likewise have `mixed_per_gc` false.
+                        match block_type_per_gc[gr][ch] {
+                            BlockType::Long => default_long_gc(),
+                            BlockType::Start | BlockType::End => {
+                                default_transition_gc(block_type_per_gc[gr][ch])
+                            }
+                            BlockType::Short if mixed_per_gc[gr][ch] => default_mixed_gc(),
+                            BlockType::Short => default_short_gc(),
                         }
-                        BlockType::Short if mixed_per_gc[gr][ch] => default_mixed_gc(),
-                        BlockType::Short => default_short_gc(),
-                    }
-                } else if self.force_short_blocks {
-                    default_short_gc()
-                } else if self.force_mixed_blocks {
-                    default_mixed_gc()
-                } else {
-                    default_long_gc()
-                };
+                    } else if self.force_short_blocks {
+                        default_short_gc()
+                    } else if self.force_mixed_blocks {
+                        default_mixed_gc()
+                    } else {
+                        default_long_gc()
+                    };
                 let per_gc_bits = self.per_gc_bit_budget();
                 // Part2 (scalefactor) cost under `scalefac_compress = 15`
                 // (slen1 = 4, slen2 = 3) depends on block type:
@@ -5892,5 +6203,359 @@ mod tests {
             .unwrap();
         assert!(!enc.model2_psychoacoustics_enabled());
         assert_eq!(enc.last_model2_window_switch(0, 0), None);
+    }
+
+    #[test]
+    fn model2_block_type_requires_model2_armed() {
+        // The Model-2-driven block-type path sources its attack signal
+        // from the armed Model 2 analysis; without it the enable call is
+        // rejected and the mode stays off.
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        assert!(!enc.auto_block_type_model2_enabled());
+        assert!(matches!(
+            enc.enable_auto_block_type_model2(),
+            Err(StreamEncodeError::Model2BlockTypeWithoutModel2)
+        ));
+        assert!(!enc.auto_block_type_model2_enabled());
+        // After arming Model 2 it succeeds.
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.enable_auto_block_type_model2().unwrap();
+        assert!(enc.auto_block_type_model2_enabled());
+    }
+
+    #[test]
+    fn model2_block_type_mutually_exclusive_with_energy_auto_and_force() {
+        // Arming the Model-2-driven path clears the energy-detector auto
+        // path and the force toggles, and arming any of those clears it.
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+
+        // energy auto -> model2 clears energy auto.
+        enc.enable_auto_block_type(10.0).unwrap();
+        assert!(enc.auto_block_type_enabled());
+        enc.enable_auto_block_type_model2().unwrap();
+        assert!(enc.auto_block_type_model2_enabled());
+        assert!(!enc.auto_block_type_enabled());
+
+        // model2 -> energy auto clears model2.
+        enc.enable_auto_block_type(10.0).unwrap();
+        assert!(enc.auto_block_type_enabled());
+        assert!(!enc.auto_block_type_model2_enabled());
+
+        // re-arm model2, then a force toggle clears it.
+        enc.enable_auto_block_type_model2().unwrap();
+        assert!(enc.auto_block_type_model2_enabled());
+        enc.force_short_blocks_for_testing(true).unwrap();
+        assert!(!enc.auto_block_type_model2_enabled());
+        assert!(enc.force_short_blocks_enabled());
+    }
+
+    #[test]
+    fn model2_block_type_disarmed_when_model2_disarmed() {
+        // Installing a static per-band vector disarms Model 2; the
+        // Model-2-driven block-type path, which depends on it, is
+        // disarmed too so the encoder never tries to drive block types
+        // from an inactive model.
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.enable_auto_block_type_model2().unwrap();
+        assert!(enc.auto_block_type_model2_enabled());
+        enc.set_per_band_xmin(crate::psy::XminThresholds::uniform(1.0e6))
+            .unwrap();
+        assert!(!enc.model2_psychoacoustics_enabled());
+        assert!(!enc.auto_block_type_model2_enabled());
+
+        // The explicit disable accessor is also a no-op-safe toggle.
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.enable_auto_block_type_model2().unwrap();
+        enc.disable_auto_block_type_model2();
+        assert!(!enc.auto_block_type_model2_enabled());
+        // Disabling the block-type path leaves the Model 2 threshold
+        // path armed (only the block-type scheduler was removed).
+        assert!(enc.model2_psychoacoustics_enabled());
+    }
+
+    #[test]
+    fn model2_block_type_steady_tone_stays_long() {
+        // A steady tone never crosses the §C.1.5.3.2.1 `pe > 1800`
+        // window-switching threshold (no transient), so every captured
+        // decision is `attack == false` and every emitted granule is a
+        // Long block — the §C.1.5.2 scheduler never leaves Long without
+        // an attack ahead.
+        use crate::frame::{parse_header, FrameWalker};
+        use crate::side_info::{parse_side_info, BlockType};
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.enable_auto_block_type_model2().unwrap();
+        let total = SAMPLES_PER_FRAME_MPEG1 * 4;
+        let pcm: Vec<i16> = (0..total)
+            .map(|i| {
+                let t = i as f64 / 44_100.0;
+                (8000.0 * (2.0 * core::f64::consts::PI * 1000.0 * t).sin()) as i16
+            })
+            .collect();
+        enc.push_samples(&pcm).unwrap();
+        // No granule of the last frame flagged an attack on a steady
+        // tone.
+        for gr in 0..GRANULES {
+            let sw = enc.last_model2_window_switch(gr, 0).unwrap();
+            assert!(
+                !sw.attack,
+                "steady tone should not exceed pe > 1800 (gr {gr}, pe {})",
+                sw.pe
+            );
+        }
+        let mut out: Vec<u8> = Vec::new();
+        enc.finish(&mut out).unwrap();
+        // Every emitted granule across every frame is a Long block.
+        for f in FrameWalker::new(&out) {
+            let hdr = parse_header(&f.data[..4]).expect("valid header");
+            let si = parse_side_info(&hdr, &f.data[4..]).expect("side info parses");
+            for gr in 0..GRANULES {
+                let gc = &si.granules[gr][0];
+                assert!(!gc.window_switching_flag, "steady tone must stay long");
+                assert_eq!(gc.block_type, BlockType::Long);
+            }
+        }
+    }
+
+    #[test]
+    fn model2_block_type_emits_valid_c152_sequence() {
+        // Across a multi-frame encode, every emitted block-type
+        // transition is a valid §C.1.5.2 walk (Short only ever follows
+        // Start or Short; Start only follows Long or End; End only
+        // follows Short; Long only follows Long or End). This holds for
+        // any signal regardless of whether `pe > 1800` ever fires, and
+        // confirms the Model-2-driven scheduler produces self-consistent
+        // window geometry rather than arbitrary per-granule types.
+        use crate::frame::{parse_header, FrameWalker};
+        use crate::side_info::{parse_side_info, BlockType};
+        let rate = 44_100;
+        let total = SAMPLES_PER_FRAME_MPEG1 * 6;
+        let pcm: Vec<i16> = (0..total)
+            .map(|i| {
+                let t = i as f64 / f64::from(rate);
+                let gate = if (i / 300) % 2 == 0 { 1.0 } else { 0.05 };
+                let s = (2.0 * core::f64::consts::PI * 4000.0 * t).sin()
+                    + (2.0 * core::f64::consts::PI * 9000.0 * t).sin()
+                    + (2.0 * core::f64::consts::PI * 14000.0 * t).sin();
+                (9000.0 * gate * s / 3.0) as i16
+            })
+            .collect();
+
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, rate, ChannelMode::SingleChannel, 1.0e6).unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.enable_auto_block_type_model2().unwrap();
+        enc.push_samples(&pcm).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        enc.finish(&mut out).unwrap();
+
+        let mut seq: Vec<BlockType> = Vec::new();
+        for f in FrameWalker::new(&out) {
+            let hdr = parse_header(&f.data[..4]).expect("valid header");
+            let si = parse_side_info(&hdr, &f.data[4..]).expect("side info parses");
+            for gr in 0..GRANULES {
+                seq.push(si.granules[gr][0].block_type);
+            }
+        }
+        assert!(!seq.is_empty());
+        let mut prev = BlockType::Long;
+        for &bt in &seq {
+            let ok = match prev {
+                BlockType::Long => matches!(bt, BlockType::Long | BlockType::Start),
+                BlockType::Start => matches!(bt, BlockType::Short),
+                BlockType::Short => matches!(bt, BlockType::Short | BlockType::End),
+                BlockType::End => matches!(bt, BlockType::Long | BlockType::Start),
+            };
+            assert!(ok, "invalid §C.1.5.2 transition {prev:?} -> {bt:?}");
+            prev = bt;
+        }
+    }
+
+    #[test]
+    fn model2_block_type_per_frame_capture_matches_emission() {
+        // Drive the encoder one frame at a time, capturing each frame's
+        // §C.1.5.3.2.1 window-switching decision before pushing the
+        // next, and confirm the emitted block types reproduce exactly
+        // what replaying those captured `pe > 1800` attack flags through
+        // a single continuous BlockTypeStateMachine yields. This is the
+        // end-to-end proof that the Model 2 decision — not the energy
+        // detector — governs the emitted window geometry, across frame
+        // boundaries (the scheduler state carries between frames).
+        use crate::block_type_sm::BlockTypeStateMachine;
+        use crate::frame::{parse_header, FrameWalker};
+        use crate::side_info::parse_side_info;
+        let rate = 44_100;
+        let nframes = 5;
+        // Build per-frame PCM chunks of exactly one frame each.
+        let make_frame = |fi: usize| -> Vec<i16> {
+            (0..SAMPLES_PER_FRAME_MPEG1)
+                .map(|j| {
+                    let i = fi * SAMPLES_PER_FRAME_MPEG1 + j;
+                    let t = i as f64 / f64::from(rate);
+                    let gate = if (i / 350) % 2 == 0 { 1.0 } else { 0.03 };
+                    let s = (2.0 * core::f64::consts::PI * 9000.0 * t).sin();
+                    (9000.0 * gate * s) as i16
+                })
+                .collect()
+        };
+
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, rate, ChannelMode::SingleChannel, 1.0e6).unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.enable_auto_block_type_model2().unwrap();
+
+        // Push one frame's PCM plus the next frame's leading granule as
+        // lookahead each step so exactly one frame assembles per push,
+        // and capture that frame's per-granule attack flags. We push
+        // frames sequentially; the held-back lookahead granule rolls
+        // forward in `pending_pcm`.
+        let mut captured_attacks: Vec<[bool; GRANULES]> = Vec::new();
+        for fi in 0..nframes {
+            enc.push_samples(&make_frame(fi)).unwrap();
+            // After the first push the encoder holds one frame + an
+            // incomplete lookahead, so a frame only assembles from the
+            // second push onward. Capture whenever a decision exists.
+            if enc.last_model2_window_switch(0, 0).is_some() {
+                let mut a = [false; GRANULES];
+                for (gr, slot) in a.iter_mut().enumerate() {
+                    *slot = enc.last_model2_window_switch(gr, 0).unwrap().attack;
+                }
+                captured_attacks.push(a);
+            }
+        }
+        let mut out: Vec<u8> = Vec::new();
+        enc.finish(&mut out).unwrap();
+
+        // The captured frames are the leading `captured_attacks.len()`
+        // emitted frames (the tail flush may add zero-padded frames we
+        // don't compare). Replay the captured attacks through one
+        // continuous scheduler and compare to the emitted block types.
+        // The §C.1.5.2 companion of granule g is granule g+1's attack;
+        // the last granule of the last captured frame uses `false`
+        // (we have no further captured lookahead).
+        let frames: Vec<_> = FrameWalker::new(&out).collect();
+        let n = captured_attacks.len();
+        assert!(n >= 2, "expected at least two captured frames, got {n}");
+        // Flatten attacks into a granule stream with a trailing false.
+        let mut flat: Vec<bool> = Vec::new();
+        for fa in &captured_attacks {
+            flat.extend_from_slice(fa);
+        }
+        flat.push(false); // lookahead past the last captured granule
+        let mut sm = BlockTypeStateMachine::new();
+        for (fidx, frame) in frames.iter().enumerate().take(n) {
+            let hdr = parse_header(&frame.data[..4]).unwrap();
+            let si = parse_side_info(&hdr, &frame.data[4..]).unwrap();
+            for gr in 0..GRANULES {
+                let g = fidx * GRANULES + gr;
+                let expect = sm.step(flat[g], flat[g + 1]);
+                assert_eq!(
+                    si.granules[gr][0].block_type, expect,
+                    "frame {fidx} gr {gr}: emitted block type must equal the \
+                     scheduler walk over captured pe > 1800 attacks"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model2_block_type_keeps_per_band_xmin_installed() {
+        // The Model-2-driven block-type path reuses the same Model 2
+        // walk for the per-band outer-loop threshold, so a real
+        // signal-dependent `xmin` is still installed after the run (the
+        // FFT history advances exactly once per granule — the block-type
+        // pre-pass and Pass 1 do not double-process).
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.enable_auto_block_type_model2().unwrap();
+        let total = SAMPLES_PER_FRAME_MPEG1 * 3;
+        let pcm: Vec<i16> = (0..total)
+            .map(|i| {
+                let t = i as f64 / 44_100.0;
+                let s = 0.4 * (2.0 * core::f64::consts::PI * 1000.0 * t).sin()
+                    + 0.3 * (2.0 * core::f64::consts::PI * 6000.0 * t).sin();
+                (8000.0 * s) as i16
+            })
+            .collect();
+        enc.push_samples(&pcm).unwrap();
+        let x = enc
+            .per_band_xmin
+            .as_ref()
+            .expect("a per-granule threshold should be installed");
+        assert!(x.long.iter().all(|&v| v.is_finite() && v > 0.0));
+        let first = x.long[0];
+        assert!(
+            x.long
+                .iter()
+                .any(|&v| (v - first).abs() > 1e-6 * first.max(1.0)),
+            "expected a spectrally-shaped threshold under the Model-2 block-type path"
+        );
+    }
+
+    #[test]
+    fn model2_block_type_matches_captured_attack_after_single_frame() {
+        // Encode exactly one frame (+ one lookahead granule). With the
+        // scheduler starting fresh at Long, the emitted block types of
+        // the single frame must equal what feeding the captured per-
+        // granule attack flags into a fresh BlockTypeStateMachine
+        // produces — directly validating that the captured `pe > 1800`
+        // decision is the signal that drives emission. The lookahead
+        // attack for the last granule (gr 1's companion) is peeked from
+        // a clone and never captured, so we assert only gr 0, whose
+        // §C.1.5.2 companion is the captured gr 1 attack flag.
+        use crate::block_type_sm::BlockTypeStateMachine;
+        use crate::frame::{parse_header, FrameWalker};
+        use crate::side_info::parse_side_info;
+        let rate = 44_100;
+        // One frame of audio plus one lookahead granule so exactly one
+        // frame is assembled by push_samples.
+        let total = SAMPLES_PER_FRAME_MPEG1 + SAMPLES_PER_GRANULE;
+        let pcm: Vec<i16> = (0..total)
+            .map(|i| {
+                let t = i as f64 / f64::from(rate);
+                let gate = if (i / 300) % 2 == 0 { 1.0 } else { 0.02 };
+                let s = (2.0 * core::f64::consts::PI * 9000.0 * t).sin();
+                (9000.0 * gate * s) as i16
+            })
+            .collect();
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, rate, ChannelMode::SingleChannel, 1.0e6).unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.enable_auto_block_type_model2().unwrap();
+        enc.push_samples(&pcm).unwrap();
+        // Exactly one frame assembled; capture its decisions.
+        let a0 = enc.last_model2_window_switch(0, 0).unwrap().attack;
+        let a1 = enc.last_model2_window_switch(1, 0).unwrap().attack;
+
+        let mut out: Vec<u8> = Vec::new();
+        enc.finish(&mut out).unwrap();
+        let frames: Vec<_> = FrameWalker::new(&out).collect();
+        // The first emitted frame is the one whose decisions we captured
+        // (finish only zero-pads a possible trailing tail; the first
+        // frame is fully signal-driven).
+        let f0 = &frames[0];
+        let hdr = parse_header(&f0.data[..4]).unwrap();
+        let si = parse_side_info(&hdr, &f0.data[4..]).unwrap();
+
+        // Replay the captured gr0 attack into a fresh scheduler with
+        // gr1's captured attack as its §C.1.5.2 lookahead companion.
+        let mut sm = BlockTypeStateMachine::new();
+        let expect_gr0 = sm.step(a0, a1);
+        assert_eq!(
+            si.granules[0][0].block_type, expect_gr0,
+            "gr0 emitted block type must equal scheduler step(attack[0], attack[1])"
+        );
     }
 }
