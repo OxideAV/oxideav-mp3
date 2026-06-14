@@ -451,8 +451,9 @@ pub use huffman::{
 };
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
 pub use inner_loop::{
-    coarse_bit_estimate, exact_bit_count, max_abs, search_bit_budget, search_magnitude_clamp,
-    ExactBitCount, InnerLoopResult, BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
+    coarse_bit_estimate, exact_bit_count, exact_bit_count_band_aligned, max_abs, search_bit_budget,
+    search_magnitude_clamp, subdivide_bands, ExactBitCount, InnerLoopResult, SubdivideBands,
+    BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
 };
 pub use lame_tag::{
     parse_lame_tag, LameParseError, LameTag, DELAY_PADDING_OFFSET_FROM_LAME_MAGIC,

@@ -863,6 +863,36 @@ match), and 250 ms of sine yields the expected count of
 is validated in r177 by `tests/decoder_trait_stereo_roundtrip.rs`
 (see "Phase 2 step 36" below).
 
+**Round 297 (§C.1.5.4.4.6 band-aligned SUBDIVIDE).** §C.1.5.4.4.6 states
+the inner loop's SUBDIVIDE "splits the **scalefactor bands** corresponding
+to these values into three groups", and the side-info fields
+`region0_count` / `region1_count` are band counts (`region0_count + 1`
+bands in region 0, `region1_count + 1` in region 1). The decoder
+reconstructs the region boundaries solely from the long-block band-start
+table and those counts, so a boundary chosen mid-band is unrepresentable
+on the wire. The default inner-loop estimate ([`inner_loop::subdivide`])
+splits on raw big-values pairs (`big_pairs/3`, `big_pairs/4`), which can
+land between band edges — so its bit count is for a partition the encoder
+cannot emit. This round adds `subdivide_bands(sample_rate, version,
+big_pairs)`, which snaps the same "~1/3 to region 0, ~1/4 to region 2"
+strategy to scalefactor-band edges and returns valid 4-bit / 3-bit
+`region0_count` / `region1_count` field values (the boundaries the
+decoder's `region_boundaries` reproduces exactly), plus
+`exact_bit_count_band_aligned`, which counts the §C.1.5.4.4.5 + .8 Huffman
+total against those band-aligned long-family boundaries (short / mixed
+blocks fall back to the two-subregion pair split — they carry the
+§C.1.5.4.4.6 blocksplit `region1_count` defaults the decoder ignores).
+Both are pure helpers; the default `exact_bit_count` / `subdivide` and the
+inner-loop `global_gain` search are untouched, so every emitted byte is
+byte-for-byte the historical default — the band-aligned estimate is opt-in
+for callers that want the bit count to match the wire partition the
+existing `choose_region_split` produces. Seven new lib tests
+(empty-range, 44.1 kHz edge alignment, field-bounds / ordering across
+32 / 44.1 / 48 kHz, decoder-round-trip of the chosen counts,
+band-aligned-vs-default self-consistency on a long block, and
+short-block fallback equivalence). Spec read: SUBDIVIDE text on PDF
+page 104 (§C.1.5.4.4.6).
+
 **Round 296 (§C.1.5.3 scalefactor-selection-information / scfsi
 reuse).** MPEG-1 Layer III carries two granules per frame, each with
 its own part2 scalefactor block; the §2.4.2.7 `scfsi[ch]` field lets a

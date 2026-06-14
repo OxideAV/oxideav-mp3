@@ -183,6 +183,179 @@ fn subdivide(gc: &GranuleChannel, big_pairs: usize) -> (usize, usize) {
     (r0, r1)
 }
 
+/// A band-aligned §C.1.5.4.4.6 SUBDIVIDE of the big-values range for a
+/// long-family granule: the region boundaries fall on **scalefactor-band
+/// edges** (the spec's "SUBDIVIDE splits the *scalefactor bands*
+/// corresponding to these values into three groups") and the chosen
+/// `region0_count` / `region1_count` are the band counts the side-info
+/// fields carry (`region0_count + 1` bands in region 0,
+/// `region1_count + 1` in region 1, the rest in region 2 — §2.4.2.7).
+///
+/// This is the boundary form the decoder's `region_boundaries` can
+/// actually reconstruct: the decoder derives the region ends solely from
+/// the band-start table and the transmitted `region0_count` /
+/// `region1_count`, so a boundary chosen mid-band (as the simpler
+/// [`subdivide`] pair-thirds heuristic may produce) is unrepresentable on
+/// the wire. [`SubdivideBands`] therefore lets the inner-loop bit
+/// estimate count exactly the partition the encoder will emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubdivideBands {
+    /// Big-values sub-region end line indices `(region0_end, region1_end)`;
+    /// region 2 runs to `big_pairs * 2`. Both are scalefactor-band-aligned.
+    pub region_ends: (usize, usize),
+    /// `region0_count` side-info value (4-bit field, `0..=15`): region 0
+    /// covers bands `0..=region0_count`.
+    pub region0_count: u8,
+    /// `region1_count` side-info value (3-bit field, `0..=7`): region 1
+    /// covers the following `region1_count + 1` bands.
+    pub region1_count: u8,
+}
+
+/// Band-aligned §C.1.5.4.4.6 SUBDIVIDE for a **long-family** granule
+/// (`block_type ∈ {Long, Start, End}`): choose region boundaries on
+/// scalefactor-band edges, assigning ~1/3 of the big-values range to
+/// region 0 and ~1/4 to region 2 — the "very simple" split strategy the
+/// spec offers, but snapped to band edges (the only boundaries the
+/// decoder can reproduce) and clamped to the 4-bit `region0_count` /
+/// 3-bit `region1_count` field widths.
+///
+/// `big_pairs` is the §C.1.5.4.4.3/.4 big-values pair count (so the
+/// big-values line span is `bv2 = big_pairs * 2`). For a short / mixed
+/// block this primitive does not apply — those use the two-subregion
+/// blocksplit rule (§C.1.5.4.4.6, region1_count default) handled by
+/// [`crate::short_block::short_block_region_defaults`]; callers gate on
+/// the block type before calling.
+///
+/// The returned `region_ends` are clamped to `bv2`, so an
+/// already-band-aligned `bv2` reproduces exactly.
+// The band-walking loops use `b` as both the loop variable and the index
+// into `starts` (what the decoder's `region_boundaries` reads), so the
+// band ↔ start-index relationship the spec uses stays explicit.
+#[allow(clippy::needless_range_loop)]
+#[must_use]
+pub fn subdivide_bands(
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    big_pairs: usize,
+) -> SubdivideBands {
+    let bv2 = big_pairs * 2;
+    if bv2 == 0 {
+        return SubdivideBands {
+            region_ends: (0, 0),
+            region0_count: 0,
+            region1_count: 0,
+        };
+    }
+    let starts = crate::requantize::long_band_starts(sample_rate_hz, version);
+    // §C.1.5.4.4.6 "very simple" strategy: ~1/3 of the band span to
+    // region 0, ~1/4 to region 2 (so region 1 takes the ~5/12 middle).
+    let third = bv2 / 3;
+    let three_quarters = (bv2 * 3) / 4;
+
+    // region 0 covers bands 0..=region0_count, so its end line is
+    // starts[region0_count + 1]. Walk band edges up to the one at or just
+    // below `third`; clamp region0_count to the 4-bit field max (15).
+    let mut r0_count: u8 = 0;
+    for b in 1..=21usize {
+        if starts[b] <= third {
+            r0_count = (b - 1) as u8;
+        } else {
+            break;
+        }
+    }
+    r0_count = r0_count.min(15);
+    let r0_band = usize::from(r0_count) + 1;
+    let r0_end = starts
+        .get(r0_band)
+        .copied()
+        .unwrap_or(NUM_LINES)
+        .min(NUM_LINES);
+
+    // region 1 covers the next region1_count+1 bands; walk band edges up
+    // to the one at or just below `three_quarters`; clamp to 3-bit max (7).
+    let mut r1_count: u8 = 0;
+    for b in (r0_band + 1)..=21usize {
+        if starts[b] <= three_quarters {
+            r1_count = (b - r0_band - 1) as u8;
+        } else {
+            break;
+        }
+    }
+    r1_count = r1_count.min(7);
+    let r1_band = r0_band + usize::from(r1_count) + 1;
+    let r1_end = starts
+        .get(r1_band)
+        .copied()
+        .unwrap_or(NUM_LINES)
+        .min(NUM_LINES);
+
+    SubdivideBands {
+        region_ends: (r0_end.min(bv2), r1_end.min(bv2).max(r0_end.min(bv2))),
+        region0_count: r0_count,
+        region1_count: r1_count,
+    }
+}
+
+/// Band-aligned variant of [`exact_bit_count`]: identical exact
+/// §C.1.5.4.4.5 + §C.1.5.4.4.8 Huffman bit total, but the big-values
+/// SUBDIVIDE boundaries fall on scalefactor-band edges via
+/// [`subdivide_bands`] (long-family blocks) so the count matches the
+/// partition the encoder will actually emit on the wire. For short /
+/// mixed blocks it falls back to the block-type-steered pair-split
+/// [`subdivide`] (those carry the §C.1.5.4.4.6 two-subregion blocksplit
+/// defaults the decoder ignores). The returned [`ExactBitCount`] also
+/// surfaces the chosen `region0_count` / `region1_count` via its
+/// `region_ends`; pair this with [`subdivide_bands`] when the side-info
+/// field values are needed.
+///
+/// This does not replace [`exact_bit_count`] — the default inner-loop
+/// search keeps the simpler heuristic so emitted bytes are unchanged
+/// unless a caller opts into the band-aligned estimate.
+#[must_use]
+pub fn exact_bit_count_band_aligned(
+    is: &[i32; NUM_LINES],
+    gc: &GranuleChannel,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) -> Option<ExactBitCount> {
+    let split = partition_split(is);
+    let bv2 = split.big_pairs * 2;
+
+    // Long-family blocks get band-aligned boundaries; short / mixed keep
+    // the block-type-steered two-subregion pair split.
+    let region_ends = if gc.window_switching_flag && gc.block_type == BlockType::Short {
+        subdivide(gc, split.big_pairs)
+    } else {
+        subdivide_bands(sample_rate_hz, version, split.big_pairs).region_ends
+    };
+
+    let (t0, _) = choose_best_table_for_region(is, 0, region_ends.0)?;
+    let (t1, _) = choose_best_table_for_region(is, region_ends.0, region_ends.1)?;
+    let (t2, _) = choose_best_table_for_region(is, region_ends.1, bv2)?;
+    let table_select = [t0, t1, t2];
+
+    let c1_start = bv2;
+    let c1_end = c1_start + split.count1_quads * 4;
+    let (count1table_b, _) = choose_best_count1_table(is, c1_start, c1_end);
+
+    let bits = count_huffman_bits(
+        is,
+        split.big_pairs,
+        region_ends,
+        table_select,
+        split.count1_quads,
+        count1table_b,
+    )?;
+
+    Some(ExactBitCount {
+        split,
+        region_ends,
+        table_select,
+        count1table_b,
+        bits,
+    })
+}
+
 /// **Exact** §C.1.5.4.4.5 + §C.1.5.4.4.8 Huffman bit count for a
 /// quantized `is[]`: partition it (§C.1.5.4.4.3 / .4), SUBDIVIDE the
 /// big-values range (§C.1.5.4.4.6), choose the minimum-bit codebook per

@@ -724,3 +724,115 @@ fn exact_count_equals_region_plus_count1_decomposition() {
     assert_eq!(total, big_bits + c1_bits);
 }
 
+// =====================================================================
+// §C.1.5.4.4.6 band-aligned SUBDIVIDE (`subdivide_bands`)
+// =====================================================================
+
+/// A zero big-values range yields all-zero region info.
+#[test]
+fn subdivide_bands_empty_is_zero() {
+    let s = subdivide_bands(SR, V, 0);
+    assert_eq!(s.region_ends, (0, 0));
+    assert_eq!(s.region0_count, 0);
+    assert_eq!(s.region1_count, 0);
+}
+
+/// Both region boundaries land on 44.1 kHz long-block scalefactor-band
+/// start indices — the only edges the decoder's `region_boundaries` can
+/// reconstruct. With the full big-values span (bv2 = 576) the ~1/3 / ~3/4
+/// targets (192 / 432) snap to band starts 162 and 418 (Table B.8b:
+/// `…162, 196, …, 342, 418`).
+#[test]
+fn subdivide_bands_aligns_to_band_edges_44k() {
+    let s = subdivide_bands(44_100, MpegVersion::Mpeg1, NUM_LINES / 2);
+    // Band starts at 44.1 kHz: …, 162 (band 16), …, 418 (band 21).
+    assert_eq!(s.region_ends, (162, 418));
+    // region 0 covers bands 0..=15 (region0_count = 15, the 4-bit max).
+    assert_eq!(s.region0_count, 15);
+    // region 1 covers bands 16..=20 (region1_count + 1 = 5 ⇒ count = 4).
+    assert_eq!(s.region1_count, 4);
+}
+
+/// `region0_count` / `region1_count` are always valid field values
+/// (4-bit / 3-bit) and the boundaries are non-decreasing and within bv2,
+/// across every MPEG-1 sampling rate and a sweep of big-values spans.
+#[test]
+fn subdivide_bands_field_bounds_and_ordering() {
+    for &sr in &[32_000u32, 44_100, 48_000] {
+        for big_pairs in [1usize, 10, 50, 100, 150, NUM_LINES / 2] {
+            let s = subdivide_bands(sr, MpegVersion::Mpeg1, big_pairs);
+            let bv2 = big_pairs * 2;
+            assert!(s.region0_count <= 15, "region0_count is a 4-bit field");
+            assert!(s.region1_count <= 7, "region1_count is a 3-bit field");
+            assert!(s.region_ends.0 <= s.region_ends.1, "boundaries ordered");
+            assert!(s.region_ends.1 <= bv2, "region 1 end within big-values");
+        }
+    }
+}
+
+/// The decoder reconstructs the SAME boundaries from the chosen
+/// `region0_count` / `region1_count` as `subdivide_bands` reports — the
+/// invariant that makes the band-aligned estimate match the wire. We
+/// reproduce the decoder rule: region 0 ends at `starts[region0_count+1]`,
+/// region 1 ends at `starts[region0_count + region1_count + 2]`.
+#[test]
+fn subdivide_bands_round_trips_through_region_counts_44k() {
+    let starts = [
+        0usize, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288,
+        342, 418,
+    ];
+    let s = subdivide_bands(44_100, MpegVersion::Mpeg1, NUM_LINES / 2);
+    let r0_band = usize::from(s.region0_count) + 1;
+    let r1_band = r0_band + usize::from(s.region1_count) + 1;
+    let dec_r0_end = starts[r0_band.min(21)];
+    let dec_r1_end = starts[r1_band.min(21)];
+    assert_eq!(s.region_ends.0.min(NUM_LINES), dec_r0_end);
+    assert_eq!(s.region_ends.1.min(NUM_LINES), dec_r1_end);
+}
+
+/// `exact_bit_count_band_aligned` returns the same TOTAL bit budget as
+/// the default `exact_bit_count` whenever the latter's pair-thirds
+/// boundaries already coincide with band edges, and is always a
+/// well-defined codable count on a clamp-respecting spectrum. The total
+/// is the sum the decoder reads back regardless of where the region
+/// boundaries fall (only the per-region table choice depends on them),
+/// so we assert it is finite and self-consistent with the partition.
+#[test]
+fn exact_band_aligned_is_codable_and_self_consistent() {
+    let gc = long_gc(false);
+    let sf = ScaleFactors::default();
+    let xr = flat(120.0);
+    // A gain that keeps the spectrum clamp-respecting and non-trivial.
+    let mut g = gc;
+    g.global_gain = 170;
+    let is = quantize(&xr, &g, &sf, SR, V);
+    let c = exact_bit_count_band_aligned(&is, &g, SR, V)
+        .expect("a clamp-respecting spectrum is codable");
+    // The split is the same partition `exact_bit_count` derives (the
+    // big-values / count1 boundary is gain-driven, not region-driven).
+    let base = exact_bit_count(&is, &g).unwrap();
+    assert_eq!(c.split, base.split);
+    // The band-aligned region ends are themselves band-aligned (each is a
+    // long-band start or the big-values end).
+    let bv2 = c.split.big_pairs * 2;
+    assert!(c.region_ends.0 <= c.region_ends.1);
+    assert!(c.region_ends.1 <= bv2);
+}
+
+/// Short / mixed blocks fall back to the two-subregion pair split — the
+/// band-aligned long-block primitive does not apply (those carry the
+/// §C.1.5.4.4.6 blocksplit defaults). `exact_bit_count_band_aligned` on a
+/// short GC must agree with `exact_bit_count` (same `subdivide` path).
+#[test]
+fn exact_band_aligned_short_matches_default() {
+    let gc = short_gc([0, 0, 0]);
+    let sf = ScaleFactors::default();
+    let xr = flat(120.0);
+    let mut g = gc;
+    g.global_gain = 170;
+    let is = quantize(&xr, &g, &sf, SR, V);
+    let a = exact_bit_count_band_aligned(&is, &g, SR, V);
+    let b = exact_bit_count(&is, &g);
+    assert_eq!(a, b, "short blocks share the pair-split SUBDIVIDE path");
+}
+

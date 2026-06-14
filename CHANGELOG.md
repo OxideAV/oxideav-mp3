@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§C.1.5.4.4.6 band-aligned SUBDIVIDE** (r297). New pure
+  helpers `inner_loop::subdivide_bands` and `exact_bit_count_band_aligned`
+  (re-exported at the crate root, with `SubdivideBands`). The spec's
+  §C.1.5.4.4.6 SUBDIVIDE "splits the *scalefactor bands*" into three
+  regions and the `region0_count` / `region1_count` side-info fields are
+  band counts; the decoder reconstructs the region boundaries only from
+  the long-block band-start table and those counts, so a boundary chosen
+  mid-band is unrepresentable on the wire. `subdivide_bands` snaps the
+  "~1/3 to region 0, ~1/4 to region 2" strategy to scalefactor-band edges
+  and returns valid 4-bit / 3-bit `region0_count` / `region1_count`
+  values; `exact_bit_count_band_aligned` counts the §C.1.5.4.4.5 + .8
+  Huffman total against those band-aligned long-family boundaries (short /
+  mixed blocks fall back to the two-subregion pair split). The default
+  `exact_bit_count` / `subdivide` and the inner-loop `global_gain` search
+  are unchanged, so the encoder's emitted bytes are byte-for-byte the
+  historical default — the band-aligned estimate is opt-in. Seven new lib
+  tests.
 - encoder: **§C.1.5.3 scalefactor-selection-information (scfsi) reuse**
   (r296). MPEG-1 Layer III carries two granules per frame, each with its
   own part2 scalefactor block. The §2.4.2.7 `scfsi[ch]` field lets a
