@@ -893,6 +893,37 @@ band-aligned-vs-default self-consistency on a long block, and
 short-block fallback equivalence). Spec read: SUBDIVIDE text on PDF
 page 104 (§C.1.5.4.4.6).
 
+**Round 298 (§C.1.5.4.4 band-aligned bit-budget inner-loop search).**
+r297 added the band-aligned SUBDIVIDE helpers
+([`inner_loop::subdivide_bands`] / [`inner_loop::exact_bit_count_band_aligned`])
+but left them as pure estimators — the actual `global_gain` rate-control
+search ([`inner_loop::search_bit_budget`]) still gated on the default
+pair-thirds heuristic ([`inner_loop::exact_bit_count`]), whose region
+boundaries may land mid-band, i.e. on a partition the decoder's
+`region_boundaries` cannot reconstruct and the encoder can therefore
+never emit. This round wires the band-aligned estimate into a search:
+`search_bit_budget_band_aligned` runs the spec's upward `qquant + 1`
+scan (§C.1.5.4.4 "increases the quantizer step size until the output
+vector can be coded with the available number of bits") gated on
+`exact_bit_count_band_aligned`, so the smallest `global_gain` it returns
+fits the part2_3 length the encoder will *actually* write — the
+§C.1.5.4.4.6 SUBDIVIDE region ends snapped to scalefactor-band edges and
+clamped to the 4-bit / 3-bit `region0_count` / `region1_count` field
+widths (long-family blocks); short / mixed blocks share the
+two-subregion blocksplit path, so for those the new search is
+bit-identical to `search_bit_budget`. Like the existing budget search the
+gating count is **not** monotone in the gain (Huffman codeword lengths
+are not monotone in magnitude — §C.1.5.4.4.7), so the upward scan returns
+the *smallest* fitting gain, never a bisection. The default
+`search_bit_budget` is untouched, so every byte the existing encoder
+emits is unchanged — the band-aligned search is an opt-in primitive for a
+future bit-budget-driven encode path. Five new lib tests
+(budget-0-to-silence, minimality of the chosen gain, tighter-budget ⇒
+coarser-gain, short-block equivalence with the default search across a
+budget sweep, and wire-partition gating on a long block); inner-loop
+suite 34 → 39 tests. Spec read: inner-iteration-loop §C.1.5.4.4 +
+§C.1.5.4.4.2 / .6 / .7 / .8 on PDF pages 103-105.
+
 **Round 296 (§C.1.5.3 scalefactor-selection-information / scfsi
 reuse).** MPEG-1 Layer III carries two granules per frame, each with
 its own part2 scalefactor block; the §2.4.2.7 `scfsi[ch]` field lets a

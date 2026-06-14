@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§C.1.5.4.4 band-aligned bit-budget inner-loop search**
+  (r298). New `inner_loop::search_bit_budget_band_aligned` (re-exported at
+  the crate root) runs the spec's upward `qquant + 1` rate-control scan
+  (§C.1.5.4.4) gated on `exact_bit_count_band_aligned` — the
+  wire-representable §C.1.5.4.4.6 SUBDIVIDE whose region boundaries fall
+  on scalefactor-band edges — so the smallest `global_gain` it returns
+  fits the part2_3 length the encoder will actually write, not an
+  unrepresentable pair-thirds approximation. The default
+  `search_bit_budget` is untouched (still gated on the simpler
+  `exact_bit_count`), so every emitted byte is byte-for-byte the
+  historical default; the band-aligned search is opt-in for a future
+  bit-budget-driven encode path. Short / mixed blocks share the
+  two-subregion blocksplit path and are bit-identical to
+  `search_bit_budget`. Five new lib tests (inner-loop suite 34 → 39).
 - encoder: **§C.1.5.4.4.6 band-aligned SUBDIVIDE** (r297). New pure
   helpers `inner_loop::subdivide_bands` and `exact_bit_count_band_aligned`
   (re-exported at the crate root, with `SubdivideBands`). The spec's

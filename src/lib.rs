@@ -224,11 +224,17 @@
 //! big-values bound (`max|is| ≤ 8191`, [`inner_loop::BIG_VALUES_LIMIT`],
 //! the §C.1.5.4.4.2 maximum-value test);
 //! [`inner_loop::search_bit_budget`] finds the smallest gain whose
-//! [`inner_loop::coarse_bit_estimate`] fits a supplied bit budget. The
-//! bit estimate is an order-of-magnitude placeholder — the exact
-//! §C.1.5.4.4.5 / §C.1.5.4.4.8 Huffman count is a later step — and there
-//! is still no psychoacoustic model, outer (distortion-control) loop, or
-//! scalefactor estimation.
+//! **exact** §C.1.5.4.4.5 / §C.1.5.4.4.8 Huffman count
+//! ([`inner_loop::exact_bit_count`]) fits a supplied bit budget, and
+//! [`inner_loop::search_bit_budget_band_aligned`] does the same but counts
+//! the bits of the **wire-representable** SUBDIVIDE (§C.1.5.4.4.6 region
+//! boundaries snapped to scalefactor-band edges via
+//! [`inner_loop::subdivide_bands`]), so the gain it picks fits the part2_3
+//! length the encoder will actually emit. The
+//! [`inner_loop::coarse_bit_estimate`] placeholder is retained only for
+//! reference. There is still no psychoacoustic model coupling here, no
+//! outer (distortion-control) loop, and no scalefactor estimation in this
+//! module.
 //!
 //! The [`stream_encoder`] module wires every Phase 2 primitive
 //! together as **Phase 2 step 10** — a top-level [`Mp3Encoder`] that
@@ -452,8 +458,8 @@ pub use huffman::{
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
 pub use inner_loop::{
     coarse_bit_estimate, exact_bit_count, exact_bit_count_band_aligned, max_abs, search_bit_budget,
-    search_magnitude_clamp, subdivide_bands, ExactBitCount, InnerLoopResult, SubdivideBands,
-    BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
+    search_bit_budget_band_aligned, search_magnitude_clamp, subdivide_bands, ExactBitCount,
+    InnerLoopResult, SubdivideBands, BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
 };
 pub use lame_tag::{
     parse_lame_tag, LameParseError, LameTag, DELAY_PADDING_OFFSET_FROM_LAME_MAGIC,

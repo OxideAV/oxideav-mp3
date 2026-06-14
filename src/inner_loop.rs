@@ -596,5 +596,51 @@ pub fn search_bit_budget(
     })
 }
 
+/// §C.1.5.4.4 bit-budget inner loop, gated on the **band-aligned**
+/// SUBDIVIDE bit count: find the smallest `global_gain` whose exact
+/// §C.1.5.4.4.5 + §C.1.5.4.4.8 Huffman bit total over the *wire-
+/// representable* big-values partition ([`exact_bit_count_band_aligned`])
+/// is `≤ budget`.
+///
+/// This differs from [`search_bit_budget`] only in which SUBDIVIDE the bit
+/// count is taken against. [`search_bit_budget`] uses the default
+/// pair-thirds heuristic ([`subdivide`]), whose region boundaries may land
+/// mid-band — a partition the decoder's `region_boundaries` cannot
+/// reconstruct, so the count it gates on is for a split the encoder can
+/// never emit. This variant uses [`subdivide_bands`] for a long-family
+/// granule (`block_type ∈ {Long, Start, End}`), snapping the same
+/// §C.1.5.4.4.6 "~1/3 to region 0, ~1/4 to region 2" strategy to
+/// scalefactor-band edges and the 4-bit / 3-bit `region0_count` /
+/// `region1_count` field widths — the exact boundaries the decoder
+/// reproduces. The bit count therefore matches the part2_3 length the
+/// encoder will actually write, so the gain it picks fits the real wire
+/// budget rather than an unrepresentable approximation of it. Short /
+/// mixed blocks share the two-subregion blocksplit path, so for those this
+/// is identical to [`search_bit_budget`].
+///
+/// As with [`search_bit_budget`], `gc_template.global_gain` is the
+/// searched field and all other fields plus `sf` are held fixed; the count
+/// is **not** monotone in the gain (Huffman codeword lengths are not
+/// monotone in magnitude — see [`search_linear`]), so this uses the spec's
+/// upward `qquant + 1` scan, returning the smallest gain whose count fits.
+/// A budget `≥ 0` is always met by the all-zero quantization at the
+/// coarsest gain (cost `0`).
+#[must_use]
+pub fn search_bit_budget_band_aligned(
+    xr: &[f32; NUM_LINES],
+    gc_template: &GranuleChannel,
+    sf: &ScaleFactors,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    budget: u64,
+) -> InnerLoopResult {
+    search_linear(xr, gc_template, sf, sample_rate_hz, version, |is| {
+        // A range no codebook can code (corrupt input) is treated as
+        // over-budget so the search raises the gain.
+        exact_bit_count_band_aligned(is, gc_template, sample_rate_hz, version)
+            .is_some_and(|c| c.bits as u64 <= budget)
+    })
+}
+
 #[cfg(test)]
 include!("inner_loop_tests.rs");

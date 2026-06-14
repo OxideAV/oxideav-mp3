@@ -836,3 +836,129 @@ fn exact_band_aligned_short_matches_default() {
     assert_eq!(a, b, "short blocks share the pair-split SUBDIVIDE path");
 }
 
+// =====================================================================
+// §C.1.5.4.4 band-aligned bit-budget search (`search_bit_budget_band_aligned`)
+// =====================================================================
+
+/// Exact band-aligned bit count of `is[]` for `gc` (u64, MAX on a corrupt
+/// uncodable range) — the predicate `search_bit_budget_band_aligned` gates on.
+fn exact_bits_band_aligned(is: &[i32; NUM_LINES], gc: &GranuleChannel) -> u64 {
+    exact_bit_count_band_aligned(is, gc, SR, V)
+        .map(|c| c.bits as u64)
+        .unwrap_or(u64::MAX)
+}
+
+/// A budget of 0 forces the all-zero quantization (cost 0) on the
+/// band-aligned search exactly as on the default one.
+#[test]
+fn band_aligned_bit_budget_zero_drives_to_silence() {
+    let gc = long_gc(false);
+    let sf = ScaleFactors::default();
+    let xr = flat(100.0);
+    let r = search_bit_budget_band_aligned(&xr, &gc, &sf, SR, V, 0);
+    assert!(r.satisfied, "budget 0 is met by the all-zero quantization");
+    assert_eq!(exact_bits_band_aligned(&r.is, &gc), 0);
+    assert!(r.is.iter().all(|&v| v == 0));
+}
+
+/// The band-aligned search returns the SMALLEST gain whose band-aligned
+/// exact count fits the budget: the chosen gain meets it, and the next
+/// finer gain (if any) overflows it — the §C.1.5.4.4 upward `qquant+1`
+/// scan guarantees minimality even though the count is not monotone.
+#[test]
+fn band_aligned_bit_budget_is_minimal() {
+    let gc = long_gc(false);
+    let sf = ScaleFactors::default();
+    let xr = flat(120.0);
+    let fine = {
+        let mut g = gc;
+        g.global_gain = 180;
+        quantize(&xr, &g, &sf, SR, V)
+    };
+    let budget = (exact_bits_band_aligned(&fine, &gc) / 2).max(1);
+    let r = search_bit_budget_band_aligned(&xr, &gc, &sf, SR, V, budget);
+    assert!(r.satisfied);
+    assert!(exact_bits_band_aligned(&r.is, &gc) <= budget);
+    if r.global_gain > GAIN_MIN {
+        let mut finer = gc;
+        finer.global_gain = r.global_gain - 1;
+        let is_finer = quantize(&xr, &finer, &sf, SR, V);
+        assert!(
+            exact_bits_band_aligned(&is_finer, &gc) > budget,
+            "gain {} is not the smallest fitting gain (gain-1 also fits)",
+            r.global_gain
+        );
+    }
+}
+
+/// A tighter budget never yields a finer gain than a looser one (the
+/// search target is the same scalar `global_gain`, monotone in the budget
+/// constraint at the chosen-gain level).
+#[test]
+fn band_aligned_bit_budget_tighter_means_coarser() {
+    let gc = long_gc(false);
+    let sf = ScaleFactors::default();
+    let xr = flat(200.0);
+
+    let clamp = search_magnitude_clamp(&xr, &gc, &sf, SR, V);
+    let clamp_cost = exact_bits_band_aligned(&clamp.is, &gc);
+    let loose_budget = clamp_cost.saturating_mul(2).max(1);
+    let loose = search_bit_budget_band_aligned(&xr, &gc, &sf, SR, V, loose_budget);
+    assert!(loose.satisfied);
+    assert!(exact_bits_band_aligned(&loose.is, &gc) <= loose_budget);
+
+    let tight_budget = (clamp_cost / 4).max(1);
+    let tight = search_bit_budget_band_aligned(&xr, &gc, &sf, SR, V, tight_budget);
+    assert!(tight.satisfied);
+    assert!(exact_bits_band_aligned(&tight.is, &gc) <= tight_budget);
+    assert!(
+        tight.global_gain >= loose.global_gain,
+        "tighter budget {tight_budget} did not yield coarser-or-equal gain ({} vs {})",
+        tight.global_gain,
+        loose.global_gain
+    );
+}
+
+/// For a SHORT block both searches gate on the identical (pair-split)
+/// SUBDIVIDE — `exact_bit_count_band_aligned` falls back to `subdivide`
+/// there — so the band-aligned search returns exactly the same result as
+/// the default `search_bit_budget` for every budget.
+#[test]
+fn band_aligned_search_matches_default_on_short_block() {
+    let gc = short_gc([0, 0, 0]);
+    let sf = ScaleFactors::default();
+    let xr = flat(150.0);
+    for &budget in &[0u64, 50, 200, 1000, 5000] {
+        let a = search_bit_budget_band_aligned(&xr, &gc, &sf, SR, V, budget);
+        let b = search_bit_budget(&xr, &gc, &sf, SR, V, budget);
+        assert_eq!(
+            a.global_gain, b.global_gain,
+            "short-block searches diverged at budget {budget}"
+        );
+        assert_eq!(a.is, b.is, "short-block is[] diverged at budget {budget}");
+    }
+}
+
+/// On a long block the gain the band-aligned search picks fits the
+/// band-aligned (wire-representable) count, and that gain's count under
+/// the DEFAULT pair-thirds split may differ — the whole point of the
+/// variant. We assert the chosen gain's band-aligned count is within
+/// budget (the contract) and that the gain is a valid 8-bit field value.
+#[test]
+fn band_aligned_search_gates_on_wire_partition() {
+    let gc = long_gc(false);
+    let sf = ScaleFactors::default();
+    let xr = flat(180.0);
+    let clamp = search_magnitude_clamp(&xr, &gc, &sf, SR, V);
+    let budget = (exact_bits_band_aligned(&clamp.is, &gc) / 3).max(1);
+    let r = search_bit_budget_band_aligned(&xr, &gc, &sf, SR, V, budget);
+    assert!(r.satisfied);
+    // The gating count is the band-aligned one, and it fits.
+    assert!(exact_bits_band_aligned(&r.is, &gc) <= budget);
+    // The returned is[] is exactly the quantization at the chosen gain
+    // (no other field perturbed) — the search varies only `global_gain`.
+    let mut chosen = gc;
+    chosen.global_gain = r.global_gain;
+    assert_eq!(r.is, quantize(&xr, &chosen, &sf, SR, V));
+}
+
