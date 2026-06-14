@@ -923,6 +923,37 @@ the spec-correct side). Spec read: ISO/IEC 11172-3 §2.4.3.4.8 (short
 reorder), §2.4.3.4.9 (stereo runs after reorder), §2.4.3.4.10
 (IMDCT consumes subband-ordered lines).
 
+**Round 306 (§2.4.3.4.9.2 MS-*auto* picker over the per-window short
+intensity region).** r305 lifted the short + intensity rejection on the
+*unconditional* MS path but left the **auto-MS** path
+(`new_joint_stereo_auto_is` + `force_short_blocks_for_testing(true)`)
+rejected: the side-energy picker that decides MS-vs-LR per frame scored
+its fraction `E_S/(E_L+E_R) = Σ(L−R)² / (2·Σ(L²+R²))` over the
+*long-block* bound line range `0..ms_region_hi`, not the per-window short
+region the rotation actually touches. r306 teaches the picker the short
+layout: when short + intensity is armed it recomputes the per-granule
+upper line as `0..3·short_starts[short_start]` (the same contiguous run
+the r305 rotation applies, with the granule's per-window bound
+`short_intensity_start_per_gr[gr]` from Pass 1.45), so the decision is
+measured on exactly the lines MS would rotate. With the picker corrected,
+the `IntensityShortBlocksUnsupported` rejection on
+`force_short_blocks_for_testing` (the MS-auto clause) is dropped; the
+long / no-intensity picker path is byte-for-byte unchanged (it still
+reads the frame-constant `ms_region_hi`). Frames carry `mode = '01'` with
+per-frame `mode_extension = '11'` (MS + intensity) when both granules'
+short MS regions fall at/under the threshold and `'01'` (intensity only)
+otherwise. Validated by three new `ms_short_intensity_roundtrip` tests:
+acceptance + byte-deterministic encode with a valid `'01'`/`'11'` header
+stream, the picker firing MS on low-side-energy short content (default
+0.5 threshold), and the picker declining MS for any non-zero short side
+energy at threshold 0 (which also proves the region read is non-empty —
+a stale long/empty bound would score zero and wrongly pick MS). The
+`intensity_rejects_block_type_toggles` unit test now asserts MS-auto +
+short + intensity acceptance alongside the still-rejected mixed /
+auto-block-type short paths. Spec read: ISO/IEC 11172-3 §2.4.3.4.8
+(short reorder) / §2.4.3.4.9.2 (MS matrix + the encoder's free choice of
+MS); ISO/IEC 13818-3 §2.4.3.2 (per-window bound).
+
 **Round 305 (§2.4.3.4.9.2 MS + short-block + intensity stereo, per-window
 bound).** r303 wired the per-window short intensity bound for the
 intensity-*only* force-short path; the combination with the §2.4.3.4.9.2
@@ -945,17 +976,15 @@ channel's side signal keeps that bound at `short_start`) and
 intensity-decodes the rest (ISO/IEC 13818-3 §2.4.3.2). Intensity and MS
 touch disjoint line sets, so applying intensity first then MS never
 double-rotates a line. Frames carry `mode = '01'`, `mode_extension =
-'11'`. The MS-*auto* + short + intensity path stays rejected: its
-side-energy picker still evaluates over the long-block bound line, not
-the per-window short region. Validated by a new integration suite
-(`ms_short_intensity_roundtrip`, 5 tests): `'11'` header + pure-short
+'11'`. (The MS-*auto* + short + intensity path was lifted the following
+round — see Round 306.) Validated by a new integration suite
+(`ms_short_intensity_roundtrip`): `'11'` header + pure-short
 side info, right-channel positions in range, a spec-order self-decode in
 which the below-bound 440 Hz MS pan reconstructs at its true 1.40 ratio
 and the hard-left 8 kHz intensity tone reconstructs strongly
-left-leaning, byte-deterministic encode, and the MS-auto rejection guard.
-The rejection unit test (`intensity_rejects_block_type_toggles`) now
-asserts MS + short force-short acceptance and the narrowed MS-auto
-rejection. Spec read: ISO/IEC 11172-3 §2.4.3.4.8 (short reorder) /
+left-leaning, and a byte-deterministic encode. The
+`intensity_rejects_block_type_toggles` unit test asserts MS + short
+force-short acceptance. Spec read: ISO/IEC 11172-3 §2.4.3.4.8 (short reorder) /
 §2.4.3.4.9.2 (MS matrix) / §2.4.3.4.9.3 (coupling); ISO/IEC 13818-3
 §2.4.3.2 (per-window bound).
 

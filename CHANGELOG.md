@@ -28,6 +28,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§2.4.3.4.9.2 MS-*auto* picker over the per-window short
+  intensity region** (r306). The force-short toggle
+  (`force_short_blocks_for_testing(true)`) is now accepted on the
+  *auto*-MS + intensity encoder (`new_joint_stereo_auto_is`); it was the
+  last combination still rejected with `IntensityShortBlocksUnsupported`.
+  The per-frame side-energy picker (`E_S/(E_L+E_R)`) previously scored
+  its fraction over the long-block bound line range `0..ms_region_hi`,
+  but the r305 MS rotation for short + intensity touches the per-window
+  short region `0..3·short_starts[short_start]`. The picker now recomputes
+  that per-granule upper line (using `short_intensity_start_per_gr[gr]`
+  from Pass 1.45) when short + intensity is armed, so the MS-vs-LR
+  decision is measured on exactly the lines the rotation applies; the
+  long / no-intensity picker path is byte-for-byte unchanged. Frames
+  carry `mode = '01'` with per-frame `mode_extension = '11'` (MS +
+  intensity) / `'01'` (intensity only). Three new
+  `tests/ms_short_intensity_roundtrip.rs` tests cover acceptance +
+  byte-deterministic encode, the picker firing MS on low-side-energy
+  short content, and the picker declining MS for any non-zero short side
+  energy at threshold 0. The `intensity_rejects_block_type_toggles` unit
+  test now asserts MS-auto + short + intensity acceptance.
+
 - encoder: **§2.4.3.4.9.2 MS + short-block + intensity stereo** (r305).
   The force-short toggle (`force_short_blocks_for_testing(true)`) is now
   accepted on the unconditional MS + intensity encoder
@@ -40,16 +61,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   reorder is a permutation of that line set) — the exact inverse of the
   decoder's per-window `process_short`. Intensity (above the bound) and
   MS (below it) touch disjoint line sets. Frames carry `mode = '01'`,
-  `mode_extension = '11'`. The MS-*auto* + short + intensity path stays
-  rejected (its energy-fraction picker still reads the long-block bound
-  line). New integration suite `tests/ms_short_intensity_roundtrip.rs`
-  (5 tests): `'11'` header + pure-short side info, right-channel
-  positions in range, a spec-order self-decode with the below-bound
-  440 Hz MS pan reconstructing at 1.40 and the hard-left 8 kHz intensity
-  tone left-leaning, byte-deterministic encode, and the MS-auto
-  rejection guard. The `intensity_rejects_block_type_toggles` unit test
-  now asserts MS + short force-short acceptance + the narrowed MS-auto
-  rejection.
+  `mode_extension = '11'`. (The MS-*auto* + short + intensity path was
+  lifted in r306.) New integration suite
+  `tests/ms_short_intensity_roundtrip.rs`: `'11'` header + pure-short
+  side info, right-channel positions in range, a spec-order self-decode
+  with the below-bound 440 Hz MS pan reconstructing at 1.40 and the
+  hard-left 8 kHz intensity tone left-leaning, and a byte-deterministic
+  encode. The `intensity_rejects_block_type_toggles` unit test asserts
+  MS + short force-short acceptance.
 
 - encoder: **§2.4.3.4.9.3 short-block intensity stereo** (r303). The
   force-short toggle (`force_short_blocks_for_testing(true)`) is now

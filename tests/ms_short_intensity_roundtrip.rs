@@ -13,6 +13,14 @@
 //! window's short intensity bound in the §2.4.3.4.8 interleaved layout,
 //! while the bands at/above the bound stay intensity-coded.
 //!
+//! r306 lifts the rejection on the **auto-MS + intensity** force-short
+//! path ([`oxideav_mp3::Mp3Encoder::new_joint_stereo_auto_is`]): the
+//! §2.4.3.4.9.2 side-energy picker now scores the per-window short MS
+//! region (the contiguous `0..3*short_starts[short_start]` run for each
+//! granule's per-window bound) instead of the long-block bound line, so
+//! its per-frame `'01'` / `'11'` decision is measured on exactly the
+//! lines the rotation would touch.
+//!
 //! Covered end-to-end with in-tree primitives only:
 //!
 //! 1. **Header + side-info** — every audio frame carries `mode = '01'`
@@ -314,18 +322,105 @@ fn ms_short_intensity_encode_is_bit_exact() {
     assert_eq!(a, b, "two encodes of the same PCM must be byte-identical");
 }
 
-/// The MS-*auto* + short + intensity path stays rejected this round (its
-/// energy-fraction picker still evaluates over the long-block bound line,
-/// not the per-window short region).
+/// r306: the MS-*auto* + short + intensity path is accepted. The
+/// §2.4.3.4.9.2 side-energy picker now measures the per-window short MS
+/// region (the contiguous `0..3*short_starts[short_start]` run for each
+/// granule's per-window bound) rather than the long-block bound line,
+/// matching exactly the line set the MS rotation applies below each
+/// window's short intensity bound.
+fn encode_auto_short_is(pcm: &[i16], threshold: f64) -> Vec<u8> {
+    let mut enc = Mp3Encoder::new_joint_stereo_auto_is(BR, SR, START_SFB)
+        .expect("auto + intensity encoder")
+        .with_ms_auto_threshold(threshold);
+    enc.force_short_blocks_for_testing(true)
+        .expect("force-short on auto-MS + intensity encoder (r306)");
+    assert!(
+        enc.intensity_stereo_enabled()
+            && enc.ms_auto_threshold().is_some()
+            && enc.force_short_blocks_enabled()
+    );
+    enc.push_samples(pcm).expect("push pcm");
+    let mut out = Vec::new();
+    enc.finish(&mut out).expect("finish");
+    out
+}
+
 #[test]
-fn ms_auto_short_intensity_still_rejected() {
-    let mut enc =
-        Mp3Encoder::new_joint_stereo_auto_is(BR, SR, START_SFB).expect("auto + intensity encoder");
-    let err = enc
-        .force_short_blocks_for_testing(true)
-        .expect_err("MS-auto + short + intensity must stay rejected");
-    assert!(matches!(
-        err,
-        oxideav_mp3::StreamEncodeError::IntensityShortBlocksUnsupported
-    ));
+fn ms_auto_short_intensity_accepted_and_bit_exact() {
+    let pcm = two_tone_stereo_pcm(SR as usize / 4, false);
+    let a = encode_auto_short_is(&pcm, 0.5);
+    let b = encode_auto_short_is(&pcm, 0.5);
+    assert_eq!(a, b, "two encodes of the same PCM must be byte-identical");
+
+    // Every frame is joint stereo with the low intensity bit set; the
+    // high MS bit reflects the per-frame picker (the wire raw value is
+    // '01' when MS is declined, '11' when it fires).
+    let mut frames = 0usize;
+    for frame in FrameWalker::new(&a) {
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        assert!(matches!(hdr.mode, ChannelMode::JointStereo));
+        assert!(
+            hdr.mode_extension.intensity_stereo,
+            "intensity bit always set"
+        );
+        assert!(
+            matches!(hdr.mode_extension.raw, 0b01 | 0b11),
+            "auto picker emits '01' (intensity only) or '11' (MS + intensity), got {:#04b}",
+            hdr.mode_extension.raw
+        );
+        frames += 1;
+    }
+    assert!(frames > 0);
+}
+
+#[test]
+fn ms_auto_short_intensity_picker_fires_on_low_side_energy() {
+    // A below-bound, mostly-correlated low tone (mild L>R pan) keeps the
+    // per-window short MS region's side-energy fraction below 0.5, so the
+    // r306 picker — measuring that region — picks MS ('11') on the steady
+    // frames. A threshold of 0.5 is the default mono-favouring knob.
+    let pcm = two_tone_stereo_pcm(SR as usize, false);
+    let out = encode_auto_short_is(&pcm, 0.5);
+
+    let mut ms_frames = 0usize;
+    let mut total = 0usize;
+    for (idx, frame) in FrameWalker::new(&out).enumerate() {
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        if idx < 2 {
+            continue; // filterbank / reservoir warm-up
+        }
+        total += 1;
+        if hdr.mode_extension.ms_stereo {
+            ms_frames += 1;
+        }
+    }
+    assert!(total > 0);
+    assert!(
+        ms_frames > 0,
+        "low-side-energy short+intensity content should pick MS on at least one steady frame"
+    );
+}
+
+#[test]
+fn ms_auto_short_intensity_picker_declines_on_high_side_energy() {
+    // With the threshold pinned to 0 the picker accepts MS only when the
+    // per-window short MS region has *exactly* zero side energy. The mild
+    // L>R pan guarantees a non-zero side fraction, so every frame declines
+    // MS and emits '01' (intensity only) — proving the picker is reading a
+    // non-empty short region (a stale empty/long bound would have scored
+    // zero and wrongly picked MS).
+    let pcm = two_tone_stereo_pcm(SR as usize / 2, false);
+    let out = encode_auto_short_is(&pcm, 0.0);
+
+    for frame in FrameWalker::new(&out) {
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        assert!(
+            !hdr.mode_extension.ms_stereo,
+            "threshold 0 with non-zero short side energy must decline MS"
+        );
+        assert_eq!(
+            hdr.mode_extension.raw, 0b01,
+            "intensity-only mode_extension"
+        );
+    }
 }

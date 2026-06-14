@@ -1009,29 +1009,25 @@ impl Mp3Encoder {
     /// constraint because every (gr, ch) tile emits the same
     /// `BlockType::Short`.
     ///
+    /// Combining force-short with intensity stereo and the *auto*-MS
+    /// picker ([`Mp3Encoder::new_joint_stereo_auto_is`]) is supported:
+    /// the §2.4.3.4.9.2 side-energy picker measures the per-window short
+    /// MS region (the contiguous `0..3*short_starts[short_start]` run for
+    /// each granule's per-window bound), matching exactly the line set
+    /// the MS rotation applies below each window's short intensity bound.
+    ///
     /// # Errors
     ///
     /// Returns `Ok` for every channel layout this round; the
     /// previous round's [`StreamEncodeError::StereoUnsupported`]
     /// guard was dropped when the cross-channel-MS agreement wiring
-    /// landed (r163).
+    /// landed (r163), and the r306 picker-region fix dropped the
+    /// auto-MS + short + intensity [`StreamEncodeError::IntensityShortBlocksUnsupported`]
+    /// rejection.
     pub fn force_short_blocks_for_testing(
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
-        if enabled && self.intensity_start_sfb.is_some() && self.ms_auto_threshold.is_some() {
-            // Force-short intensity coupling is wired for the
-            // intensity-only path (`new_joint_stereo_is`, r303) and the
-            // unconditional MS + intensity path (`new_joint_stereo_ms_is`,
-            // r305): the §2.4.3.4.9.2 MS matrix now applies per window
-            // below each window's short bound in the §2.4.3.4.8
-            // interleaved layout. The *auto*-MS picker
-            // (`new_joint_stereo_auto_is`) still evaluates its
-            // side-energy fraction over the long-block bound line, not the
-            // per-window short region, so MS-auto + short + intensity
-            // stays rejected until that picker is taught the short layout.
-            return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
-        }
         if enabled {
             // Mixed and pure-short are mutually exclusive: a granule is
             // long, short, or mixed. Enabling pure-short clears mixed.
@@ -3683,13 +3679,43 @@ impl Mp3Encoder {
                 // below-bound lines only — the region the MS rotation
                 // would actually apply to (above the bound the right
                 // channel is already the coupled zero-part).
+                //
+                // The picker must measure the *same* line set the
+                // rotation (Pass 1.5 below) will touch, or it scores the
+                // decision on the wrong spectrum. Two intensity regimes:
+                //
+                //   * **Long / no-intensity:** the MS region is the
+                //     single contiguous run `0..ms_region_hi`
+                //     (`ms_region_hi == NUM_LINES` without intensity, the
+                //     long-block bound line with it). Frame-constant.
+                //   * **Short + intensity** (`short_intensity &&
+                //     intensity_active`): the §2.4.3.4.9.2 MS rotation
+                //     runs per window below each window's short bound, and
+                //     in the §2.4.3.4.8 interleaved layout that is exactly
+                //     the contiguous run `0..3*short_starts[short_start]`
+                //     for the granule's per-window bound `short_start`
+                //     (`short_intensity_start_per_gr[gr]`, set in Pass
+                //     1.45). The bound is *per granule*, so the upper line
+                //     is recomputed each granule rather than reused from
+                //     the long-derived `ms_region_hi`.
+                let short_starts_for_picker = if short_intensity && intensity_active {
+                    Some(short_band_starts_for(self.sample_rate_hz))
+                } else {
+                    None
+                };
                 let mut all_ok = true;
                 for gr in 0..ngr {
                     let left = &xr_pre_per_gc[gr][0];
                     let right = &xr_pre_per_gc[gr][1];
+                    let gr_region_hi = match short_starts_for_picker {
+                        Some(short_starts) => {
+                            (3 * short_starts[short_intensity_start_per_gr[gr]]).min(NUM_LINES)
+                        }
+                        None => ms_region_hi,
+                    };
                     let mut lr_energy = 0.0f64;
                     let mut side_energy_x2 = 0.0f64;
-                    for i in 0..ms_region_hi {
+                    for i in 0..gr_region_hi {
                         let l = f64::from(left[i]);
                         let r = f64::from(right[i]);
                         lr_energy += l * l + r * r;
@@ -6336,10 +6362,11 @@ mod tests {
     /// §2.4.3.4.9.2 per-window MS rotation below the short bound, so
     /// force-short on the unconditional MS + intensity path
     /// ([`Mp3Encoder::new_joint_stereo_ms_is`]) now succeeds too. The
-    /// mixed and auto-scheduled short paths (whose per-window bound
-    /// geometry isn't wired yet) and the MS-*auto* + short + intensity
-    /// combination (whose energy-fraction picker still reads the
-    /// long-block bound line) stay rejected.
+    /// r306 wired the §2.4.3.4.9.2 *auto*-MS picker over the per-window
+    /// short region, so force-short on the auto-MS + intensity path
+    /// ([`Mp3Encoder::new_joint_stereo_auto_is`]) now succeeds too. Only
+    /// the mixed and auto-scheduled short paths (whose per-window bound
+    /// geometry isn't wired yet) stay rejected.
     #[test]
     fn intensity_rejects_block_type_toggles() {
         // Force-short on the intensity-only path is accepted (r303).
@@ -6352,6 +6379,13 @@ mod tests {
         let mut ms_enc = Mp3Encoder::new_joint_stereo_ms_is(192, 44_100, 8).unwrap();
         assert!(ms_enc.force_short_blocks_for_testing(true).is_ok());
         assert!(ms_enc.force_short_blocks_enabled());
+
+        // Force-short on the auto-MS + intensity path is accepted (r306):
+        // the side-energy picker now measures the per-window short MS
+        // region.
+        let mut auto_enc = Mp3Encoder::new_joint_stereo_auto_is(192, 44_100, 8).unwrap();
+        assert!(auto_enc.force_short_blocks_for_testing(true).is_ok());
+        assert!(auto_enc.force_short_blocks_enabled());
 
         // Mixed + intensity and the auto-scheduled short paths remain
         // unsupported.
@@ -6366,15 +6400,6 @@ mod tests {
         ));
         assert!(matches!(
             enc.enable_auto_block_type_with_mixed(10.0, 4.0),
-            Err(StreamEncodeError::IntensityShortBlocksUnsupported)
-        ));
-
-        // MS-*auto* + short + intensity stays rejected (the energy
-        // picker still evaluates over the long-block bound line, not the
-        // per-window short region).
-        let mut auto_enc = Mp3Encoder::new_joint_stereo_auto_is(192, 44_100, 8).unwrap();
-        assert!(matches!(
-            auto_enc.force_short_blocks_for_testing(true),
             Err(StreamEncodeError::IntensityShortBlocksUnsupported)
         ));
 
