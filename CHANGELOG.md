@@ -6,6 +6,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- decoder: **§2.4.3.4.8 reorder restored to the trait decode path**
+  (r304). `Mp3CoreDecoder` (the registered `oxideav_core::Decoder`) ran
+  `requantize → process_stereo → alias_reduce → imdct_granule` with no
+  short-block reorder stage. Long blocks were unaffected (reorder is the
+  identity there), but short (`block_type == 2`) and mixed granules
+  reached the IMDCT and the joint-stereo short-block path still in the
+  native `(sfb, window, freqline)` Huffman interleave instead of the
+  expected subband-window-interleaved layout, so every short-block (and
+  mixed short-region) granule decoded to corrupt PCM through the trait
+  API, mono and stereo. `reorder` now runs between `requantize` and
+  `process_stereo`, matching the spec stage order and the proven direct
+  decode helpers. New lib regression test
+  `trait_decode_short_block_runs_reorder_and_is_not_silent` (force-short
+  stream, byte-exact vs the reordering direct chain + non-silent
+  witness); the `decoder_trait_lsf_roundtrip` reference helper, which had
+  the same omission against a short-block fixture, is corrected in the
+  same commit.
+
 ### Added
 
 - encoder: **§2.4.3.4.9.3 short-block intensity stereo** (r303). The

@@ -44,7 +44,7 @@ use oxideav_core::{
 };
 use oxideav_mp3::{
     alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, process_stereo, requantize, synth_granule, ChannelMode, FrameWalker,
+    parse_side_info, process_stereo, reorder, requantize, synth_granule, ChannelMode, FrameWalker,
     ImdctState, MainDataReader, MpegVersion, Reservoir, SynthState, PCM_PER_GRANULE,
 };
 
@@ -99,7 +99,11 @@ fn decode_stereo_direct(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
                 let is = decode_huffman(&mut r, gc, part3_bits, hdr.sample_rate_hz, hdr.version)
                     .expect("huffman");
                 let sf = &fsf.granules[gr][ch];
-                *xr_slot = requantize(&is, gc, sf, hdr.sample_rate_hz, hdr.version);
+                let xr = requantize(&is, gc, sf, hdr.sample_rate_hz, hdr.version);
+                // §2.4.3.4.8 reorder must run before §2.4.3.4.9 stereo and
+                // the §2.4.3.4.10 IMDCT for short / mixed granules; long
+                // granules pass through unchanged.
+                *xr_slot = reorder(&xr, gc, hdr.sample_rate_hz, hdr.version);
                 bit_cursor += gc.part2_3_length as usize;
             }
             if nch == 2 && hdr.mode == ChannelMode::JointStereo {

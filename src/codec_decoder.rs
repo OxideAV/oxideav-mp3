@@ -86,6 +86,7 @@ use crate::demuxer::{CODEC_ID_STR, WAVE_FORMAT_MP3};
 use crate::frame::{parse_header, Layer, Mp3FrameHeader, MpegVersion};
 use crate::huffman::decode_huffman;
 use crate::imdct::{imdct_granule, ImdctState};
+use crate::reorder::reorder;
 use crate::requantize::requantize;
 use crate::scalefactors::{decode_scalefactors, MainDataReader, Reservoir};
 use crate::side_info::parse_side_info;
@@ -327,7 +328,16 @@ impl Mp3CoreDecoder {
                 let is = decode_huffman(&mut r, gc, part3_bits, hdr.sample_rate_hz, hdr.version)
                     .map_err(|e| Error::other(format!("oxideav-mp3: huffman: {e:?}")))?;
                 let sf = &fsf.granules[gr][ch];
-                *xr_slot = requantize(&is, gc, sf, hdr.sample_rate_hz, hdr.version);
+                let xr = requantize(&is, gc, sf, hdr.sample_rate_hz, hdr.version);
+                // §2.4.3.4.8 reorder: short-block (and mixed short-region)
+                // lines leave requantize in the native `(sfb, window,
+                // freqline)` Huffman interleave and must be rewritten into
+                // subband-window-interleaved order before the §2.4.3.4.9
+                // stereo stage (whose intensity/MS short-block path indexes
+                // the reordered layout) and the §2.4.3.4.10 IMDCT (whose
+                // short-block path gathers `lines[3·k + win]`). Long blocks
+                // pass through unchanged.
+                *xr_slot = reorder(&xr, gc, hdr.sample_rate_hz, hdr.version);
                 bit_cursor += gc.part2_3_length as usize;
             }
 
@@ -492,6 +502,24 @@ mod tests {
         bytes
     }
 
+    /// Build an MP3 byte stream whose every granule is a `block_type == 2`
+    /// short block (via the encoder's force-short testing toggle), so the
+    /// decode path under test exercises the §2.4.3.4.8 reorder stage.
+    fn encode_to_mp3_short(pcm: &[i16], sample_rate: u32, bitrate_kbps: u32) -> Vec<u8> {
+        let mut enc = Mp3Encoder::new(
+            bitrate_kbps,
+            sample_rate,
+            crate::frame::ChannelMode::SingleChannel,
+        )
+        .expect("Mp3Encoder build");
+        enc.force_short_blocks_for_testing(true)
+            .expect("force-short toggle");
+        enc.push_samples(pcm).expect("push_samples");
+        let mut bytes: Vec<u8> = Vec::new();
+        enc.finish(&mut bytes).expect("finish");
+        bytes
+    }
+
     /// Synthesize a mono sine in i16.
     fn sine_pcm(n: usize, freq_hz: f32, sr: f32, amp: f32) -> Vec<i16> {
         let two_pi = 2.0 * PI;
@@ -560,6 +588,7 @@ mod tests {
                             .unwrap();
                     let sf = &fsf.granules[gr][ch];
                     let xr = requantize(&is, gc, sf, hdr.sample_rate_hz, hdr.version);
+                    let xr = reorder(&xr, gc, hdr.sample_rate_hz, hdr.version);
                     let xar = alias_reduce(&xr, gc);
                     let st = imdct_granule(&xar, gc, &mut imdct_state);
                     let pcm_f32 = synth_granule(&st, &mut synth_state);
@@ -692,6 +721,108 @@ mod tests {
         assert_eq!(
             mismatches, 0,
             "trait-driven decode differs from direct chain in {mismatches} samples"
+        );
+    }
+
+    #[test]
+    fn trait_decode_short_block_runs_reorder_and_is_not_silent() {
+        // Regression test for the missing §2.4.3.4.8 reorder stage in the
+        // trait decode path. Before the fix, `decode_packet` ran
+        // requantize → (stereo) → alias → imdct with NO reorder, so a
+        // short-block (`block_type == 2`) granule's frequency lines were
+        // still in the native `(sfb, window, freqline)` Huffman interleave
+        // when the IMDCT gathered `lines[3·k + win]` — reading the wrong
+        // samples and producing corrupt PCM. Forcing every granule to a
+        // short block (the encoder's force-short testing toggle) drives
+        // that path.
+        //
+        // Two assertions: (1) the trait decoder is byte-exact with the
+        // in-module `decode_direct` reference (which now also calls
+        // reorder), and (2) the reconstructed PCM is finite, non-silent,
+        // and crosses zero — a runaway / mis-gathered IMDCT would saturate
+        // the i16 clamp or collapse to silence.
+        const SR: u32 = 44_100;
+        let n = (SR as usize) / 4; // 250 ms
+        let pcm = sine_pcm(n, 440.0, SR as f32, 0.5);
+        let wire = encode_to_mp3_short(&pcm, SR, 192);
+        assert!(wire.len() > 100, "encoded short-block stream too small");
+
+        // Confirm the stream really is short-block coded (otherwise this
+        // test would silently pass on the long-block pass-through path).
+        let mut short_granules = 0usize;
+        for frame in crate::frame::FrameWalker::new(&wire) {
+            let hdr = parse_header(&frame.data[..4]).unwrap();
+            let si = parse_side_info(&hdr, &frame.data[4..]).unwrap();
+            for gr in 0..si.granule_count as usize {
+                for ch in 0..si.channels as usize {
+                    let gc = &si.granules[gr][ch];
+                    if gc.window_switching_flag
+                        && gc.block_type == crate::side_info::BlockType::Short
+                    {
+                        short_granules += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            short_granules > 0,
+            "force-short stream carried no short-block granules"
+        );
+
+        let direct = decode_direct(&wire);
+
+        let mut dec = make_decoder(&build_decoder_params(SR)).expect("make_decoder");
+        let mut trait_out: Vec<i16> = Vec::new();
+        for pkt in mp3_to_packets(&wire, SR) {
+            dec.send_packet(&pkt).expect("send_packet");
+            loop {
+                match dec.receive_frame() {
+                    Ok(Frame::Audio(a)) => {
+                        for chunk in a.data[0].chunks_exact(2) {
+                            trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                        }
+                    }
+                    Ok(other) => panic!("non-audio frame: {other:?}"),
+                    Err(Error::NeedMore) => break,
+                    Err(e) => panic!("receive_frame: {e}"),
+                }
+            }
+        }
+
+        assert_eq!(
+            trait_out.len(),
+            direct.len(),
+            "short-block trait sample count {} != direct-chain {}",
+            trait_out.len(),
+            direct.len()
+        );
+        let mismatches = trait_out
+            .iter()
+            .zip(direct.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "short-block trait decode differs from direct chain in {mismatches} samples"
+        );
+
+        // Non-silent / finite / zero-crossing witness.
+        let energy: f64 = trait_out
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum::<f64>()
+            / trait_out.len().max(1) as f64;
+        assert!(
+            energy.is_finite() && energy > 0.0,
+            "short-block decode produced zero / non-finite energy ({energy})"
+        );
+        let zero_crossings = trait_out
+            .windows(2)
+            .filter(|w| (w[0] >= 0) != (w[1] >= 0))
+            .count();
+        assert!(
+            zero_crossings > 10,
+            "short-block decode had too few zero crossings ({zero_crossings})"
         );
     }
 

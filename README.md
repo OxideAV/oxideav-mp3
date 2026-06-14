@@ -841,8 +841,9 @@ The `codec_decoder` module ships the **symmetric** decoder-side
 trait wiring. `Mp3CoreDecoder` implements `oxideav_core::Decoder`:
 `send_packet` parses one inbound MP3 frame (header + optional CRC +
 side-info + main-data slot), runs the per-granule
-`decode_huffman` → `requantize` → `process_stereo` (joint granules
-only) → `alias_reduce` → `imdct_granule` → `synth_granule` chain,
+`decode_huffman` → `requantize` → `reorder` (§2.4.3.4.8) →
+`process_stereo` (joint granules only) → `alias_reduce` →
+`imdct_granule` → `synth_granule` chain,
 and queues an `AudioFrame` of planar S16 PCM (1152 samples/channel
 for MPEG-1 Layer III; one plane per channel — `data[0]` = L,
 `data[1]` = R for stereo, single plane for mono). Per-stream state —
@@ -892,6 +893,35 @@ existing `choose_region_split` produces. Seven new lib tests
 band-aligned-vs-default self-consistency on a long block, and
 short-block fallback equivalence). Spec read: SUBDIVIDE text on PDF
 page 104 (§C.1.5.4.4.6).
+
+**Round 304 (§2.4.3.4.8 reorder restored to the trait decode path —
+short-block decode fix).** The `Mp3CoreDecoder` trait wrapper
+(`codec_decoder::decode_packet`) was running
+`requantize → process_stereo → alias_reduce → imdct_granule` with **no
+§2.4.3.4.8 `reorder` call**. For a long block that is harmless (long
+blocks are already increasing-frequency-ordered and `reorder` is the
+identity), but a short (`block_type == 2`) or mixed granule leaves
+`requantize` in the native `(sfb, window, freqline)` Huffman interleave,
+while `imdct_granule`'s short path gathers `lines[3·k + win]` (the
+subband-window-interleaved layout) and `process_stereo`'s short
+intensity/MS path indexes `base + 3·k + win` — both reading the wrong
+samples, so every short-block (and mixed-block short-region) granule
+decoded to corrupt PCM through the registered `Decoder` trait, mono and
+stereo alike. r304 inserts `reorder` between `requantize` and
+`process_stereo` (the spec order — §2.4.3.4.8 precedes the §2.4.3.4.9
+stereo stage, whose own short-block path already assumes reordered
+input), matching the proven `decode_mp3_mono_short_aware` helper in
+`short_block_encoder_roundtrip`. New lib test
+`trait_decode_short_block_runs_reorder_and_is_not_silent`: a force-short
+mono stream (every granule `block_type == 2`, asserted on the wire)
+decoded through the trait API is byte-exact against the in-module
+`decode_direct` reference (now also reordering) **and** yields finite,
+non-silent, zero-crossing PCM. The standing `decoder_trait_lsf_roundtrip`
+reference helper was missing the same stage — its fixture carries short
+blocks — so it is corrected in the same commit (the trait decoder is now
+the spec-correct side). Spec read: ISO/IEC 11172-3 §2.4.3.4.8 (short
+reorder), §2.4.3.4.9 (stereo runs after reorder), §2.4.3.4.10
+(IMDCT consumes subband-ordered lines).
 
 **Round 303 (§2.4.3.4.9.3 short-block intensity stereo, per-window
 bound).** Every intensity constructor before this round was long-block
