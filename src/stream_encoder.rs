@@ -734,13 +734,22 @@ pub struct Mp3Encoder {
     /// decoded sample — are bit-identical; only the part2 scalefactor
     /// bits of granule 1 shrink.
     ///
-    /// Default `false`: every emitted frame carries `scfsi = 0`
-    /// throughout, byte-for-byte as in every previous round. Armed via
-    /// [`Self::enable_scfsi_reuse`]. The optimisation never fires on
-    /// LSF (MPEG-2 / MPEG-2.5 have no scfsi field and one granule) nor
-    /// on any channel whose either granule is a short block (§2.4.2.7:
-    /// "if short windows are switched on … then scfsi is always 0 for
-    /// this frame").
+    /// **Default `true` as of r301: scfsi reuse is auto-armed.** Because
+    /// the detection is byte-exact (a group is marked only when the two
+    /// granules' scalefactors already agree across every band in it) and
+    /// the decoder reconstructs granule 0's values for a marked group,
+    /// auto-arming is lossless by construction: the reconstructed PCM is
+    /// identical to the historical `scfsi = 0` output while granule 1's
+    /// part2 budget shrinks wherever consecutive granules naturally share
+    /// scalefactors. The optimisation never fires on LSF (MPEG-2 /
+    /// MPEG-2.5 have no scfsi field and one granule) nor on any channel
+    /// whose either granule is a short block (§2.4.2.7: "if short windows
+    /// are switched on … then scfsi is always 0 for this frame").
+    ///
+    /// [`Self::disable_scfsi_reuse`] forces the historical
+    /// byte-for-byte `scfsi = 0` output back on; [`Self::enable_scfsi_reuse`]
+    /// is retained (now a no-op on a fresh encoder) for callers that
+    /// re-arm after an explicit disable.
     scfsi_reuse: bool,
 }
 
@@ -910,7 +919,7 @@ impl Mp3Encoder {
             model2_psy: None,
             last_model2_switch: None,
             model2_block_type: None,
-            scfsi_reuse: false,
+            scfsi_reuse: true,
         })
     }
 
@@ -2164,17 +2173,33 @@ impl Mp3Encoder {
     /// granule keeps `scfsi[ch] = 0` and transmits both granules in
     /// full.
     ///
-    /// Default off: without this call every emitted frame carries
-    /// `scfsi = 0` throughout, byte-for-byte as in every previous
-    /// round. The flag is a no-op on LSF (MPEG-2 / MPEG-2.5) frames,
-    /// which have a single granule and no scfsi field.
+    /// **Auto-armed as of r301:** a freshly constructed encoder already
+    /// has scfsi reuse on (the detection is byte-exact and the saving is
+    /// lossless, so there is no reason to leave it off). This method
+    /// re-arms reuse after a prior [`Self::disable_scfsi_reuse`] call; on
+    /// a default encoder it is a no-op. The flag is a no-op on LSF
+    /// (MPEG-2 / MPEG-2.5) frames, which have a single granule and no
+    /// scfsi field.
     pub fn enable_scfsi_reuse(&mut self) {
         self.scfsi_reuse = true;
     }
 
-    /// `true` when [`Self::enable_scfsi_reuse`] has armed §C.1.5.3
-    /// scalefactor-selection-information reuse — used by integration
-    /// tests / observability.
+    /// Disarm §C.1.5.3 scalefactor-selection-information (scfsi) reuse.
+    ///
+    /// Forces every emitted MPEG-1 frame back to `scfsi = 0` throughout,
+    /// reproducing the byte-for-byte pre-r301 output (granule 1 always
+    /// retransmits its full part2 scalefactor block). This is purely a
+    /// compatibility / regression-bisection escape hatch — the
+    /// auto-armed default is lossless, so disabling it only enlarges the
+    /// stream. No-op on LSF, which never carried scfsi.
+    pub fn disable_scfsi_reuse(&mut self) {
+        self.scfsi_reuse = false;
+    }
+
+    /// `true` when §C.1.5.3 scalefactor-selection-information reuse is
+    /// armed (the auto-armed default; cleared by
+    /// [`Self::disable_scfsi_reuse`]) — used by integration tests /
+    /// observability.
     #[must_use]
     pub fn scfsi_reuse_enabled(&self) -> bool {
         self.scfsi_reuse
@@ -4181,8 +4206,9 @@ impl Mp3Encoder {
         // for reuse. The §2.4.2.7 write path skips a reused group in
         // granule 1; the decoder reproduces granule 0's values there,
         // so the reconstructed scalefactors are bit-identical and only
-        // the part2 bit count shrinks. Default-off: untouched
-        // (`scfsi == 0` everywhere) unless `enable_scfsi_reuse` armed.
+        // the part2 bit count shrinks. Auto-armed by default (r301);
+        // `disable_scfsi_reuse` clears `self.scfsi_reuse` to restore the
+        // historical `scfsi == 0` output.
         if self.scfsi_reuse && !self.version.is_lsf() && ngr == 2 {
             for ch in 0..self.nch {
                 side_info.scfsi[ch] = compute_scfsi_reuse(
@@ -6778,10 +6804,17 @@ mod tests {
     }
 
     #[test]
-    fn scfsi_reuse_disabled_by_default_armed_by_toggle() {
-        let enc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+    fn scfsi_reuse_auto_armed_by_default_disarmed_by_toggle() {
+        // r301: scfsi reuse is on out of the box (auto-armed in
+        // `push_samples`). `disable_scfsi_reuse` restores the historical
+        // `scfsi = 0` output, and `enable_scfsi_reuse` re-arms.
+        let mut enc = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        assert!(
+            enc.scfsi_reuse_enabled(),
+            "scfsi reuse must be auto-armed by default as of r301"
+        );
+        enc.disable_scfsi_reuse();
         assert!(!enc.scfsi_reuse_enabled());
-        let mut enc = enc;
         enc.enable_scfsi_reuse();
         assert!(enc.scfsi_reuse_enabled());
     }

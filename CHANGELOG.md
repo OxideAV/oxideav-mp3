@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§C.1.5.3 scfsi reuse auto-armed inside `push_samples`**
+  (r301). r296 added `Mp3Encoder::enable_scfsi_reuse()` as an opt-in
+  post-quantization pass that marks, per channel, every long-block
+  scfsi_band group whose granule-1 scalefactors are byte-identical to
+  granule 0's so they are transmitted once instead of twice. This round
+  flips it on by default: a freshly constructed `Mp3Encoder` (every
+  constructor funnels through `new`) now emits scfsi automatically. The
+  detection is byte-exact and the decoder reconstructs granule 0's values
+  for a marked group, so auto-arming is lossless by construction — the
+  reconstructed PCM is identical to the historical `scfsi = 0` output
+  while granule 1's part2 budget shrinks wherever consecutive granules
+  naturally share scalefactors. The optimisation still never fires on LSF
+  (one granule, no scfsi field) nor on a channel with a short granule
+  (§2.4.2.7). New `Mp3Encoder::disable_scfsi_reuse()` restores the
+  pre-r301 byte-for-byte `scfsi = 0` stream (compatibility /
+  regression-bisection escape hatch); `enable_scfsi_reuse()` is retained
+  to re-arm after an explicit disable. The renamed lib test
+  `scfsi_reuse_auto_armed_by_default_disarmed_by_toggle` asserts
+  default-on / `disable` clears / `enable` re-arms; a new integration
+  test `scfsi_auto_armed_by_default_sets_reuse_flags` confirms a default
+  encoder sets scfsi on a steady tone, never grows the stream vs.
+  disarmed, and decodes sample-for-sample identical. The intensity-stereo
+  roundtrip decoder's hand-rolled part2 skip is now scfsi-aware. Full
+  suite green; every self-decode test reconstructs bit-exactly. Spec
+  read: §2.4.2.7 / §C.1.5.3.
+
 - encoder: **§C.1.5.4.4 band-aligned bit-budget search wired into the
   outer (distortion-control) loop** (r300). r299 swapped the fixed-gain
   CBR path to `search_bit_budget_band_aligned` but left the §C.1.5.4.3

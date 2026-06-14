@@ -893,6 +893,37 @@ band-aligned-vs-default self-consistency on a long block, and
 short-block fallback equivalence). Spec read: SUBDIVIDE text on PDF
 page 104 (§C.1.5.4.4.6).
 
+**Round 301 (§C.1.5.3 scfsi reuse auto-armed inside `push_samples`).**
+r296 added `Mp3Encoder::enable_scfsi_reuse()` as an opt-in
+post-quantization pass; this round flips it on by default. Because the
+detection is byte-exact (a scfsi_band group is marked only when the two
+granules' scalefactors already agree across every band in it) and the
+decoder reconstructs granule 0's values for a marked group, auto-arming
+is lossless by construction: the reconstructed PCM is identical to the
+historical `scfsi = 0` output while granule 1's part2 budget shrinks
+wherever consecutive granules naturally share scalefactors. A fresh
+`Mp3Encoder` (every constructor funnels through `new`, so the auto-arm
+covers single-channel / stereo / dual / all four joint-stereo
+constructors / the outer-loop and threshold-in-quiet builders) now emits
+scfsi automatically; the new `Mp3Encoder::disable_scfsi_reuse()` restores
+the pre-r301 byte-for-byte `scfsi = 0` stream as a
+compatibility / regression-bisection escape hatch, and
+`enable_scfsi_reuse()` is retained to re-arm after an explicit disable.
+The optimisation still never fires on LSF (MPEG-2 / MPEG-2.5 have one
+granule and no scfsi field) nor on any channel whose either granule is a
+short block (§2.4.2.7). One lib test renamed + extended
+(`scfsi_reuse_auto_armed_by_default_disarmed_by_toggle`: default-on,
+`disable` clears, `enable` re-arms); `tests/scfsi_reuse_roundtrip.rs`
+gains `scfsi_auto_armed_by_default_sets_reuse_flags` (a default encoder
+sets scfsi on a steady tone, never grows the stream vs. disarmed, and
+decodes sample-for-sample identical) and routes its disarmed baselines
+through `disable_scfsi_reuse()`. The intensity-stereo roundtrip decoder's
+hand-rolled part2 skip is now scfsi-aware (its old "the only shape the
+intensity encoder emits is no-scfsi" premise no longer holds once reuse
+is auto-armed). Full suite green (1086 lib + integration); every
+self-decode test still reconstructs bit-exactly. Spec read: §2.4.2.7 /
+§C.1.5.3, ISO/IEC 11172-3 body PDF.
+
 **Round 300 (§C.1.5.4.4 band-aligned bit-budget search wired into the
 outer (distortion-control) loop).** r299 swapped the fixed-gain CBR path
 to `search_bit_budget_band_aligned` but explicitly left the §C.1.5.4.3
@@ -1008,9 +1039,9 @@ short-granule-disqualification / default-off-armed-by-toggle) plus a new
 armed fixed-gain encode sets reuse on long-block frames, armed-vs-
 disarmed decode is bit-identical on both the fixed-gain and outer-loop
 paths, and the armed outer-loop encode strictly shrinks granule-1's
-summed part2_3 budget without growing the CBR stream. It still lacks
-auto-arming inside `push_samples` (the reuse is opt-in via the explicit
-toggle this round).
+summed part2_3 budget without growing the CBR stream. (Auto-arming
+inside `push_samples` — the reuse default-on rather than opt-in — landed
+in r301; see above.)
 
 **Round 295 (Phase 2 step 92 — §C.1.5.3.2.1 Model-2-driven auto
 block-type path).** r294 captured the per-granule Model 2 `pe > 1800`

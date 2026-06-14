@@ -198,19 +198,68 @@ fn count_scfsi_bits(bytes: &[u8]) -> (usize, usize) {
 
 #[test]
 fn scfsi_disarmed_emits_no_reuse_flags() {
-    // Without arming, every frame carries scfsi = 0 — byte-for-byte the
-    // historical default.
+    // r301: scfsi reuse is auto-armed by default, so the historical
+    // byte-for-byte `scfsi = 0` output now requires an explicit
+    // `disable_scfsi_reuse()`. With reuse disarmed, every frame carries
+    // scfsi = 0.
     let pcm = sine_pcm(PCM_LEN_SAMPLES, 440.0, 0.5);
     let bytes = encode_with(
-        || Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("encoder build"),
+        || {
+            let mut e = Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("encoder build");
+            e.disable_scfsi_reuse();
+            e
+        },
         &pcm,
     );
     let (frames_with_reuse, total_set) = count_scfsi_bits(&bytes);
     assert_eq!(
         frames_with_reuse, 0,
-        "default encode must not set any scfsi"
+        "disarmed encode must not set any scfsi"
     );
     assert_eq!(total_set, 0);
+}
+
+#[test]
+fn scfsi_auto_armed_by_default_sets_reuse_flags() {
+    // r301: a default encoder (no explicit toggle) auto-arms scfsi reuse
+    // inside `push_samples`. A steady tone whose granules frequently share
+    // scalefactors must therefore set scfsi on at least one frame, and the
+    // default stream must never be larger than the explicitly-disarmed one.
+    let pcm = sine_pcm(PCM_LEN_SAMPLES, 440.0, 0.5);
+    let default_stream = encode_with(
+        || Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("encoder build"),
+        &pcm,
+    );
+    let disarmed = encode_with(
+        || {
+            let mut e = Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("encoder build");
+            e.disable_scfsi_reuse();
+            e
+        },
+        &pcm,
+    );
+    let (frames_with_reuse, total_set) = count_scfsi_bits(&default_stream);
+    assert!(
+        frames_with_reuse > 0,
+        "default encode auto-armed no scfsi reuse on a steady tone"
+    );
+    assert!(total_set >= frames_with_reuse);
+    assert!(
+        default_stream.len() <= disarmed.len(),
+        "auto-armed default stream grew vs. disarmed: {} > {}",
+        default_stream.len(),
+        disarmed.len()
+    );
+
+    // Lossless: the auto-armed default decodes sample-for-sample like the
+    // explicitly-disarmed encode.
+    let recon_default = decode_mp3_mono(&default_stream);
+    let recon_disarmed = decode_mp3_mono(&disarmed);
+    assert_eq!(recon_default.len(), recon_disarmed.len());
+    assert!(
+        recon_default == recon_disarmed,
+        "auto-armed scfsi reuse changed the decoded PCM"
+    );
 }
 
 #[test]
@@ -244,7 +293,11 @@ fn scfsi_armed_decode_is_bit_identical_to_disarmed() {
     // a single decoded sample.
     let pcm = sine_pcm(PCM_LEN_SAMPLES, 440.0, 0.5);
     let disarmed = encode_with(
-        || Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("encoder build"),
+        || {
+            let mut e = Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("encoder build");
+            e.disable_scfsi_reuse();
+            e
+        },
         &pcm,
     );
     let armed = encode_with(
@@ -277,13 +330,15 @@ fn scfsi_armed_outer_loop_decode_is_bit_identical() {
     let pcm = sine_pcm(PCM_LEN_SAMPLES, 1234.0, 0.6);
     let disarmed = encode_with(
         || {
-            Mp3Encoder::new_with_outer_loop(
+            let mut e = Mp3Encoder::new_with_outer_loop(
                 BR,
                 SR,
                 ChannelMode::SingleChannel,
                 oxideav_mp3::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD,
             )
-            .expect("encoder build")
+            .expect("encoder build");
+            e.disable_scfsi_reuse();
+            e
         },
         &pcm,
     );
@@ -336,13 +391,15 @@ fn scfsi_reuse_shrinks_granule1_part2_on_outer_loop() {
     let pcm = sine_pcm(PCM_LEN_SAMPLES, 440.0, 0.5);
     let disarmed = encode_with(
         || {
-            Mp3Encoder::new_with_outer_loop(
+            let mut e = Mp3Encoder::new_with_outer_loop(
                 BR,
                 SR,
                 ChannelMode::SingleChannel,
                 oxideav_mp3::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD,
             )
-            .expect("encoder build")
+            .expect("encoder build");
+            e.disable_scfsi_reuse();
+            e
         },
         &pcm,
     );

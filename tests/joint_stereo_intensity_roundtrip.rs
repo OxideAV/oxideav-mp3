@@ -42,15 +42,36 @@ use oxideav_mp3::{
 };
 
 /// Part2 (scalefactor) bit count of one MPEG-1 **long-block** granule
-/// channel with no scfsi reuse (the only shape the intensity encoder
-/// emits): 11 bands at `slen1` + 10 bands at `slen2` per §2.4.2.7. The
-/// intensity streams carry `scalefac_compress = 15` on the right
-/// channel (the positions need ≥ 3 bits per band), so — unlike the
-/// zero-part2 MS-test streams — the Huffman reader must skip past the
-/// scalefactor bits and the part3 budget must exclude them.
-fn mpeg1_long_part2_bits(scalefac_compress: u16) -> usize {
+/// channel, honouring §2.4.2.7 scfsi reuse. Bands 0..=10 carry `slen1`
+/// bits and bands 11..=20 carry `slen2` bits; for granule 1, any of the
+/// four scfsi_band groups (`{0..6}`, `{6..11}`, `{11..16}`, `{16..21}`)
+/// whose `scfsi` flag is set is *not* retransmitted, so its bands
+/// contribute zero bits. The intensity streams carry
+/// `scalefac_compress = 15` on the right channel (the positions need ≥ 3
+/// bits per band), so — unlike the zero-part2 MS-test streams — the
+/// Huffman reader must skip past the scalefactor bits and the part3
+/// budget must exclude them.
+///
+/// As of r301 the encoder auto-arms scfsi reuse, so an intensity frame's
+/// long-block channels may share a group between granules; this counter
+/// must therefore match the scfsi-aware part2 the encoder actually wrote
+/// or the part3 skip desyncs.
+fn mpeg1_long_part2_bits(scalefac_compress: u16, scfsi: &[bool; 4], gr: usize) -> usize {
     let (slen1, slen2) = MPEG1_SLEN[(scalefac_compress & 0xF) as usize];
-    11 * slen1 as usize + 10 * slen2 as usize
+    // (group bands, slen index): groups span bands {0..6}, {6..11},
+    // {11..16}, {16..21}; slen1 covers bands 0..=10, slen2 bands 11..=20.
+    const GROUPS: [(usize, usize); 4] = [(0, 6), (6, 11), (11, 16), (16, 21)];
+    let mut bits = 0usize;
+    for (g, &(lo, hi)) in GROUPS.iter().enumerate() {
+        if gr == 1 && scfsi[g] {
+            continue; // reused from granule 0 — not on the wire.
+        }
+        for sfb in lo..hi {
+            let slen = if sfb <= 10 { slen1 } else { slen2 };
+            bits += slen as usize;
+        }
+    }
+    bits
 }
 
 const SR: u32 = 44_100;
@@ -143,7 +164,7 @@ fn decode_mp3_stereo(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
                 let gc = &si.granules[gr][ch];
                 // Position the reader at the first huffmancodebits()
                 // bit: past the previous tiles plus this tile's part2.
-                let part2_bits = mpeg1_long_part2_bits(gc.scalefac_compress);
+                let part2_bits = mpeg1_long_part2_bits(gc.scalefac_compress, &si.scfsi[ch], gr);
                 let mut r = MainDataReader::new(&run);
                 let mut left = bit_cursor + part2_bits;
                 while left >= 32 {
@@ -301,7 +322,7 @@ fn intensity_right_channel_scalefactors_carry_positions() {
             let mut right_is = [0i32; NUM_LINES];
             for ch in 0..2usize {
                 let gc = &si.granules[gr][ch];
-                let part2_bits = mpeg1_long_part2_bits(gc.scalefac_compress);
+                let part2_bits = mpeg1_long_part2_bits(gc.scalefac_compress, &si.scfsi[ch], gr);
                 let mut r = MainDataReader::new(&run);
                 let mut skip = bit_cursor + part2_bits;
                 while skip >= 32 {
@@ -415,7 +436,7 @@ fn intensity_marker_seven_fills_silent_below_bound_bands() {
             let mut right_is = [0i32; NUM_LINES];
             for ch in 0..2usize {
                 let gc = &si.granules[gr][ch];
-                let part2_bits = mpeg1_long_part2_bits(gc.scalefac_compress);
+                let part2_bits = mpeg1_long_part2_bits(gc.scalefac_compress, &si.scfsi[ch], gr);
                 let mut r = MainDataReader::new(&run);
                 let mut skip = bit_cursor + part2_bits;
                 while skip >= 32 {
