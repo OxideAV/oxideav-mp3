@@ -28,6 +28,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§2.4.3.4.9 auto-block-type-scheduled short granules with
+  MS-joint intensity stereo** (r307). `enable_auto_block_type` is now
+  accepted on an MS-joint intensity encoder
+  (`new_joint_stereo_ms_is` / `new_joint_stereo_auto_is`) — previously
+  rejected with `IntensityShortBlocksUnsupported`. The §C.1.5.2 attack
+  scheduler emits a *mix* of Long / Start / Short / End granules within
+  one stream; the intensity coupling is now chosen **per granule** rather
+  than per frame. A granule the scheduler emits as a **pure short** block
+  takes the §2.4.3.4.9.3 per-window short coupling (the r303/r305
+  machinery, now keyed on `block_type_per_gc[gr][0]` instead of the
+  frame-wide `force_short_blocks`); Long / Start / End granules take the
+  long-block band-walk coupling. The Pass 1.5 MS picker and rotation pick
+  their region per granule the same way. MS-joint stereo mirrors one
+  shared scheduler emission across both channels, so the §2.4.3.4.9
+  channel agreement intensity coupling needs (it folds each granule's
+  `(L, R)` band-by-band) holds by construction. **Still rejected:** the
+  *intensity-only* auto path (no MS — independent per-channel scheduling
+  may diverge L/R block types), mixed-block intensity
+  (`enable_auto_block_type_with_mixed`, the §2.4.3.4.10.3 carve-out bound
+  is not wired), and the Model-2-driven auto path under intensity. New
+  `tests/auto_block_type_intensity_roundtrip.rs` (5 tests): API
+  acceptance/rejection matrix, a transient stimulus that drives the
+  scheduler into both long-family AND pure-short granules (with §2.4.3.4.9
+  per-granule channel-agreement assertions), per-window short scalefactor
+  positions in range, a hard-left intensity-region tone reconstructing
+  left-leaning through a spec-order self-decode, and byte-deterministic
+  encode. The `intensity_rejects_block_type_toggles` unit test now
+  asserts auto + MS + intensity acceptance and intensity-only-auto
+  rejection.
+
 - encoder: **§2.4.3.4.9.2 MS-*auto* picker over the per-window short
   intensity region** (r306). The force-short toggle
   (`force_short_blocks_for_testing(true)`) is now accepted on the

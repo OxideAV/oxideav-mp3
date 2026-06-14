@@ -203,12 +203,18 @@ pub enum StreamEncodeError {
         /// The rejected start band.
         start_sfb: usize,
     },
-    /// A short-block / mixed-block / auto-block-type toggle was
-    /// requested on an encoder with intensity-stereo coupling armed.
-    /// The intensity encode path is long-block only this round: the
-    /// short-window intensity bound is per window (each window has its
-    /// own zero-part), which needs the per-window `is_pos` derivation
-    /// from `scalefac_s` — deferred to a follow-up.
+    /// A block-type toggle that the intensity-stereo encode path does
+    /// not yet support was requested on an encoder with intensity
+    /// coupling armed. Supported as of r307: force-short and force-mixed
+    /// short coupling (r303 / r305 / r306), and signal-driven
+    /// `enable_auto_block_type` scheduling **when MS-joint stereo is also
+    /// armed** (the §2.4.3.4.9 channel agreement that intensity coupling
+    /// needs holds by construction). Still rejected: the *intensity-only*
+    /// auto path (no MS — independent per-channel block-type scheduling
+    /// may diverge L/R, breaking the per-band fold geometry), the
+    /// mixed-promotion auto variant (`enable_auto_block_type_with_mixed`
+    /// — the §2.4.3.4.10.3 carve-out bound is unwired), and the
+    /// Model-2-driven auto path under intensity.
     IntensityShortBlocksUnsupported,
     /// [`Mp3Encoder::set_per_band_xmin_from_model2`] was called with a
     /// granule whose length is not `SAMPLES_PER_GRANULE` (576), or on an
@@ -265,7 +271,7 @@ impl core::fmt::Display for StreamEncodeError {
                 "intensity-stereo start band {start_sfb} out of range (must be 1..=20: at least one normal band below the bound and one intensity band at or above it)"
             ),
             StreamEncodeError::IntensityShortBlocksUnsupported => f.write_str(
-                "intensity-stereo encode is long-block only this round (short / mixed / auto block-type toggles are unavailable while intensity coupling is armed)",
+                "this block-type toggle is not supported with intensity-stereo coupling armed (intensity-only auto block-type, mixed-promotion auto, and Model-2-driven auto remain unavailable; force-short / force-mixed and MS-joint auto block-type are supported)",
             ),
             StreamEncodeError::Model2AnalysisUnsupported { sample_rate_hz } => {
                 if *sample_rate_hz == 0 {
@@ -1077,8 +1083,11 @@ impl Mp3Encoder {
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
         if enabled && self.intensity_start_sfb.is_some() {
-            // See `force_short_blocks_for_testing` — the intensity
-            // path is long-block only this round.
+            // Mixed-block intensity coupling is not wired: the
+            // §2.4.3.4.10.3 carve-out (long lowest subbands + short rest)
+            // needs a two-region intensity bound this round does not
+            // derive. Force-short and MS-joint auto short coupling are
+            // supported (r303 / r305 / r307); mixed stays rejected.
             return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
         }
         if enabled {
@@ -1148,9 +1157,22 @@ impl Mp3Encoder {
     ///
     /// # Errors
     ///
-    /// Returns `Ok` for every channel layout this round; the
-    /// previous round's [`StreamEncodeError::StereoUnsupported`]
-    /// guard was dropped in r163.
+    /// * [`StreamEncodeError::IntensityShortBlocksUnsupported`] —
+    ///   intensity-stereo coupling is armed **without** MS-joint stereo
+    ///   (a plain [`Mp3Encoder::new_joint_stereo_is`] encoder). The auto
+    ///   scheduler runs an independent state machine per channel, so the
+    ///   per-granule block types may diverge between L and R; intensity
+    ///   coupling folds each granule's `(L, R)` band-by-band and needs
+    ///   both channels to share window geometry (§2.4.3.4.9). r307 lifts
+    ///   the rejection when MS-joint stereo is also armed
+    ///   ([`Mp3Encoder::new_joint_stereo_ms_is`] /
+    ///   [`Mp3Encoder::new_joint_stereo_auto_is`]): MS-agreement mirrors
+    ///   one shared scheduler emission across both channels, so each
+    ///   granule's Short / Long intensity coupling is channel-consistent.
+    ///
+    /// Otherwise returns `Ok` for every channel layout; the previous
+    /// round's [`StreamEncodeError::StereoUnsupported`] guard was dropped
+    /// in r163.
     ///
     /// As of r287 the auto block-type scheduler is **version-agnostic**:
     /// the §C.1.5.2 walk in `assemble_frame_with_lookahead` steps the
@@ -1165,10 +1187,19 @@ impl Mp3Encoder {
     /// scheduler step per frame and the next frame's single granule as
     /// the §C.1.5.2 lookahead.
     pub fn enable_auto_block_type(&mut self, threshold: f64) -> Result<(), StreamEncodeError> {
-        if self.intensity_start_sfb.is_some() {
-            // Intensity coupling is long-block only this round; the
-            // auto scheduler emits Start / Short / End granules whose
-            // per-window intensity bound is not wired yet.
+        if self.intensity_start_sfb.is_some() && !self.ms_joint_stereo_active() {
+            // Auto block-type under intensity coupling is supported only
+            // when MS-joint stereo is also armed (r307). Intensity
+            // coupling folds each granule's `(L, R)` band-by-band, which
+            // requires both channels to share window geometry
+            // (§2.4.3.4.9 channel agreement); MS-joint
+            // (`new_joint_stereo_ms` / `new_joint_stereo_auto`) mirrors
+            // one shared scheduler emission across both channels, so the
+            // agreement holds by construction and every Short granule
+            // takes the §2.4.3.4.9.3 per-window short coupling. Plain
+            // intensity stereo (no MS) runs an independent scheduler per
+            // channel, so the per-granule block types may diverge between
+            // L and R — that case stays rejected.
             return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
         }
         // Outer loop is now compatible with auto block-type for every
@@ -1268,6 +1299,16 @@ impl Mp3Encoder {
         attack_threshold: f64,
         mixed_low_band_stability: f64,
     ) -> Result<(), StreamEncodeError> {
+        // Mixed-block intensity coupling is not wired (the §2.4.3.4.10.3
+        // mixed carve-out's long-lowest-subbands + short-rest split needs
+        // a two-region intensity bound that this round does not derive).
+        // r307 lifted the rejection on the *pure-short* auto path under
+        // MS-joint stereo, but the mixed-promotion variant stays rejected
+        // when intensity is armed — guard before the plain path would
+        // accept it.
+        if self.intensity_start_sfb.is_some() {
+            return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
+        }
         // Reuse the plain path for detector / scheduler construction
         // + the MS-stereo reject + force-toggle clearing it does,
         // then augment the resulting config with the mixed classifier
@@ -1388,17 +1429,18 @@ impl Mp3Encoder {
     ///   staged Annex D Model 2 rates (32 / 44.1 / 48 kHz, all MPEG-1
     ///   two-granule frames).
     /// * [`StreamEncodeError::IntensityShortBlocksUnsupported`] —
-    ///   intensity-stereo coupling is armed; the intensity encode path
-    ///   is long-block only this round (same restriction the
-    ///   energy-detector path carries).
+    ///   intensity-stereo coupling is armed. The Model-2-driven auto path
+    ///   under intensity is not wired this round (unlike the
+    ///   energy-detector [`Self::enable_auto_block_type`] path, which r307
+    ///   accepts under MS-joint stereo).
     pub fn enable_auto_block_type_model2(&mut self) -> Result<(), StreamEncodeError> {
         if self.model2_psy.is_none() {
             return Err(StreamEncodeError::Model2BlockTypeWithoutModel2);
         }
         if self.intensity_start_sfb.is_some() {
-            // Intensity coupling is long-block only this round; the
-            // scheduler emits Start / Short / End granules whose
-            // per-window intensity bound is not wired yet.
+            // The Model-2-driven auto path under intensity coupling is not
+            // wired this round (a separate increment from the r307
+            // energy-detector auto + MS-joint intensity support).
             return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
         }
         // Mutually exclusive with the force-toggles and the
@@ -3489,83 +3531,106 @@ impl Mp3Encoder {
             }
             _ => NUM_LINES,
         };
-        // Force-short intensity granules use the §2.4.3.4.9.3 +
-        // 13818-3 §2.4.3.2 *per-window* short-block bound instead of the
-        // long-block band walk: the bound is derived independently for
-        // each of the three windows, and the positions land on
-        // `scalefac_s[sfb][win]` in Pass 2. The force-short toggle puts
-        // every (gr, ch) on the short path, so the whole frame takes the
-        // short coupling here; the long branch below covers all other
-        // intensity modes (the long-block / adaptive paths from r284 /
-        // r302). Mixed and auto-scheduled short granules keep their
-        // r303 `IntensityShortBlocksUnsupported` rejection.
-        let short_intensity = self.force_short_blocks;
+        // Per-granule intensity block-type dispatch. The intensity
+        // coupling fold reads each granule's `(L, R)` band-by-band and
+        // requires both channels to share the same window geometry
+        // (§2.4.3.4.9 channel agreement); the per-window short layout
+        // (§2.4.3.4.8 reorder, then 13818-3 §2.4.3.2) and the long-block
+        // band walk are entirely different line partitions, so the choice
+        // is made per granule:
+        //
+        //   * `force_short_blocks` — every granule is pure-short; the
+        //     whole frame takes the short coupling (r303 / r305).
+        //   * auto block-type under MS-joint agreement
+        //     (`new_joint_stereo_ms` / `new_joint_stereo_auto`) — the
+        //     scheduler may emit a *mix* of Long / Start / End / Short
+        //     granules within one frame, but `ms_agreement_active`
+        //     guarantees both channels of each granule share the same
+        //     `block_type` / `window_switching_flag` / `mixed_block_flag`
+        //     (the channel-0 emission is mirrored across the granule).
+        //     A granule the scheduler emitted as **pure short**
+        //     (`block_type == Short`, `mixed_block_flag == false`) takes
+        //     the §2.4.3.4.9.3 per-window short coupling; Long / Start /
+        //     End granules take the long-block band walk. (r307)
+        //
+        // `short_intensity_gr[gr]` is the per-granule selector; the
+        // long-block branch below runs for every granule it is `false`
+        // for. Mixed blocks (`mixed_block_flag == true`) and
+        // independent-stereo auto (channel block-types may diverge → the
+        // fold geometry would differ between L and R) keep the
+        // `IntensityShortBlocksUnsupported` rejection.
+        let mut short_intensity_gr = [false; GRANULES];
+        for gr in 0..ngr {
+            short_intensity_gr[gr] = self.force_short_blocks
+                || (block_type_per_gc[gr][0] == BlockType::Short && !mixed_per_gc[gr][0]);
+        }
         if let Some(start_sfb) = self.intensity_start_sfb {
-            if self.nch == 2 && short_intensity {
+            if self.nch == 2 {
                 let short_starts = short_band_starts_for(self.sample_rate_hz);
+                let long_starts = long_band_starts_for(self.sample_rate_hz);
+                let starts = long_starts;
                 for gr in 0..ngr {
-                    let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
-                    let left = &mut left_slice[0];
-                    let right = &mut right_slice[0];
-                    // Map the long-block `intensity_start_sfb` (1..=20,
-                    // the public API's only knob) onto a short-block
-                    // start band by frequency: the short band whose first
-                    // line is at or beyond the long start line. This
-                    // keeps the one user-facing bound consistent across
-                    // block types without a second API surface.
-                    let long_starts = long_band_starts_for(self.sample_rate_hz);
-                    let start_line = long_starts[start_sfb];
-                    let short_start = (0..12)
-                        .find(|&sfb| short_starts[sfb] >= start_line)
-                        .unwrap_or(12);
-                    // Force-short always couples (every granule shares the
-                    // short geometry); the per-window zero-part below the
-                    // bound is what makes the decoder's per-window bound
-                    // derivation land where intended.
-                    intensity_coupled_per_gr[gr] = short_start < 12;
-                    short_intensity_start_per_gr[gr] = short_start;
-                    for sfb in short_start..12 {
-                        let s = short_starts[sfb];
-                        let w = short_starts[sfb + 1] - short_starts[sfb];
-                        let base = 3 * s;
-                        for win in 0..3 {
-                            let mut l_energy = 0.0f64;
-                            let mut r_energy = 0.0f64;
-                            // Native bitstream layout (post-reorder):
-                            // band `sfb` window `win` occupies the
-                            // contiguous run `base + win·w .. base +
-                            // (win+1)·w`. Coupling is a per-line
-                            // operation, so deriving the position and
-                            // folding the magnitude over this run yields
-                            // exactly the spectrum the decoder rebuilds
-                            // from `scalefac_s[sfb][win]` after its
-                            // §2.4.3.4.8 reorder.
-                            let win_base = base + win * w;
-                            for k in 0..w {
-                                let i = win_base + k;
-                                if i < NUM_LINES {
-                                    l_energy += f64::from(left[i]) * f64::from(left[i]);
-                                    r_energy += f64::from(right[i]) * f64::from(right[i]);
+                    if short_intensity_gr[gr] {
+                        let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
+                        let left = &mut left_slice[0];
+                        let right = &mut right_slice[0];
+                        // Map the long-block `intensity_start_sfb` (1..=20,
+                        // the public API's only knob) onto a short-block
+                        // start band by frequency: the short band whose first
+                        // line is at or beyond the long start line. This
+                        // keeps the one user-facing bound consistent across
+                        // block types without a second API surface.
+                        let start_line = long_starts[start_sfb];
+                        let short_start = (0..12)
+                            .find(|&sfb| short_starts[sfb] >= start_line)
+                            .unwrap_or(12);
+                        // A short granule always couples (it shares the short
+                        // geometry); the per-window zero-part below the bound
+                        // is what makes the decoder's per-window bound
+                        // derivation land where intended.
+                        intensity_coupled_per_gr[gr] = short_start < 12;
+                        short_intensity_start_per_gr[gr] = short_start;
+                        for sfb in short_start..12 {
+                            let s = short_starts[sfb];
+                            let w = short_starts[sfb + 1] - short_starts[sfb];
+                            let base = 3 * s;
+                            for win in 0..3 {
+                                let mut l_energy = 0.0f64;
+                                let mut r_energy = 0.0f64;
+                                // Native bitstream layout (post-reorder):
+                                // band `sfb` window `win` occupies the
+                                // contiguous run `base + win·w .. base +
+                                // (win+1)·w`. Coupling is a per-line
+                                // operation, so deriving the position and
+                                // folding the magnitude over this run yields
+                                // exactly the spectrum the decoder rebuilds
+                                // from `scalefac_s[sfb][win]` after its
+                                // §2.4.3.4.8 reorder.
+                                let win_base = base + win * w;
+                                for k in 0..w {
+                                    let i = win_base + k;
+                                    if i < NUM_LINES {
+                                        l_energy += f64::from(left[i]) * f64::from(left[i]);
+                                        r_energy += f64::from(right[i]) * f64::from(right[i]);
+                                    }
                                 }
-                            }
-                            is_pos_short_per_gr[gr][sfb][win] = if self.version.is_lsf() {
-                                derive_intensity_position_lsf(l_energy, r_energy)
-                            } else {
-                                derive_intensity_position(l_energy, r_energy)
-                            };
-                            for k in 0..w {
-                                let i = win_base + k;
-                                if i < NUM_LINES {
-                                    left[i] += right[i];
-                                    right[i] = 0.0;
+                                is_pos_short_per_gr[gr][sfb][win] = if self.version.is_lsf() {
+                                    derive_intensity_position_lsf(l_energy, r_energy)
+                                } else {
+                                    derive_intensity_position(l_energy, r_energy)
+                                };
+                                for k in 0..w {
+                                    let i = win_base + k;
+                                    if i < NUM_LINES {
+                                        left[i] += right[i];
+                                        right[i] = 0.0;
+                                    }
                                 }
                             }
                         }
+                        continue;
                     }
-                }
-            } else if self.nch == 2 {
-                let starts = long_band_starts_for(self.sample_rate_hz);
-                for (gr, is_pos_bands) in is_pos_per_gr.iter_mut().enumerate().take(ngr) {
+                    let is_pos_bands = &mut is_pos_per_gr[gr];
                     let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
                     let left = &mut left_slice[0];
                     let right = &mut right_slice[0];
@@ -3688,7 +3753,7 @@ impl Mp3Encoder {
                 //     single contiguous run `0..ms_region_hi`
                 //     (`ms_region_hi == NUM_LINES` without intensity, the
                 //     long-block bound line with it). Frame-constant.
-                //   * **Short + intensity** (`short_intensity &&
+                //   * **Short + intensity** (`short_intensity_gr[gr] &&
                 //     intensity_active`): the §2.4.3.4.9.2 MS rotation
                 //     runs per window below each window's short bound, and
                 //     in the §2.4.3.4.8 interleaved layout that is exactly
@@ -3698,7 +3763,11 @@ impl Mp3Encoder {
                 //     1.45). The bound is *per granule*, so the upper line
                 //     is recomputed each granule rather than reused from
                 //     the long-derived `ms_region_hi`.
-                let short_starts_for_picker = if short_intensity && intensity_active {
+                // The short-block bound is per granule (auto-scheduled
+                // frames mix Long / Short granules), so the table lookup
+                // is done per granule below rather than once for the
+                // frame.
+                let short_starts_for_picker = if intensity_active {
                     Some(short_band_starts_for(self.sample_rate_hz))
                 } else {
                     None
@@ -3707,11 +3776,15 @@ impl Mp3Encoder {
                 for gr in 0..ngr {
                     let left = &xr_pre_per_gc[gr][0];
                     let right = &xr_pre_per_gc[gr][1];
+                    // A short-coupled granule's MS region is the contiguous
+                    // run `0..3*short_starts[short_start]` for that
+                    // granule's per-window bound; a long-coupled granule's
+                    // region is the frame-constant `ms_region_hi`.
                     let gr_region_hi = match short_starts_for_picker {
-                        Some(short_starts) => {
+                        Some(short_starts) if short_intensity_gr[gr] => {
                             (3 * short_starts[short_intensity_start_per_gr[gr]]).min(NUM_LINES)
                         }
-                        None => ms_region_hi,
+                        _ => ms_region_hi,
                     };
                     let mut lr_energy = 0.0f64;
                     let mut side_energy_x2 = 0.0f64;
@@ -3748,67 +3821,54 @@ impl Mp3Encoder {
         };
         if apply_ms_this_frame {
             const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
-            if short_intensity && intensity_active {
-                // MS + short + intensity (r305). The intensity bound is
-                // per window, so the MS region is not a single contiguous
-                // line range: in the §2.4.3.4.8 interleaved short layout
-                // (post-reorder) band `sfb` window `win` occupies the run
-                // `3*s + win*w .. 3*s + (win+1)*w`. Pass 1.45 coupled
-                // intensity over `short_start..12` for every window
-                // (zeroing the right channel there), so the below-bound MS
-                // region is bands `0..short_start` across all three
-                // windows. Rotating those lines (and only those) is the
-                // exact inverse of the decoder's per-window
-                // `process_short`: it MS-decodes bands below each window's
-                // derived bound (= `short_start`, since the right channel
-                // is non-zero up to band `short_start-1` after this
-                // rotation) and intensity-decodes the rest (ISO/IEC
-                // 13818-3 §2.4.3.2). The two regions are disjoint line
-                // sets, so applying intensity first (Pass 1.45) then MS
-                // here never double-touches a line.
-                let short_starts = short_band_starts_for(self.sample_rate_hz);
-                for gr in 0..ngr {
-                    let short_start = short_intensity_start_per_gr[gr];
-                    // The below-bound MS region is bands `0..short_start`
-                    // across every window. In the interleaved short layout
-                    // each band `sfb` window `win` occupies the lines
-                    // `3*s + 3*k + win`; taking *all* three windows of
-                    // *every* band `0..short_start` is exactly the
-                    // contiguous run `0 .. 3*short_starts[short_start]`
-                    // (the reorder is a permutation of that set). MS is a
-                    // per-line rotation, so rotating the contiguous run is
-                    // identical to walking each (sfb, win, k) cell.
-                    let hi = (3 * short_starts[short_start]).min(NUM_LINES);
-                    let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
-                    let left = &mut left_slice[0];
-                    let right = &mut right_slice[0];
-                    for i in 0..hi {
-                        let l = left[i];
-                        let r = right[i];
-                        left[i] = (l + r) * INV_SQRT2;
-                        right[i] = (l - r) * INV_SQRT2;
-                    }
-                }
-            } else {
-                for gr in 0..ngr {
-                    // Split the per-channel borrow without copying both
-                    // arrays: `split_at_mut(1)` gives us `[L]` and `[R]`
-                    // as disjoint slices, then we index into them.
-                    //
-                    // The rotation covers the whole spectrum when MS is
-                    // the only joint method, and only the lines below the
-                    // intensity bound when intensity is also armed
-                    // (§2.4.3.4.9.1: with both methods enabled, the MS
-                    // equations apply to the bands below the bound).
-                    let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
-                    let left = &mut left_slice[0];
-                    let right = &mut right_slice[0];
-                    for i in 0..ms_region_hi {
-                        let l = left[i];
-                        let r = right[i];
-                        left[i] = (l + r) * INV_SQRT2;
-                        right[i] = (l - r) * INV_SQRT2;
-                    }
+            // The MS region is decided **per granule**: an auto-scheduled
+            // frame can mix Long / Short granules, and each granule's
+            // below-intensity-bound region has a different geometry.
+            //
+            //   * **Short + intensity** (`short_intensity_gr[gr]`, r305 /
+            //     r307): the intensity bound is per window, but in the
+            //     §2.4.3.4.8 interleaved short layout (post-reorder) band
+            //     `sfb` window `win` occupies the run `3*s + win*w ..
+            //     3*s + (win+1)*w`. Pass 1.45 coupled intensity over
+            //     `short_start..12` for every window (zeroing the right
+            //     channel there), so the below-bound MS region is bands
+            //     `0..short_start` across all three windows — and taking
+            //     all three windows of every band `0..short_start` is
+            //     exactly the contiguous run `0 ..
+            //     3*short_starts[short_start]` (the reorder is a
+            //     permutation of that set). Rotating those lines (and only
+            //     those) is the exact inverse of the decoder's per-window
+            //     `process_short`: it MS-decodes bands below each window's
+            //     derived bound and intensity-decodes the rest (ISO/IEC
+            //     13818-3 §2.4.3.2). The two regions are disjoint line
+            //     sets, so applying intensity first (Pass 1.45) then MS
+            //     here never double-touches a line.
+            //   * **Long / no-intensity:** the region is the single
+            //     contiguous run `0..ms_region_hi` (`ms_region_hi ==
+            //     NUM_LINES` without intensity; the long-block bound line
+            //     with it — §2.4.3.4.9.1: with both methods enabled the MS
+            //     equations apply to the bands below the bound).
+            //
+            // MS is a per-line rotation, so rotating the contiguous run is
+            // identical to walking each (sfb, win, k) cell.
+            let short_starts = short_band_starts_for(self.sample_rate_hz);
+            for gr in 0..ngr {
+                let hi = if intensity_active && short_intensity_gr[gr] {
+                    (3 * short_starts[short_intensity_start_per_gr[gr]]).min(NUM_LINES)
+                } else {
+                    ms_region_hi
+                };
+                // Split the per-channel borrow without copying both
+                // arrays: `split_at_mut(1)` gives us `[L]` and `[R]` as
+                // disjoint slices, then we index into them.
+                let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
+                let left = &mut left_slice[0];
+                let right = &mut right_slice[0];
+                for i in 0..hi {
+                    let l = left[i];
+                    let r = right[i];
+                    left[i] = (l + r) * INV_SQRT2;
+                    right[i] = (l - r) * INV_SQRT2;
                 }
             }
         }
@@ -4474,7 +4534,7 @@ impl Mp3Encoder {
                 //     (§2.4.3.4.9.1), so without the marker those
                 //     bands would be intensity-decoded with whatever
                 //     scalefactor the quantizer left behind.
-                if intensity_right && short_intensity {
+                if intensity_right && short_intensity_gr[gr] {
                     // Short-block right channel: positions and markers go
                     // on `scalefac_s[sfb][win]`, derived independently per
                     // window. The decoder's per-window bound
@@ -6387,7 +6447,18 @@ mod tests {
         assert!(auto_enc.force_short_blocks_for_testing(true).is_ok());
         assert!(auto_enc.force_short_blocks_enabled());
 
-        // Mixed + intensity and the auto-scheduled short paths remain
+        // Signal-driven auto block-type under MS-joint intensity is
+        // accepted (r307): MS-agreement mirrors one scheduler emission
+        // across both channels, so the per-granule short/long intensity
+        // coupling has a channel-consistent geometry.
+        let mut auto_ms = Mp3Encoder::new_joint_stereo_ms_is(192, 44_100, 8).unwrap();
+        assert!(auto_ms.enable_auto_block_type(10.0).is_ok());
+        assert!(auto_ms.auto_block_type_enabled());
+        let mut auto_pick = Mp3Encoder::new_joint_stereo_auto_is(192, 44_100, 8).unwrap();
+        assert!(auto_pick.enable_auto_block_type(10.0).is_ok());
+
+        // Mixed + intensity, mixed-promotion auto, and the *intensity-
+        // only* auto path (independent per-channel scheduling) remain
         // unsupported.
         let mut enc = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8).unwrap();
         assert!(matches!(
@@ -6398,8 +6469,9 @@ mod tests {
             enc.enable_auto_block_type(10.0),
             Err(StreamEncodeError::IntensityShortBlocksUnsupported)
         ));
+        let mut ms_mixed = Mp3Encoder::new_joint_stereo_ms_is(192, 44_100, 8).unwrap();
         assert!(matches!(
-            enc.enable_auto_block_type_with_mixed(10.0, 4.0),
+            ms_mixed.enable_auto_block_type_with_mixed(10.0, 4.0),
             Err(StreamEncodeError::IntensityShortBlocksUnsupported)
         ));
 
