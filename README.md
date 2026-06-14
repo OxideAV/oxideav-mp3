@@ -890,6 +890,30 @@ encoder still emits only fixed-`bitrate_index` frames, and demuxer
 free-format framing (deriving the constant length from the first
 syncword interval) remains a follow-up.
 
+**Round 294 (Phase 2 step 91 — captured Model 2 window-switching
+decision per granule).** The automatic Model 2 mode (r293, step 90)
+runs each granule's PCM through the channel's Model 2 state to derive
+the per-band `xmin(sb)` threshold; the same §C.1.5.3.2.1 walk also
+yields the psychoacoustic entropy `pe` and its `pe > 1800` short-block
+switching condition — the §C.1.5.3.2 deliverable the spec defines for
+window switching — which the encode loop previously threw away. The
+Pass-1 walk now retains both into a per-(granule, channel) matrix
+committed after each frame, exposed by
+`Mp3Encoder::last_model2_window_switch(gr, ch) -> Option<Model2WindowSwitch>`
+(`Model2WindowSwitch { pe, attack }`). It reflects exactly the last
+frame assembled and returns `None` before any frame is encoded under
+the armed mode, for out-of-range `gr`/`ch` (e.g. `gr == 1` on a
+single-granule LSF frame), and once the mode is disarmed. This makes
+the spec-canonical switching signal observable and lays the foundation
+for a future Model-2-driven auto-block-type path; **no emitted bytes
+change** in any current configuration (block type is still governed by
+the attack-detector auto path or the force toggles). 4 new unit tests:
+populated / finite / `attack == pe > 1800` invariants,
+signal-dependence across two spectra, the `None` pre-frame and
+out-of-range cases, and disarm-clears-capture. Truth from
+`docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md` (§C.1.5.3.2.1
+PE + window-switching threshold); no new tables required.
+
 **Round 293 (Phase 2 step 90 — automatic per-granule Model 2
 psychoacoustics in the encode loop).** Step 89 (r288) wired the
 §C.1.5.3.2.1 Layer III Model 2 masking threshold `thm(sb)` into the

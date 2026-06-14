@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **Captured §C.1.5.3.2.1 Model 2 window-switching decision per
+  granule** (r294, Phase 2 step 91). The automatic Model 2 mode
+  (`enable_model2_psychoacoustics`) already runs each granule's PCM
+  through the channel's continuous-history Model 2 state to derive the
+  per-band `xmin(sb)` outer-loop threshold; that same walk also computes
+  the §C.1.5.3.2.1 psychoacoustic entropy `pe` and its `pe > 1800`
+  short-block switching condition (the §C.1.5.3.2 deliverable the spec
+  defines for window switching), which the encode loop previously
+  discarded. The Pass-1 walk now retains both into a per-(granule,
+  channel) matrix committed to the encoder after each frame, exposed by
+  the new
+  `Mp3Encoder::last_model2_window_switch(gr, ch) -> Option<Model2WindowSwitch>`
+  accessor (`Model2WindowSwitch { pe, attack }`). The decision reflects
+  exactly the last frame assembled; it returns `None` before any frame
+  is encoded under the armed mode, for out-of-range `gr`/`ch` (e.g.
+  `gr == 1` on a single-granule LSF frame, or `ch >= nch`), and once the
+  mode is disarmed (installing a static per-band vector clears the
+  capture). This surfaces the spec-canonical switching signal for
+  inspection and as the foundation for a future Model-2-driven
+  auto-block-type path — **no bytes change** in any current
+  configuration (the emitted block type is still governed by the
+  attack-detector auto path or the force toggles). Four new lib tests
+  cover the populated / finite / `attack == pe > 1800` invariants,
+  signal-dependence across two spectra, the `None` pre-frame and
+  out-of-range cases, and the disarm-clears-capture path.
+
 - decode: **Free-format (`bitrate_index == 0`) frame decode through the
   `oxideav_core::Decoder` trait** (r292). The trait wiring previously
   rejected any free-format frame because `Mp3FrameHeader::frame_len`

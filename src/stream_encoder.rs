@@ -657,6 +657,49 @@ pub struct Mp3Encoder {
     /// outer-loop / per-band setters installed (or the uniform
     /// scalar), byte-for-byte as in every previous round.
     model2_psy: Option<Vec<crate::psy::Model2Layer3State>>,
+
+    /// Per-(granule, channel) §C.1.5.3.2.1 window-switching decision
+    /// captured from the most recently encoded frame's automatic
+    /// Model 2 Pass-1 walk, when
+    /// [`Self::enable_model2_psychoacoustics`] is armed.
+    ///
+    /// Each cell holds the [`crate::psy::Model2Layer3Granule`]'s
+    /// `pe` (the §C.1.5.3.2.1 psychoacoustic entropy of the long path)
+    /// and `attack` (`pe > 1800`, the §C.1.5.3.2 short-block
+    /// switching condition) for that granule/channel. The Model 2
+    /// analysis already computes both as it derives the per-band
+    /// `xmin(sb)` threshold; this field simply retains the deliverable
+    /// instead of discarding it, making the spec-canonical
+    /// window-switching signal observable through
+    /// [`Self::last_model2_window_switch`].
+    ///
+    /// `None` outer (no frame yet encoded with the mode armed) or
+    /// `None` per cell (a granule/channel the last frame did not
+    /// populate — e.g. the second granule of an LSF frame, which has
+    /// only one granule). Reset to a fresh per-frame matrix at the
+    /// start of every `push_samples`/`flush` frame assembly so the
+    /// accessor always reflects exactly the last emitted frame.
+    last_model2_switch: Option<[[Option<Model2WindowSwitch>; 2]; GRANULES]>,
+}
+
+/// The §C.1.5.3.2.1 Layer III window-switching deliverable for one
+/// granule/channel, as computed by the automatic Model 2 analysis.
+///
+/// `pe` is the long-path psychoacoustic entropy; `attack` is the
+/// `pe > 1800` short-block switching condition the spec derives from
+/// it (Phase 2 step 81 of [`crate::psy`] transcribes the threshold
+/// from the staged ISO PDF). This is the signal an encoder uses to
+/// decide whether a granule should switch to short blocks; the
+/// automatic Model 2 path surfaces it here so callers can inspect the
+/// decision the analysis reached for the granules of the last frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Model2WindowSwitch {
+    /// §C.1.5.3.2.1 psychoacoustic entropy of the long path for this
+    /// granule/channel.
+    pub pe: f64,
+    /// `pe > 1800` — the §C.1.5.3.2 short-block switching condition
+    /// (strictly greater than the 1800 threshold).
+    pub attack: bool,
 }
 
 /// Per-channel auto-block-type state for [`Mp3Encoder`]. Holds the
@@ -803,6 +846,7 @@ impl Mp3Encoder {
             force_mixed_blocks: false,
             auto_block_type: None,
             model2_psy: None,
+            last_model2_switch: None,
         })
     }
 
@@ -1843,8 +1887,10 @@ impl Mp3Encoder {
         // A static per-band threshold and the per-granule Model 2
         // analysis are mutually exclusive (the latter overwrites
         // `per_band_xmin` on every granule); installing a static
-        // vector turns the automatic analysis off.
+        // vector turns the automatic analysis off, so the captured
+        // window-switching decision no longer reflects an active mode.
         self.model2_psy = None;
+        self.last_model2_switch = None;
         self.per_band_xmin = Some(xmin);
         Ok(())
     }
@@ -1913,6 +1959,9 @@ impl Mp3Encoder {
         // Mutually exclusive with a static per-band vector.
         self.per_band_xmin = None;
         self.model2_psy = Some(states);
+        // No frame has been analysed under the freshly-armed mode yet;
+        // drop any decision captured by a previous arming.
+        self.last_model2_switch = None;
         Ok(())
     }
 
@@ -1922,6 +1971,39 @@ impl Mp3Encoder {
     #[must_use]
     pub fn model2_psychoacoustics_enabled(&self) -> bool {
         self.model2_psy.is_some()
+    }
+
+    /// The §C.1.5.3.2.1 window-switching decision the automatic Model 2
+    /// analysis reached for a granule/channel of the **most recently
+    /// emitted frame**.
+    ///
+    /// When [`Self::enable_model2_psychoacoustics`] is armed, every
+    /// granule's PCM passes through the channel's continuous-history
+    /// Model 2 state, which yields both the per-band masking threshold
+    /// (used to drive the outer loop) and the §C.1.5.3.2.1
+    /// psychoacoustic entropy `pe` plus its `pe > 1800` short-block
+    /// switching condition. This accessor surfaces the latter — the
+    /// spec-canonical signal an encoder uses to decide window
+    /// switching — for the granules of the frame the encoder last
+    /// assembled.
+    ///
+    /// Returns `None` when:
+    /// * no frame has been assembled yet with the mode armed;
+    /// * `gr >= granules_per_frame()` (e.g. `gr == 1` for an LSF frame,
+    ///   which carries a single granule), or `ch >= nch`;
+    /// * the Model 2 mode is not armed (the analysis never ran).
+    ///
+    /// The block-type the encoder actually emits is still governed by
+    /// the [`Self::enable_auto_block_type`] path or the force toggles;
+    /// this accessor exposes the Model 2 decision for inspection and as
+    /// the foundation for a future Model-2-driven auto-block-type mode,
+    /// without changing the bytes any current configuration emits.
+    #[must_use]
+    pub fn last_model2_window_switch(&self, gr: usize, ch: usize) -> Option<Model2WindowSwitch> {
+        if gr >= self.granules_per_frame() || ch >= self.nch {
+            return None;
+        }
+        self.last_model2_switch.as_ref().and_then(|m| m[gr][ch])
     }
 
     /// Run one granule of PCM through the §C.1.5.3.2.1 **Model 2**
@@ -2230,6 +2312,17 @@ impl Mp3Encoder {
         let mut model2_xmin_per_gc: [[Option<crate::psy::XminThresholds>; 2]; GRANULES] =
             Default::default();
 
+        // Parallel to `model2_xmin_per_gc`: the §C.1.5.3.2.1
+        // window-switching deliverable (`pe` + `attack`) captured from
+        // the same Pass-1 Model 2 walk. Discarded today by the encode
+        // path (the xmin is what drives the outer loop), but retained
+        // here so the last frame's spec-canonical switching decision is
+        // observable via [`Self::last_model2_window_switch`]. Every cell
+        // starts `None`; only granules/channels the Model 2 walk
+        // actually processed populate a `Some`.
+        let mut model2_switch_per_gc: [[Option<Model2WindowSwitch>; 2]; GRANULES] =
+            Default::default();
+
         // ---- Pre-pass: per-(gr, ch) block type ----
         //
         // The per-granule block type is the §C.1.5.2 transition state
@@ -2489,6 +2582,13 @@ impl Mp3Encoder {
                 if let Some(states) = self.model2_psy.as_mut() {
                     let granule_f64: Vec<f64> = pcm_arr.iter().map(|&s| f64::from(s)).collect();
                     if let Some(out) = states[ch].process(&granule_f64) {
+                        // Retain the §C.1.5.3.2.1 window-switching
+                        // deliverable alongside the xmin threshold — the
+                        // analysis computed both in one walk.
+                        model2_switch_per_gc[gr][ch] = Some(Model2WindowSwitch {
+                            pe: out.pe,
+                            attack: out.attack,
+                        });
                         model2_xmin_per_gc[gr][ch] =
                             Some(crate::psy::XminThresholds::from_layer3_granule(&out));
                     }
@@ -2805,6 +2905,15 @@ impl Mp3Encoder {
                     xr_pre_per_gc[gr][ch] = inverse_alias_reduce(&xr);
                 }
             }
+        }
+
+        // Commit this frame's §C.1.5.3.2.1 window-switching decisions so
+        // `last_model2_window_switch` reflects exactly the frame just
+        // assembled. Only meaningful when the automatic Model 2 mode is
+        // armed; otherwise the matrix is all-`None` and we leave the
+        // accessor at `None` (no decision was made).
+        if self.model2_psy.is_some() {
+            self.last_model2_switch = Some(model2_switch_per_gc);
         }
 
         // ---- Pass 1.45: optional §2.4.3.4.9.3 intensity coupling ----
@@ -5671,5 +5780,117 @@ mod tests {
                 .any(|&v| (v - first).abs() > 1e-6 * first.max(1.0)),
             "expected a spectrally-shaped threshold, got a flat vector"
         );
+    }
+
+    #[test]
+    fn last_model2_window_switch_none_before_any_frame() {
+        // The accessor reports `None` for every cell until a frame has
+        // been encoded under the armed mode — and also when the mode
+        // was never armed at all.
+        let off = Mp3Encoder::new(128, 44_100, ChannelMode::SingleChannel).unwrap();
+        assert_eq!(off.last_model2_window_switch(0, 0), None);
+
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        // Armed, but nothing pushed yet.
+        assert_eq!(enc.last_model2_window_switch(0, 0), None);
+    }
+
+    #[test]
+    fn last_model2_window_switch_populated_after_encode() {
+        // After encoding, the accessor returns the §C.1.5.3.2.1
+        // window-switching decision (pe + `pe > 1800` attack) for every
+        // granule of the last frame, with the flag exactly `pe > 1800`.
+        // Two structurally different signals yield different captured
+        // pe — confirming the value is signal-derived, not a constant.
+        let rate = 44_100;
+        let make = |f: f64| -> Vec<i16> {
+            let total = SAMPLES_PER_FRAME_MPEG1 * 2;
+            (0..total)
+                .map(|i| {
+                    let t = i as f64 / f64::from(rate);
+                    let burst = if i % 800 < 40 { 1.0 } else { 0.2 };
+                    let s = burst * (2.0 * core::f64::consts::PI * f * t).sin();
+                    (9000.0 * s) as i16
+                })
+                .collect()
+        };
+
+        let mut enc_a =
+            Mp3Encoder::new_with_outer_loop(128, rate, ChannelMode::SingleChannel, 1.0e6).unwrap();
+        enc_a.enable_model2_psychoacoustics().unwrap();
+        enc_a.push_samples(&make(1200.0)).unwrap();
+
+        let mut pe_a = [0.0_f64; GRANULES];
+        for (gr, slot) in pe_a.iter_mut().enumerate() {
+            let sw = enc_a
+                .last_model2_window_switch(gr, 0)
+                .expect("both granules of the last frame should carry a decision");
+            // pe is a log-domain entropy sum: finite, and may be
+            // negative for a low-energy granule. The only hard
+            // invariant on the flag is that it equals `pe > 1800`.
+            assert!(sw.pe.is_finite(), "pe = {}", sw.pe);
+            assert_eq!(
+                sw.attack,
+                sw.pe > 1800.0,
+                "attack flag must be exactly pe > 1800"
+            );
+            *slot = sw.pe;
+        }
+
+        // A different tone frequency through a fresh encoder: at least
+        // one granule's captured pe must differ, so the captured
+        // decision genuinely depends on the spectrum.
+        let mut enc_b =
+            Mp3Encoder::new_with_outer_loop(128, rate, ChannelMode::SingleChannel, 1.0e6).unwrap();
+        enc_b.enable_model2_psychoacoustics().unwrap();
+        enc_b.push_samples(&make(6000.0)).unwrap();
+        let mut differs = false;
+        for (gr, &prev) in pe_a.iter().enumerate() {
+            let sw = enc_b.last_model2_window_switch(gr, 0).unwrap();
+            if (sw.pe - prev).abs() > 1e-6 * prev.abs().max(1.0) {
+                differs = true;
+            }
+        }
+        assert!(
+            differs,
+            "captured pe should differ between two spectrally distinct signals"
+        );
+    }
+
+    #[test]
+    fn last_model2_window_switch_rejects_out_of_range() {
+        // gr beyond granules_per_frame() and ch beyond nch both yield
+        // `None`, even after a populated frame.
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.push_samples(&vec![0_i16; SAMPLES_PER_FRAME_MPEG1])
+            .unwrap();
+        // gr 0 is in range; gr == GRANULES and ch == 1 (mono) are not.
+        assert!(enc.last_model2_window_switch(0, 0).is_some());
+        assert_eq!(enc.last_model2_window_switch(GRANULES, 0), None);
+        assert_eq!(enc.last_model2_window_switch(0, 1), None);
+    }
+
+    #[test]
+    fn last_model2_window_switch_cleared_when_mode_disarmed() {
+        // Installing a static per-band vector disarms the automatic
+        // mode and drops the captured decision (it no longer reflects an
+        // active analysis).
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        enc.push_samples(&vec![1234_i16; SAMPLES_PER_FRAME_MPEG1])
+            .unwrap();
+        assert!(enc.last_model2_window_switch(0, 0).is_some());
+        enc.set_per_band_xmin(crate::psy::XminThresholds::uniform(1.0e6))
+            .unwrap();
+        assert!(!enc.model2_psychoacoustics_enabled());
+        assert_eq!(enc.last_model2_window_switch(0, 0), None);
     }
 }
