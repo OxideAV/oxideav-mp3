@@ -6,6 +6,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- encoder: **§C.1.5.3.2.1 Model-2-driven auto block-type under
+  intensity-stereo coupling** (r313). `enable_auto_block_type_model2`
+  previously rejected an intensity-armed encoder with
+  `IntensityShortBlocksUnsupported`; that guard was the sole blocker. The
+  frame-assembly `channel_agreement_active` OR-fold already keyed off
+  `intensity_start_sfb.is_some()` for the Model-2 emission path (the
+  per-channel `pe > 1800` window-switching flags are OR-folded into one
+  shared channel-0 scheduler whose emission is mirrored across both
+  channels, so the §2.4.3.4.9 "both channels of a granule share
+  `block_type` / `window_switching_flag` / `mixed_block_flag`" agreement
+  intensity coupling needs holds by construction), and Pass 1 selects the
+  per-granule §2.4.3.4.9.3 per-window short coupling (pure-short granules)
+  vs the long-block band walk (Long / Start / End granules) from the same
+  `block_type_per_gc` matrix the Model-2 path produces. The §C.1.5.2 walk
+  emits no mixed block, so the §2.4.3.4.10.3 mixed carve-out coupling is
+  never reached. This mirrors the energy-detector
+  `enable_auto_block_type` acceptance (r307 MS+intensity, r308
+  intensity-only). New public `Mp3Encoder::enable_intensity_stereo`
+  (running-state counterpart of `new_joint_stereo_is`) makes the
+  combination reachable on an outer-loop encoder, so the
+  Model-2 per-band threshold and the Model-2 block-type scheduler can be
+  armed alongside intensity coupling. Three new lib tests:
+  `enable_intensity_stereo_arms_and_rejects_mono` (arming + mono / range
+  rejection), `model2_block_type_accepts_intensity_coupling` (the lifted
+  guard now returns `Ok`), and
+  `model2_intensity_emits_valid_joint_intensity_frames` (a transient
+  hard-panned stereo stimulus emits `mode = '01'` intensity frames with
+  L/R window geometry consistent per granule, plus byte-deterministic
+  re-encode). **Still rejected:** the mixed-promotion auto variant
+  (`enable_auto_block_type_with_mixed`) under intensity.
+
 ### Fixed
 
 - decoder: **§2.4.3.4.8 reorder restored to the trait decode path**

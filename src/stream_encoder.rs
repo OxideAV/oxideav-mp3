@@ -1430,6 +1430,22 @@ impl Mp3Encoder {
     /// [`Self::enable_auto_block_type`] path and the force toggles —
     /// enabling this clears them, and enabling any of them clears this.
     ///
+    /// As of r313 this path accepts **intensity-stereo coupling** (with
+    /// or without MS-joint stereo), mirroring the energy-detector
+    /// [`Self::enable_auto_block_type`] acceptance (r307 MS+intensity,
+    /// r308 intensity-only). Arming intensity coupling forces the same
+    /// §2.4.3.4.9 channel-agreement OR-fold the energy path uses
+    /// (`channel_agreement_active = MS-joint OR intensity-armed`): the
+    /// per-channel `pe > 1800` flags are OR-folded into one shared
+    /// (channel-0) scheduler whose emission is mirrored across both
+    /// channels of each granule, so L/R block types stay consistent and
+    /// the per-window short / long-block intensity coupling is
+    /// well-defined. A granule the Model-2 scheduler emits as **pure
+    /// short** takes the §2.4.3.4.9.3 per-window short coupling; Long /
+    /// Start / End granules take the long-block band walk. The §C.1.5.2
+    /// walk never emits a mixed block, so the §2.4.3.4.10.3 mixed
+    /// carve-out coupling is not exercised here.
+    ///
     /// # Errors
     ///
     /// * [`StreamEncodeError::Model2BlockTypeWithoutModel2`] — the
@@ -1438,21 +1454,18 @@ impl Mp3Encoder {
     ///   constructor also fixes the sampling rate to one of the three
     ///   staged Annex D Model 2 rates (32 / 44.1 / 48 kHz, all MPEG-1
     ///   two-granule frames).
-    /// * [`StreamEncodeError::IntensityShortBlocksUnsupported`] —
-    ///   intensity-stereo coupling is armed. The Model-2-driven auto path
-    ///   under intensity is not wired this round (unlike the
-    ///   energy-detector [`Self::enable_auto_block_type`] path, which r307
-    ///   accepts under MS-joint stereo).
     pub fn enable_auto_block_type_model2(&mut self) -> Result<(), StreamEncodeError> {
         if self.model2_psy.is_none() {
             return Err(StreamEncodeError::Model2BlockTypeWithoutModel2);
         }
-        if self.intensity_start_sfb.is_some() {
-            // The Model-2-driven auto path under intensity coupling is not
-            // wired this round (a separate increment from the r307
-            // energy-detector auto + MS-joint intensity support).
-            return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
-        }
+        // Intensity-stereo coupling is now accepted (r313): the
+        // frame-assembly `channel_agreement_active` OR-fold already keyed
+        // off `intensity_start_sfb.is_some()` for the Model-2 emission
+        // path, and Pass 1 already selects the per-granule short / long
+        // intensity coupling from the same `block_type_per_gc` matrix this
+        // path produces. The §C.1.5.2 walk emits no mixed block, so the
+        // §2.4.3.4.10.3 mixed carve-out coupling is never reached.
+        //
         // Mutually exclusive with the force-toggles and the
         // energy-detector auto path; clear them.
         self.force_short_blocks = false;
@@ -1900,10 +1913,46 @@ impl Mp3Encoder {
         Ok(())
     }
 
+    /// Arm §2.4.3.4.9.3 intensity-stereo coupling on an already-built
+    /// stereo encoder, emitting `mode = '01'` /
+    /// `mode_extension = '01'` (intensity on, MS off) — the running-state
+    /// counterpart of the [`Mp3Encoder::new_joint_stereo_is`]
+    /// constructor for encoders that were built another way (e.g. via
+    /// [`Mp3Encoder::new_with_outer_loop`], so the §C.1.5.3.2.1 Model 2
+    /// per-band threshold and the Model-2-driven block-type scheduler can
+    /// be armed alongside intensity coupling).
+    ///
+    /// `intensity_start_sfb` is the first intensity-coded long
+    /// scalefactor band (same `1..=20` meaning as the constructors).
+    ///
+    /// # Errors
+    ///
+    /// * [`StreamEncodeError::StereoUnsupported`] — the encoder is not a
+    ///   two-channel encoder; intensity coupling folds an `(L, R)` pair.
+    /// * [`StreamEncodeError::InvalidIntensityStartSfb`] —
+    ///   `intensity_start_sfb` is outside `1..=20`.
+    pub fn enable_intensity_stereo(
+        &mut self,
+        intensity_start_sfb: usize,
+    ) -> Result<(), StreamEncodeError> {
+        if self.nch != 2 {
+            return Err(StreamEncodeError::StereoUnsupported);
+        }
+        self.arm_intensity(intensity_start_sfb)?;
+        self.header_template.mode = ChannelMode::JointStereo;
+        self.header_template.mode_extension = ModeExtension {
+            intensity_stereo: true,
+            ms_stereo: false,
+            raw: 0b01,
+        };
+        Ok(())
+    }
+
     /// `true` when §2.4.3.4.9.3 intensity-stereo coupling is armed
     /// (see [`Mp3Encoder::new_joint_stereo_is`] /
     /// [`Mp3Encoder::new_joint_stereo_ms_is`] /
-    /// [`Mp3Encoder::new_joint_stereo_auto_is`]).
+    /// [`Mp3Encoder::new_joint_stereo_auto_is`] /
+    /// [`Mp3Encoder::enable_intensity_stereo`]).
     #[must_use]
     pub fn intensity_stereo_enabled(&self) -> bool {
         self.intensity_start_sfb.is_some()
@@ -7557,6 +7606,140 @@ mod tests {
                 .iter()
                 .any(|&v| (v - first).abs() > 1e-6 * first.max(1.0)),
             "expected a spectrally-shaped threshold under the Model-2 block-type path"
+        );
+    }
+
+    #[test]
+    fn enable_intensity_stereo_arms_and_rejects_mono() {
+        // The running-state intensity arming method (r313) sets the
+        // `mode = '01'` / `mode_extension = '01'` header template and the
+        // intensity bound on an already-built stereo encoder, and rejects
+        // a mono encoder (intensity folds an (L, R) pair).
+        let mut stereo =
+            Mp3Encoder::new_with_outer_loop(256, 44_100, ChannelMode::Stereo, 1.0e6).unwrap();
+        assert!(!stereo.intensity_stereo_enabled());
+        stereo.enable_intensity_stereo(8).unwrap();
+        assert!(stereo.intensity_stereo_enabled());
+        assert_eq!(stereo.intensity_start_sfb(), Some(8));
+        assert_eq!(stereo.header_template.mode, ChannelMode::JointStereo);
+        assert!(stereo.header_template.mode_extension.intensity_stereo);
+        assert!(!stereo.header_template.mode_extension.ms_stereo);
+
+        // Out-of-range bound is rejected.
+        let mut s2 =
+            Mp3Encoder::new_with_outer_loop(256, 44_100, ChannelMode::Stereo, 1.0e6).unwrap();
+        assert!(matches!(
+            s2.enable_intensity_stereo(0),
+            Err(StreamEncodeError::InvalidIntensityStartSfb { start_sfb: 0 })
+        ));
+
+        // Mono is rejected.
+        let mut mono =
+            Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
+                .unwrap();
+        assert!(matches!(
+            mono.enable_intensity_stereo(8),
+            Err(StreamEncodeError::StereoUnsupported)
+        ));
+    }
+
+    #[test]
+    fn model2_block_type_accepts_intensity_coupling() {
+        // r313: the Model-2-driven block-type scheduler now accepts
+        // intensity-stereo coupling (previously rejected with
+        // `IntensityShortBlocksUnsupported`). The frame-assembly
+        // `channel_agreement_active` OR-fold already keyed off
+        // `intensity_start_sfb.is_some()` for the Model-2 emission path,
+        // and Pass 1 selects the per-granule short / long intensity
+        // coupling from the same block-type matrix this path produces, so
+        // the only blocker was the constructor guard.
+        let mut enc =
+            Mp3Encoder::new_with_outer_loop(256, 44_100, ChannelMode::Stereo, 1.0e6).unwrap();
+        enc.enable_intensity_stereo(8).unwrap();
+        enc.enable_model2_psychoacoustics().unwrap();
+        // Was previously `Err(IntensityShortBlocksUnsupported)`.
+        enc.enable_auto_block_type_model2().unwrap();
+        assert!(enc.auto_block_type_model2_enabled());
+        assert!(enc.intensity_stereo_enabled());
+    }
+
+    #[test]
+    fn model2_intensity_emits_valid_joint_intensity_frames() {
+        // A transient hard-panned stereo stimulus drives the
+        // Model-2-driven scheduler under intensity coupling. Every
+        // emitted frame must carry `mode = '01'` (joint stereo) with the
+        // intensity-stereo bit set, parse cleanly, and keep both channels
+        // of each granule on the same window geometry (the §2.4.3.4.9
+        // channel agreement the OR-fold enforces). Encoding the same PCM
+        // twice yields byte-identical output (determinism).
+        use crate::frame::{parse_header, FrameWalker};
+        use crate::side_info::parse_side_info;
+        let rate = 44_100;
+        let total = SAMPLES_PER_FRAME_MPEG1 * 6;
+        // Interleaved stereo: a high (intensity-region) tone gated into
+        // bursts, panned mostly to the left channel.
+        let pcm: Vec<i16> = (0..total)
+            .flat_map(|i| {
+                let t = i as f64 / f64::from(rate);
+                let gate = if (i / 320) % 2 == 0 { 1.0 } else { 0.04 };
+                let s = (2.0 * core::f64::consts::PI * 11000.0 * t).sin();
+                let l = (9000.0 * gate * s) as i16;
+                let r = (900.0 * gate * s) as i16;
+                [l, r]
+            })
+            .collect();
+
+        let encode_once = || -> Vec<u8> {
+            let mut enc =
+                Mp3Encoder::new_with_outer_loop(256, rate, ChannelMode::Stereo, 1.0e6).unwrap();
+            enc.enable_intensity_stereo(8).unwrap();
+            enc.enable_model2_psychoacoustics().unwrap();
+            enc.enable_auto_block_type_model2().unwrap();
+            enc.push_samples(&pcm).unwrap();
+            let mut out: Vec<u8> = Vec::new();
+            enc.finish(&mut out).unwrap();
+            out
+        };
+
+        let out = encode_once();
+        let mut nframes = 0usize;
+        for f in FrameWalker::new(&out) {
+            let hdr = parse_header(&f.data[..4]).expect("valid header");
+            assert_eq!(
+                hdr.mode,
+                ChannelMode::JointStereo,
+                "intensity frames carry mode = '01'"
+            );
+            assert!(
+                hdr.mode_extension.intensity_stereo,
+                "the intensity-stereo bit must be set"
+            );
+            let si = parse_side_info(&hdr, &f.data[4..]).expect("side info parses");
+            for gr in 0..GRANULES {
+                let l = &si.granules[gr][0];
+                let r = &si.granules[gr][1];
+                assert_eq!(
+                    l.window_switching_flag, r.window_switching_flag,
+                    "frame {nframes} gr {gr}: both channels must share window geometry"
+                );
+                assert_eq!(
+                    l.block_type, r.block_type,
+                    "frame {nframes} gr {gr}: both channels must share block_type"
+                );
+                assert_eq!(
+                    l.mixed_block_flag, r.mixed_block_flag,
+                    "frame {nframes} gr {gr}: both channels must share mixed_block_flag"
+                );
+            }
+            nframes += 1;
+        }
+        assert!(nframes >= 4, "expected several frames, got {nframes}");
+
+        // Determinism: same PCM in ⇒ same bytes out.
+        let out2 = encode_once();
+        assert_eq!(
+            out, out2,
+            "Model-2 + intensity encode must be deterministic"
         );
     }
 

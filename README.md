@@ -72,8 +72,12 @@ Registered as a container alongside the codec.
   accepts MPEG-1 and MPEG-2 LSF and rejects MPEG-2.5), pending the
   low-rate (8 / 11.025 / 12 kHz) scalefactor-band and Huffman-table
   mappings.
-- A full Annex D psychoacoustic model driving encoder quality (the
-  current quantization is rate/distortion-driven).
+- Annex D psychoacoustic shaping is **opt-in**: the default quantization
+  is rate/distortion-driven, while `enable_model2_psychoacoustics`
+  arms the §C.1.5.3.2.1 Model 2 analysis (per-band `xmin` threshold plus
+  the `pe > 1800` Model-2-driven block-type scheduler, now usable under
+  MS-joint and intensity-stereo coupling). A psychoacoustically tuned
+  default-on quality preset is the remaining work.
 
 ## Robustness
 
