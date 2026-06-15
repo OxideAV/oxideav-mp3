@@ -923,6 +923,44 @@ the spec-correct side). Spec read: ISO/IEC 11172-3 §2.4.3.4.8 (short
 reorder), §2.4.3.4.9 (stereo runs after reorder), §2.4.3.4.10
 (IMDCT consumes subband-ordered lines).
 
+**Round 308 (§2.4.3.4.9 auto-block-type-scheduled short granules with
+intensity-only — non-MS — joint stereo).** r307 lifted the
+`IntensityShortBlocksUnsupported` rejection on the signal-driven
+`enable_auto_block_type` scheduler only when MS-joint stereo was *also*
+armed; the plain intensity path (`new_joint_stereo_is`, no MS) stayed
+rejected because its independent per-channel scheduler could emit
+different block types on L and R, breaking the per-band fold geometry that
+intensity coupling needs (§2.4.3.4.9: both channels of a granule must
+share `block_type` / `window_switching_flag` / `mixed_block_flag`). r308
+lifts that last rejection by making the channel agreement **structural**
+for intensity, not just for MS. The auto/Model-2 scheduler walk now keys
+on `channel_agreement_active = ms_joint_stereo_active() ||
+intensity_start_sfb.is_some()` (both `&& nch == 2`) in place of the
+MS-only `ms_agreement_active`. Whenever it is true the walk OR-folds the
+per-channel attack flags into one shared (channel-0) state machine and
+mirrors that single emission across both channels of every granule — the
+same "safe upper envelope" the MS path already used. L/R block types are
+therefore identical by construction, so the per-granule
+`short_intensity_gr[gr]` selector (keyed on `block_type_per_gc[gr][0]`)
+correctly drives the §2.4.3.4.9.3 per-window short coupling vs the
+long-block band-walk for the whole channel pair. No MS rotation is added
+(Pass 1.5 stays gated on the MS drivers), so the header emits
+`mode = '01'` with `mode_extension = '01'` (intensity on, MS off). The
+`enable_auto_block_type` constructor guard and the encode-side rejection
+note are removed for this case; the mixed-promotion variant
+(`enable_auto_block_type_with_mixed`, §2.4.3.4.10.3 two-region carve-out
+unwired), force-mixed under intensity, and the Model-2-driven auto path
+under intensity stay rejected. Validated by four new intensity-only
+`auto_block_type_intensity_roundtrip` tests (block-type mix with
+per-granule agreement + `mode_extension == '01'`, per-window scalefactor
+positions in range, a hard-left intensity-region tone reconstructing
+left-leaning through a spec-order self-decode, byte-deterministic
+re-encode); the `intensity_rejects_block_type_toggles` unit test now
+asserts intensity-only-auto acceptance. Spec read: ISO/IEC 11172-3
+§2.4.3.4.9 (channel agreement) / §2.4.3.4.9.3 (intensity positions) /
+Annex C.1.5.2 (transition scheduler); ISO/IEC 13818-3 §2.4.3.2 (per-window
+bound).
+
 **Round 307 (§2.4.3.4.9 auto-block-type-scheduled short granules with
 MS-joint intensity stereo).** Through r306 every short + intensity path
 required the **force-short** toggle — every granule pinned to a pure
@@ -945,13 +983,13 @@ of every granule (the `ms_agreement_active` walk), so the §2.4.3.4.9
 "both channels share `block_type` / `window_switching_flag` /
 `mixed_block_flag`" agreement that intensity coupling needs (it folds
 each granule's `(L, R)` band-by-band, which requires identical band
-geometry on both channels) holds by construction. The **intensity-only**
-auto path (no MS) stays rejected: its independent per-channel scheduler
-may emit different block types on L and R, breaking the fold geometry;
-likewise the mixed-promotion variant
-(`enable_auto_block_type_with_mixed`, the §2.4.3.4.10.3 carve-out bound
-is unwired) and the Model-2-driven auto path under intensity. Validated
-by five new `auto_block_type_intensity_roundtrip` tests: the
+geometry on both channels) holds by construction. (The **intensity-only**
+auto path was rejected through r307 — its independent per-channel
+scheduler could diverge L/R block types — and is lifted in r308 above by
+forcing the same agreement OR-fold for intensity; the mixed-promotion
+variant `enable_auto_block_type_with_mixed`, the §2.4.3.4.10.3 carve-out
+bound being unwired, and the Model-2-driven auto path under intensity stay
+rejected.) Validated by five `auto_block_type_intensity_roundtrip` tests: the
 API acceptance/rejection matrix, a transient stimulus that drives the
 scheduler into both long-family AND pure-short granules in one stream
 (with per-granule §2.4.3.4.9 channel-agreement assertions), per-window

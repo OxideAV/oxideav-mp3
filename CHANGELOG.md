@@ -29,6 +29,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - encoder: **§2.4.3.4.9 auto-block-type-scheduled short granules with
+  intensity-only (non-MS) joint stereo** (r308). `enable_auto_block_type`
+  is now accepted on a plain intensity encoder
+  (`new_joint_stereo_is`, no MS) — the last rejected signal-driven
+  auto + intensity combination, previously
+  `IntensityShortBlocksUnsupported`. r307 lifted the rejection only when
+  MS-joint stereo was also armed (the §2.4.3.4.9 channel agreement that
+  intensity coupling needs held by construction via the MS scheduler
+  mirroring). r308 makes that agreement structural for intensity too:
+  whenever intensity coupling is armed, the auto/Model-2 scheduler walk
+  now keys on `channel_agreement_active = MS-joint OR intensity-armed`,
+  which OR-folds the per-channel attack flags into one shared (channel-0)
+  state machine and mirrors its emission across both channels. L/R block
+  types are therefore channel-consistent by construction, so each
+  granule's pure-short / long intensity coupling has a well-defined fold
+  geometry without MS. Header emits `mode = '01'` with
+  `mode_extension = '01'` (intensity on, MS off). The mixed-promotion
+  auto variant (`enable_auto_block_type_with_mixed`, §2.4.3.4.10.3
+  two-region carve-out unwired) and the Model-2-driven auto path under
+  intensity remain rejected; force-mixed under intensity remains
+  rejected. `tests/auto_block_type_intensity_roundtrip.rs` grows 4
+  intensity-only tests (block-type mix + per-granule agreement with
+  `mode_extension == '01'`, per-window scalefactor positions in range, a
+  hard-left intensity-region tone reconstructing left-leaning through a
+  spec-order self-decode, deterministic byte-exact re-encode); the
+  `intensity_rejects_block_type_toggles` unit test now asserts
+  intensity-only-auto acceptance and keeps the mixed-promotion rejection.
+
+- encoder: **§2.4.3.4.9 auto-block-type-scheduled short granules with
   MS-joint intensity stereo** (r307). `enable_auto_block_type` is now
   accepted on an MS-joint intensity encoder
   (`new_joint_stereo_ms_is` / `new_joint_stereo_auto_is`) — previously

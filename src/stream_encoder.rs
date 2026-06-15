@@ -205,16 +205,16 @@ pub enum StreamEncodeError {
     },
     /// A block-type toggle that the intensity-stereo encode path does
     /// not yet support was requested on an encoder with intensity
-    /// coupling armed. Supported as of r307: force-short and force-mixed
-    /// short coupling (r303 / r305 / r306), and signal-driven
-    /// `enable_auto_block_type` scheduling **when MS-joint stereo is also
-    /// armed** (the §2.4.3.4.9 channel agreement that intensity coupling
-    /// needs holds by construction). Still rejected: the *intensity-only*
-    /// auto path (no MS — independent per-channel block-type scheduling
-    /// may diverge L/R, breaking the per-band fold geometry), the
-    /// mixed-promotion auto variant (`enable_auto_block_type_with_mixed`
-    /// — the §2.4.3.4.10.3 carve-out bound is unwired), and the
-    /// Model-2-driven auto path under intensity.
+    /// coupling armed. Supported: force-short and force-mixed short
+    /// coupling (r303 / r305 / r306), and signal-driven
+    /// `enable_auto_block_type` scheduling with MS-joint stereo (r307) OR
+    /// on the intensity-only path (r308) — in both cases the
+    /// §2.4.3.4.9 channel agreement is forced by mirroring the channel-0
+    /// scheduler emission across both channels, so the per-band fold
+    /// geometry is well-defined. Still rejected: the mixed-promotion auto
+    /// variant (`enable_auto_block_type_with_mixed` — the §2.4.3.4.10.3
+    /// carve-out bound is unwired) and the Model-2-driven auto path under
+    /// intensity.
     IntensityShortBlocksUnsupported,
     /// [`Mp3Encoder::set_per_band_xmin_from_model2`] was called with a
     /// granule whose length is not `SAMPLES_PER_GRANULE` (576), or on an
@@ -271,7 +271,7 @@ impl core::fmt::Display for StreamEncodeError {
                 "intensity-stereo start band {start_sfb} out of range (must be 1..=20: at least one normal band below the bound and one intensity band at or above it)"
             ),
             StreamEncodeError::IntensityShortBlocksUnsupported => f.write_str(
-                "this block-type toggle is not supported with intensity-stereo coupling armed (intensity-only auto block-type, mixed-promotion auto, and Model-2-driven auto remain unavailable; force-short / force-mixed and MS-joint auto block-type are supported)",
+                "this block-type toggle is not supported with intensity-stereo coupling armed (mixed-promotion auto and Model-2-driven auto remain unavailable; force-short / force-mixed and signal-driven auto block-type — MS-joint or intensity-only — are supported)",
             ),
             StreamEncodeError::Model2AnalysisUnsupported { sample_rate_hz } => {
                 if *sample_rate_hz == 0 {
@@ -1157,22 +1157,25 @@ impl Mp3Encoder {
     ///
     /// # Errors
     ///
-    /// * [`StreamEncodeError::IntensityShortBlocksUnsupported`] —
-    ///   intensity-stereo coupling is armed **without** MS-joint stereo
-    ///   (a plain [`Mp3Encoder::new_joint_stereo_is`] encoder). The auto
-    ///   scheduler runs an independent state machine per channel, so the
-    ///   per-granule block types may diverge between L and R; intensity
-    ///   coupling folds each granule's `(L, R)` band-by-band and needs
-    ///   both channels to share window geometry (§2.4.3.4.9). r307 lifts
-    ///   the rejection when MS-joint stereo is also armed
-    ///   ([`Mp3Encoder::new_joint_stereo_ms_is`] /
-    ///   [`Mp3Encoder::new_joint_stereo_auto_is`]): MS-agreement mirrors
-    ///   one shared scheduler emission across both channels, so each
-    ///   granule's Short / Long intensity coupling is channel-consistent.
+    /// Returns `Ok` for every channel layout, including intensity-stereo
+    /// coupling with or without MS-joint stereo. r307 lifted the
+    /// [`StreamEncodeError::IntensityShortBlocksUnsupported`] rejection
+    /// for the MS+intensity combination; r308 lifts it for the remaining
+    /// intensity-only path ([`Mp3Encoder::new_joint_stereo_is`]). The
+    /// concern that the auto scheduler runs an independent state machine
+    /// per channel — so the per-granule block types could diverge between
+    /// L and R while intensity coupling folds each granule's `(L, R)`
+    /// band-by-band and needs both channels to share window geometry
+    /// (§2.4.3.4.9) — is resolved structurally: whenever intensity
+    /// coupling is armed, `block_types_for_frame` forces the same
+    /// channel-agreement OR-fold the MS path uses (channel-0's emission
+    /// mirrored across both channels, the per-channel attack flags
+    /// OR-folded into one shared scheduler). The block types are
+    /// therefore channel-consistent by construction, so each granule's
+    /// Short / Long intensity coupling is well-defined.
     ///
-    /// Otherwise returns `Ok` for every channel layout; the previous
-    /// round's [`StreamEncodeError::StereoUnsupported`] guard was dropped
-    /// in r163.
+    /// The previous round's [`StreamEncodeError::StereoUnsupported`]
+    /// guard was dropped in r163.
     ///
     /// As of r287 the auto block-type scheduler is **version-agnostic**:
     /// the §C.1.5.2 walk in `assemble_frame_with_lookahead` steps the
@@ -1187,21 +1190,24 @@ impl Mp3Encoder {
     /// scheduler step per frame and the next frame's single granule as
     /// the §C.1.5.2 lookahead.
     pub fn enable_auto_block_type(&mut self, threshold: f64) -> Result<(), StreamEncodeError> {
-        if self.intensity_start_sfb.is_some() && !self.ms_joint_stereo_active() {
-            // Auto block-type under intensity coupling is supported only
-            // when MS-joint stereo is also armed (r307). Intensity
-            // coupling folds each granule's `(L, R)` band-by-band, which
-            // requires both channels to share window geometry
-            // (§2.4.3.4.9 channel agreement); MS-joint
-            // (`new_joint_stereo_ms` / `new_joint_stereo_auto`) mirrors
-            // one shared scheduler emission across both channels, so the
-            // agreement holds by construction and every Short granule
-            // takes the §2.4.3.4.9.3 per-window short coupling. Plain
-            // intensity stereo (no MS) runs an independent scheduler per
-            // channel, so the per-granule block types may diverge between
-            // L and R — that case stays rejected.
-            return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
-        }
+        // Auto block-type under intensity coupling (r307: MS-joint armed;
+        // r308: intensity-only too). Intensity coupling folds each
+        // granule's `(L, R)` band-by-band, which requires both channels
+        // to share window geometry (§2.4.3.4.9 channel agreement). r307
+        // covered the case where MS-joint stereo is also armed: MS-joint
+        // (`new_joint_stereo_ms` / `new_joint_stereo_auto`) mirrors one
+        // shared scheduler emission across both channels, so the
+        // agreement holds by construction. r308 lifts the remaining
+        // intensity-only rejection: when intensity coupling is armed, the
+        // encode-side scheduler walk forces the SAME channel-agreement
+        // OR-fold (channel-0's emission mirrored across both channels)
+        // regardless of MS — `channel_agreement_active` in
+        // `block_types_for_frame` is now `MS-joint OR intensity-armed`.
+        // That makes the per-granule block types channel-consistent by
+        // construction, so every Short granule takes the §2.4.3.4.9.3
+        // per-window short coupling and the long-family granules take the
+        // long-block band walk, exactly as the MS path already did.
+        //
         // Outer loop is now compatible with auto block-type for every
         // block-type the auto scheduler ever emits:
         //   * Long granules — `outer_loop_search_long`
@@ -2770,7 +2776,22 @@ impl Mp3Encoder {
         // (force-toggles, default-long, plain
         // `enable_auto_block_type`).
         let mut mixed_per_gc: [[bool; 2]; GRANULES] = [[false; 2]; GRANULES];
-        let ms_agreement_active = self.ms_joint_stereo_active() && self.nch == 2;
+        // §2.4.3.4.9 cross-channel agreement for the auto/Model-2
+        // scheduler walk. The two-channel joint regimes that fold L/R
+        // together — MS-joint stereo (the §2.4.3.4.9.2 matrix rotates the
+        // pair before quantize) and intensity coupling (the §2.4.3.4.9.3
+        // fold reads each granule's `(L, R)` band-by-band) — both require
+        // both channels of a granule to share `block_type` /
+        // `window_switching_flag` / `mixed_block_flag`. When this holds
+        // the scheduler runs ONE shared (channel-0) state machine fed the
+        // OR-fold of the per-channel attack flags, and mirrors its
+        // emission across both channels (the "safe upper envelope"). r307
+        // armed this for MS-joint; r308 extends it to the intensity-only
+        // path (`new_joint_stereo_is` + `enable_auto_block_type`), where
+        // the same mirroring keeps L/R block types consistent so the
+        // per-window short / long intensity coupling is well-defined.
+        let channel_agreement_active =
+            (self.ms_joint_stereo_active() || self.intensity_start_sfb.is_some()) && self.nch == 2;
         let block_type_per_gc: [[BlockType; 2]; GRANULES] = if let Some(schedulers) =
             self.model2_block_type.as_mut()
         {
@@ -2873,7 +2894,7 @@ impl Mp3Encoder {
                 }
             }
 
-            if ms_agreement_active {
+            if channel_agreement_active {
                 // OR-fold the per-channel `pe > 1800` flags into the
                 // channel-0 scheduler (§2.4.3.4.9 cross-channel
                 // agreement) and mirror its emission across both
@@ -2982,7 +3003,7 @@ impl Mp3Encoder {
                     }
                 }
             };
-            if ms_agreement_active {
+            if channel_agreement_active {
                 // Per-channel attack-flag computation. Each channel's
                 // detector still classifies its own PCM so the
                 // ambient estimate stays meaningful for that
@@ -3541,24 +3562,27 @@ impl Mp3Encoder {
         //
         //   * `force_short_blocks` — every granule is pure-short; the
         //     whole frame takes the short coupling (r303 / r305).
-        //   * auto block-type under MS-joint agreement
-        //     (`new_joint_stereo_ms` / `new_joint_stereo_auto`) — the
-        //     scheduler may emit a *mix* of Long / Start / End / Short
-        //     granules within one frame, but `ms_agreement_active`
-        //     guarantees both channels of each granule share the same
-        //     `block_type` / `window_switching_flag` / `mixed_block_flag`
-        //     (the channel-0 emission is mirrored across the granule).
-        //     A granule the scheduler emitted as **pure short**
+        //   * auto block-type under channel agreement — the scheduler may
+        //     emit a *mix* of Long / Start / End / Short granules within
+        //     one frame, but `channel_agreement_active` guarantees both
+        //     channels of each granule share the same `block_type` /
+        //     `window_switching_flag` / `mixed_block_flag` (the channel-0
+        //     emission is mirrored across the granule). That agreement is
+        //     forced whenever intensity coupling is armed — with MS-joint
+        //     stereo (`new_joint_stereo_ms_is` / `new_joint_stereo_auto_is`,
+        //     r307) OR on the intensity-only path (`new_joint_stereo_is`,
+        //     r308). A granule the scheduler emitted as **pure short**
         //     (`block_type == Short`, `mixed_block_flag == false`) takes
         //     the §2.4.3.4.9.3 per-window short coupling; Long / Start /
-        //     End granules take the long-block band walk. (r307)
+        //     End granules take the long-block band walk.
         //
         // `short_intensity_gr[gr]` is the per-granule selector; the
         // long-block branch below runs for every granule it is `false`
-        // for. Mixed blocks (`mixed_block_flag == true`) and
-        // independent-stereo auto (channel block-types may diverge → the
-        // fold geometry would differ between L and R) keep the
-        // `IntensityShortBlocksUnsupported` rejection.
+        // for. Mixed blocks (`mixed_block_flag == true`) keep the
+        // `IntensityShortBlocksUnsupported` rejection (the §2.4.3.4.10.3
+        // two-region carve-out bound is not wired); the
+        // `channel_agreement_active` OR-fold removes the L/R divergence
+        // that previously blocked the intensity-only auto path.
         let mut short_intensity_gr = [false; GRANULES];
         for gr in 0..ngr {
             short_intensity_gr[gr] = self.force_short_blocks
@@ -6457,16 +6481,26 @@ mod tests {
         let mut auto_pick = Mp3Encoder::new_joint_stereo_auto_is(192, 44_100, 8).unwrap();
         assert!(auto_pick.enable_auto_block_type(10.0).is_ok());
 
-        // Mixed + intensity, mixed-promotion auto, and the *intensity-
-        // only* auto path (independent per-channel scheduling) remain
-        // unsupported.
+        // The *intensity-only* signal-driven auto path is now accepted
+        // (r308): arming intensity coupling forces the §2.4.3.4.9
+        // channel-agreement OR-fold (channel-0 emission mirrored across
+        // both channels), so L/R block types stay consistent even
+        // without MS.
+        let mut auto_is_only = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8).unwrap();
+        assert!(auto_is_only.enable_auto_block_type(10.0).is_ok());
+        assert!(auto_is_only.auto_block_type_enabled());
+
+        // Mixed + intensity (force-mixed) and the mixed-promotion auto
+        // variant remain unsupported (the §2.4.3.4.10.3 two-region
+        // carve-out bound is unwired) — on the intensity-only path AND
+        // the MS+intensity path.
         let mut enc = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8).unwrap();
         assert!(matches!(
             enc.force_mixed_blocks_for_testing(true),
             Err(StreamEncodeError::IntensityShortBlocksUnsupported)
         ));
         assert!(matches!(
-            enc.enable_auto_block_type(10.0),
+            enc.enable_auto_block_type_with_mixed(10.0, 4.0),
             Err(StreamEncodeError::IntensityShortBlocksUnsupported)
         ));
         let mut ms_mixed = Mp3Encoder::new_joint_stereo_ms_is(192, 44_100, 8).unwrap();

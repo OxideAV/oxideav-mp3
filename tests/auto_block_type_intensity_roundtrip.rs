@@ -22,14 +22,25 @@
 //! granule, so the §2.4.3.4.9 "both channels share the same block_type /
 //! window_switching_flag / mixed_block_flag" agreement that intensity
 //! coupling needs (it folds each granule's `(L, R)` band-by-band) holds
-//! by construction. Plain intensity stereo (no MS) runs an independent
-//! per-channel scheduler whose block types may diverge between L and R,
-//! so that combination stays rejected.
+//! by construction.
+//!
+//! r308 lifts the remaining rejection on the **intensity-only** path
+//! ([`oxideav_mp3::Mp3Encoder::new_joint_stereo_is`] +
+//! `enable_auto_block_type`, no MS). Arming intensity coupling now forces
+//! the SAME channel-agreement OR-fold in the scheduler walk
+//! (`channel_agreement_active = MS-joint OR intensity-armed`): the
+//! per-channel attack flags are OR-folded into one shared (channel-0)
+//! scheduler and its emission is mirrored across both channels, so L/R
+//! block types stay consistent even without MS — the per-band fold
+//! geometry is therefore well-defined. The mixed-promotion auto variant
+//! and the Model-2-driven auto path under intensity stay rejected.
 //!
 //! Covered end-to-end with in-tree primitives only:
 //!
 //! 1. **API acceptance** — `enable_auto_block_type` succeeds on an
-//!    MS+intensity encoder and is rejected on an intensity-only one.
+//!    MS+intensity encoder AND on an intensity-only encoder; the
+//!    mixed-promotion + Model-2 auto variants under intensity stay
+//!    rejected.
 //! 2. **Mixed block-type stream** — a transient stereo stimulus drives
 //!    the scheduler to emit both long-family AND pure-short granules in
 //!    the same stream, each carrying `mode = '01'`, the intensity bit set,
@@ -148,6 +159,24 @@ fn encode_auto_ms_is(pcm: &[i16]) -> Vec<u8> {
     out
 }
 
+/// Intensity-only (no MS) auto-block-type encode (r308). `mode = '01'`,
+/// `mode_extension` low bit set (intensity on) but the MS bit clear, so
+/// `mode_extension.raw == 0b01`. The auto scheduler still mirrors its
+/// channel-0 emission across both channels because intensity coupling
+/// forces the §2.4.3.4.9 agreement OR-fold.
+fn encode_auto_is_only(pcm: &[i16]) -> Vec<u8> {
+    let mut enc = Mp3Encoder::new_joint_stereo_is(BR, SR, START_SFB).expect("intensity encoder");
+    enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .expect("auto block-type on intensity-only encoder (r308)");
+    assert!(
+        enc.intensity_stereo_enabled() && !enc.ms_stereo_enabled() && enc.auto_block_type_enabled()
+    );
+    enc.push_samples(pcm).expect("push pcm");
+    let mut out = Vec::new();
+    enc.finish(&mut out).expect("finish");
+    out
+}
+
 /// Spec-order stereo self-decode handling a per-granule mix of
 /// long-family and pure-short blocks (the §2.4.3.4.8 reorder runs only on
 /// the short granules, driven by the parsed side-info).
@@ -245,12 +274,22 @@ fn auto_ms_intensity_api_acceptance() {
         .enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
         .is_ok());
 
-    // Still rejected on the intensity-only path (independent per-channel
-    // scheduling: L/R block types may diverge, breaking coupling
-    // geometry).
+    // Accepted on the intensity-only path too (r308): arming intensity
+    // coupling forces the §2.4.3.4.9 channel-agreement OR-fold in the
+    // scheduler walk (channel-0's emission mirrored across both
+    // channels), so L/R block types stay consistent and the per-window /
+    // long intensity coupling is well-defined.
     let mut is_only = Mp3Encoder::new_joint_stereo_is(BR, SR, START_SFB).expect("is-only");
+    assert!(is_only
+        .enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+        .is_ok());
+    assert!(is_only.auto_block_type_enabled() && is_only.intensity_stereo_enabled());
+
+    // Mixed promotion stays rejected on the intensity-only path too (the
+    // §2.4.3.4.10.3 carve-out bound is unwired regardless of MS).
+    let mut is_only_mixed = Mp3Encoder::new_joint_stereo_is(BR, SR, START_SFB).expect("is-only");
     assert!(matches!(
-        is_only.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD),
+        is_only_mixed.enable_auto_block_type_with_mixed(DEFAULT_ATTACK_THRESHOLD, 4.0),
         Err(StreamEncodeError::IntensityShortBlocksUnsupported)
     ));
 
@@ -398,5 +437,149 @@ fn auto_ms_intensity_encode_is_bit_exact() {
     let pcm = transient_stereo_pcm(SR as usize);
     let a = encode_auto_ms_is(&pcm);
     let b = encode_auto_ms_is(&pcm);
+    assert_eq!(a, b, "two encodes of the same PCM must be byte-identical");
+}
+
+// ---- r308: intensity-only (no MS) auto block-type ----
+
+#[test]
+fn auto_is_only_stream_mixes_block_types_and_agrees() {
+    // The intensity-only auto path mixes long-family AND pure-short
+    // granules; the §2.4.3.4.9 agreement is forced by the
+    // intensity-armed OR-fold even though MS is OFF, so every granule's
+    // channels share geometry and the header carries '01' (intensity on,
+    // MS off).
+    let pcm = transient_stereo_pcm(SR as usize * 2);
+    let out = encode_auto_is_only(&pcm);
+
+    let mut frames = 0usize;
+    let mut saw_long = false;
+    let mut saw_short = false;
+    for frame in FrameWalker::new(&out) {
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        assert!(matches!(hdr.mode, ChannelMode::JointStereo));
+        assert!(hdr.mode_extension.intensity_stereo, "intensity bit set");
+        assert!(
+            !hdr.mode_extension.ms_stereo,
+            "MS bit clear (intensity-only)"
+        );
+        assert_eq!(
+            hdr.mode_extension.raw, 0b01,
+            "mode_extension '01' (intensity only), got {:#04b}",
+            hdr.mode_extension.raw
+        );
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("si");
+        for gr in 0..si.granule_count as usize {
+            let g0 = &si.granules[gr][0];
+            let g1 = &si.granules[gr][1];
+            assert_eq!(g0.block_type, g1.block_type, "channels share block_type");
+            assert_eq!(
+                g0.window_switching_flag, g1.window_switching_flag,
+                "channels share window_switching_flag"
+            );
+            assert_eq!(
+                g0.mixed_block_flag, g1.mixed_block_flag,
+                "channels share mixed_block_flag"
+            );
+            assert!(!g0.mixed_block_flag, "auto path emits no mixed blocks");
+            if g0.block_type == BlockType::Short && g0.window_switching_flag {
+                saw_short = true;
+            } else if g0.block_type == BlockType::Long {
+                saw_long = true;
+            }
+        }
+        frames += 1;
+    }
+    assert!(frames > 0);
+    assert!(
+        saw_long,
+        "scheduler must keep long blocks on steady stretches"
+    );
+    assert!(
+        saw_short,
+        "transient bursts must drive at least one short granule"
+    );
+}
+
+#[test]
+fn auto_is_only_short_positions_in_range() {
+    let pcm = transient_stereo_pcm(SR as usize * 2);
+    let out = encode_auto_is_only(&pcm);
+
+    let mut reservoir = Reservoir::new();
+    let mut checked_short = false;
+    for (idx, frame) in FrameWalker::new(&out).enumerate() {
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("si");
+        let run = reservoir
+            .assemble(
+                usize::from(si.main_data_begin),
+                &frame.data[4 + si.byte_len()..],
+            )
+            .expect("assemble");
+        if idx < 4 {
+            continue; // filterbank warm-up
+        }
+        let fsf = decode_scalefactors(&hdr, &si, &run).expect("scalefactors");
+        for gr in 0..si.granule_count as usize {
+            let gc = &si.granules[gr][1];
+            let sf = &fsf.granules[gr][1];
+            if gc.window_switching_flag && gc.block_type == BlockType::Short && !gc.mixed_block_flag
+            {
+                checked_short = true;
+                for sfb in 0..12 {
+                    for win in 0..3 {
+                        assert!(
+                            sf.short[sfb][win] <= 7,
+                            "frame {idx} gr {gr}: short pos {} out of range",
+                            sf.short[sfb][win]
+                        );
+                    }
+                }
+            } else {
+                for sfb in 0..21 {
+                    assert!(
+                        sf.long[sfb] <= 7,
+                        "frame {idx} gr {gr}: long pos {} out of range",
+                        sf.long[sfb]
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        checked_short,
+        "no short granule appeared to validate per-window positions"
+    );
+}
+
+#[test]
+fn auto_is_only_self_decode_left_leaning() {
+    let n = SR as usize * 2;
+    let pcm = transient_stereo_pcm(n);
+    let out = encode_auto_is_only(&pcm);
+
+    let (recon_l, recon_r) = decode_mp3_stereo(&out);
+    let head = 4 * 1152 + 1057;
+    assert!(recon_l.len() > head + 8192, "not enough steady PCM");
+    let seg_l = &recon_l[head..head + 8192];
+    let seg_r = &recon_r[head..head + 8192];
+
+    let hi_l = goertzel_power(seg_l, HIGH_HZ);
+    let hi_r = goertzel_power(seg_r, HIGH_HZ);
+    assert!(hi_l > 0.0, "high tone vanished on the left");
+    let hi_ratio = (hi_l / hi_r.max(1.0)).sqrt();
+    eprintln!("auto+intensity-only 8 kHz reconstructed |L|/|R| = {hi_ratio:.3}");
+    assert!(
+        hi_ratio > 1.8,
+        "coupled hard-left high tone should reconstruct left-leaning, got {hi_ratio}"
+    );
+}
+
+#[test]
+fn auto_is_only_encode_is_bit_exact() {
+    let pcm = transient_stereo_pcm(SR as usize);
+    let a = encode_auto_is_only(&pcm);
+    let b = encode_auto_is_only(&pcm);
     assert_eq!(a, b, "two encodes of the same PCM must be byte-identical");
 }
