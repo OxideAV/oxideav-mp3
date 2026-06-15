@@ -162,6 +162,40 @@ pub fn synth_row(s: &[f64; NUM_SUBBANDS], state: &mut SynthState) -> [f64; NUM_S
     out
 }
 
+/// Convert one decoder output PCM sample (the §2.4.3.4 "range of the
+/// output values of the decoder (PCM samples) is between -1,0 and +1,0"
+/// fractional value) into a 16-bit signed integer sample.
+///
+/// The synthesis filterbank emits the reconstructed signal as a
+/// fractional two's-complement number whose MSB carries the value -1
+/// (§2.4.3.4.7.1: *"the requantized value … two's complement fractional
+/// number, where the MSB represents the value -1"*), and §2.4.3.4.7
+/// states the decoder's PCM output lies in `[-1.0, +1.0]`. A full-scale
+/// 16-bit two's-complement sample spans `[-2^15, 2^15 - 1] = [-32768,
+/// 32767]`, so the fractional value maps to the integer grid by scaling
+/// by `2^15 = 32768` (the magnitude of the MSB weight), not `32767`.
+///
+/// The real-valued product is then rounded to the **nearest integer**,
+/// with half-integer values rounded **away from zero** — exactly the
+/// spec's "Nearest integer operator" (§2.3, the `Round()` / `[ ]`
+/// operator: *"Returns the nearest integer value to the real-valued
+/// argument. Half-integer values are rounded away from zero."*).
+/// Rust's [`f32::round`] implements that rounding rule. Truncation
+/// toward zero (`x as i16` on the un-rounded product) would bias every
+/// non-integer sample one step toward zero and is not what the spec's
+/// nearest-integer rule prescribes.
+///
+/// Finally the result is clipped to the representable 16-bit range. Only
+/// an exact `+1.0` input (or a value that rounds up to `+32768`) needs
+/// the high clip; `-1.0` maps to `-32768` without clipping.
+#[must_use]
+pub fn pcm_f32_to_i16(sample: f32) -> i16 {
+    // Scale by the MSB weight 2^15, round half-away-from-zero, clip to
+    // the signed 16-bit range [-32768, 32767].
+    let scaled = (f64::from(sample) * 32768.0).round();
+    scaled.clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+}
+
 /// Run the §2.4.3.4.10 / §2.4.3.2 polyphase synthesis filter for one
 /// granule-channel: 18 sequential calls to [`synth_row`] over the 32×18
 /// subband-time block produced by [`crate::imdct::imdct_granule`].

@@ -33,8 +33,12 @@ The full Layer III decode pipeline is implemented:
 - **CRC-16** frame protection (§2.4.3.1).
 
 Output is interleaved PCM through the `oxideav_core::Decoder` trait. The
-decode path is validated by PSNR self-round-trip tests and against
-staged reference fixtures.
+final float-to-`i16` conversion follows §2.4.3.4.7 exactly: the decoder
+output range is `[-1.0, +1.0]`, so samples scale by the MSB weight
+`2^15 = 32768` and round to the nearest integer with half-integer values
+rounded away from zero (§2.3 "Nearest integer operator"). The decode
+path is validated by PSNR self-round-trip tests and against staged
+reference fixtures.
 
 ## Encoder
 

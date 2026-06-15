@@ -447,3 +447,61 @@ fn d_table_first_values_match_table_b3() {
         assert_eq!(D_TABLE[i], -0.000030518, "D[{i}]");
     }
 }
+
+// ----- §2.4.3.4.7 decoder output PCM -> i16 conversion -----
+
+#[test]
+fn pcm_zero_maps_to_zero() {
+    assert_eq!(pcm_f32_to_i16(0.0), 0);
+}
+
+#[test]
+fn pcm_full_scale_endpoints_map_to_16bit_range() {
+    // §2.4.3.4.7: the decoder PCM output range is [-1.0, +1.0]. The MSB
+    // weight 2^15 = 32768 maps -1.0 -> -32768 exactly; +1.0 -> +32768
+    // saturates to the 16-bit maximum 32767.
+    assert_eq!(pcm_f32_to_i16(-1.0), i16::MIN); // -32768
+    assert_eq!(pcm_f32_to_i16(1.0), i16::MAX); //  32767 (clipped)
+}
+
+#[test]
+fn pcm_scales_by_32768_not_32767() {
+    // Half-scale 0.5 * 32768 = 16384 exactly; scaling by 32767 would
+    // give 16383.5 -> a different integer.
+    assert_eq!(pcm_f32_to_i16(0.5), 16384);
+    assert_eq!(pcm_f32_to_i16(-0.5), -16384);
+    // A quarter scale: 0.25 * 32768 = 8192.
+    assert_eq!(pcm_f32_to_i16(0.25), 8192);
+}
+
+#[test]
+fn pcm_rounds_to_nearest_not_truncates() {
+    // Pick an input whose scaled product has a fractional part well above
+    // 0.5 so nearest-integer rounding and truncation-toward-zero disagree.
+    // (100 + 0.8)/32768 -> product ~100.8 -> nearest 101, truncation 100.
+    let v = (100.8_f64 / 32768.0) as f32;
+    let expect_round = (f64::from(v) * 32768.0).round() as i16;
+    let truncated = (f64::from(v) * 32768.0) as i16;
+    assert_ne!(expect_round, truncated, "test value must distinguish modes");
+    assert_eq!(pcm_f32_to_i16(v), expect_round);
+    assert_eq!(pcm_f32_to_i16(v), 101);
+}
+
+#[test]
+fn pcm_rounds_half_away_from_zero() {
+    // A value whose scaled product lands exactly on .5: 0.5/32768 added
+    // to an integer grid point. (n + 0.5)/32768 with n = 100 ->
+    // 100.5 -> rounds away from zero to 101; the negative -> -101.
+    let pos = (100.5_f64 / 32768.0) as f32;
+    let neg = (-100.5_f64 / 32768.0) as f32;
+    assert_eq!(pcm_f32_to_i16(pos), 101);
+    assert_eq!(pcm_f32_to_i16(neg), -101);
+}
+
+#[test]
+fn pcm_clips_out_of_range_inputs() {
+    // Inputs slightly outside [-1, 1] (possible from filterbank ringing)
+    // saturate rather than wrap.
+    assert_eq!(pcm_f32_to_i16(2.0), i16::MAX);
+    assert_eq!(pcm_f32_to_i16(-2.0), i16::MIN);
+}

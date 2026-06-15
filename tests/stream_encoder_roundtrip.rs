@@ -22,8 +22,9 @@ use std::io::Cursor;
 use oxideav_core::Demuxer;
 use oxideav_mp3::{
     alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, requantize, synth_granule, ChannelMode, FrameWalker, ImdctState,
-    MainDataReader, Mp3Demuxer, Mp3Encoder, MpegVersion, Reservoir, SynthState, PCM_PER_GRANULE,
+    parse_side_info, pcm_f32_to_i16, requantize, synth_granule, ChannelMode, FrameWalker,
+    ImdctState, MainDataReader, Mp3Demuxer, Mp3Encoder, MpegVersion, Reservoir, SynthState,
+    PCM_PER_GRANULE,
 };
 
 /// Synthesise an `n`-sample mono `i16` sine tone of `freq_hz` at
@@ -110,8 +111,7 @@ fn decode_mp3_mono(bytes: &[u8]) -> Vec<i16> {
                 let subband_time = imdct_granule(&xar, gc, &mut imdct_state);
                 let pcm_f32 = synth_granule(&subband_time, &mut synth_state);
                 for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
-                    let v = p * f32::from(i16::MAX);
-                    out_pcm.push(v.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                    out_pcm.push(pcm_f32_to_i16(p));
                 }
                 bit_cursor += gc.part2_3_length as usize;
             }

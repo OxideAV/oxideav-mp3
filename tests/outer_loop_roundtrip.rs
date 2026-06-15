@@ -34,9 +34,10 @@ use std::io::Cursor;
 
 use oxideav_core::Demuxer;
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, imdct_granule, parse_header, parse_side_info, requantize,
-    synth_granule, BlockType, ChannelMode, FrameWalker, ImdctState, MainDataReader, Mp3Demuxer,
-    Mp3Encoder, MpegVersion, Reservoir, ScaleFactors, SynthState, MPEG1_SLEN, PCM_PER_GRANULE,
+    alias_reduce, decode_huffman, imdct_granule, parse_header, parse_side_info, pcm_f32_to_i16,
+    requantize, synth_granule, BlockType, ChannelMode, FrameWalker, ImdctState, MainDataReader,
+    Mp3Demuxer, Mp3Encoder, MpegVersion, Reservoir, ScaleFactors, SynthState, MPEG1_SLEN,
+    PCM_PER_GRANULE,
 };
 
 const SR: u32 = 44_100;
@@ -206,8 +207,7 @@ fn decode_mp3_mono(bytes: &[u8]) -> Vec<i16> {
                 let subband_time = imdct_granule(&xar, gc, &mut imdct_state);
                 let pcm_f32 = synth_granule(&subband_time, &mut synth_state);
                 for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
-                    let v = p * f32::from(i16::MAX);
-                    out_pcm.push(v.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                    out_pcm.push(pcm_f32_to_i16(p));
                 }
             }
         }

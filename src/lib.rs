@@ -510,7 +510,9 @@ pub use stream_encoder::{
     Mp3Encoder, StreamEncodeError, LSF_L3_BITRATE_LADDER_KBPS, MPEG1_L3_BITRATE_LADDER_KBPS,
     SAMPLES_PER_FRAME_MPEG1, SAMPLES_PER_GRANULE,
 };
-pub use synth::{n_coefficient, synth_granule, synth_row, SynthState, D_TABLE, PCM_PER_GRANULE};
+pub use synth::{
+    n_coefficient, pcm_f32_to_i16, synth_granule, synth_row, SynthState, D_TABLE, PCM_PER_GRANULE,
+};
 pub use xing_info::{
     build_info_frame, build_xing_info_payload, flag_bit as xing_flag_bit, XingEmitError,
     XingTagSpec, MAX_PAYLOAD_BYTES as XING_MAX_PAYLOAD_BYTES,

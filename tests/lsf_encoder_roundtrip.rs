@@ -18,9 +18,10 @@ use std::f32::consts::PI;
 
 use oxideav_mp3::{
     alias_reduce, crc16_layer3_lsf, decode_huffman, decode_scalefactors, imdct_granule,
-    lsf_scale_params, parse_header, parse_side_info, process_stereo, reorder, requantize,
-    synth_granule, BlockType, ChannelMode, FrameWalker, GranuleChannel, ImdctState, MainDataReader,
-    Mp3Encoder, MpegVersion, Reservoir, StreamEncodeError, SynthState, PCM_PER_GRANULE,
+    lsf_scale_params, parse_header, parse_side_info, pcm_f32_to_i16, process_stereo, reorder,
+    requantize, synth_granule, BlockType, ChannelMode, FrameWalker, GranuleChannel, ImdctState,
+    MainDataReader, Mp3Encoder, MpegVersion, Reservoir, StreamEncodeError, SynthState,
+    PCM_PER_GRANULE,
 };
 
 /// Synthesise an `n`-sample mono `i16` sine tone.
@@ -146,8 +147,7 @@ fn decode_lsf_stream(bytes: &[u8]) -> Vec<Vec<i16>> {
             let subband_time = imdct_granule(&xar, gc, &mut imdct[ch]);
             let pcm_f32 = synth_granule(&subband_time, &mut synth[ch]);
             for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
-                let v = p * f32::from(i16::MAX);
-                out[ch].push(v.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                out[ch].push(pcm_f32_to_i16(p));
             }
         }
     }

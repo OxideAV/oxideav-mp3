@@ -34,8 +34,8 @@ use oxideav_core::{
 };
 use oxideav_mp3::{
     alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, process_stereo, requantize, synth_granule, ChannelMode, FrameWalker,
-    ImdctState, MainDataReader, Mp3Encoder, Reservoir, SynthState, PCM_PER_GRANULE,
+    parse_side_info, pcm_f32_to_i16, process_stereo, requantize, synth_granule, ChannelMode,
+    FrameWalker, ImdctState, MainDataReader, Mp3Encoder, Reservoir, SynthState, PCM_PER_GRANULE,
     SAMPLES_PER_FRAME_MPEG1,
 };
 
@@ -137,8 +137,7 @@ fn decode_stereo_direct(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
                 let pcm_f32 = synth_granule(&subband_time, &mut synth[ch]);
                 let sink = if ch == 0 { &mut out_l } else { &mut out_r };
                 for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
-                    let v = p * f32::from(i16::MAX);
-                    sink.push(v.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                    sink.push(pcm_f32_to_i16(p));
                 }
             }
         }

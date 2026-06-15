@@ -91,7 +91,7 @@ use crate::requantize::requantize;
 use crate::scalefactors::{decode_scalefactors, MainDataReader, Reservoir};
 use crate::side_info::parse_side_info;
 use crate::stream_encoder::SAMPLES_PER_FRAME_MPEG1;
-use crate::synth::{synth_granule, SynthState, PCM_PER_GRANULE};
+use crate::synth::{pcm_f32_to_i16, synth_granule, SynthState, PCM_PER_GRANULE};
 
 /// Build a boxed MPEG-1 / MPEG-2 LSF Audio Layer III [`Decoder`] from
 /// `params`.
@@ -371,8 +371,7 @@ impl Mp3CoreDecoder {
                 let subband_time = imdct_granule(&xar, gc, &mut self.imdct_state[ch]);
                 let pcm_f32 = synth_granule(&subband_time, &mut self.synth_state[ch]);
                 for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
-                    let v = p * f32::from(i16::MAX);
-                    pcm_planes[ch].push(v.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                    pcm_planes[ch].push(pcm_f32_to_i16(p));
                 }
             }
         }
@@ -593,8 +592,7 @@ mod tests {
                     let st = imdct_granule(&xar, gc, &mut imdct_state);
                     let pcm_f32 = synth_granule(&st, &mut synth_state);
                     for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
-                        let v = p * f32::from(i16::MAX);
-                        out_pcm.push(v.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                        out_pcm.push(pcm_f32_to_i16(p));
                     }
                     bit_cursor += gc.part2_3_length as usize;
                 }

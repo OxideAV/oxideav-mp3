@@ -29,8 +29,9 @@ use oxideav_core::{
 };
 use oxideav_mp3::{
     alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, requantize, synth_granule, ChannelMode, FrameWalker, ImdctState,
-    MainDataReader, Mp3Encoder, Reservoir, SynthState, PCM_PER_GRANULE, SAMPLES_PER_FRAME_MPEG1,
+    parse_side_info, pcm_f32_to_i16, requantize, synth_granule, ChannelMode, FrameWalker,
+    ImdctState, MainDataReader, Mp3Encoder, Reservoir, SynthState, PCM_PER_GRANULE,
+    SAMPLES_PER_FRAME_MPEG1,
 };
 
 fn sine_pcm(n: usize, freq_hz: f32, sr: f32, amp: f32) -> Vec<i16> {
@@ -108,8 +109,7 @@ fn decode_direct(bytes: &[u8]) -> Vec<i16> {
                 let st = imdct_granule(&xar, gc, &mut imdct_state);
                 let pcm_f32 = synth_granule(&st, &mut synth_state);
                 for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
-                    let v = p * f32::from(i16::MAX);
-                    out_pcm.push(v.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                    out_pcm.push(pcm_f32_to_i16(p));
                 }
                 bit_cursor += gc.part2_3_length as usize;
             }

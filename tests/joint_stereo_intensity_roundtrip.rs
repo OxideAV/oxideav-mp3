@@ -36,9 +36,9 @@ use std::process::Command;
 
 use oxideav_mp3::{
     alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, process_stereo, requantize, synth_granule, ChannelMode, FrameWalker,
-    ImdctState, MainDataReader, Mp3Encoder, Reservoir, SynthState, MPEG1_SLEN, NUM_LINES,
-    PCM_PER_GRANULE,
+    parse_side_info, pcm_f32_to_i16, process_stereo, requantize, synth_granule, ChannelMode,
+    FrameWalker, ImdctState, MainDataReader, Mp3Encoder, Reservoir, SynthState, MPEG1_SLEN,
+    NUM_LINES, PCM_PER_GRANULE,
 };
 
 /// Part2 (scalefactor) bit count of one MPEG-1 **long-block** granule
@@ -202,8 +202,7 @@ fn decode_mp3_stereo(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
                 let pcm_f32 = synth_granule(&subband_time, &mut synth[ch]);
                 let sink = if ch == 0 { &mut out_l } else { &mut out_r };
                 for &p in pcm_f32.iter().take(PCM_PER_GRANULE) {
-                    let v = p * f32::from(i16::MAX);
-                    sink.push(v.clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16);
+                    sink.push(pcm_f32_to_i16(p));
                 }
             }
         }

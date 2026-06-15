@@ -6,6 +6,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- decoder: **§2.4.3.4.7 output-PCM rounding made spec-exact** (r318). The
+  reconstructed signal is a fractional two's-complement value in
+  `[-1.0, +1.0]` whose MSB carries the weight `-1`; the 16-bit signed PCM
+  output therefore scales by the MSB weight `2^15 = 32768` (not `32767`)
+  and rounds to the **nearest integer with half-integer values rounded
+  away from zero** — the spec's §2.3 "Nearest integer operator". The
+  previous conversion scaled by `32767` and truncated toward zero (`x as
+  i16`), biasing every non-integer sample one step toward zero and
+  slightly attenuating full-scale amplitude. New shared
+  `synth::pcm_f32_to_i16` helper centralises the conversion; the trait
+  decode path, the direct-chain decode helpers, and every roundtrip test's
+  reference decoder now route through it. Six unit tests cover the scale
+  factor, endpoint saturation, nearest-integer rounding, and
+  half-away-from-zero behaviour.
+
 ### Added
 
 - encoder: **§C.1.5.3.2.1 Model-2-driven auto block-type under
