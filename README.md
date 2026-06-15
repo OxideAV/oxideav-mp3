@@ -923,6 +923,44 @@ the spec-correct side). Spec read: ISO/IEC 11172-3 §2.4.3.4.8 (short
 reorder), §2.4.3.4.9 (stereo runs after reorder), §2.4.3.4.10
 (IMDCT consumes subband-ordered lines).
 
+**Round 311 (§2.4.3.4.10.3 mixed-block intensity stereo, intensity-only
+non-MS).** Through r308 every intensity path accepted long, pure-short,
+and auto-scheduled granules, but the **mixed** block (`block_type == 2`
+with `mixed_block_flag == 1`) was the last block-type toggle still
+rejected with `IntensityShortBlocksUnsupported`. r311 wires the
+§2.4.3.4.10.3 carve-out for `force_mixed_blocks_for_testing(true)` on an
+intensity-only encoder (`new_joint_stereo_is`, no MS). A mixed block
+transforms its lowest 2 polyphase subbands (long bands 0..=7, lines 0..36)
+with a normal long window and the upper 30 subbands (short bands 3..12) as
+short blocks (PDF p.26; `docs/audio/mp3/mp3-alias-reduction-clarification.md`
+§"Mixed blocks"), so intensity coupling runs in **two regions**: the long
+region couples on the long-band walk (positions on the right channel's
+`scalefac_l[sfb]`) and the short region couples per window (positions on
+`scalefac_s[sfb][win]`). This is the exact two-region geometry the
+decoder's `process_stereo` already reconstructs for a `mixed_block_flag`
+granule (`for sfb in 0..8` long, then per-window short bands
+`MIXED_FIRST_SHORT_SFB..12`), so encode and decode use a shared band map.
+The user `intensity_start_sfb` (1..=20) addresses the long grid directly;
+for the short region it is mapped onto a short band by frequency and
+clamped to `MIXED_FIRST_SHORT_SFB` (the three lowest short bands fall
+inside the long carve-out). All-zero bands below each region's derived
+bound carry the illegal-position marker `7` (Annex G.2 c); the right
+channel carries `scalefac_compress = 15` so the long (slen1) and short
+(slen1/slen2) positions fit. Header emits `mode = '01'` /
+`mode_extension = '01'`. **Still rejected:** mixed + intensity under
+MS-joint stereo (the §2.4.3.4.9.2 below-bound rotation over the mixed split
+line set is a follow-up) and the mixed-promotion *auto* variant
+(`enable_auto_block_type_with_mixed` under intensity). Validated by four
+new `mixed_block_intensity_roundtrip` tests: the `'01'` header + mixed
+side-info, long-and-short right-channel positions in range, a hard-left
+8 kHz intensity tone reconstructing strongly left-leaning (|L|/|R| ≈ 9500)
+through a spec-order self-decode, and a byte-deterministic re-encode; the
+`intensity_rejects_block_type_toggles` unit test now asserts force-mixed +
+intensity-only acceptance and keeps the MS-mixed / auto-mixed rejections.
+Spec read: ISO/IEC 11172-3 §2.4.3.4.10.3 (mixed-block geometry) /
+§2.4.3.4.9.3 (intensity positions) / Annex G.2 c) (position marker);
+ISO/IEC 13818-3 §2.4.3.2 (per-window bound).
+
 **Round 308 (§2.4.3.4.9 auto-block-type-scheduled short granules with
 intensity-only — non-MS — joint stereo).** r307 lifted the
 `IntensityShortBlocksUnsupported` rejection on the signal-driven
@@ -5127,15 +5165,19 @@ cover ratio preservation, the geometric-mean scale anchor, the
 silent / zero-band floor, the outer-loop / rate / granule guards,
 and an end-to-end install producing a spectrally-shaped (not
 flat) threshold — it
-still lacks
-the §C.1.5.3.2 driver that runs Model 2 *automatically* inside
-`push_samples` per granule (the threshold is installed via the
-explicit `set_per_band_xmin_from_model2` entry point this round;
-auto-wiring it into the per-granule encode walk — including the
-MS-vs-independent channel split and the auto-block-type lookahead
-— is the follow-up),
+— the automatic per-granule Model 2 driver inside `push_samples`
+(armed by `enable_model2_psychoacoustics`, including the
+MS-vs-independent channel split and the auto-block-type lookahead)
+landed in r293, with the §C.1.5.3.2.1 Model-2-driven block-type
+path in r295.
+
+The encoder still lacks:
+mixed-block intensity stereo under **MS-joint** stereo (r311 wired
+the intensity-only non-MS mixed carve-out; the §2.4.3.4.9.2
+below-bound rotation over the mixed split line set, and the
+mixed-promotion *auto* variant under intensity, remain follow-ups);
 LSF / MPEG-2.5 Model 2 (the Annex D Tables D.3 / D.4 / C.7 / C.8
-are staged only for 32 / 44.1 / 48 kHz), and
+are staged only for 32 / 44.1 / 48 kHz); and
 externally-valid MPEG-2.5 encode (the encoder emits
 self-consistent MPEG-2.5 streams this crate's decoder
 round-trips, but the MPEG-2.5-specific scalefactor-band tables

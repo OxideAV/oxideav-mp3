@@ -82,8 +82,8 @@ use crate::main_data::{
 use crate::mdct::{forward_overlap, mdct, window_long_family_analysis, MdctState, LONG_N};
 use crate::outer_loop::{
     outer_loop_search_long, outer_loop_search_mixed, outer_loop_search_short,
-    INTENSITY_SCALEFAC_COMPRESS_LSF, OUTER_LOOP_SCALEFAC_COMPRESS,
-    OUTER_LOOP_SCALEFAC_COMPRESS_LSF,
+    INTENSITY_SCALEFAC_COMPRESS_LSF, MIXED_FIRST_SHORT_SFB, MIXED_LAST_LONG_SFB,
+    OUTER_LOOP_SCALEFAC_COMPRESS, OUTER_LOOP_SCALEFAC_COMPRESS_LSF,
 };
 use crate::quantize::quantize;
 use crate::scalefactors::{FrameScaleFactors, ScaleFactors, LONG_SFB};
@@ -1082,12 +1082,16 @@ impl Mp3Encoder {
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
-        if enabled && self.intensity_start_sfb.is_some() {
-            // Mixed-block intensity coupling is not wired: the
-            // §2.4.3.4.10.3 carve-out (long lowest subbands + short rest)
-            // needs a two-region intensity bound this round does not
-            // derive. Force-short and MS-joint auto short coupling are
-            // supported (r303 / r305 / r307); mixed stays rejected.
+        if enabled && self.intensity_start_sfb.is_some() && self.ms_joint_stereo_active() {
+            // §2.4.3.4.10.3 mixed-block intensity coupling is wired for
+            // the *intensity-only* (non-MS) path (r311): the carve-out's
+            // long lowest 2 subbands take the long-band intensity walk and
+            // the upper short region takes the per-window short walk (the
+            // exact two-region geometry the decoder's `process_short`
+            // applies for a `mixed_block_flag` granule). The MS-joint
+            // combination — the §2.4.3.4.9.2 below-bound rotation over the
+            // mixed block's split line set — remains a follow-up, so it
+            // stays rejected.
             return Err(StreamEncodeError::IntensityShortBlocksUnsupported);
         }
         if enabled {
@@ -3583,10 +3587,24 @@ impl Mp3Encoder {
         // two-region carve-out bound is not wired); the
         // `channel_agreement_active` OR-fold removes the L/R divergence
         // that previously blocked the intensity-only auto path.
+        //
+        // r311 wires the §2.4.3.4.10.3 mixed carve-out for the
+        // intensity-only (non-MS) force-mixed path: a mixed granule
+        // couples its long lowest 2 subbands (long bands `start..=7`,
+        // lines 0..36) on the long-band walk AND its upper short region
+        // (short bands 3..12) per window — exactly the two regions the
+        // decoder's `process_short` reconstructs for a
+        // `mixed_block_flag == true` granule. `mixed_intensity_gr[gr]`
+        // selects this path; it is mutually exclusive with the pure-short
+        // `short_intensity_gr[gr]` below.
+        let mut mixed_intensity_gr = [false; GRANULES];
         let mut short_intensity_gr = [false; GRANULES];
         for gr in 0..ngr {
-            short_intensity_gr[gr] = self.force_short_blocks
-                || (block_type_per_gc[gr][0] == BlockType::Short && !mixed_per_gc[gr][0]);
+            mixed_intensity_gr[gr] = self.force_mixed_blocks
+                || (block_type_per_gc[gr][0] == BlockType::Short && mixed_per_gc[gr][0]);
+            short_intensity_gr[gr] = !mixed_intensity_gr[gr]
+                && (self.force_short_blocks
+                    || (block_type_per_gc[gr][0] == BlockType::Short && !mixed_per_gc[gr][0]));
         }
         if let Some(start_sfb) = self.intensity_start_sfb {
             if self.nch == 2 {
@@ -3594,6 +3612,94 @@ impl Mp3Encoder {
                 let long_starts = long_band_starts_for(self.sample_rate_hz);
                 let starts = long_starts;
                 for gr in 0..ngr {
+                    if mixed_intensity_gr[gr] {
+                        // §2.4.3.4.10.3 mixed-block intensity coupling.
+                        // The granule's lowest 2 polyphase subbands
+                        // (long bands 0..=7, lines 0..36) are long-windowed
+                        // and the upper 30 subbands (short bands 3..12) are
+                        // short-windowed. Couple the long region on the
+                        // long-band walk and the short region per window —
+                        // the exact two regions the decoder's
+                        // `process_short` rebuilds for a `mixed_block_flag`
+                        // granule (`for sfb in 0..8` long, then per-window
+                        // short bands `MIXED_FIRST_SHORT_SFB..12`).
+                        let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
+                        let left = &mut left_slice[0];
+                        let right = &mut right_slice[0];
+                        let is_pos_bands = &mut is_pos_per_gr[gr];
+
+                        // --- Long region: long bands `start_sfb..8` ---
+                        // The user `intensity_start_sfb` (1..=20) addresses
+                        // the long-band grid directly. A granule couples at
+                        // all whenever it has a long-region band at/above
+                        // the bound (`start_sfb < 8`) or any short region
+                        // above its mapped bound (handled below).
+                        let long_eff_end = MIXED_LAST_LONG_SFB + 1; // = 8
+                        for sfb in start_sfb..long_eff_end {
+                            let lo = long_starts[sfb];
+                            let hi = long_starts[sfb + 1];
+                            let mut l_energy = 0.0f64;
+                            let mut r_energy = 0.0f64;
+                            for i in lo..hi {
+                                l_energy += f64::from(left[i]) * f64::from(left[i]);
+                                r_energy += f64::from(right[i]) * f64::from(right[i]);
+                            }
+                            is_pos_bands[sfb] = if self.version.is_lsf() {
+                                derive_intensity_position_lsf(l_energy, r_energy)
+                            } else {
+                                derive_intensity_position(l_energy, r_energy)
+                            };
+                            for i in lo..hi {
+                                left[i] += right[i];
+                                right[i] = 0.0;
+                            }
+                        }
+
+                        // --- Short region: per-window short bands ---
+                        // Map the long start line onto a short band, then
+                        // clamp to `MIXED_FIRST_SHORT_SFB` (= 3): the lowest
+                        // three short bands fall inside the long-windowed
+                        // carve-out and carry no short-region intensity.
+                        let start_line = long_starts[start_sfb];
+                        let mapped = (0..12)
+                            .find(|&sfb| short_starts[sfb] >= start_line)
+                            .unwrap_or(12);
+                        let short_start = mapped.max(MIXED_FIRST_SHORT_SFB);
+                        short_intensity_start_per_gr[gr] = short_start;
+                        // A mixed granule couples whenever either region has
+                        // a band at/above the bound.
+                        intensity_coupled_per_gr[gr] = start_sfb < long_eff_end || short_start < 12;
+                        for sfb in short_start..12 {
+                            let s = short_starts[sfb];
+                            let w = short_starts[sfb + 1] - short_starts[sfb];
+                            let base = 3 * s;
+                            for win in 0..3 {
+                                let mut l_energy = 0.0f64;
+                                let mut r_energy = 0.0f64;
+                                let win_base = base + win * w;
+                                for k in 0..w {
+                                    let i = win_base + k;
+                                    if i < NUM_LINES {
+                                        l_energy += f64::from(left[i]) * f64::from(left[i]);
+                                        r_energy += f64::from(right[i]) * f64::from(right[i]);
+                                    }
+                                }
+                                is_pos_short_per_gr[gr][sfb][win] = if self.version.is_lsf() {
+                                    derive_intensity_position_lsf(l_energy, r_energy)
+                                } else {
+                                    derive_intensity_position(l_energy, r_energy)
+                                };
+                                for k in 0..w {
+                                    let i = win_base + k;
+                                    if i < NUM_LINES {
+                                        left[i] += right[i];
+                                        right[i] = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if short_intensity_gr[gr] {
                         let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
                         let left = &mut left_slice[0];
@@ -4558,7 +4664,90 @@ impl Mp3Encoder {
                 //     (§2.4.3.4.9.1), so without the marker those
                 //     bands would be intensity-decoded with whatever
                 //     scalefactor the quantizer left behind.
-                if intensity_right && short_intensity_gr[gr] {
+                if intensity_right && mixed_intensity_gr[gr] {
+                    // §2.4.3.4.10.3 mixed-block right channel: positions
+                    // and markers go on BOTH `scalefac_l[sfb]` (long
+                    // region, bands 0..8) and `scalefac_s[sfb][win]`
+                    // (short region, bands 3..12 per window) — the two
+                    // regions the decoder's `process_short` rebuilds for a
+                    // `mixed_block_flag` granule.
+                    let short_starts = short_band_starts_for(self.sample_rate_hz);
+                    let long_starts = long_band_starts_for(self.sample_rate_hz);
+                    let start_sfb = self.intensity_start_sfb.unwrap_or(LONG_SFB);
+                    let long_end = MIXED_LAST_LONG_SFB + 1; // = 8
+
+                    // --- Long region markers + positions (bands 0..8) ---
+                    // The decoder derives the long-region bound from the
+                    // last non-zero right line in lines 0..36 (one band
+                    // past it), so the all-zero bands between that bound and
+                    // the coupled start carry the illegal marker 7; coupled
+                    // bands carry the pass-1.45 `is_pos`.
+                    // The mixed long region is the lowest 2 polyphase
+                    // subbands = lines 0..36; long band 8 starts at line 36
+                    // for every sample rate, so `long_starts[long_end]`
+                    // bounds the region exactly.
+                    let long_region_hi = long_starts[long_end];
+                    let mut last_nz_long: Option<usize> = None;
+                    for (i, &v) in is.iter().enumerate().take(long_region_hi) {
+                        if v != 0 {
+                            last_nz_long = Some(i);
+                        }
+                    }
+                    let zero_tail_from_long = match last_nz_long {
+                        None => 0,
+                        Some(line) => {
+                            let mut band = long_end;
+                            for sfb in 0..long_end {
+                                if line < long_starts[sfb + 1] {
+                                    band = sfb + 1;
+                                    break;
+                                }
+                            }
+                            band
+                        }
+                    };
+                    for sfb in zero_tail_from_long..start_sfb.min(long_end) {
+                        sf.long[sfb] = 7;
+                    }
+                    for sfb in start_sfb.min(long_end)..long_end {
+                        sf.long[sfb] = is_pos_per_gr[gr][sfb];
+                    }
+
+                    // --- Short region markers + positions (bands 3..12) ---
+                    // Map the long start line onto a short band, clamped to
+                    // `MIXED_FIRST_SHORT_SFB` (the lowest three short bands
+                    // are absorbed by the long carve-out and never carry a
+                    // short-region position).
+                    let start_line = long_starts[start_sfb];
+                    let mapped = (0..12)
+                        .find(|&sfb| short_starts[sfb] >= start_line)
+                        .unwrap_or(12);
+                    let short_start = mapped.max(MIXED_FIRST_SHORT_SFB);
+                    for win in 0..3 {
+                        let mut last_nz_sfb: Option<usize> = None;
+                        for sfb in MIXED_FIRST_SHORT_SFB..12 {
+                            let s = short_starts[sfb];
+                            let w = short_starts[sfb + 1] - short_starts[sfb];
+                            let win_base = 3 * s + win * w;
+                            for k in 0..w {
+                                let i = win_base + k;
+                                if i < NUM_LINES && is[i] != 0 {
+                                    last_nz_sfb = Some(sfb);
+                                }
+                            }
+                        }
+                        let zero_tail_from = match last_nz_sfb {
+                            None => MIXED_FIRST_SHORT_SFB,
+                            Some(sfb) => sfb + 1,
+                        };
+                        for sfb in zero_tail_from..short_start.min(12) {
+                            sf.short[sfb][win] = 7;
+                        }
+                        for sfb in short_start..12 {
+                            sf.short[sfb][win] = is_pos_short_per_gr[gr][sfb][win];
+                        }
+                    }
+                } else if intensity_right && short_intensity_gr[gr] {
                     // Short-block right channel: positions and markers go
                     // on `scalefac_s[sfb][win]`, derived independently per
                     // window. The decoder's per-window bound
@@ -6490,17 +6679,29 @@ mod tests {
         assert!(auto_is_only.enable_auto_block_type(10.0).is_ok());
         assert!(auto_is_only.auto_block_type_enabled());
 
-        // Mixed + intensity (force-mixed) and the mixed-promotion auto
-        // variant remain unsupported (the §2.4.3.4.10.3 two-region
-        // carve-out bound is unwired) — on the intensity-only path AND
-        // the MS+intensity path.
+        // Force-mixed + intensity on the *intensity-only* (non-MS) path
+        // is now accepted (r311): the §2.4.3.4.10.3 carve-out couples the
+        // long lowest 2 subbands on the long walk and the short rest per
+        // window.
         let mut enc = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8).unwrap();
+        assert!(enc.force_mixed_blocks_for_testing(true).is_ok());
+        assert!(enc.force_mixed_blocks_enabled());
+
+        // Force-mixed + intensity under MS-joint stereo stays rejected
+        // (the below-bound MS rotation over the mixed split line set is a
+        // follow-up).
+        let mut ms_enc = Mp3Encoder::new_joint_stereo_ms_is(192, 44_100, 8).unwrap();
         assert!(matches!(
-            enc.force_mixed_blocks_for_testing(true),
+            ms_enc.force_mixed_blocks_for_testing(true),
             Err(StreamEncodeError::IntensityShortBlocksUnsupported)
         ));
+
+        // The mixed-promotion *auto* variant remains unsupported (the
+        // signal-driven mixed classifier carve-out is unwired) — on the
+        // intensity-only path AND the MS+intensity path.
+        let mut auto_mixed = Mp3Encoder::new_joint_stereo_is(192, 44_100, 8).unwrap();
         assert!(matches!(
-            enc.enable_auto_block_type_with_mixed(10.0, 4.0),
+            auto_mixed.enable_auto_block_type_with_mixed(10.0, 4.0),
             Err(StreamEncodeError::IntensityShortBlocksUnsupported)
         ));
         let mut ms_mixed = Mp3Encoder::new_joint_stereo_ms_is(192, 44_100, 8).unwrap();

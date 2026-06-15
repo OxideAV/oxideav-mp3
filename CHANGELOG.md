@@ -28,6 +28,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder: **§2.4.3.4.10.3 mixed-block intensity stereo (intensity-only,
+  non-MS)** (r311). `force_mixed_blocks_for_testing(true)` is now accepted
+  on an intensity-only encoder (`new_joint_stereo_is`); it was the last
+  block-type toggle still rejected with `IntensityShortBlocksUnsupported`.
+  A mixed block (§2.4.3.4.10.3 / PDF p.26) transforms its lowest 2
+  polyphase subbands (long bands 0..=7, lines 0..36) with a normal long
+  window and the upper 30 subbands (short bands 3..12) as short blocks, so
+  intensity coupling runs in **two regions**: the long region couples on
+  the long-band walk (positions on the right channel's `scalefac_l[sfb]`)
+  and the short region couples per window (positions on
+  `scalefac_s[sfb][win]`) — the exact two-region geometry the decoder's
+  `process_stereo` already reconstructs for a `mixed_block_flag` granule
+  (long bands `0..8`, then per-window short bands
+  `MIXED_FIRST_SHORT_SFB..12`). The user-facing `intensity_start_sfb`
+  (1..=20) addresses the long grid directly; for the short region it is
+  mapped onto a short band by frequency and clamped to
+  `MIXED_FIRST_SHORT_SFB` (the three lowest short bands fall inside the
+  long carve-out). All-zero bands below each region's derived bound carry
+  the illegal-position marker `7` (Annex G.2 c); the right channel carries
+  `scalefac_compress = 15` so the long (slen1) and short (slen1/slen2)
+  positions fit. Header emits `mode = '01'` / `mode_extension = '01'`.
+  **Still rejected:** mixed + intensity under MS-joint stereo (the
+  §2.4.3.4.9.2 below-bound rotation over the mixed split line set) and the
+  mixed-promotion *auto* variant (`enable_auto_block_type_with_mixed`
+  under intensity). New `tests/mixed_block_intensity_roundtrip.rs` (4
+  tests): the `'01'` header + mixed side-info, long-and-short right-channel
+  positions in range, a hard-left 8 kHz intensity tone reconstructing
+  strongly left-leaning through a spec-order self-decode
+  (huffman → requantize → reorder → process_stereo → alias → imdct →
+  synth), and a byte-deterministic re-encode. The
+  `intensity_rejects_block_type_toggles` unit test now asserts force-mixed
+  + intensity-only acceptance and keeps the MS-mixed / auto-mixed
+  rejections.
+
 - encoder: **§2.4.3.4.9 auto-block-type-scheduled short granules with
   intensity-only (non-MS) joint stereo** (r308). `enable_auto_block_type`
   is now accepted on a plain intensity encoder
