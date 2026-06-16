@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- decoder/trait: **MPEG-2.5 at 11.025 / 12 kHz now decodes through the
+  `Decoder` trait wrapper** (r326). The wrapper's version guard
+  previously rejected *all* MPEG-2.5 frames; it now accepts the two
+  fully-grounded extension rates. Per
+  `docs/audio/mp3/mpeg2.5-scalefactor-bands.md` (#147/#151) the
+  11.025 / 12 kHz scalefactor-band tables are byte-identical to the
+  in-repo ISO/IEC 13818-3 22.05 / 24 kHz LSF Table B.2 entries, and the
+  header `id`-field → sample-rate dispatch is grounded in the staged
+  datavoyage header reference (`MPEG-2.5-GAP.md`), so these rates decode
+  through the identical side-info → scalefactor → Huffman → requantize →
+  reorder → stereo → IMDCT → synthesis chain that MPEG-2 LSF already
+  uses. The **8 kHz** rate stays rejected: its band table is a distinct
+  Fraunhofer table with no in-repo half-rate sibling and no
+  observer-trace fixture, so it remains gated on the residual
+  `MPEG-2.5-GAP.md` observer-trace item. New tests:
+  `trait_decode_mpeg25_11025_byte_exact_with_direct_chain` (byte-exact
+  trait-vs-direct), `send_packet_accepts_mpeg25_12khz_header_through_the_guard`,
+  and `send_packet_rejects_mpeg25_8khz_pending_observer_trace` (replaces
+  the prior all-MPEG-2.5 rejection test, whose premise no longer holds).
 - encoder/band-tables: **MPEG-2.5 (8 / 11.025 / 12 kHz) Layer III
   scalefactor-band tables wired in** (r321). Closes the README "lacks
   only MPEG-2.5 band tables" tail using the newly-staged

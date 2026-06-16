@@ -38,9 +38,9 @@
 //!
 //! ## Scope
 //!
-//! This module wires the Layer III decode path — MPEG-1 and MPEG-2 LSF,
-//! mono **and** stereo (independent, joint MS, joint MS+intensity) —
-//! through the framework trait.
+//! This module wires the Layer III decode path — MPEG-1, MPEG-2 LSF, and
+//! MPEG-2.5 (11.025 / 12 kHz), mono **and** stereo (independent, joint
+//! MS, joint MS+intensity) — through the framework trait.
 //!
 //! * **Mono and stereo.** `channels == 1` or `2`. For stereo frames the
 //!   per-channel state — `ImdctState` and `SynthState` — is carried
@@ -59,10 +59,18 @@
 //!   downstream by [`requantize`] / [`crate::process_stereo`], so
 //!   widening the trait wrapper to LSF is just dropping the
 //!   MPEG-1-only header guard and letting `si.granule_count` /
-//!   `si.channels` drive the per-frame iteration count. MPEG-2.5 is
-//!   still rejected here: its observer-trace items in
-//!   `docs/audio/mp3/MPEG-2.5-GAP.md` block byte-exact decode at
-//!   8 / 11.025 / 12 kHz.
+//!   `si.channels` drive the per-frame iteration count.
+//! * **MPEG-2.5 (11.025 / 12 kHz).** The Fraunhofer-IIS extension
+//!   reuses the §13818-3 LSF framing on the half-rate sample rates. At
+//!   11.025 and 12 kHz the scalefactor-band tables are byte-identical to
+//!   the in-repo 13818-3 22.05 / 24 kHz LSF tables (fully grounded —
+//!   `docs/audio/mp3/mpeg2.5-scalefactor-bands.md`, #147/#151) and the
+//!   sample-rate dispatch is grounded in the staged datavoyage header
+//!   reference (`docs/audio/mp3/MPEG-2.5-GAP.md`), so these two rates
+//!   decode through the identical LSF chain and are accepted. The
+//!   **8 kHz** rate uses a distinct Fraunhofer SFB table with no in-repo
+//!   sibling and no observer-trace fixture, so it remains rejected here
+//!   pending the residual `MPEG-2.5-GAP.md` observer-trace item.
 //! * **Layer III only.** Layer I / Layer II frames are rejected at the
 //!   `send_packet` boundary.
 //!
@@ -215,18 +223,36 @@ impl Mp3CoreDecoder {
             MpegVersion::Mpeg1 | MpegVersion::Mpeg2 => {}
             MpegVersion::Mpeg25 => {
                 // MPEG-2.5 framing parses (§MPEG-2.5 step 25) and the
-                // scalefactor-band tables are now staged
-                // (`docs/audio/mp3/mpeg2.5-scalefactor-bands.md`, #147/
-                // #151: 11.025/12 kHz reuse the 13818-3 22.05/24 kHz LSF
-                // tables verbatim, 8 kHz is the distinct Fraunhofer
-                // table). The full trait decode chain stays gated on the
-                // remaining `MPEG-2.5-GAP.md` observer-trace items — the
-                // header `id`-field dispatch, the bit-exact Huffman table
-                // mapping, and the 8 kHz table's in-repo grounding —
-                // rather than produce non-spec PCM.
-                return Err(Error::unsupported(
-                    "oxideav-mp3: MPEG-2.5 trait decode pending observer-trace items",
-                ));
+                // whole LSF decode chain (side-info → scalefactors →
+                // Huffman → requantize → reorder → stereo → IMDCT →
+                // synthesis) already routes the extension sample rates
+                // through the §13818-3 LSF path. The remaining question
+                // is the scalefactor-band table grounding, which differs
+                // by rate (`docs/audio/mp3/mpeg2.5-scalefactor-bands.md`,
+                // #147/#151):
+                //
+                // * **11.025 kHz** and **12 kHz**: the long+short SFB
+                //   tables are *byte-identical* to the in-repo ISO/IEC
+                //   13818-3 22.05 / 24 kHz LSF Table B.2 entries — fully
+                //   grounded in the staged 13818-3 PDF. The header
+                //   `id`-field → sample-rate dispatch (`00→11025`,
+                //   `01→12000`, `10→8000`) is grounded in the staged
+                //   datavoyage header reference (`MPEG-2.5-GAP.md`). These
+                //   two rates decode through the identical chain MPEG-2
+                //   LSF uses, so they are accepted here.
+                // * **8 kHz**: the SFB table is a distinct Fraunhofer
+                //   table with no in-repo half-rate sibling and no
+                //   observer-trace fixture, so it remains
+                //   published-factual-but-ungrounded. Decoding it would
+                //   emit PCM whose band layout we cannot yet attest to
+                //   from the in-repo specs alone, so 8 kHz stays gated on
+                //   the residual `MPEG-2.5-GAP.md` observer-trace item.
+                if hdr.sample_rate_hz == 8_000 {
+                    return Err(Error::unsupported(
+                        "oxideav-mp3: MPEG-2.5 8 kHz trait decode pending observer-trace \
+                         grounding of the 8 kHz scalefactor-band table",
+                    ));
+                }
             }
         }
         let nch = hdr.channel_count() as usize;
@@ -890,42 +916,159 @@ mod tests {
     }
 
     #[test]
-    fn send_packet_rejects_mpeg25_header_pending_observer_trace() {
-        // Build a real Fraunhofer MPEG-2.5 4-byte header via the
-        // crate's own header writer (32 kbps Layer III at 11.025 kHz,
-        // mono — round-trip-verified in `encoder` unit tests). Feed
-        // it to the trait decoder and confirm it is rejected with
-        // an `Error::Unsupported` rather than silently producing
-        // non-spec PCM. The scalefactor-band tables are now staged
-        // (`mpeg2.5-scalefactor-bands.md`, #147/#151) and wired into
-        // the encoder, but the remaining `MPEG-2.5-GAP.md`
-        // observer-trace items (header `id`-field dispatch, the
-        // bit-exact Huffman table mapping, the 8 kHz table's in-repo
-        // grounding) still gate proper trait decode at 8 / 11.025 /
-        // 12 kHz; this guard keeps the residual gap honest.
+    fn send_packet_rejects_mpeg25_8khz_pending_observer_trace() {
+        // The 8 kHz MPEG-2.5 rate is the one residual gap: its
+        // scalefactor-band table is a distinct Fraunhofer table with no
+        // in-repo half-rate sibling and no observer-trace fixture
+        // (`docs/audio/mp3/mpeg2.5-scalefactor-bands.md` §"8 kHz
+        // provenance"; `MPEG-2.5-GAP.md`). Until that table is grounded
+        // the trait decoder must reject 8 kHz frames rather than emit
+        // PCM whose band layout we cannot attest to from the in-repo
+        // specs alone. Build a real Fraunhofer MPEG-2.5 8 kHz header via
+        // the crate's own header writer (24 kbps Layer III, mono) and
+        // confirm an `Error::Unsupported` fires.
         use crate::encoder::{make_silent_header, write_header};
         use crate::frame::ChannelMode;
-        let hdr = make_silent_header(32, 11_025, ChannelMode::SingleChannel)
-            .expect("mpeg-2.5 silent header build");
+        let hdr = make_silent_header(24, 8_000, ChannelMode::SingleChannel)
+            .expect("mpeg-2.5 8 kHz silent header build");
+        assert_eq!(hdr.version, MpegVersion::Mpeg25);
+        assert_eq!(hdr.sample_rate_hz, 8_000);
         let hdr_bytes = write_header(&hdr);
         let frame_len = hdr.frame_len().expect("mpeg-2.5 frame_len derivable");
         // Pad to the header-implied frame_len so the rejection arm
         // is reached before the truncation check (we want to assert
-        // the version guard fires, not the length guard).
+        // the 8 kHz guard fires, not the length guard).
         let mut payload = hdr_bytes.to_vec();
         payload.resize(frame_len, 0u8);
-        let tb = TimeBase::new(1, 11_025);
+        let tb = TimeBase::new(1, 8_000);
         let pkt = Packet::new(0, tb, payload);
-        let mut dec = make_decoder(&build_decoder_params(11_025)).expect("make_decoder");
+        let mut dec = make_decoder(&build_decoder_params(8_000)).expect("make_decoder");
         match dec.send_packet(&pkt) {
             Err(e) => {
                 let msg = format!("{e}");
                 assert!(
-                    msg.contains("MPEG-2.5") || msg.contains("observer-trace"),
-                    "expected MPEG-2.5-pending error, got: {msg}"
+                    msg.contains("8 kHz") || msg.contains("observer-trace"),
+                    "expected MPEG-2.5 8 kHz-pending error, got: {msg}"
                 );
             }
-            Ok(()) => panic!("send_packet must reject MPEG-2.5 pending observer-trace items"),
+            Ok(()) => panic!("send_packet must reject MPEG-2.5 8 kHz pending observer-trace"),
+        }
+    }
+
+    #[test]
+    fn trait_decode_mpeg25_11025_byte_exact_with_direct_chain() {
+        // MPEG-2.5 at 11.025 kHz now decodes through the trait wrapper:
+        // its scalefactor-band tables are byte-identical to the in-repo
+        // ISO/IEC 13818-3 22.05 kHz LSF tables (fully grounded —
+        // `docs/audio/mp3/mpeg2.5-scalefactor-bands.md`, #147/#151) and
+        // the header `id`-field → sample-rate dispatch is grounded in
+        // the staged datavoyage reference (`MPEG-2.5-GAP.md`). Encode a
+        // real MPEG-2.5 11.025 kHz stream, then assert the trait wrapper
+        // produces the identical i16 PCM as the in-module `decode_direct`
+        // reference chain (same chain MPEG-1 / MPEG-2 LSF already use).
+        const SR: u32 = 11_025;
+        let n = SR as usize / 2; // 0.5 s
+        let pcm = sine_pcm(n, 220.0, SR as f32, 0.5);
+        let wire = encode_to_mp3(&pcm, SR, 32);
+        assert!(wire.len() > 100, "encoded MPEG-2.5 stream too small");
+
+        // Confirm the stream really is MPEG-2.5 at 11.025 kHz.
+        let first = crate::frame::FrameWalker::new(&wire)
+            .next()
+            .expect("at least one frame");
+        let hdr = parse_header(&first.data[..4]).unwrap();
+        assert_eq!(hdr.version, MpegVersion::Mpeg25);
+        assert_eq!(hdr.sample_rate_hz, SR);
+        assert_eq!(hdr.samples_per_frame(), 576);
+
+        let direct = decode_direct(&wire);
+
+        let mut dec = make_decoder(&build_decoder_params(SR)).expect("make_decoder");
+        let mut trait_out: Vec<i16> = Vec::new();
+        for pkt in mp3_to_packets(&wire, SR) {
+            dec.send_packet(&pkt).expect("send_packet");
+            loop {
+                match dec.receive_frame() {
+                    Ok(Frame::Audio(a)) => {
+                        for chunk in a.data[0].chunks_exact(2) {
+                            trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                        }
+                    }
+                    Ok(other) => panic!("non-audio frame: {other:?}"),
+                    Err(Error::NeedMore) => break,
+                    Err(e) => panic!("receive_frame: {e}"),
+                }
+            }
+        }
+        dec.flush().expect("flush");
+        loop {
+            match dec.receive_frame() {
+                Ok(Frame::Audio(a)) => {
+                    for chunk in a.data[0].chunks_exact(2) {
+                        trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    }
+                }
+                Ok(other) => panic!("non-audio frame on flush: {other:?}"),
+                Err(Error::Eof) | Err(Error::NeedMore) => break,
+                Err(e) => panic!("post-flush receive_frame: {e}"),
+            }
+        }
+
+        assert_eq!(
+            trait_out.len(),
+            direct.len(),
+            "trait-driven sample count {} != direct-chain {}",
+            trait_out.len(),
+            direct.len()
+        );
+        let mismatches = trait_out
+            .iter()
+            .zip(direct.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "MPEG-2.5 trait decode differs from direct chain in {mismatches} samples"
+        );
+        // Sanity: the decode is non-silent (a runaway / mis-routed band
+        // table would collapse to silence or saturate).
+        assert!(
+            trait_out.iter().any(|&s| s.abs() > 64),
+            "MPEG-2.5 11.025 kHz trait decode produced silence"
+        );
+    }
+
+    #[test]
+    fn send_packet_accepts_mpeg25_12khz_header_through_the_guard() {
+        // The 12 kHz MPEG-2.5 rate is the other fully-grounded extension
+        // rate (its SFB tables are byte-identical to the in-repo 24 kHz
+        // LSF tables). A header at 12 kHz must pass the version/rate
+        // guard through to the side-info / reservoir stage rather than
+        // being rejected up front; the main-data slot here is zeros, so
+        // the frame may buffer (Ok) or error at a *later* decode stage,
+        // but the 8 kHz-style up-front rejection must NOT fire.
+        use crate::encoder::{make_silent_header, write_header};
+        use crate::frame::ChannelMode;
+        let hdr = make_silent_header(32, 12_000, ChannelMode::SingleChannel)
+            .expect("mpeg-2.5 12 kHz silent header build");
+        assert_eq!(hdr.version, MpegVersion::Mpeg25);
+        assert_eq!(hdr.sample_rate_hz, 12_000);
+        let hdr_bytes = write_header(&hdr);
+        let frame_len = hdr.frame_len().expect("mpeg-2.5 frame_len derivable");
+        let mut payload = hdr_bytes.to_vec();
+        payload.resize(frame_len, 0u8);
+        let tb = TimeBase::new(1, 12_000);
+        let pkt = Packet::new(0, tb, payload);
+        let mut dec = make_decoder(&build_decoder_params(12_000)).expect("make_decoder");
+        match dec.send_packet(&pkt) {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    !msg.contains("8 kHz") && !msg.contains("observer-trace"),
+                    "MPEG-2.5 12 kHz must not hit the 8 kHz rejection arm (got: {msg})"
+                );
+            }
         }
     }
 

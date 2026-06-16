@@ -8,9 +8,11 @@ decoder, CBR/VBR encoder, and a stream demuxer.
 
 Clean-room implementation. Every numeric constant is transcribed from
 ISO/IEC 11172-3:1993 and ISO/IEC 13818-3:1997 and from no other source.
-The decoder produces PCM end-to-end for MPEG-1 and MPEG-2 LSF (mono and
-stereo); MPEG-2.5 framing is parsed but full decode through the trait
-wrapper is pending. The encoder produces valid CBR and VBR MP3 streams.
+The decoder produces PCM end-to-end for MPEG-1, MPEG-2 LSF, and MPEG-2.5
+at 11.025 / 12 kHz (mono and stereo); MPEG-2.5 at 8 kHz is parsed but
+held back from trait decode pending observer-trace grounding of its
+distinct scalefactor-band table. The encoder produces valid CBR and VBR
+MP3 streams.
 
 ## Decoder
 
@@ -78,12 +80,17 @@ Registered as a container alongside the codec.
 
 ## Not yet supported
 
-- MPEG-2.5 decode through the `Decoder` trait wrapper (the header guard
-  accepts MPEG-1 and MPEG-2 LSF and rejects MPEG-2.5). The low-rate
-  (8 / 11.025 / 12 kHz) scalefactor-band tables are now staged and wired
-  in; the remaining gate is the residual `MPEG-2.5-GAP.md` observer-trace
-  items — the header `id`-field dispatch, the bit-exact Huffman table
-  mapping, and the 8 kHz table's in-repo grounding.
+- MPEG-2.5 decode at **8 kHz** through the `Decoder` trait wrapper. The
+  header guard now accepts MPEG-1, MPEG-2 LSF, and MPEG-2.5 at 11.025 /
+  12 kHz — those two extension rates reuse the in-repo ISO/IEC 13818-3
+  22.05 / 24 kHz LSF scalefactor-band tables verbatim (fully grounded per
+  `mpeg2.5-scalefactor-bands.md`, #147/#151) and decode through the same
+  chain as MPEG-2 LSF, byte-exact with the direct decode chain. Only the
+  **8 kHz** rate is still rejected: its scalefactor-band table is a
+  distinct Fraunhofer table with no in-repo half-rate sibling, so it
+  stays gated on the residual `MPEG-2.5-GAP.md` observer-trace item (an
+  8 kHz trace fixture that would independently confirm the band
+  boundaries).
 - Annex D psychoacoustic shaping is **opt-in**: the default quantization
   is rate/distortion-driven, while `enable_model2_psychoacoustics`
   arms the §C.1.5.3.2.1 Model 2 analysis (per-band `xmin` threshold plus
