@@ -349,3 +349,139 @@ fn power_law_magnitude_8191_finite() {
     let expected = (8191f32).powf(4.0 / 3.0) * (45.0 / 4.0f32).exp2();
     approx(xr[0], expected);
 }
+
+// --- MPEG-2.5 (8 / 11.025 / 12 kHz) scalefactor-band tables ---
+// docs/audio/mp3/mpeg2.5-scalefactor-bands.md (#147/#151). The 11.025 /
+// 12 kHz tables are byte-identical to the 22.05 / 24 kHz LSF tables; the
+// 8 kHz table is the distinct Fraunhofer table with collapsed top bands.
+
+/// Every long table has 22 entries forming a contiguous, strictly
+/// non-decreasing partition of the 576-line granule, with band 21
+/// spanning `starts[21]..576` (cross-check column of the doc).
+fn assert_long_invariants(starts: &[usize; 22]) {
+    assert_eq!(starts[0], 0, "band 0 starts at line 0");
+    for w in starts.windows(2) {
+        assert!(w[0] < w[1], "long bands must be strictly increasing");
+    }
+    assert!(starts[21] < NUM_LINES, "band 21 spans starts[21]..576");
+}
+
+/// Every short table has 13 per-window entries partitioning the 192-line
+/// window, band 12 spanning `starts[12]..192`.
+fn assert_short_invariants(starts: &[usize; 13]) {
+    assert_eq!(starts[0], 0);
+    for w in starts.windows(2) {
+        assert!(w[0] < w[1], "short bands must be strictly increasing");
+    }
+    assert!(starts[12] < 192, "band 12 spans starts[12]..192 per window");
+}
+
+#[test]
+fn mpeg25_8khz_long_table_exact() {
+    // docs §"8 kHz, long blocks": widths 12×6, 16,20,24,28,32,40,48,56,
+    // 64,76,90, then five width-2 filler bands. Σ widths = 576.
+    let starts = long_band_starts(8000, MpegVersion::Mpeg25);
+    assert_eq!(
+        *starts,
+        [
+            0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568,
+            570, 572, 574,
+        ]
+    );
+    assert_long_invariants(starts);
+    // Top long bands 17..21 collapse to width 2 (the 8 kHz signature).
+    for sfb in 17..21 {
+        assert_eq!(starts[sfb + 1] - starts[sfb], 2, "band {sfb} width 2");
+    }
+    assert_eq!(NUM_LINES - starts[21], 2, "band 21 width 2");
+}
+
+#[test]
+fn mpeg25_8khz_short_table_exact() {
+    // docs §"8 kHz, short blocks": widths 8,8,8,12,16,20,24,28,36, three
+    // width-2 fillers, then band 12 sweeping the residual 26 lines.
+    let starts = short_band_starts(8000, MpegVersion::Mpeg25);
+    assert_eq!(*starts, [0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166]);
+    assert_short_invariants(starts);
+    for sfb in 9..12 {
+        assert_eq!(starts[sfb + 1] - starts[sfb], 2, "band {sfb} width 2");
+    }
+    assert_eq!(192 - starts[12], 26, "band 12 width 26");
+}
+
+#[test]
+fn mpeg25_11025_reuses_lsf_22050() {
+    // docs key result: 11.025 kHz tables are byte-identical to the
+    // in-repo 13818-3 22.05 kHz LSF tables (long + short).
+    assert_eq!(
+        long_band_starts(11025, MpegVersion::Mpeg25),
+        long_band_starts(22050, MpegVersion::Mpeg2),
+        "11.025 kHz long == 22.05 kHz LSF long"
+    );
+    assert_eq!(
+        short_band_starts(11025, MpegVersion::Mpeg25),
+        short_band_starts(22050, MpegVersion::Mpeg2),
+        "11.025 kHz short == 22.05 kHz LSF short"
+    );
+}
+
+#[test]
+fn mpeg25_12000_reuses_lsf_24000() {
+    // docs key result: 12 kHz tables are byte-identical to the in-repo
+    // 13818-3 24 kHz LSF tables (long + short).
+    assert_eq!(
+        long_band_starts(12000, MpegVersion::Mpeg25),
+        long_band_starts(24000, MpegVersion::Mpeg2),
+        "12 kHz long == 24 kHz LSF long"
+    );
+    assert_eq!(
+        short_band_starts(12000, MpegVersion::Mpeg25),
+        short_band_starts(24000, MpegVersion::Mpeg2),
+        "12 kHz short == 24 kHz LSF short"
+    );
+}
+
+#[test]
+fn mpeg25_all_rates_satisfy_band_invariants() {
+    for &rate in &[8000u32, 11025, 12000] {
+        assert_long_invariants(long_band_starts(rate, MpegVersion::Mpeg25));
+        assert_short_invariants(short_band_starts(rate, MpegVersion::Mpeg25));
+    }
+}
+
+#[test]
+fn mpeg25_8khz_no_longer_aliases_mpeg1_32k() {
+    // Regression: before #147/#151 the 8 kHz rate borrowed the 32 kHz
+    // MPEG-1 layout as a placeholder. It must now resolve to the distinct
+    // Fraunhofer 8 kHz table.
+    assert_ne!(
+        long_band_starts(8000, MpegVersion::Mpeg25),
+        long_band_starts(32000, MpegVersion::Mpeg1),
+        "8 kHz long must not reuse the 32 kHz placeholder"
+    );
+    assert_ne!(
+        short_band_starts(8000, MpegVersion::Mpeg25),
+        short_band_starts(32000, MpegVersion::Mpeg1),
+        "8 kHz short must not reuse the 32 kHz placeholder"
+    );
+}
+
+#[test]
+fn mpeg25_8khz_band_boundaries_select_correct_scalefactor() {
+    // At 8 kHz, long band 0 spans lines 0..12, band 1 12..24, band 2
+    // 24..36. A line in band 1 must pick scalefac_l[1], band 2 [2].
+    let gc = long_gc(210, false);
+    let mut sf = ScaleFactors::default();
+    sf.long[1] = 2; // 2^-1 = 0.5
+    sf.long[2] = 4; // 2^-2 = 0.25
+    let mut is = [0i32; NUM_LINES];
+    is[0] = 1; // band 0 (no sf)
+    is[12] = 1; // band 1
+    is[23] = 1; // band 1 (last line)
+    is[24] = 1; // band 2
+    let xr = requantize(&is, &gc, &sf, 8000, MpegVersion::Mpeg25);
+    approx(xr[0], 1.0);
+    approx(xr[12], 0.5);
+    approx(xr[23], 0.5);
+    approx(xr[24], 0.25);
+}

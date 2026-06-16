@@ -97,19 +97,23 @@ pub fn scalefac_multiplier(scalefac_scale: bool) -> f32 {
 pub(crate) fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 22] {
     // MPEG-1 rates: ISO/IEC 11172-3 Table B.8a/b/c. MPEG-2 LSF rates
     // (16 / 22.05 / 24 kHz): ISO/IEC 13818-3:1997 Table B.2 ("Layer III
-    // scalefactor bands", long blocks). The MPEG-2.5 rates (8 / 11.025 /
-    // 12 kHz) have no published band tables — the Fraunhofer patent
-    // describes only the derivation method, a documented residual gap
-    // (`docs/audio/mp3/MPEG-2.5-GAP.md`, "Scalefactor band index table
-    // values") — so they keep the half-rate MPEG-1 layouts as a
-    // self-consistent placeholder until observer-trace fills the gap.
+    // scalefactor bands", long blocks).
+    //
+    // MPEG-2.5 rates (8 / 11.025 / 12 kHz) — `docs/audio/mp3/`
+    // `mpeg2.5-scalefactor-bands.md` (#147/#151): the 11.025 / 12 kHz
+    // tables are *byte-identical* to the 13818-3 22.05 / 24 kHz LSF long
+    // tables (the half-rate sibling reuse, fully grounded in the in-repo
+    // 13818-3 PDF), so they share the LSF constants below. 8 kHz is a
+    // distinct Fraunhofer-defined table whose top long bands collapse to
+    // width 2 (`LONG_STARTS_MPEG25_8`).
     let _ = version;
     match sample_rate_hz {
-        16000 | 22050 => &LONG_STARTS_LSF_16_22,
-        24000 => &LONG_STARTS_LSF_24,
-        32000 | 8000 => &LONG_STARTS_32,
-        48000 | 12000 => &LONG_STARTS_48,
-        _ => &LONG_STARTS_44, // 44100, 11025 and any default.
+        16000 | 22050 | 11025 => &LONG_STARTS_LSF_16_22,
+        24000 | 12000 => &LONG_STARTS_LSF_24,
+        32000 => &LONG_STARTS_32,
+        48000 => &LONG_STARTS_48,
+        8000 => &LONG_STARTS_MPEG25_8,
+        _ => &LONG_STARTS_44, // 44100 and any default.
     }
 }
 
@@ -123,14 +127,18 @@ pub(crate) fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'s
 pub(crate) fn short_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 13] {
     // Same per-rate provenance split as [`long_band_starts`]: MPEG-1
     // rates from 11172-3 Table B.8, LSF rates from 13818-3 Table B.2
-    // (short blocks), MPEG-2.5 rates on the documented placeholder.
+    // (short blocks). MPEG-2.5 (`mpeg2.5-scalefactor-bands.md`): the
+    // 11.025 / 12 kHz short tables are byte-identical to the 22.05 / 24
+    // kHz LSF short tables; 8 kHz is the distinct Fraunhofer short table
+    // (`SHORT_STARTS_MPEG25_8`).
     let _ = version;
     match sample_rate_hz {
         16000 => &SHORT_STARTS_LSF_16,
-        22050 => &SHORT_STARTS_LSF_22,
-        24000 => &SHORT_STARTS_LSF_24,
-        32000 | 8000 => &SHORT_STARTS_32,
-        48000 | 12000 => &SHORT_STARTS_48,
+        22050 | 11025 => &SHORT_STARTS_LSF_22,
+        24000 | 12000 => &SHORT_STARTS_LSF_24,
+        32000 => &SHORT_STARTS_32,
+        48000 => &SHORT_STARTS_48,
+        8000 => &SHORT_STARTS_MPEG25_8,
         _ => &SHORT_STARTS_44,
     }
 }
@@ -163,6 +171,19 @@ const LONG_STARTS_LSF_24: [usize; 22] = [
     0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 114, 136, 162, 194, 232, 278, 332, 394, 464, 540,
 ];
 
+/// MPEG-2.5 8 kHz long-block band start indices + end+1
+/// (`docs/audio/mp3/mpeg2.5-scalefactor-bands.md`, "8 kHz, long blocks").
+/// Widths 12×6, 16, 20, 24, 28, 32, 40, 48, 56, 64, 76, 90, then five
+/// width-2 filler bands (17–21): at 8 kHz the 4 kHz Nyquist leaves no
+/// energy above line 565, so the top long bands collapse to width 2.
+/// Band 21 spans `starts[21]..576`. This is a distinct Fraunhofer table
+/// with no 13818-3 sibling (the 16 kHz LSF long table is *not* its
+/// source — see the doc's "8 kHz provenance" section).
+const LONG_STARTS_MPEG25_8: [usize; 22] = [
+    0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572,
+    574,
+];
+
 /// Table B.8a (32 kHz) short-block per-window band start indices + end+1.
 const SHORT_STARTS_32: [usize; 13] = [0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180];
 /// Table B.8b (44.1 kHz) short-block per-window band start indices + end+1.
@@ -185,6 +206,15 @@ const SHORT_STARTS_LSF_22: [usize; 13] = [0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 1
 /// authoritative one (the rendered "index of start/end" columns for
 /// this rate carry off-by-one typography).
 const SHORT_STARTS_LSF_24: [usize; 13] = [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180];
+
+/// MPEG-2.5 8 kHz short-block per-window band start indices + end+1
+/// (`docs/audio/mp3/mpeg2.5-scalefactor-bands.md`, "8 kHz, short
+/// blocks"). Widths 8, 8, 8, 12, 16, 20, 24, 28, 36, then three width-2
+/// filler bands (9–11) mirroring the long-block collapse, with band 12
+/// (width 26) sweeping the residual lines; band 12 spans
+/// `starts[12]..192` per window. Distinct Fraunhofer table, no 13818-3
+/// sibling.
+const SHORT_STARTS_MPEG25_8: [usize; 13] = [0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166];
 
 /// In a mixed block the two lowest polyphase subbands (36 lines) are
 /// coded as a long block; the remainder uses short windows (§2.4.2.7,

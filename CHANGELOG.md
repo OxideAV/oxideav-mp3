@@ -6,6 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- encoder/band-tables: **MPEG-2.5 (8 / 11.025 / 12 kHz) Layer III
+  scalefactor-band tables wired in** (r321). Closes the README "lacks
+  only MPEG-2.5 band tables" tail using the newly-staged
+  `docs/audio/mp3/mpeg2.5-scalefactor-bands.md` (#147/#151). The
+  11.025 kHz and 12 kHz long+short tables are byte-identical to the
+  in-repo ISO/IEC 13818-3 22.05 kHz / 24 kHz LSF Table B.2 entries and
+  now alias those constants; 8 kHz is the distinct Fraunhofer table
+  (new `LONG_STARTS_MPEG25_8` / `SHORT_STARTS_MPEG25_8`, top long bands
+  17–21 and short bands 9–11 collapsing to width 2 as the 4 kHz Nyquist
+  leaves no high-frequency energy). The previous half-rate MPEG-1
+  placeholders (8 kHz→32 kHz, 11.025→44.1 kHz, 12→48 kHz layouts) are
+  removed. Because `requantize::{long,short}_band_starts` is the single
+  band-boundary source shared by quantize, the inner/outer loops,
+  reorder, stereo, and the requantizer, the fix propagates through the
+  whole encode (and decode) pipeline at the MPEG-2.5 rates. Eight new
+  tests: exact 8 kHz long/short values + width-2 collapse, the
+  11.025/12 kHz LSF aliasing, structural invariants across all three
+  rates, an 8 kHz band-boundary scalefactor-selection check, a
+  regression against the old 32 kHz placeholder alias, and a full
+  `Mp3Encoder` 8 kHz encode producing a valid MPEG-2.5 stream.
+  (Trait *decode* at MPEG-2.5 stays gated on the remaining
+  `MPEG-2.5-GAP.md` observer-trace items — header `id`-field dispatch,
+  bit-exact Huffman table mapping, the 8 kHz table's in-repo grounding.)
+
 ### Changed
 
 - decoder: **§2.4.3.4.7 output-PCM rounding made spec-exact** (r318). The

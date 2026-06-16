@@ -6088,6 +6088,35 @@ mod tests {
     }
 
     #[test]
+    fn mpeg25_8khz_encode_produces_valid_stream() {
+        // End-to-end reachability of the MPEG-2.5 8 kHz scalefactor-band
+        // tables (docs/audio/mp3/mpeg2.5-scalefactor-bands.md, #147/#151):
+        // a full `Mp3Encoder` run at 8 kHz exercises quantize / inner-loop
+        // / Huffman / main-data assembly against the new 8 kHz band
+        // layout (LONG/SHORT_STARTS_MPEG25_8 via long/short_band_starts).
+        // MPEG-2.5 is single-granule (576 samples/frame/channel).
+        let mut enc = Mp3Encoder::new(32, 8_000, ChannelMode::SingleChannel).unwrap();
+        assert_eq!(enc.version, MpegVersion::Mpeg25);
+        let mut pcm = vec![0i16; SAMPLES_PER_GRANULE * 6];
+        for (n, v) in pcm.iter_mut().enumerate() {
+            // 800 Hz tone at 8 kHz (well below the 4 kHz Nyquist).
+            let t = n as f32 / 8_000.0;
+            *v = (8000.0 * (2.0 * std::f32::consts::PI * 800.0 * t).sin()) as i16;
+        }
+        enc.push_samples(&pcm).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let bytes = enc.finish(&mut out).unwrap();
+        assert!(bytes > 0, "8 kHz encode produced no bytes");
+        assert_eq!(out.len(), bytes);
+        // Every emitted frame must carry a valid sync word + MPEG-2.5 id.
+        assert!(out.len() >= 4);
+        assert_eq!(out[0], 0xFF, "frame sync byte 0");
+        assert_eq!(out[1] & 0xE0, 0xE0, "frame sync byte 1 top 3 bits");
+        // version field (bits 4..3 of byte 1) == 0b00 => MPEG-2.5.
+        assert_eq!((out[1] >> 3) & 0b11, 0b00, "MPEG-2.5 version id");
+    }
+
+    #[test]
     fn silent_frame_helper_matches_silent_encoder() {
         // Confirm a single-frame "silent" encoder run produces a frame
         // matching the [`encode_silent_frame`] convenience constructor

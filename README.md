@@ -57,7 +57,13 @@ cross-frame bit-reservoir scheduling. Additional capabilities:
   state machine (opt-in auto block typing).
 - True-VBR per-frame bitrate, opt-in Xing / Info VBR information-frame
   emission with auto-filled TOC, and opt-in CRC-16 protection.
-- MPEG-2.5 frame header writing and sample-rate dispatch.
+- MPEG-2.5 frame header writing and sample-rate dispatch, with the
+  low-rate (8 / 11.025 / 12 kHz) Layer III scalefactor-band tables wired
+  through the shared band-boundary functions, so quantization, the
+  inner/outer loops, reorder, and stereo all use the correct band
+  layout at the MPEG-2.5 rates. Per `mpeg2.5-scalefactor-bands.md`, the
+  11.025 / 12 kHz tables reuse the ISO/IEC 13818-3 22.05 / 24 kHz LSF
+  tables verbatim and 8 kHz is the distinct Fraunhofer table.
 
 The encoder is reachable through the `oxideav_core::Encoder` trait and
 several direct `make_encoder*` factory variants.
@@ -73,9 +79,11 @@ Registered as a container alongside the codec.
 ## Not yet supported
 
 - MPEG-2.5 decode through the `Decoder` trait wrapper (the header guard
-  accepts MPEG-1 and MPEG-2 LSF and rejects MPEG-2.5), pending the
-  low-rate (8 / 11.025 / 12 kHz) scalefactor-band and Huffman-table
-  mappings.
+  accepts MPEG-1 and MPEG-2 LSF and rejects MPEG-2.5). The low-rate
+  (8 / 11.025 / 12 kHz) scalefactor-band tables are now staged and wired
+  in; the remaining gate is the residual `MPEG-2.5-GAP.md` observer-trace
+  items — the header `id`-field dispatch, the bit-exact Huffman table
+  mapping, and the 8 kHz table's in-repo grounding.
 - Annex D psychoacoustic shaping is **opt-in**: the default quantization
   is rate/distortion-driven, while `enable_model2_psychoacoustics`
   arms the §C.1.5.3.2.1 Model 2 analysis (per-band `xmin` threshold plus

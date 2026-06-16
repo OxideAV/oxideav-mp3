@@ -214,12 +214,16 @@ impl Mp3CoreDecoder {
         match hdr.version {
             MpegVersion::Mpeg1 | MpegVersion::Mpeg2 => {}
             MpegVersion::Mpeg25 => {
-                // MPEG-2.5 framing parses (§MPEG-2.5 step 25) but the
-                // full decode chain is gated on `MPEG-2.5-GAP.md`'s
-                // observer-trace items (scalefactor-band tables,
-                // Huffman table mapping, frame-size validation at
-                // 8 / 11.025 / 12 kHz). Reject here rather than
-                // produce non-spec PCM.
+                // MPEG-2.5 framing parses (§MPEG-2.5 step 25) and the
+                // scalefactor-band tables are now staged
+                // (`docs/audio/mp3/mpeg2.5-scalefactor-bands.md`, #147/
+                // #151: 11.025/12 kHz reuse the 13818-3 22.05/24 kHz LSF
+                // tables verbatim, 8 kHz is the distinct Fraunhofer
+                // table). The full trait decode chain stays gated on the
+                // remaining `MPEG-2.5-GAP.md` observer-trace items — the
+                // header `id`-field dispatch, the bit-exact Huffman table
+                // mapping, and the 8 kHz table's in-repo grounding —
+                // rather than produce non-spec PCM.
                 return Err(Error::unsupported(
                     "oxideav-mp3: MPEG-2.5 trait decode pending observer-trace items",
                 ));
@@ -892,11 +896,13 @@ mod tests {
         // mono — round-trip-verified in `encoder` unit tests). Feed
         // it to the trait decoder and confirm it is rejected with
         // an `Error::Unsupported` rather than silently producing
-        // non-spec PCM. The MPEG-2.5 observer-trace items in
-        // `docs/audio/mp3/MPEG-2.5-GAP.md` (sample-rate-index
-        // dispatch in scalefactor-band tables, low-rate frame-size
-        // validation, Huffman table mapping) gate proper decode at
-        // 8 / 11.025 / 12 kHz; this guard keeps the gap honest.
+        // non-spec PCM. The scalefactor-band tables are now staged
+        // (`mpeg2.5-scalefactor-bands.md`, #147/#151) and wired into
+        // the encoder, but the remaining `MPEG-2.5-GAP.md`
+        // observer-trace items (header `id`-field dispatch, the
+        // bit-exact Huffman table mapping, the 8 kHz table's in-repo
+        // grounding) still gate proper trait decode at 8 / 11.025 /
+        // 12 kHz; this guard keeps the residual gap honest.
         use crate::encoder::{make_silent_header, write_header};
         use crate::frame::ChannelMode;
         let hdr = make_silent_header(32, 11_025, ChannelMode::SingleChannel)
