@@ -6,6 +6,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- encoder/psychoacoustics: **Layer III Model 2 long-block partition
+  threshold sign** (r331). `model2_layer3_long_nb` (the §C.1.5.3.2.1 /
+  Figure C.6.b long-path threshold `nbb(b) = ecbb(b)·norm(b)·10^(…/10)`)
+  was applying a **negative** exponent — it reused the §D.2.4 step i)
+  Layer-I/II *power ratio* operator `bc_b = 10^(−SNR_b/10)`, a different
+  quantity — so the long-path threshold was flipped relative to both the
+  printed spec and the crate's own short-path
+  (`model2_layer3_short_nb`, already positive). The in-repo ISO/IEC
+  11172-3:1993 §C.1.5.3.2.1 Figure C.6.b box prints the **positive**
+  exponent `10^(SNR(b)/10)`, and Figure C.6.d (short blocks) prints the
+  same positive form; the §C.6.b corrigendum render
+  (`docs/audio/mp3/mpeg2.5-scalefactor-bands.md` §"§C.6.b corrigendum
+  check", #139) independently confirms there is no minus sign in the
+  figure. The long path now uses `10^(+SNR/10)` directly, making the
+  long- and short-block threshold the one identical function. Affects
+  only the opt-in `enable_model2_psychoacoustics` path. Unit test
+  `layer3_snr_and_nb_conventions` updated to the positive convention.
+
 ### Added
 
 - decoder/trait: **MPEG-2.5 at 11.025 / 12 kHz now decodes through the

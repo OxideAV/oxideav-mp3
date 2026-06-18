@@ -9712,20 +9712,24 @@ pub fn model2_layer3_step_h_snr_db(tb: f64, minval_db: f64) -> f64 {
 }
 
 /// Figure C.6.b **long-block** partition threshold
-/// `nbb(b) = ecbb(b)·norm(b)·10^(−SNR(b)/10)`.
+/// `nbb(b) = ecbb(b)·norm(b)·10^(+SNR(b)/10)`.
 ///
-/// Sign note: the printed C.6.b box annotates the exponent as
-/// `SNR(b)/10` with no sign, but §C.1.5.3.2.1 introduces the Layer
-/// III model as clause D.2 "modified as described below" and none of
-/// the enumerated modifications touches the §D.2.4 step i) power
-/// ratio `bc_b = 10^(−SNR_b/10)` — so the step i) convention carries
-/// over (the long-path SNR is ≥ 0 dB, and a threshold a positive SNR
-/// *above* the spread energy would be vacuous). [`model2_step_i_bc`]
-/// supplies the conversion.
+/// Sign note: the in-repo ISO/IEC 11172-3:1993 §C.1.5.3.2.1 Figure
+/// C.6.b threshold box prints the exponent with a **positive** sign —
+/// `nbb(b) = ecbb(b)·norm(b)·10^(SNR(b)/10)` — and the same positive
+/// form recurs verbatim in the Figure C.6.d short-block box
+/// (PDF p.94). The §C.6.b corrigendum render (`docs/audio/mp3/`
+/// `mpeg2.5-scalefactor-bands.md` §"§C.6.b corrigendum check") confirms
+/// there is no minus sign in the figure. This is **not** the §D.2.4
+/// step i) Layer-I/II *power ratio* `bc_b = 10^(−SNR_b/10)`, which is a
+/// different quantity (a mask-to-energy ratio, not a partition
+/// threshold) carrying its own negative convention; the Layer III
+/// threshold uses the positive exponent directly, identical to the
+/// short-block path [`model2_layer3_short_nb`].
 #[inline]
 #[must_use]
 pub fn model2_layer3_long_nb(ecbb: f64, norm: f64, snr_db: f64) -> f64 {
-    ecbb * norm * model2_step_i_bc(snr_db)
+    ecbb * norm * (10.0_f64).powf(snr_db / 10.0)
 }
 
 /// Figure C.6.d **short-block** partition threshold
@@ -9734,11 +9738,14 @@ pub fn model2_layer3_long_nb(ecbb: f64, norm: f64, snr_db: f64) -> f64 {
 /// short blocks is read from a table").
 ///
 /// The printed short-block SNR values are negative (−8,24 …
-/// −3,98 dB), so the exponent is applied exactly as printed — the
-/// negative table value already encodes the threshold-below-energy
-/// direction that the long path expresses through the step i)
-/// negation (`model2_layer3_short_nb(e, n, −x) ==
-/// model2_layer3_long_nb(e, n, x)`).
+/// −3,98 dB), so the positive exponent applied exactly as printed
+/// places the threshold below the spread energy. Long and short blocks
+/// share the one positive-exponent convention — Figures C.6.b and
+/// C.6.d both print `10^(+SNR/10)` — so this is the identical function
+/// to [`model2_layer3_long_nb`] (`model2_layer3_short_nb(e, n, x) ==
+/// model2_layer3_long_nb(e, n, x)`); only the sign of the supplied
+/// `SNR` differs (short reads a negative table value, long derives a
+/// non-negative step-h value).
 #[inline]
 #[must_use]
 pub fn model2_layer3_short_nb(ecbb: f64, norm: f64, snr_db: f64) -> f64 {
@@ -19557,17 +19564,20 @@ mod tests {
         assert_eq!(model2_layer3_step_h_snr_db(0.0, 0.0), 6.0);
         assert_eq!(model2_layer3_step_h_snr_db(0.0, 24.5), 24.5);
         assert_eq!(model2_layer3_step_h_snr_db(0.5, 3.0), 17.5);
-        // Long path: nbb = ecbb·norm·10^(−SNR/10) — 29 dB below.
+        // Long path: nbb = ecbb·norm·10^(+SNR/10) (the printed
+        // Figure C.6.b positive exponent; §C.6.b corrigendum #139).
         let nb = model2_layer3_long_nb(1000.0, 0.5, 29.0);
-        assert!((nb - 1000.0 * 0.5 * 10f64.powf(-2.9)).abs() < 1e-12);
-        assert!(nb < 1000.0 * 0.5);
+        assert!((nb - 1000.0 * 0.5 * 10f64.powf(2.9)).abs() < 1e-9);
+        assert!(nb > 1000.0 * 0.5);
         // Short path: the printed positive exponent over the negative
-        // table SNR lands in the same direction…
+        // table SNR lands below the spread energy.
         let nb_s = model2_layer3_short_nb(1000.0, 0.5, -8.240);
         assert!(nb_s < 1000.0 * 0.5);
-        // …and is exactly the long-path convention with the sign
-        // pre-baked into the table value.
-        assert_eq!(nb_s, model2_layer3_long_nb(1000.0, 0.5, 8.240));
+        // Long and short paths share the one positive-exponent
+        // convention: the long-block threshold is the same function as
+        // the short-block one (Figures C.6.b and C.6.d both print
+        // 10^(+SNR/10)).
+        assert_eq!(nb_s, model2_layer3_long_nb(1000.0, 0.5, -8.240));
     }
 
     #[test]
