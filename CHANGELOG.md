@@ -28,6 +28,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- decoder/trait: **MPEG-2.5 at 8 kHz now decodes through the `Decoder`
+  trait wrapper** (r335) — completes the full MPEG-2.5 decode path
+  (8 / 11.025 / 12 kHz). The wrapper previously rejected 8 kHz up front
+  pending observer-trace grounding of its band table. The newly-staged
+  `docs/audio/mp3/mpeg2.5-scalefactor-bands.md` (commit `c2e236e`, #147 /
+  #151) documents the Fraunhofer 8 kHz long/short SFB tables verbatim
+  (top long bands 17–21 and short bands 9–11 collapse to width 2 at the
+  4 kHz Nyquist) as published-factual constants satisfying the
+  Table-B.2 structural invariants (Σ = 576 long / 192 short, contiguous,
+  22/13 bands); they were already transcribed into
+  `requantize::{LONG,SHORT}_STARTS_MPEG25_8` and the whole
+  side-info → scalefactor → Huffman → requantize → reorder → stereo →
+  IMDCT → synthesis chain is rate-generic, so dropping the gate lets
+  8 kHz decode through the identical path as the other LSF rates. The
+  former `send_packet_rejects_mpeg25_8khz_pending_observer_trace` test is
+  replaced by `send_packet_accepts_mpeg25_8khz_header_through_the_guard`
+  and a new byte-exact `trait_decode_mpeg25_8khz_byte_exact_with_direct_chain`
+  (trait wrapper output == direct decode chain, sample-for-sample, on a
+  real encoder-produced 8 kHz stream).
 - decoder/trait: **MPEG-2.5 at 11.025 / 12 kHz now decodes through the
   `Decoder` trait wrapper** (r326). The wrapper's version guard
   previously rejected *all* MPEG-2.5 frames; it now accepts the two
