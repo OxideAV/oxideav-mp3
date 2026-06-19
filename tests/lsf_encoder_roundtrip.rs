@@ -21,7 +21,7 @@ use oxideav_mp3::{
     lsf_scale_params, parse_header, parse_side_info, pcm_f32_to_i16, process_stereo, reorder,
     requantize, synth_granule, BlockType, ChannelMode, FrameWalker, GranuleChannel, ImdctState,
     MainDataReader, Mp3Encoder, MpegVersion, Reservoir, StreamEncodeError, SynthState,
-    PCM_PER_GRANULE,
+    XminThresholds, PCM_PER_GRANULE,
 };
 
 /// Synthesise an `n`-sample mono `i16` sine tone.
@@ -226,10 +226,13 @@ fn lsf_mono_24000_and_16000_roundtrip() {
 
 #[test]
 fn mpeg25_mono_11025_roundtrip() {
-    // MPEG-2.5: same LSF framing on the extension rates. The band
-    // tables for these rates are the documented placeholder
-    // (MPEG-2.5-GAP.md), which is self-consistent encoder↔decoder, so
-    // the self-decode round-trip is exact in the same sense.
+    // MPEG-2.5 11.025 kHz: the LSF framing on the extension rate. The
+    // scalefactor-band tables are the real grounded tables now
+    // (`mpeg2.5-scalefactor-bands.md`, #147/#151): 11.025 kHz reuses
+    // the in-repo ISO/IEC 13818-3 22.05 kHz LSF long+short tables
+    // verbatim, threaded through `long_band_starts` / `short_band_starts`
+    // by the shared band-boundary functions. The self-decode round-trip
+    // confirms the encoder and decoder agree on that band layout.
     const SR: u32 = 11_025;
     let pcm = sine_pcm(SR as usize, 220.0, SR as f32, 0.5); // 1 s
     let enc = Mp3Encoder::new(32, SR, ChannelMode::SingleChannel).expect("encoder build");
@@ -238,6 +241,129 @@ fn mpeg25_mono_11025_roundtrip() {
     let hdr = parse_header(&first.data[..4]).unwrap();
     assert_eq!(hdr.version, MpegVersion::Mpeg25);
     assert_eq!(hdr.samples_per_frame(), 576);
+}
+
+#[test]
+fn mpeg25_mono_12000_roundtrip() {
+    // MPEG-2.5 12 kHz: reuses the in-repo ISO/IEC 13818-3 24 kHz LSF
+    // long+short scalefactor-band tables verbatim
+    // (`mpeg2.5-scalefactor-bands.md`). Same band-aligned encode path as
+    // 11.025 kHz, distinct table shape (24 kHz LSF vs 22.05 kHz LSF).
+    const SR: u32 = 12_000;
+    let pcm = sine_pcm(SR as usize, 300.0, SR as f32, 0.5);
+    let enc = Mp3Encoder::new(32, SR, ChannelMode::SingleChannel).expect("encoder build");
+    let out = assert_mono_roundtrip(enc, &pcm, 20.0);
+    let first = FrameWalker::new(&out).next().expect("one frame");
+    let hdr = parse_header(&first.data[..4]).unwrap();
+    assert_eq!(hdr.version, MpegVersion::Mpeg25);
+    assert_eq!(hdr.sample_rate_hz, 12_000);
+    assert_eq!(hdr.samples_per_frame(), 576);
+}
+
+#[test]
+fn mpeg25_mono_8000_roundtrip() {
+    // MPEG-2.5 8 kHz: the genuinely distinct Fraunhofer table — its top
+    // long bands (sfb 17..21) collapse to width 2 at the 4 kHz Nyquist
+    // (`mpeg2.5-scalefactor-bands.md`, `LONG_STARTS_MPEG25_8`), and the
+    // short table bands 9..11 are width-2 fillers. This round-trip
+    // exercises the encoder's quantization / inner+outer loops over a
+    // band layout that exists at no other rate, so a band-misalignment
+    // (e.g. silently falling back to a 16 kHz LSF table) would break it.
+    // Use a tone well below the 4 kHz Nyquist so the transmitted bands
+    // carry real energy.
+    const SR: u32 = 8_000;
+    let pcm = sine_pcm(SR as usize, 1000.0, SR as f32, 0.5);
+    let enc = Mp3Encoder::new(32, SR, ChannelMode::SingleChannel).expect("encoder build");
+    let out = assert_mono_roundtrip(enc, &pcm, 20.0);
+    let first = FrameWalker::new(&out).next().expect("one frame");
+    let hdr = parse_header(&first.data[..4]).unwrap();
+    assert_eq!(hdr.version, MpegVersion::Mpeg25);
+    assert_eq!(hdr.sample_rate_hz, 8_000);
+    assert_eq!(hdr.samples_per_frame(), 576);
+}
+
+#[test]
+fn mpeg25_mono_8000_short_blocks_band_aligned_roundtrip() {
+    // 8 kHz forced short blocks: drives the distinct
+    // `SHORT_STARTS_MPEG25_8` short-band layout (bands 9..11 width-2
+    // fillers, band 12 the residual sweep) through the reorder + outer
+    // loop on the one rate whose short table has no LSF sibling. A
+    // self-consistent encode↔decode here proves the encoder's short
+    // reorder and the decoder's reorder both index the same 8 kHz short
+    // table.
+    const SR: u32 = 8_000;
+    // Need > WARMUP_GRANULES granules + TOTAL_DELAY samples of recon to
+    // reach steady state; at 8 kHz that is ~5665 samples, so encode a
+    // full ~1.25 s.
+    let pcm = sine_pcm(SR as usize * 5 / 4, 1200.0, SR as f32, 0.5);
+    let mut enc = Mp3Encoder::new(32, SR, ChannelMode::SingleChannel).expect("encoder build");
+    enc.force_short_blocks_for_testing(true)
+        .expect("force short blocks");
+    assert!(enc.force_short_blocks_enabled());
+    let out = assert_mono_roundtrip(enc, &pcm, 18.0);
+    let first = FrameWalker::new(&out).next().expect("one frame");
+    let hdr = parse_header(&first.data[..4]).unwrap();
+    assert_eq!(hdr.version, MpegVersion::Mpeg25);
+    assert_eq!(hdr.sample_rate_hz, 8_000);
+}
+
+#[test]
+fn mpeg25_threshold_in_quiet_psychoacoustic_roundtrip_all_rates() {
+    // The milestone wiring: the threshold-in-quiet psychoacoustic path
+    // (`XminThresholds::threshold_in_quiet` → the §C.1.5.4.3
+    // distortion-control outer loop) must produce a band-aligned,
+    // self-decodable MP3 stream at every MPEG-2.5 rate. The per-band
+    // threshold is built over the rate's `long_band_starts` /
+    // `short_band_starts`, so a band-table regression at 8 kHz (the
+    // distinct Fraunhofer table) would mis-shape `xmin` and surface here.
+    for sr in [8_000u32, 11_025, 12_000] {
+        let pcm = sine_pcm(sr as usize, 700.0, sr as f32, 0.5);
+        let enc = Mp3Encoder::new_with_threshold_in_quiet(32, sr, ChannelMode::SingleChannel)
+            .expect("threshold-in-quiet MPEG-2.5 encoder build");
+        let out = assert_mono_roundtrip(enc, &pcm, 18.0);
+        let first = FrameWalker::new(&out).next().expect("one frame");
+        let hdr = parse_header(&first.data[..4]).unwrap();
+        assert_eq!(hdr.version, MpegVersion::Mpeg25);
+        assert_eq!(hdr.sample_rate_hz, sr);
+    }
+}
+
+#[test]
+fn mpeg25_threshold_in_quiet_band_vector_is_band_aligned() {
+    // Directly inspect the per-band threshold vector the encoder
+    // installs at each MPEG-2.5 rate. The threshold-in-quiet bowl is a
+    // function of each band's centre frequency, which is derived from
+    // that rate's scalefactor-band start indices. The vector must be
+    // (a) all-finite-positive over the 21 transmitted long bands and
+    // (b) genuinely non-uniform (a real bowl, not a degenerate
+    // constant) — the latter is the witness that the band partitioning
+    // actually shaped the threshold rather than collapsing to a single
+    // value. The −12 dB high-bitrate offset is irrelevant here; 32 kbps
+    // mono → 0 dB offset, the low-rate transparency reference.
+    for sr in [8_000u32, 11_025, 12_000] {
+        let xmin = XminThresholds::threshold_in_quiet(sr, MpegVersion::Mpeg25, 32);
+        // 21 transmitted long bands (band 21 is the fixed non-transmitted
+        // filler); all must be finite and strictly positive.
+        let mut min = f64::INFINITY;
+        let mut max = 0.0_f64;
+        for &v in xmin.long.iter().take(21) {
+            assert!(
+                v.is_finite() && v > 0.0,
+                "non-positive xmin at {sr} Hz: {v}"
+            );
+            min = min.min(v);
+            max = max.max(v);
+        }
+        // Real spectral shape: the loudest-vs-quietest band ratio must be
+        // appreciable. (At MPEG-2.5 the audio band spans only a few kHz,
+        // but the threshold-in-quiet bowl still varies by orders of
+        // magnitude between the mid-band minimum and the band edges.)
+        assert!(
+            max / min > 4.0,
+            "xmin vector at {sr} Hz is too flat (max/min = {}), band shaping did not apply",
+            max / min
+        );
+    }
 }
 
 #[test]
