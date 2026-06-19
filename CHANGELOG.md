@@ -28,6 +28,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- encoder/tests: **end-to-end MPEG-2.5 encode verification at all three
+  extension rates** (r340). The band tables were wired in r321 and the
+  psychoacoustic threshold path is rate-generic, but encode→self-decode
+  coverage only exercised 11.025 kHz. Added long-block round-trips at
+  12 kHz (reuses the 24 kHz LSF table) and 8 kHz (the distinct
+  Fraunhofer table, top long bands 17–21 collapsing to width 2), an
+  8 kHz forced-short-block round-trip driving the distinct
+  `SHORT_STARTS_MPEG25_8` layout through reorder + outer loop, and the
+  milestone integration test
+  `mpeg25_threshold_in_quiet_psychoacoustic_roundtrip_all_rates` —
+  `XminThresholds::threshold_in_quiet` built over each rate's band
+  starts feeds the §C.1.5.4.3 distortion-control loop and yields a
+  decodable band-aligned stream at 8 / 11.025 / 12 kHz. A companion
+  `mpeg25_threshold_in_quiet_band_vector_is_band_aligned` asserts the
+  per-band `xmin` vector is finite-positive over all 21 transmitted
+  long bands and genuinely non-uniform (`max/min > 4`), witnessing that
+  the band partitioning shaped the threshold instead of collapsing to a
+  constant. Six new tests; the stale "documented placeholder" comment
+  on the 11.025 kHz round-trip (the tables are real grounded tables
+  now) is corrected.
 - decoder/trait: **MPEG-2.5 at 8 kHz now decodes through the `Decoder`
   trait wrapper** (r335) — completes the full MPEG-2.5 decode path
   (8 / 11.025 / 12 kHz). The wrapper previously rejected 8 kHz up front

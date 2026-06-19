@@ -60,10 +60,15 @@ cross-frame bit-reservoir scheduling. Additional capabilities:
 - MPEG-2.5 frame header writing and sample-rate dispatch, with the
   low-rate (8 / 11.025 / 12 kHz) Layer III scalefactor-band tables wired
   through the shared band-boundary functions, so quantization, the
-  inner/outer loops, reorder, and stereo all use the correct band
-  layout at the MPEG-2.5 rates. Per `mpeg2.5-scalefactor-bands.md`, the
-  11.025 / 12 kHz tables reuse the ISO/IEC 13818-3 22.05 / 24 kHz LSF
-  tables verbatim and 8 kHz is the distinct Fraunhofer table.
+  inner/outer loops, reorder, stereo, and the psychoacoustic
+  threshold-in-quiet path all use the correct band layout at the
+  MPEG-2.5 rates. Per `mpeg2.5-scalefactor-bands.md`, the 11.025 / 12 kHz
+  tables reuse the ISO/IEC 13818-3 22.05 / 24 kHz LSF tables verbatim and
+  8 kHz is the distinct Fraunhofer table. Encode→self-decode round-trips
+  cover all three rates (including 8 kHz long *and* forced-short
+  blocks), and the `threshold_in_quiet` psychoacoustic vector is
+  verified band-aligned (finite-positive, non-uniform bowl) over each
+  rate's band partitioning.
 
 The encoder is reachable through the `oxideav_core::Encoder` trait and
 several direct `make_encoder*` factory variants.
