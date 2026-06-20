@@ -410,6 +410,7 @@ pub mod mdct;
 pub mod mixed_classifier;
 pub mod outer_loop;
 pub mod psy;
+pub mod quality;
 pub mod quantize;
 pub mod reorder;
 pub mod requantize;
@@ -492,6 +493,7 @@ pub use psy::{
     STEP5_TONAL_DECIMATION_WINDOW_BARK, STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE,
     STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE,
 };
+pub use quality::{QualityPreset, QualityPresetParams};
 pub use quantize::quantize;
 pub use reorder::reorder;
 pub use requantize::{requantize, scalefac_multiplier, PRETAB};

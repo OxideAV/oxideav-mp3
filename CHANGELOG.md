@@ -6,6 +6,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- encoder: **named psychoacoustic `QualityPreset` quality knob** (r355).
+  New `quality` module + [`Mp3Encoder::with_quality_preset`] collapse the
+  §C.1.5 / Annex D perceptual toggles (the §C.1.5.4.3 outer loop's per-band
+  threshold, the §C.1.5.3.2.1 Model 2 analysis, and the §C.1.5.2
+  Model-2-driven block-type scheduler) into one named level —
+  `Transparent` / `High` / `Standard` / `Fast`, ordered by §D.1 Step 3
+  threshold offset (`-24` / `-12` / `0` / `+6` dB). At the three staged
+  Annex D rates (32 / 44.1 / 48 kHz) the richer presets arm the full
+  signal-dependent Model 2 path; at the MPEG-2 LSF / MPEG-2.5 rates (no
+  staged calculation-partition tables) a preset falls back to the
+  signal-independent per-band threshold-in-quiet vector translated by the
+  preset offset, so a preset is usable at every supported rate.
+  `quality_preset()` and `quality_preset_is_signal_dependent()` report the
+  applied preset and which path it took. This is the "psychoacoustically
+  tuned default-on quality preset" the README listed as the remaining
+  encoder work.
+
 ### Fixed
 
 - decoder: **part-2 / part-3 split — `decode_huffman` was reading

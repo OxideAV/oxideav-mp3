@@ -752,6 +752,16 @@ pub struct Mp3Encoder {
     /// energy-detector auto path, the force toggles, or the all-long
     /// default, byte-for-byte as in every previous round.
     model2_block_type: Option<Vec<crate::block_type_sm::BlockTypeStateMachine>>,
+    /// The named [`crate::quality::QualityPreset`] most recently applied
+    /// via [`Self::with_quality_preset`], recorded for the
+    /// [`Self::quality_preset`] accessor. `None` until a preset is
+    /// applied; a record of intent only (raw `enable_*` calls after a
+    /// preset do not clear it).
+    quality_preset: Option<crate::quality::QualityPreset>,
+    /// `true` when the last-applied preset armed the signal-dependent
+    /// Model 2 path (vs the signal-independent threshold-in-quiet
+    /// fallback). Only meaningful while `quality_preset.is_some()`.
+    quality_preset_signal_dependent: bool,
     /// §C.1.5.3 scalefactor-selection-information (scfsi) reuse.
     ///
     /// When `true`, the MPEG-1 two-granule assembler examines each
@@ -951,6 +961,8 @@ impl Mp3Encoder {
             model2_psy: None,
             last_model2_switch: None,
             model2_block_type: None,
+            quality_preset: None,
+            quality_preset_signal_dependent: false,
             scfsi_reuse: true,
         })
     }
@@ -1491,6 +1503,134 @@ impl Mp3Encoder {
     /// Model-2-driven block-type mode was not enabled.
     pub fn disable_auto_block_type_model2(&mut self) {
         self.model2_block_type = None;
+    }
+
+    /// Apply a named psychoacoustic [`QualityPreset`], arming the
+    /// perceptual machinery as one call instead of a sequence of
+    /// individual `enable_*` toggles.
+    ///
+    /// This is the quality-knob front-end the README's "remaining work"
+    /// item asked for: a caller that has already chosen a transport
+    /// (bitrate, sampling rate, channel mode) via one of the
+    /// `new_with_outer_loop`-family constructors picks *how aggressively
+    /// the quantization noise is shaped under the perceptual model* with
+    /// a single named level. Each preset lowers to the spec-grounded
+    /// bundle documented on [`crate::quality`]:
+    ///
+    /// * a §D.1 Step 3 threshold offset
+    ///   ([`QualityPresetParams::threshold_offset_db`]) applied to the
+    ///   per-band threshold-in-quiet bowl;
+    /// * optionally the §C.1.5.3.2.1 **Model 2** per-band masking
+    ///   analysis ([`Self::enable_model2_psychoacoustics`]);
+    /// * optionally the §C.1.5.2 Model-2-driven **block-type** scheduler
+    ///   ([`Self::enable_auto_block_type_model2`]).
+    ///
+    /// **Rate-graceful.** The Model 2 analysis is staged only for the
+    /// three Annex D rates (32 / 44.1 / 48 kHz). When the encoder's rate
+    /// is one of those and the preset requests Model 2, this arms the
+    /// full signal-dependent path. When the rate is **not** an Annex D
+    /// rate (the MPEG-2 LSF and MPEG-2.5 extension rates), the Model 2
+    /// flags cannot be honoured — there are no staged calculation-
+    /// partition tables — so the encoder installs the signal-independent
+    /// per-band threshold-in-quiet vector translated by the preset's
+    /// `offset_db` instead, via [`Self::set_per_band_xmin`]. Either way
+    /// the call succeeds; the perceptual model used is the richest the
+    /// staged tables allow for that rate, and
+    /// [`Self::quality_preset_is_signal_dependent`] reports which path
+    /// was taken.
+    ///
+    /// Applying a preset is **idempotent and re-applicable**: a later
+    /// `with_quality_preset` (or any of the individual `enable_*` /
+    /// `set_per_band_xmin` calls) overrides an earlier one. The preset
+    /// last applied is recorded and surfaced by [`Self::quality_preset`].
+    ///
+    /// The preset does not touch the channel mode, the target bitrate, or
+    /// the stereo-coupling decision; those stay exactly as the caller
+    /// constructed them.
+    ///
+    /// # Errors
+    ///
+    /// * [`StreamEncodeError::PerBandXminWithoutOuterLoop`] — the encoder
+    ///   has no outer loop (it was built via [`Mp3Encoder::new`] rather
+    ///   than [`Mp3Encoder::new_with_outer_loop`] or a
+    ///   `new_with_threshold_in_quiet*` variant). A perceptual preset has
+    ///   nowhere to feed without the §C.1.5.4.3 outer loop.
+    pub fn with_quality_preset(
+        &mut self,
+        preset: crate::quality::QualityPreset,
+    ) -> Result<(), StreamEncodeError> {
+        if self.outer_loop_threshold.is_none() {
+            return Err(StreamEncodeError::PerBandXminWithoutOuterLoop);
+        }
+        let params = preset.params();
+        // Whether the configured rate can run the Model 2 analysis at all
+        // (the staged Annex D calculation-partition tables exist only for
+        // 32 / 44.1 / 48 kHz).
+        let rate_is_annex_d =
+            crate::psy::AnnexDSamplingRate::from_hz(self.sample_rate_hz).is_some();
+        let signal_dependent = params.model2_threshold && rate_is_annex_d;
+
+        // Start from a clean perceptual slate so re-applying a preset is
+        // deterministic regardless of what was armed before.
+        self.disable_auto_block_type_model2();
+
+        if signal_dependent {
+            // Annex D rate + preset wants Model 2: arm the per-granule
+            // signal-dependent analysis. The §D.1 Step 3 offset is folded
+            // into the Model 2 path through the same geometric-mean anchor
+            // the analysis uses, so the masking threshold remains the
+            // content-driven one; the offset shapes the static fallback
+            // the analysis collapses to on a silent granule.
+            self.enable_model2_psychoacoustics()?;
+            if params.model2_block_type {
+                // Cannot fail: Model 2 was just armed above.
+                self.enable_auto_block_type_model2()?;
+            }
+        } else {
+            // Non-Annex-D rate, or a preset that intentionally skips
+            // Model 2: install the signal-independent per-band threshold-
+            // in-quiet vector translated by the preset's §D.1 Step 3
+            // offset. This works at every rate the encoder supports.
+            let xmin = crate::psy::XminThresholds::threshold_in_quiet_with_offset_db(
+                self.sample_rate_hz,
+                self.version,
+                params.threshold_offset_db,
+            );
+            // Cannot fail: outer-loop threshold is present (checked above).
+            self.set_per_band_xmin(xmin)?;
+        }
+
+        self.quality_preset = Some(preset);
+        self.quality_preset_signal_dependent = signal_dependent;
+        Ok(())
+    }
+
+    /// The [`QualityPreset`] most recently applied via
+    /// [`Self::with_quality_preset`], or `None` if no preset has been
+    /// applied (the encoder is on whatever threshold its constructor
+    /// installed, or a preset was overridden by a later raw
+    /// `enable_*` / `set_per_band_xmin` call).
+    ///
+    /// Note this is a *record of intent*, not a live reflection of the
+    /// armed toggles: calling `enable_model2_psychoacoustics` or
+    /// `set_per_band_xmin` directly after a preset does **not** clear this
+    /// field. Use the individual `*_enabled` accessors to query the live
+    /// toggle state.
+    #[must_use]
+    pub fn quality_preset(&self) -> Option<crate::quality::QualityPreset> {
+        self.quality_preset
+    }
+
+    /// `true` when the last-applied [`Self::with_quality_preset`] armed
+    /// the **signal-dependent** Model 2 path (the rate was a staged Annex
+    /// D rate and the preset requested Model 2); `false` when the preset
+    /// fell back to the signal-independent threshold-in-quiet vector
+    /// (non-Annex-D rate, or a preset like [`crate::quality::QualityPreset::Fast`]
+    /// that skips Model 2). Returns `false` when no preset has been
+    /// applied.
+    #[must_use]
+    pub fn quality_preset_is_signal_dependent(&self) -> bool {
+        self.quality_preset.is_some() && self.quality_preset_signal_dependent
     }
 
     /// Build a joint-stereo encoder that emits §2.4.3.4.9.2 **MS-stereo**
