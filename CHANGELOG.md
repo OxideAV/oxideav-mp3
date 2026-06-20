@@ -46,6 +46,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- tests: **MPEG-2.5 fixture now exercised at the demuxer level** (r348).
+  `tests/docs_corpus.rs` adds `layer3-mpeg25-11025-32kbps` to the
+  `every_fixture_walks_without_panic` walk and a dedicated
+  `mpeg25_11025_fixture_demuxes_with_correct_params` test asserting the
+  demuxer reports 11.025 kHz / mono, parses the Xing/Info frame, matches
+  the first-frame offset, and walks all 18 playable frames with monotone
+  PTS. The stale exclusion comment claiming the parser needed the 12-bit
+  `0xFFF` syncword was removed — the framing layer has synced on the
+  11-bit `0xFFE` pattern (so MPEG-2.5's `id`-bit-0 passes through) for
+  many rounds.
+
 - tests: **MPEG-2.5 11.025 kHz decode reference-PCM test** (r348). New
   `tests/mpeg25_reference_pcm.rs` decodes the staged
   `layer3-mpeg25-11025-32kbps` fixture (`input.mp3`) through the direct

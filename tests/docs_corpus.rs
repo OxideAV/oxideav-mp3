@@ -256,18 +256,67 @@ fn xing_vbri_tag_matches_trace_byte_for_byte() {
     assert_eq!(d.first_frame_offset(), offsets[0]);
 }
 
+#[test]
+fn mpeg25_11025_fixture_demuxes_with_correct_params() {
+    // The demuxer must accept the Fraunhofer MPEG-2.5 extension: sync on
+    // the 11-bit `0xFFE` pattern, dispatch `id`-bit-0 to the MPEG-2.5
+    // version, and surface the 11.025 kHz / mono stream params. The
+    // fixture carries an ID3v2 head + a Xing/Info frame.
+    let Some((mut d, trace)) = open_fixture("layer3-mpeg25-11025-32kbps") else {
+        return;
+    };
+    let info = &d.streams()[0];
+    assert_eq!(
+        info.params.sample_rate,
+        Some(11_025),
+        "MPEG-2.5 11.025 kHz sample rate must be reported"
+    );
+    assert_eq!(info.params.channels, Some(1), "fixture is mono");
+
+    // The first MPEG-audio frame offset matches the trace, and the Xing
+    // info frame is parsed.
+    let offsets = trace_frame_offsets(&trace);
+    assert_eq!(d.first_frame_offset(), offsets[0]);
+    assert!(
+        d.xing().is_some(),
+        "fixture's first frame is a Xing/Info frame"
+    );
+
+    // Walk every playable frame (trace HEADER count minus the info frame)
+    // and confirm monotone PTS.
+    let expected_playable = offsets.len().saturating_sub(1);
+    let mut got = 0usize;
+    let mut last_pts = -1i64;
+    loop {
+        match d.next_packet() {
+            Ok(pkt) => {
+                let p = pkt.pts.unwrap();
+                assert!(p > last_pts, "non-monotonic pts");
+                last_pts = p;
+                got += 1;
+            }
+            Err(Error::Eof) => break,
+            Err(e) => panic!("mpeg25 demux error: {e:?}"),
+        }
+    }
+    assert_eq!(
+        got, expected_playable,
+        "walked {got} MPEG-2.5 frames, trace says {expected_playable}"
+    );
+}
+
 /// Walk every fixture, confirm next_packet emits at least one packet
 /// per file that has a HEADER line in its trace (the count after the
 /// Xing/Info info frame), and that PTS is monotonic across the walk.
 #[test]
 fn every_fixture_walks_without_panic() {
-    // MPEG-2.5 fixtures are excluded — the current frame-header
-    // parser requires the 12-bit MPEG-1/2 syncword `0xFFF` and so
-    // can't sync on the MPEG-2.5 `0xFFE3..` pattern. The MPEG-2.5
-    // extension to the parser is tracked separately in
-    // `docs/audio/mp3/MPEG-2.5-GAP.md` (header `id` field encoding
-    // for MPEG-2.5 listed as a residual gap awaiting observer-trace).
-    // Layer II fixtures are also excluded — the demuxer accepts any
+    // The MPEG-2.5 (8/11.025/12 kHz) fixture IS now walked: the frame
+    // parser syncs on the 11-bit `0xFFE` pattern (mask `& 0xE0 == 0xE0`,
+    // not the 12-bit `0xFFF`) so the MPEG-2.5 `id`-bit-0 encoding passes
+    // through to the version dispatch (`raw >> 19 & 0b11 == 0b00 =>
+    // Mpeg25`). The earlier exclusion comment cited a 12-bit-sync parser
+    // that no longer exists.
+    // Layer II fixtures are still excluded — the demuxer accepts any
     // layer the framing layer accepts, but the side-info length used
     // for Xing-magic offset arithmetic is Layer III specific; a
     // Layer II info-frame would slot in at a different offset that
@@ -282,6 +331,7 @@ fn every_fixture_walks_without_panic() {
         "layer3-stereo-48000-128kbps",
         "layer3-mono-44100-128kbps",
         "layer3-mpeg2-22050-64kbps",
+        "layer3-mpeg25-11025-32kbps",
         "layer3-padding-byte-cycle",
         "layer3-ms-stereo-44100-128kbps",
         "layer3-joint-stereo-44100-128kbps",
