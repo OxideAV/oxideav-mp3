@@ -93,9 +93,22 @@ bands collapse to width 2 at the 4 kHz Nyquist — transcribed into
 long/short blocks" tables (published-factual; satisfies the Table-B.2
 structural invariants: Σ = 576 long / 192 short, contiguous, 22/13
 bands). All three rates decode through the same chain as MPEG-2 LSF,
-byte-exact with the direct decode chain. A dedicated 8 kHz
-observer-trace fixture would further corroborate the published-factual
-8 kHz boundaries (`MPEG-2.5-GAP.md`).
+byte-exact with the direct decode chain. The 11.025 kHz path is
+validated end-to-end against the staged `layer3-mpeg25-11025-32kbps`
+reference PCM (`tests/mpeg25_reference_pcm.rs`): the decode locks at the
+canonical 1105-sample codec delay with steady-state normalized RMS error
+≈ 1e-4, and the production trait decoder reproduces the direct chain
+byte-exact. A dedicated 8 kHz observer-trace fixture would further
+corroborate the published-factual 8 kHz boundaries (`MPEG-2.5-GAP.md`).
+
+This validation surfaced and fixed a latent decoder bug shared by all
+versions: the per-granule decode loop handed the *full* `part2_3_length`
+to `decode_huffman` while the reader still sat on the part-2 scalefactor
+bits, so frames with a non-zero `slen` partition (scalefac_compress ≠ 0)
+mis-read scalefactors as Huffman codewords. `decode_scalefactors` now
+records the part-2 bit length (`FrameScaleFactors::part2_bits`); the
+decode path skips it and budgets Huffman at `part2_3_length −
+part2_bits`.
 
 ## Not yet supported
 
