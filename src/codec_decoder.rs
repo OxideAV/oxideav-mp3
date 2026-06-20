@@ -348,7 +348,18 @@ impl Mp3CoreDecoder {
             for (ch, xr_slot) in xr_per_ch.iter_mut().enumerate() {
                 let gc = &si.granules[gr][ch];
                 let mut r = MainDataReader::new(&run);
-                let mut left = bit_cursor;
+                // Skip to the start of this granule/channel's
+                // `part2_3_length` field, then skip its part-2
+                // (scalefactor) bits so the reader lands on the part-3
+                // Huffman codewords. `part2_3_length` covers part-2 +
+                // part-3; the Huffman budget is therefore the remainder
+                // after the scalefactor bits already consumed by
+                // `decode_scalefactors`. (Omitting the part-2 skip made
+                // `decode_huffman` mis-read scalefactor bits as Huffman
+                // codewords on every frame with a non-zero `slen`
+                // partition — silent for `scalefac_compress == 0`
+                // streams but corrupting for real scalefactors.)
+                let mut left = bit_cursor + fsf.part2_bits[gr][ch] as usize;
                 while left >= 32 {
                     let _ = r.read(32);
                     left -= 32;
@@ -356,7 +367,8 @@ impl Mp3CoreDecoder {
                 if left > 0 {
                     let _ = r.read(left as u32);
                 }
-                let part3_bits = u32::from(gc.part2_3_length);
+                let part3_bits =
+                    u32::from(gc.part2_3_length).saturating_sub(fsf.part2_bits[gr][ch]);
                 let is = decode_huffman(&mut r, gc, part3_bits, hdr.sample_rate_hz, hdr.version)
                     .map_err(|e| Error::other(format!("oxideav-mp3: huffman: {e:?}")))?;
                 let sf = &fsf.granules[gr][ch];
@@ -605,7 +617,7 @@ mod tests {
                 for ch in 0..si.channels as usize {
                     let gc = &si.granules[gr][ch];
                     let mut r = MainDataReader::new(&run);
-                    let mut left = bit_cursor;
+                    let mut left = bit_cursor + fsf.part2_bits[gr][ch] as usize;
                     while left >= 32 {
                         let _ = r.read(32);
                         left -= 32;
@@ -613,7 +625,8 @@ mod tests {
                     if left > 0 {
                         let _ = r.read(left as u32);
                     }
-                    let part3_bits = u32::from(gc.part2_3_length);
+                    let part3_bits =
+                        u32::from(gc.part2_3_length).saturating_sub(fsf.part2_bits[gr][ch]);
                     let is =
                         decode_huffman(&mut r, gc, part3_bits, hdr.sample_rate_hz, hdr.version)
                             .unwrap();

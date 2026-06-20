@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- decoder: **part-2 / part-3 split — `decode_huffman` was reading
+  Huffman codewords starting at the part-2 scalefactor bits** (r348).
+  The per-granule/channel decode loop positioned the `MainDataReader`
+  at the start of the granule's `part2_3_length` field and passed the
+  *full* `part2_3_length` as the Huffman budget, so `decode_huffman`
+  decoded the part-2 (scalefactor) bits as if they were part-3
+  big_values codewords. This was silent for `scalefac_compress == 0`
+  streams (part-2 length 0 — the case every synthetic encode fixture
+  hit), but corrupted **every frame carrying a non-zero `slen`
+  partition** across MPEG-1, MPEG-2 LSF, and MPEG-2.5. `decode_scalefactors`
+  now records the part-2 bit length per granule/channel
+  (`FrameScaleFactors::part2_bits`); the decode path skips those bits
+  before `decode_huffman` and budgets it at `part2_3_length −
+  part2_bits`. Surfaced by the new MPEG-2.5 11.025 kHz reference-PCM
+  test: steady-state normalized RMS error against the staged reference
+  dropped from ≈ 0.77 to ≈ 1e-4 and the decode now locks at the
+  canonical 1105-sample codec delay.
+
 - encoder/psychoacoustics: **Layer III Model 2 long-block partition
   threshold sign** (r331). `model2_layer3_long_nb` (the §C.1.5.3.2.1 /
   Figure C.6.b long-path threshold `nbb(b) = ecbb(b)·norm(b)·10^(…/10)`)
@@ -27,6 +45,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `layer3_snr_and_nb_conventions` updated to the positive convention.
 
 ### Added
+
+- tests: **MPEG-2.5 11.025 kHz decode reference-PCM test** (r348). New
+  `tests/mpeg25_reference_pcm.rs` decodes the staged
+  `layer3-mpeg25-11025-32kbps` fixture (`input.mp3`) through the direct
+  decode chain and aligns it against the toolchain's `expected.wav`,
+  asserting a lock at the canonical 1105-sample codec delay and
+  steady-state normalized RMS error < 0.005 (measured ≈ 1e-4). The
+  MPEG-2.5 sibling of `tests/lsf_reference_pcm.rs`; it is the test that
+  surfaced the part-2/part-3 decode bug fixed above.
 
 - encoder/tests: **end-to-end MPEG-2.5 encode verification at all three
   extension rates** (r340). The band tables were wired in r321 and the

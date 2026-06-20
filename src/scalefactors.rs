@@ -142,6 +142,16 @@ pub struct FrameScaleFactors {
     /// Number of channels actually decoded (mirrors
     /// [`SideInfo::channels`]).
     pub channels: u8,
+    /// Part-2 (scalefactor) bit length actually consumed for each
+    /// granule/channel, indexed `[granule][channel]`. The part-3
+    /// (Huffman) data for a granule/channel begins this many bits after
+    /// the start of its `part2_3_length` field, so a decoder must skip
+    /// `part2_bits[gr][ch]` before reading Huffman codewords and cap the
+    /// Huffman budget at `part2_3_length - part2_bits[gr][ch]`. For
+    /// `scalefac_compress == 0` (MPEG-1) and any layout whose `slen`
+    /// partitions are all zero, this is `0`. Cells outside the decoded
+    /// `granule_count × channels` are left `0`.
+    pub part2_bits: [[u32; 2]; 2],
 }
 
 /// Errors returned by the scalefactor decode stage.
@@ -910,6 +920,7 @@ pub fn decode_scalefactors(
         granules: [[ScaleFactors::default(); 2]; 2],
         granule_count: side_info.granule_count,
         channels: side_info.channels,
+        part2_bits: [[0; 2]; 2],
     };
 
     let nch = side_info.channels as usize;
@@ -951,6 +962,7 @@ pub fn decode_scalefactors(
                         return Err(ScaleFactorError::OutOfData);
                     }
                     let part2_bits = r.bit_pos() - start_bit;
+                    out.part2_bits[gr][ch] = part2_bits as u32;
                     let part3_skip = (gc.part2_3_length as usize).saturating_sub(part2_bits);
                     skip_bits(&mut r, part3_skip);
                 }
@@ -971,6 +983,7 @@ pub fn decode_scalefactors(
                     return Err(ScaleFactorError::OutOfData);
                 }
                 let part2_bits = r.bit_pos() - start_bit;
+                out.part2_bits[0][ch] = part2_bits as u32;
                 let part3_skip = (gc.part2_3_length as usize).saturating_sub(part2_bits);
                 skip_bits(&mut r, part3_skip);
             }

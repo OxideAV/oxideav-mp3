@@ -2731,6 +2731,7 @@ impl Mp3Encoder {
             granules: [[ScaleFactors::default(); 2]; 2],
             granule_count: ngr as u8,
             channels: self.nch as u8,
+            part2_bits: [[0; 2]; 2],
         };
         let mut gc_data: [[GranuleChannelData; 2]; 2] = Default::default();
 

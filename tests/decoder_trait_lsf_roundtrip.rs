@@ -88,7 +88,9 @@ fn decode_stereo_direct(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
             for (ch, xr_slot) in xr_per_ch.iter_mut().enumerate() {
                 let gc = &si.granules[gr][ch];
                 let mut r = MainDataReader::new(&run);
-                let mut left = bit_cursor;
+                // Skip part-2 (scalefactor) bits so the reader lands on
+                // the part-3 Huffman codewords; budget the remainder.
+                let mut left = bit_cursor + fsf.part2_bits[gr][ch] as usize;
                 while left >= 32 {
                     let _ = r.read(32);
                     left -= 32;
@@ -96,7 +98,8 @@ fn decode_stereo_direct(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
                 if left > 0 {
                     let _ = r.read(left as u32);
                 }
-                let part3_bits = u32::from(gc.part2_3_length);
+                let part3_bits =
+                    u32::from(gc.part2_3_length).saturating_sub(fsf.part2_bits[gr][ch]);
                 let is = decode_huffman(&mut r, gc, part3_bits, hdr.sample_rate_hz, hdr.version)
                     .expect("huffman");
                 let sf = &fsf.granules[gr][ch];

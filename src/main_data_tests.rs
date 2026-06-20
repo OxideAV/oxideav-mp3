@@ -54,6 +54,7 @@ mod tests {
             granules: [[ScaleFactors::default(); 2]; 2],
             granule_count,
             channels,
+            part2_bits: [[0; 2]; 2],
         }
     }
 
