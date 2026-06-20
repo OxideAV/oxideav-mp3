@@ -64,7 +64,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   asserting a lock at the canonical 1105-sample codec delay and
   steady-state normalized RMS error < 0.005 (measured ≈ 1e-4). The
   MPEG-2.5 sibling of `tests/lsf_reference_pcm.rs`; it is the test that
-  surfaced the part-2/part-3 decode bug fixed above.
+  surfaced the part-2/part-3 decode bug fixed above. A companion
+  `mpeg25_11025_trait_decoder_matches_direct_chain` test drives the same
+  fixture through the registered `oxideav_core::Decoder` trait wrapper
+  (`Mp3CoreDecoder`) and asserts it reconstructs the same PCM as the
+  direct chain byte-exactly (modulo the leading Xing/Info granule the
+  production decoder emits), proving the part-2/part-3 fix is wired into
+  the production decode path, not just the test harness.
 
 - encoder/tests: **end-to-end MPEG-2.5 encode verification at all three
   extension rates** (r340). The band tables were wired in r321 and the

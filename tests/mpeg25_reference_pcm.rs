@@ -29,9 +29,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase};
 use oxideav_mp3::{
     alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, requantize, synth_granule, FrameWalker, ImdctState, MainDataReader,
+    parse_side_info, reorder, requantize, synth_granule, FrameWalker, ImdctState, MainDataReader,
     MpegVersion, Reservoir, SynthState, PCM_PER_GRANULE,
 };
 
@@ -112,6 +113,10 @@ fn decode_mono_f32(bytes: &[u8]) -> Vec<f32> {
                 .expect("huffman");
             let sf = &fsf.granules[gr][0];
             let xr = requantize(&is, gc, sf, hdr.sample_rate_hz, hdr.version);
+            // §2.4.3.4.8 reorder: short/mixed granules must be rewritten
+            // into subband-window order before alias reduction + IMDCT;
+            // long granules pass through unchanged.
+            let xr = reorder(&xr, gc, hdr.sample_rate_hz, hdr.version);
             bit_cursor += gc.part2_3_length as usize;
             let xar = alias_reduce(&xr, gc);
             let subband_time = imdct_granule(&xar, gc, &mut imdct);
@@ -262,5 +267,103 @@ fn mpeg25_11025_fixture_decode_tracks_reference_pcm() {
     assert!(
         nrmse < 0.005,
         "MPEG-2.5 11025 decode diverges from reference PCM: nrmse={nrmse:.6}"
+    );
+}
+
+/// Slice the contiguous MP3 byte stream into per-frame packets.
+fn mp3_to_packets(bytes: &[u8]) -> Vec<Packet> {
+    let mut out = Vec::new();
+    let mut pts: i64 = 0;
+    for f in FrameWalker::new(bytes) {
+        let hdr = parse_header(&f.data[..4]).expect("walker yields parseable headers");
+        let tb = TimeBase::new(1, i64::from(hdr.sample_rate_hz));
+        let mut pkt = Packet::new(0, tb, f.data.to_vec());
+        pkt.pts = Some(pts);
+        pkt.duration = Some(PCM_PER_GRANULE as i64); // one LSF granule
+        out.push(pkt);
+        pts += PCM_PER_GRANULE as i64;
+    }
+    out
+}
+
+/// Drive the MPEG-2.5 mono stream through the registered trait
+/// [`oxideav_core::Decoder`] (the production `Mp3CoreDecoder` path) and
+/// recover the mono `i16` PCM.
+fn trait_decode_mono(bytes: &[u8]) -> Vec<i16> {
+    let mut params = CodecParameters::audio(CodecId::new("mp3"));
+    params.sample_rate = Some(11_025);
+    params.channels = Some(1);
+    params.sample_format = Some(SampleFormat::S16);
+    let mut dec = oxideav_mp3::make_decoder(&params).expect("make_decoder");
+    let mut out: Vec<i16> = Vec::new();
+    let drain = |a: &oxideav_core::AudioFrame, out: &mut Vec<i16>| {
+        for chunk in a.data[0].chunks_exact(2) {
+            out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+    };
+    for pkt in mp3_to_packets(bytes) {
+        dec.send_packet(&pkt).expect("send_packet");
+        loop {
+            match dec.receive_frame() {
+                Ok(Frame::Audio(a)) => drain(&a, &mut out),
+                Ok(other) => panic!("non-audio frame: {other:?}"),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_frame: {e}"),
+            }
+        }
+    }
+    dec.flush().expect("flush");
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Audio(a)) => drain(&a, &mut out),
+            Ok(other) => panic!("non-audio frame on flush: {other:?}"),
+            Err(Error::Eof | Error::NeedMore) => break,
+            Err(e) => panic!("post-flush receive_frame: {e}"),
+        }
+    }
+    out
+}
+
+/// The production trait decoder must reconstruct the same PCM the direct
+/// decode chain does — byte-exact — proving the part-2/part-3 split fix
+/// is wired into `Mp3CoreDecoder`, not just the test harness.
+#[test]
+fn mpeg25_11025_trait_decoder_matches_direct_chain() {
+    let Some(dir) = fixture_dir() else {
+        eprintln!("skip: layer3-mpeg25-11025-32kbps fixture absent (standalone-crate CI checkout)");
+        return;
+    };
+    let mp3 = fs::read(dir.join("input.mp3")).expect("read input.mp3");
+    let wire = strip_id3v2(&mp3);
+
+    let direct_f32 = decode_mono_f32(wire);
+    let direct: Vec<i16> = direct_f32
+        .iter()
+        .map(|&p| oxideav_mp3::pcm_f32_to_i16(p))
+        .collect();
+    let traited = trait_decode_mono(wire);
+
+    // The production trait decoder emits the Xing/Info carrier frame as
+    // one (near-silent) granule of audio, whereas the direct chain here
+    // skips it; trim that leading granule before comparing. After the
+    // trim the two paths must agree byte-exactly — same scalefactor /
+    // Huffman / requantize / IMDCT / synthesis arithmetic, including the
+    // part-2/part-3 split fix wired into `Mp3CoreDecoder`.
+    assert_eq!(
+        traited.len(),
+        direct.len() + PCM_PER_GRANULE,
+        "trait decoder sample count {} != direct {} + one info granule",
+        traited.len(),
+        direct.len()
+    );
+    let traited_audio = &traited[PCM_PER_GRANULE..];
+    let mism = traited_audio
+        .iter()
+        .zip(direct.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        mism, 0,
+        "trait decoder diverges from direct chain in {mism} samples"
     );
 }
