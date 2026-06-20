@@ -371,6 +371,37 @@ fn preset_offset_orders_installed_threshold_on_fallback() {
     }
 }
 
+/// The one-call `new_with_quality_preset` constructor produces an
+/// encoder equivalent to `new_with_outer_loop` + `with_quality_preset`:
+/// the preset is recorded, the signal-dependent path is armed at the
+/// Annex D rate, and the stream self-decodes.
+#[test]
+fn one_call_constructor_round_trips() {
+    let pcm = multi_tone_pcm(PCM_LEN_SAMPLES, &[440.0, 1760.0, 5280.0], 0.10);
+    let mut enc = Mp3Encoder::new_with_quality_preset(
+        BR,
+        SR,
+        ChannelMode::SingleChannel,
+        QualityPreset::High,
+    )
+    .expect("one-call build");
+    assert_eq!(enc.quality_preset(), Some(QualityPreset::High));
+    assert!(
+        enc.quality_preset_is_signal_dependent(),
+        "High at 44.1 kHz should arm Model 2"
+    );
+    enc.push_samples(&pcm).expect("push pcm");
+    let mut out: Vec<u8> = Vec::new();
+    let n = enc.finish(&mut out).expect("finish");
+    assert_eq!(out.len(), n);
+    let recon = decode_mp3_mono(&out);
+    let p = aligned_psnr(&pcm, &recon);
+    assert!(
+        p.is_finite() && p > 15.0,
+        "one-call constructor PSNR {p:.2} dB below floor"
+    );
+}
+
 #[test]
 fn preset_without_outer_loop_is_rejected() {
     let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("plain encoder");

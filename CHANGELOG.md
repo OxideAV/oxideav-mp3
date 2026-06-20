@@ -27,9 +27,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   signal-dependent path through the new
   `XminThresholds::from_layer3_granule_with_offset_db`, which translates
   the Model 2 geometric-mean anchor by `10^(offset_db/10)` (preserving
-  every per-band ratio — only the level moves). This is the
-  "psychoacoustically tuned default-on quality preset" the README listed
-  as the remaining encoder work.
+  every per-band ratio — only the level moves). A one-call
+  [`Mp3Encoder::new_with_quality_preset`] constructor bundles
+  `new_with_outer_loop` + the preset for the common quality-knob
+  front-end. This is the "psychoacoustically tuned default-on quality
+  preset" the README listed as the remaining encoder work.
 
 ### Fixed
 

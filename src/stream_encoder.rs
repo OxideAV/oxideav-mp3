@@ -2403,6 +2403,40 @@ impl Mp3Encoder {
         Ok(enc)
     }
 
+    /// Build an encoder with the §C.1.5.4.3 outer loop and a named
+    /// psychoacoustic [`crate::quality::QualityPreset`] applied in one
+    /// call — the one-shot bundle of [`Self::new_with_outer_loop`] (at
+    /// [`DEFAULT_OUTER_LOOP_THRESHOLD`]) + [`Self::with_quality_preset`].
+    ///
+    /// This is the most direct entry point for a quality-knob front-end:
+    /// pick the transport (`bitrate_kbps`, `sample_rate_hz`, `mode`) and a
+    /// named perceptual level, and the perceptual machinery is armed per
+    /// [`Self::with_quality_preset`] (the full signal-dependent Model 2
+    /// path at the staged Annex D rates, the signal-independent
+    /// threshold-in-quiet fallback elsewhere).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::new_with_outer_loop`]; the inner
+    /// [`Self::with_quality_preset`] cannot fail here because the outer
+    /// loop is always installed first.
+    pub fn new_with_quality_preset(
+        bitrate_kbps: u32,
+        sample_rate_hz: u32,
+        mode: ChannelMode,
+        preset: crate::quality::QualityPreset,
+    ) -> Result<Self, StreamEncodeError> {
+        let mut enc = Self::new_with_outer_loop(
+            bitrate_kbps,
+            sample_rate_hz,
+            mode,
+            DEFAULT_OUTER_LOOP_THRESHOLD,
+        )?;
+        // Cannot fail: the outer loop was just installed above.
+        enc.with_quality_preset(preset)?;
+        Ok(enc)
+    }
+
     /// Install a per-band threshold vector
     /// ([`crate::psy::XminThresholds`]) the long-block outer-loop
     /// branch will consume INSTEAD of the uniform scalar threshold the
