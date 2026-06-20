@@ -434,8 +434,9 @@ pub use codec_decoder::{make_decoder, register_codecs, Mp3CoreDecoder};
 pub use codec_encoder::{
     make_encoder, make_encoder_joint_stereo_auto, make_encoder_joint_stereo_auto_with_threshold,
     make_encoder_joint_stereo_is, make_encoder_joint_stereo_ms, make_encoder_joint_stereo_ms_is,
-    make_encoder_with_outer_loop, make_encoder_with_threshold_in_quiet,
-    make_encoder_with_threshold_in_quiet_offset, Mp3CoreEncoder,
+    make_encoder_quality_preset, make_encoder_with_outer_loop,
+    make_encoder_with_threshold_in_quiet, make_encoder_with_threshold_in_quiet_offset,
+    Mp3CoreEncoder,
 };
 pub use crc::{crc16_bits, crc16_layer3, crc16_layer3_lsf, INITIAL_STATE as CRC_INITIAL_STATE};
 pub use demuxer::{

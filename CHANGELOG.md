@@ -20,10 +20,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   staged calculation-partition tables) a preset falls back to the
   signal-independent per-band threshold-in-quiet vector translated by the
   preset offset, so a preset is usable at every supported rate.
-  `quality_preset()` and `quality_preset_is_signal_dependent()` report the
-  applied preset and which path it took. This is the "psychoacoustically
-  tuned default-on quality preset" the README listed as the remaining
-  encoder work.
+  `quality_preset()`, `quality_preset_is_signal_dependent()`, and
+  `installed_per_band_xmin()` report the applied preset, which path it
+  took, and the installed fallback vector. The registry path gains the
+  `make_encoder_quality_preset` factory. The preset offset reaches the
+  signal-dependent path through the new
+  `XminThresholds::from_layer3_granule_with_offset_db`, which translates
+  the Model 2 geometric-mean anchor by `10^(offset_db/10)` (preserving
+  every per-band ratio — only the level moves). This is the
+  "psychoacoustically tuned default-on quality preset" the README listed
+  as the remaining encoder work.
 
 ### Fixed
 

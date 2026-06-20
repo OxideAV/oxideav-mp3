@@ -461,6 +461,87 @@ fn make_encoder_inner_threshold_in_quiet(
     )))
 }
 
+/// Build a boxed Layer III CBR [`Encoder`] with a named psychoacoustic
+/// [`QualityPreset`](crate::quality::QualityPreset) applied — the
+/// trait-API bundle of [`Mp3Encoder::new_with_outer_loop`] +
+/// [`Mp3Encoder::with_quality_preset`].
+///
+/// This is the registry-path entry point for the quality knob: a
+/// front-end that exposes a small set of named quality levels rather
+/// than the individual perceptual toggles passes its level straight
+/// through. The preset governs how aggressively the §C.1.5.4.3 outer
+/// loop shapes quantization noise under the perceptual model:
+///
+/// * at the three staged Annex D rates (32 / 44.1 / 48 kHz) the richer
+///   presets arm the §C.1.5.3.2.1 Model 2 signal-dependent path;
+/// * at every other supported rate (MPEG-2 LSF, MPEG-2.5) the preset
+///   falls back to the signal-independent per-band threshold-in-quiet
+///   vector translated by the preset's §D.1 Step 3 offset.
+///
+/// `params.sample_rate` / `params.channels` / `params.bit_rate` are
+/// interpreted exactly as for [`make_encoder`]. The uniform outer-loop
+/// slot is seeded with [`DEFAULT_OUTER_LOOP_THRESHOLD`]; the preset then
+/// installs the per-band vector (or arms Model 2) on top.
+///
+/// # Errors
+///
+/// Returns [`Error::invalid`] when `sample_rate` / `channels` are missing
+/// or out of scope, and [`Error::other`] when the underlying
+/// [`Mp3Encoder::new_with_outer_loop`] or
+/// [`Mp3Encoder::with_quality_preset`] rejects the configuration.
+pub fn make_encoder_quality_preset(
+    params: &CodecParameters,
+    preset: crate::quality::QualityPreset,
+) -> Result<Box<dyn Encoder>> {
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| Error::invalid("oxideav-mp3: sample_rate required"))?;
+    let channels = params
+        .channels
+        .ok_or_else(|| Error::invalid("oxideav-mp3: channels required"))?;
+    let mode = match channels {
+        1 => ChannelMode::SingleChannel,
+        2 => ChannelMode::Stereo,
+        _ => {
+            return Err(Error::invalid(format!(
+                "oxideav-mp3: encoder supports 1 or 2 channels (channels={channels})"
+            )));
+        }
+    };
+    let bitrate_bps = params.bit_rate.unwrap_or(128_000);
+    if bitrate_bps == 0 || bitrate_bps > 1_000_000 {
+        return Err(Error::invalid(format!(
+            "oxideav-mp3: bit_rate {bitrate_bps} out of range"
+        )));
+    }
+    let bitrate_kbps = (bitrate_bps / 1000) as u32;
+    let mut inner = Mp3Encoder::new_with_outer_loop(
+        bitrate_kbps,
+        sample_rate,
+        mode,
+        crate::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD,
+    )
+    .map_err(|e| Error::other(format!("oxideav-mp3: encoder build: {e}")))?;
+    inner
+        .with_quality_preset(preset)
+        .map_err(|e| Error::other(format!("oxideav-mp3: quality preset: {e}")))?;
+
+    let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+    out_params.sample_rate = Some(sample_rate);
+    out_params.channels = Some(channels);
+    out_params.sample_format = Some(SampleFormat::S16);
+    out_params.bit_rate = Some(u64::from(bitrate_kbps) * 1000);
+    out_params.tag = Some(CodecTag::wave_format(WAVE_FORMAT_MP3));
+
+    Ok(Box::new(Mp3CoreEncoder::new(
+        CodecId::new(CODEC_ID_STR),
+        inner,
+        out_params,
+        sample_rate,
+        channels as usize,
+    )))
+}
+
 /// Frame-to-packet adaptor that wires [`Mp3Encoder`] into the
 /// framework [`Encoder`] trait.
 ///

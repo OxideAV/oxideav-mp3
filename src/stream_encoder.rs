@@ -762,6 +762,13 @@ pub struct Mp3Encoder {
     /// Model 2 path (vs the signal-independent threshold-in-quiet
     /// fallback). Only meaningful while `quality_preset.is_some()`.
     quality_preset_signal_dependent: bool,
+    /// §D.1 Step 3 threshold offset (dB) the Model 2 per-granule install
+    /// applies to its geometric-mean anchor
+    /// ([`crate::psy::XminThresholds::from_layer3_granule_with_offset_db`]).
+    /// `0.0` reproduces the unoffset Model 2 path; a quality preset sets
+    /// it so the preset's level reaches the signal-dependent path. Reset
+    /// to `0.0` whenever Model 2 is (re-)armed outside a preset.
+    model2_offset_db: f64,
     /// §C.1.5.3 scalefactor-selection-information (scfsi) reuse.
     ///
     /// When `true`, the MPEG-1 two-granule assembler examines each
@@ -963,6 +970,7 @@ impl Mp3Encoder {
             model2_block_type: None,
             quality_preset: None,
             quality_preset_signal_dependent: false,
+            model2_offset_db: 0.0,
             scfsi_reuse: true,
         })
     }
@@ -1582,6 +1590,10 @@ impl Mp3Encoder {
             // content-driven one; the offset shapes the static fallback
             // the analysis collapses to on a silent granule.
             self.enable_model2_psychoacoustics()?;
+            // Thread the preset's §D.1 Step 3 offset into the Model 2
+            // per-granule anchor so the preset's level (not just its
+            // per-band shape) reaches the signal-dependent path.
+            self.model2_offset_db = params.threshold_offset_db;
             if params.model2_block_type {
                 // Cannot fail: Model 2 was just armed above.
                 self.enable_auto_block_type_model2()?;
@@ -1631,6 +1643,25 @@ impl Mp3Encoder {
     #[must_use]
     pub fn quality_preset_is_signal_dependent(&self) -> bool {
         self.quality_preset.is_some() && self.quality_preset_signal_dependent
+    }
+
+    /// The static per-band threshold vector currently installed (via
+    /// [`Self::set_per_band_xmin`], a `new_with_threshold_in_quiet*`
+    /// constructor, or a [`Self::with_quality_preset`] that fell back to
+    /// the signal-independent path), or `None` when no static vector is
+    /// installed.
+    ///
+    /// Returns `None` while the per-granule Model 2 analysis is armed: the
+    /// signal-dependent path overwrites the vector on every granule, so
+    /// there is no stable static vector to surface (query
+    /// [`Self::model2_psychoacoustics_enabled`] /
+    /// [`Self::quality_preset_is_signal_dependent`] instead). Exposed for
+    /// integration tests / observability so a caller can confirm a
+    /// preset's §D.1 Step 3 offset reached the installed threshold on the
+    /// fallback path.
+    #[must_use]
+    pub fn installed_per_band_xmin(&self) -> Option<&crate::psy::XminThresholds> {
+        self.per_band_xmin.as_ref()
     }
 
     /// Build a joint-stereo encoder that emits §2.4.3.4.9.2 **MS-stereo**
@@ -2492,6 +2523,9 @@ impl Mp3Encoder {
         // Mutually exclusive with a static per-band vector.
         self.per_band_xmin = None;
         self.model2_psy = Some(states);
+        // A raw arm uses the unoffset anchor; a quality preset overrides
+        // this immediately after via `with_quality_preset`.
+        self.model2_offset_db = 0.0;
         // No frame has been analysed under the freshly-armed mode yet;
         // drop any decision captured by a previous arming.
         self.last_model2_switch = None;
@@ -3018,6 +3052,9 @@ impl Mp3Encoder {
             // `enable_model2_psychoacoustics` set `model2_psy`, and
             // disarming `model2_psy` (via `set_per_band_xmin`) clears
             // `model2_block_type` too.
+            // Capture the preset's Model 2 anchor offset before the
+            // disjoint `&mut` borrow of `model2_psy` below (f64 is Copy).
+            let model2_offset_db = self.model2_offset_db;
             let states = self
                 .model2_psy
                 .as_mut()
@@ -3070,8 +3107,12 @@ impl Mp3Encoder {
                             pe: gran.pe,
                             attack: gran.attack,
                         });
-                        model2_xmin_per_gc[g][ch] =
-                            Some(crate::psy::XminThresholds::from_layer3_granule(&gran));
+                        model2_xmin_per_gc[g][ch] = Some(
+                            crate::psy::XminThresholds::from_layer3_granule_with_offset_db(
+                                &gran,
+                                model2_offset_db,
+                            ),
+                        );
                         model2_granule_per_gc[g][ch] = Some(gran);
                     }
                 }
@@ -3341,6 +3382,7 @@ impl Mp3Encoder {
                 // skip the call entirely for any (gr, ch) the pre-pass
                 // populated.
                 if model2_granule_per_gc[gr][ch].is_none() {
+                    let model2_offset_db = self.model2_offset_db;
                     if let Some(states) = self.model2_psy.as_mut() {
                         let granule_f64: Vec<f64> = pcm_arr.iter().map(|&s| f64::from(s)).collect();
                         if let Some(out) = states[ch].process(&granule_f64) {
@@ -3351,8 +3393,12 @@ impl Mp3Encoder {
                                 pe: out.pe,
                                 attack: out.attack,
                             });
-                            model2_xmin_per_gc[gr][ch] =
-                                Some(crate::psy::XminThresholds::from_layer3_granule(&out));
+                            model2_xmin_per_gc[gr][ch] = Some(
+                                crate::psy::XminThresholds::from_layer3_granule_with_offset_db(
+                                    &out,
+                                    model2_offset_db,
+                                ),
+                            );
                         }
                     }
                 }

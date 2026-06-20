@@ -110,14 +110,39 @@ records the part-2 bit length (`FrameScaleFactors::part2_bits`); the
 decode path skips it and budgets Huffman at `part2_3_length −
 part2_bits`.
 
+## Quality presets
+
+A named psychoacoustic **quality knob** bundles the §C.1.5 / Annex D
+perceptual toggles into one level. `Mp3Encoder::with_quality_preset`
+(and the registry-path `make_encoder_quality_preset` factory) take a
+`QualityPreset` — `Transparent` / `High` / `Standard` / `Fast`, ordered
+by the §D.1 Step 3 threshold offset (`-24` / `-12` / `0` / `+6` dB;
+`High` and `Standard` mirror the spec's own `>= 96` / `< 96` kbit/s-per-
+channel branches exactly). Each preset lowers to:
+
+- a §D.1 Step 3 threshold offset on the per-band threshold-in-quiet bowl;
+- optionally the §C.1.5.3.2.1 **Model 2** per-band masking analysis;
+- optionally the §C.1.5.2 Model-2-driven **block-type** scheduler.
+
+The knob is **rate-graceful**: at the three staged Annex D rates (32 /
+44.1 / 48 kHz) the richer presets arm the full signal-dependent Model 2
+path (the preset offset translates the Model 2 geometric-mean anchor via
+`XminThresholds::from_layer3_granule_with_offset_db`, so the preset's
+*level* reaches the signal-dependent path while its content-driven *shape*
+is preserved). At the MPEG-2 LSF / MPEG-2.5 rates (no staged calculation-
+partition tables) a preset falls back to the signal-independent per-band
+threshold-in-quiet vector translated by the preset offset, so a preset is
+usable at every supported rate. `quality_preset()` /
+`quality_preset_is_signal_dependent()` / `installed_per_band_xmin()`
+surface which path was taken.
+
 ## Not yet supported
 
-- Annex D psychoacoustic shaping is **opt-in**: the default quantization
-  is rate/distortion-driven, while `enable_model2_psychoacoustics`
-  arms the §C.1.5.3.2.1 Model 2 analysis (per-band `xmin` threshold plus
-  the `pe > 1800` Model-2-driven block-type scheduler, now usable under
-  MS-joint and intensity-stereo coupling). A psychoacoustically tuned
-  default-on quality preset is the remaining work.
+- Annex D psychoacoustic shaping remains **opt-in** under the perceptual
+  presets above; the bare-constructor default quantization is still
+  rate/distortion-driven. A perceptual preset applied by default at
+  construction time (rather than as an explicit `with_quality_preset`
+  call) is a possible future ergonomic refinement.
 
 ## Robustness
 

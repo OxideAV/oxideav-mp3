@@ -437,6 +437,47 @@ impl XminThresholds {
     /// granule), the result is [`Self::uniform`] at the default scale.
     #[must_use]
     pub fn from_layer3_granule(granule: &Model2Layer3Granule) -> Self {
+        Self::from_layer3_granule_with_offset_db(granule, 0.0)
+    }
+
+    /// As [`Self::from_layer3_granule`], but the geometric-mean
+    /// normalization anchor is translated by `offset_db` dB before the
+    /// rescale, so a quality-preset front-end can tighten or loosen the
+    /// **overall bit-spend level** of the Model 2 path while leaving its
+    /// content-driven per-band *shape* untouched.
+    ///
+    /// The Model 2 analysis delivers a per-band masking threshold whose
+    /// absolute scale is calibrated by anchoring the granule's
+    /// geometric-mean threshold to [`DEFAULT_OUTER_LOOP_THRESHOLD`] (see
+    /// [`Self::from_layer3_granule`]). That anchor fixes how aggressively
+    /// the outer loop drives quantization noise below the masking curve.
+    /// This variant multiplies the anchor by `10^(offset_db / 10)`:
+    ///
+    /// * `offset_db = 0.0` reproduces [`Self::from_layer3_granule`]
+    ///   exactly (the anchor is `DEFAULT_OUTER_LOOP_THRESHOLD`).
+    /// * `offset_db < 0.0` **lowers** the anchor (a smaller `xmin`
+    ///   energy), so every band asks for a higher SNR → more bits →
+    ///   tighter quantization. This is the §D.1 Step 3 sense (the
+    ///   spec's `-12 dB` high-bitrate offset tightens the threshold).
+    /// * `offset_db > 0.0` raises the anchor → fewer bits.
+    ///
+    /// Because the offset scales the single common anchor, every per-band
+    /// ratio Model 2 produced is preserved — only the level moves, the
+    /// same way [`Self::threshold_in_quiet_with_offset_db`] translates the
+    /// LTq bowl without reshaping it. This is the seam a
+    /// [`crate::quality::QualityPreset`] uses so its threshold offset
+    /// reaches the signal-dependent path, not only the static fallback.
+    #[must_use]
+    pub fn from_layer3_granule_with_offset_db(
+        granule: &Model2Layer3Granule,
+        offset_db: f64,
+    ) -> Self {
+        // §D.1 Step 3 sense: a more-negative offset lowers the anchor
+        // energy (tighter threshold, more bits). 10^(offset_db/10) is the
+        // dB→linear-power conversion, matching `db_to_xfsf_energy`'s
+        // direction on the LTq path.
+        let anchor = DEFAULT_OUTER_LOOP_THRESHOLD * 10.0_f64.powf(offset_db / 10.0);
+
         // Collect every positive threshold across the long + short
         // deliverables for the geometric-mean normalization anchor.
         let mut log_sum = 0.0_f64;
@@ -462,13 +503,13 @@ impl XminThresholds {
 
         // Fully silent granule — no positive threshold to anchor on.
         if log_count == 0 {
-            return Self::uniform(DEFAULT_OUTER_LOOP_THRESHOLD);
+            return Self::uniform(anchor);
         }
 
         // Geometric mean of the positive thresholds, and the
-        // single rescale that maps it to DEFAULT_OUTER_LOOP_THRESHOLD.
+        // single rescale that maps it to the (offset-translated) anchor.
         let geo_mean = (log_sum / log_count as f64).exp();
-        let scale = DEFAULT_OUTER_LOOP_THRESHOLD / geo_mean;
+        let scale = anchor / geo_mean;
         // Floor for silent (non-positive) bands after rescaling: the
         // smallest rescaled positive threshold, so a quiet band asks
         // for at least as much SNR as the quietest real band, never
@@ -19895,6 +19936,62 @@ mod tests {
         // Mixed regions mirror the long / short fills.
         assert_eq!(x.mixed_long, x.long);
         assert_eq!(x.mixed_short, x.short);
+    }
+
+    #[test]
+    fn xmin_from_layer3_granule_offset_db_translates_anchor_preserving_shape() {
+        // Same multi-decade granule as the ordering test.
+        let thm: Vec<f64> = (0..LONG_SFB).map(|i| 10.0_f64.powi(i as i32 % 7)).collect();
+        let thm_short_one: Vec<f64> = (0..SHORT_SFB)
+            .map(|i| 10.0_f64.powi(i as i32 % 5))
+            .collect();
+        let granule = Model2Layer3Granule {
+            pe: 0.0,
+            attack: false,
+            en: vec![1.0; LONG_SFB],
+            thm: thm.clone(),
+            ratio: vec![1.0; LONG_SFB],
+            thm_short: [
+                thm_short_one.clone(),
+                thm_short_one.clone(),
+                thm_short_one.clone(),
+            ],
+            ratio_short: [
+                vec![1.0; SHORT_SFB],
+                vec![1.0; SHORT_SFB],
+                vec![1.0; SHORT_SFB],
+            ],
+        };
+
+        // offset_db = 0.0 reproduces the unoffset path exactly.
+        let base = XminThresholds::from_layer3_granule(&granule);
+        let zero = XminThresholds::from_layer3_granule_with_offset_db(&granule, 0.0);
+        assert_eq!(base.long, zero.long);
+        assert_eq!(base.short, zero.short);
+
+        // A more-negative offset lowers every long band (tighter ⇒ more
+        // bits); a positive offset raises them. The per-band *shape* is
+        // untouched — every band scales by the same 10^(offset/10) factor.
+        let tight = XminThresholds::from_layer3_granule_with_offset_db(&granule, -12.0);
+        let loose = XminThresholds::from_layer3_granule_with_offset_db(&granule, 6.0);
+        let exp_tight = 10.0_f64.powf(-12.0 / 10.0);
+        let exp_loose = 10.0_f64.powf(6.0 / 10.0);
+        for sfb in 0..LONG_SFB {
+            assert!(
+                tight.long[sfb] < base.long[sfb],
+                "sfb {sfb}: -12 dB not tighter"
+            );
+            assert!(
+                loose.long[sfb] > base.long[sfb],
+                "sfb {sfb}: +6 dB not looser"
+            );
+            // Uniform multiplicative translation: ratio to base equals the
+            // dB-to-linear factor at every band.
+            let rt = tight.long[sfb] / base.long[sfb];
+            let rl = loose.long[sfb] / base.long[sfb];
+            assert!((rt - exp_tight).abs() <= 1e-9 * exp_tight);
+            assert!((rl - exp_loose).abs() <= 1e-9 * exp_loose);
+        }
     }
 
     #[test]
