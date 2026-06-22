@@ -110,6 +110,26 @@ pub fn n_coefficient(i: usize, k: usize) -> f64 {
     arg.cos()
 }
 
+/// Precomputed matrixing matrix `N[i][k] = n_coefficient(i, k)` for the
+/// 64 `V[]` outputs × 32 subband inputs of the §2.4.3.2.2 matrixing step.
+///
+/// The coefficients depend only on the constant index pair `(i, k)`, so
+/// every `cos()` is evaluated exactly once at first use and reused for
+/// every `synth_row` call thereafter — the inner matrixing loop becomes a
+/// plain table lookup. Each `N_MATRIX[i][k]` holds the identical `f64` bit
+/// pattern that `n_coefficient(i, k)` returns, and the per-`k` products are
+/// accumulated in the same `k = 0..32` order as before, so the matrixing
+/// result is bit-for-bit identical to evaluating the cosine per sample.
+static N_MATRIX: std::sync::LazyLock<[[f64; NUM_SUBBANDS]; 64]> = std::sync::LazyLock::new(|| {
+    let mut m = [[0.0f64; NUM_SUBBANDS]; 64];
+    for (i, row) in m.iter_mut().enumerate() {
+        for (k, slot) in row.iter_mut().enumerate() {
+            *slot = n_coefficient(i, k);
+        }
+    }
+    m
+});
+
 /// Run one pass of the Figure A.2 polyphase synthesis filter: consume 32
 /// subband samples `s[0..32]` and produce 32 PCM samples (returned).
 ///
@@ -125,10 +145,14 @@ pub fn synth_row(s: &[f64; NUM_SUBBANDS], state: &mut SynthState) -> [f64; NUM_S
     state.v.copy_within(0..(V_LEN - 64), 64);
 
     // Step 2: Matrixing — V[i] = sum_{k=0..31} N[i,k] * S[k] for i = 0..64.
-    for (i, slot) in state.v[..64].iter_mut().enumerate() {
+    // `N_MATRIX` is the per-`(i,k)` cosine table computed once at first use;
+    // the products are summed in the same `k = 0..32` order as the original
+    // per-sample `n_coefficient` call, so the result is bit-identical.
+    let n_matrix = &*N_MATRIX;
+    for (slot, n_row) in state.v[..64].iter_mut().zip(n_matrix.iter()) {
         let mut acc = 0.0f64;
-        for (k, &sk) in s.iter().enumerate() {
-            acc += n_coefficient(i, k) * sk;
+        for (&nk, &sk) in n_row.iter().zip(s.iter()) {
+            acc += nk * sk;
         }
         *slot = acc;
     }
