@@ -302,6 +302,50 @@ impl Mp3FrameHeader {
     pub fn is_free_format(&self) -> bool {
         self.bitrate_index == 0
     }
+
+    /// Byte width of one framing "slot" for this header's layer.
+    ///
+    /// Per ISO/IEC 11172-3 §2.4.2.1 a slot is four bytes in Layer I
+    /// and one byte in Layers II and III. The padding slot
+    /// (§2.4.2.3) and the free-format frame body are both whole
+    /// multiples of this width.
+    #[must_use]
+    pub fn slot_bytes(&self) -> usize {
+        match self.layer {
+            Layer::LayerI => 4,
+            Layer::LayerII | Layer::LayerIII => 1,
+        }
+    }
+
+    /// Total free-format frame length in bytes given the
+    /// **unpadded** body length `base_unpadded_len` measured once
+    /// for the stream's fixed free-format bitrate.
+    ///
+    /// In free format the bitrate is fixed but absent from the
+    /// header bitrate table, so [`frame_len`] returns `None`. The
+    /// standard (§2.4.1.3, `bitrate_index = '0000'`) requires a
+    /// frame to contain either `N` or `N + 1` slots depending on the
+    /// `padding_bit`, where `N` is the constant unpadded slot count
+    /// for the stream. Once a caller has measured that constant
+    /// `base_unpadded_len` (the byte distance between two adjacent
+    /// frame syncs with `padding == false`, or one measured length
+    /// minus the padding slot it carried), this returns
+    /// `base_unpadded_len + padding * slot_bytes` for the current
+    /// header — the per-frame length under that fixed bitrate.
+    ///
+    /// Returns `None` for a non-free-format header, where
+    /// [`frame_len`] already derives the length from the bitrate
+    /// table.
+    ///
+    /// [`frame_len`]: Mp3FrameHeader::frame_len
+    #[must_use]
+    pub fn frame_len_free_format(&self, base_unpadded_len: usize) -> Option<usize> {
+        if !self.is_free_format() {
+            return None;
+        }
+        let pad = usize::from(self.padding) * self.slot_bytes();
+        Some(base_unpadded_len + pad)
+    }
 }
 
 /// Error returned when four candidate bytes do not form a valid
@@ -1017,6 +1061,43 @@ mod tests {
         assert!(hdr.is_free_format());
         assert_eq!(hdr.bitrate_kbps, None);
         assert_eq!(hdr.frame_len(), None);
+    }
+
+    #[test]
+    fn free_format_length_from_measured_base() {
+        // bitrate_index = 0 (free format), Layer III, padding = 0.
+        let h0 = build_header(1, 0b01, 1, 0b0000, 0b00, 0, 0, 0b00, 0, 0, 1, 0);
+        let hdr0 = parse_header(&h0).unwrap();
+        assert!(hdr0.is_free_format());
+        // Layer III slot is 1 byte; unpadded == base.
+        assert_eq!(hdr0.slot_bytes(), 1);
+        assert_eq!(hdr0.frame_len_free_format(836), Some(836));
+
+        // Same fixed bitrate, padding = 1 => one extra slot.
+        let h1 = build_header(1, 0b01, 1, 0b0000, 0b00, 1, 0, 0b00, 0, 0, 1, 0);
+        let hdr1 = parse_header(&h1).unwrap();
+        assert!(hdr1.padding);
+        assert_eq!(hdr1.frame_len_free_format(836), Some(837));
+    }
+
+    #[test]
+    fn free_format_length_layer1_slot_is_four_bytes() {
+        // Layer I free format, padding = 1 adds a 4-byte slot.
+        let h = build_header(1, 0b11, 1, 0b0000, 0b00, 1, 0, 0b00, 0, 0, 1, 0);
+        let hdr = parse_header(&h).unwrap();
+        assert_eq!(hdr.layer, Layer::LayerI);
+        assert_eq!(hdr.slot_bytes(), 4);
+        assert_eq!(hdr.frame_len_free_format(1660), Some(1664));
+    }
+
+    #[test]
+    fn frame_len_free_format_none_for_normal_bitrate() {
+        // Non-free-format header => the measured-base path returns
+        // None; callers use `frame_len()` instead.
+        let h = build_header(1, 0b01, 1, 0b1001, 0b00, 0, 0, 0b00, 0, 0, 1, 0);
+        let hdr = parse_header(&h).unwrap();
+        assert!(!hdr.is_free_format());
+        assert_eq!(hdr.frame_len_free_format(836), None);
     }
 
     #[test]
