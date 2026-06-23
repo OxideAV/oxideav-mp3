@@ -478,6 +478,14 @@ pub struct Mp3Demuxer {
     /// Bitrate (in bits/s) inherited from the first audio frame.
     /// `None` when the stream is free-format.
     bitrate_bps: Option<u32>,
+    /// Constant **unpadded** frame body length (bytes) for a
+    /// free-format stream, measured once at open-time as the byte
+    /// distance between the first two frame syncs (§2.4.1.3 fixes
+    /// the free-format bitrate, so every frame is this length plus
+    /// the per-frame padding slot). `None` for table-bitrate
+    /// streams, whose per-frame length comes from
+    /// [`crate::frame::Mp3FrameHeader::frame_len`].
+    free_format_base_len: Option<usize>,
     /// Sequential PTS counter, ticked once per emitted packet by
     /// [`Self::next_packet`]. Expressed in `time_base = 1 /
     /// sample_rate` units, so each tick adds `samples_per_frame`.
@@ -508,6 +516,7 @@ impl std::fmt::Debug for Mp3Demuxer {
             .field("sample_rate", &self.sample_rate)
             .field("samples_per_frame", &self.samples_per_frame)
             .field("bitrate_bps", &self.bitrate_bps)
+            .field("free_format_base_len", &self.free_format_base_len)
             .field("next_pts", &self.next_pts)
             .field("finished", &self.finished)
             .field("trimmed_duration_samples", &self.trimmed_duration_samples)
@@ -574,9 +583,34 @@ impl Mp3Demuxer {
         }
         let first_header =
             parse_header(&hdr).map_err(|e| Error::invalid(format!("first frame header: {e}")))?;
-        let first_len = first_header
-            .frame_len()
-            .ok_or_else(|| Error::unsupported("free-format MPEG audio frame at start"))?;
+
+        // Free-format streams carry no table bitrate, so the first
+        // frame's length is measured from the distance to the next
+        // sync (§2.4.1.3). The measured constant is the *unpadded*
+        // body; the first frame's actual length adds back its own
+        // padding slot.
+        let (first_len, free_format_base_len) = match first_header.frame_len() {
+            Some(len) => (len, None),
+            None => {
+                let base = measure_free_format_base_len(
+                    &mut input,
+                    first_frame_offset,
+                    &first_header,
+                    audio_end_offset,
+                )?;
+                let len = first_header
+                    .frame_len_free_format(base)
+                    .ok_or_else(|| Error::unsupported("free-format MPEG audio frame at start"))?;
+                (len, Some(base))
+            }
+        };
+
+        // Re-seek to the start of the first frame; the free-format
+        // measurement above advanced the reader past the header.
+        input.seek(SeekFrom::Start(cursor))?;
+        if read_up_to(input.as_mut(), &mut hdr)? < 4 {
+            return Err(Error::invalid("truncated MPEG audio frame at start"));
+        }
 
         let mut first_frame_buf = vec![0u8; first_len];
         first_frame_buf[..4].copy_from_slice(&hdr);
@@ -617,7 +651,17 @@ impl Mp3Demuxer {
         let sample_rate = first_header.sample_rate_hz;
         let samples_per_frame = first_header.samples_per_frame();
         let bitrate_kbps = first_header.bitrate_kbps;
-        let bitrate_bps = bitrate_kbps.map(|k| k * 1000);
+        // Free-format streams have no table bitrate, but a fixed one:
+        // the unpadded body carries `samples_per_frame` samples, so
+        // the effective constant bitrate is
+        // `base_len * 8 * sample_rate / samples_per_frame` bit/s.
+        // Table-bitrate streams take their declared rate directly.
+        let bitrate_bps = match bitrate_kbps {
+            Some(k) => Some(k * 1000),
+            None => free_format_base_len.map(|base| {
+                ((base as u128) * 8 * sample_rate as u128 / samples_per_frame as u128) as u32
+            }),
+        };
         let time_base = TimeBase::new(1, sample_rate as i64);
 
         // Duration estimation.
@@ -683,6 +727,7 @@ impl Mp3Demuxer {
             sample_rate,
             samples_per_frame,
             bitrate_bps,
+            free_format_base_len,
             next_pts: 0,
             finished: false,
             trimmed_duration_samples,
@@ -799,7 +844,11 @@ fn locate_first_frame(
     for i in 0..buf.len().saturating_sub(3) {
         if buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0 {
             if let Ok(h) = parse_header(&buf[i..i + 4]) {
-                if h.frame_len().is_some() {
+                // A table-bitrate header is accepted on its derivable
+                // length; a free-format header (no table length) is
+                // accepted on a valid sync alone — its length is
+                // measured separately from the next sync.
+                if h.frame_len().is_some() || h.is_free_format() {
                     return Ok(start_offset + i as u64);
                 }
             }
@@ -807,6 +856,75 @@ fn locate_first_frame(
     }
     Err(Error::invalid(
         "no MPEG audio frame sync within the scan window after ID3v2",
+    ))
+}
+
+/// Measure the constant **unpadded** body length of a free-format
+/// stream.
+///
+/// In free format (§2.4.1.3, `bitrate_index == '0000'`) the bitrate
+/// is fixed but absent from the header table, so a frame's length is
+/// not derivable from its header. Every frame, however, is the same
+/// size up to the padding slot. We measure it once: starting just
+/// after the first frame's 4-byte header at `first_frame_offset`,
+/// scan forward to the next valid frame sync that agrees with the
+/// first frame's `(version, layer, sample_rate)` and is itself
+/// free-format. The byte distance from `first_frame_offset` to that
+/// next sync is the first frame's *padded* length; subtracting the
+/// first frame's own padding slot yields the constant unpadded base.
+///
+/// Returns the unpadded base length, or an error if no second sync
+/// is found within the scan window (a single-frame free-format
+/// stream cannot be length-measured this way).
+fn measure_free_format_base_len(
+    input: &mut Box<dyn ReadSeek>,
+    first_frame_offset: u64,
+    first_header: &crate::frame::Mp3FrameHeader,
+    end_offset: u64,
+) -> Result<usize> {
+    // A free-format frame is bounded above by the spec's maximum
+    // free-format bitrates (448/384/320 kbit/s for Layers I/II/III)
+    // at the lowest sample rate; ~3 KiB is a comfortable ceiling for
+    // a single Layer III frame, so a 8 KiB scan window always spans
+    // at least one full frame plus the next sync.
+    const SCAN: u64 = 8192;
+    // Start one byte past the first sync so we don't immediately
+    // re-match it.
+    let search_start = first_frame_offset + 1;
+    if search_start + 4 > end_offset {
+        return Err(Error::unsupported(
+            "free-format stream has no second frame to measure frame length",
+        ));
+    }
+    let limit = end_offset.min(search_start + SCAN);
+    let mut buf = vec![0u8; (limit - search_start) as usize];
+    input.seek(SeekFrom::Start(search_start))?;
+    let n = read_up_to(input.as_mut(), &mut buf)?;
+    buf.truncate(n);
+    for i in 0..buf.len().saturating_sub(3) {
+        if buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0 {
+            if let Ok(h) = parse_header(&buf[i..i + 4]) {
+                let same_stream = h.version == first_header.version
+                    && h.layer == first_header.layer
+                    && h.sample_rate_hz == first_header.sample_rate_hz;
+                if same_stream && h.is_free_format() {
+                    // Padded length of the first frame = distance from
+                    // the first sync to this one.
+                    let padded_len = (search_start - first_frame_offset) + i as u64;
+                    let pad = (usize::from(first_header.padding)) * first_header.slot_bytes();
+                    let padded = padded_len as usize;
+                    if padded <= pad {
+                        return Err(Error::invalid(
+                            "free-format measured frame length is smaller than its padding slot",
+                        ));
+                    }
+                    return Ok(padded - pad);
+                }
+            }
+        }
+    }
+    Err(Error::unsupported(
+        "no second free-format frame sync within the scan window",
     ))
 }
 
@@ -844,7 +962,16 @@ impl Demuxer for Mp3Demuxer {
                     continue;
                 }
             };
-            let len = match header.frame_len() {
+            // Frame length: table bitrate derives it directly; a
+            // free-format stream uses the constant unpadded base
+            // measured at open-time plus the current frame's padding.
+            let frame_len = match header.frame_len() {
+                Some(l) => Some(l),
+                None => self
+                    .free_format_base_len
+                    .and_then(|base| header.frame_len_free_format(base)),
+            };
+            let len = match frame_len {
                 Some(l) if l >= 4 => l,
                 _ => {
                     self.cursor += 1;
@@ -966,7 +1093,12 @@ impl Mp3Demuxer {
         for i in 0..buf.len().saturating_sub(3) {
             if buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0 {
                 if let Ok(h) = parse_header(&buf[i..i + 4]) {
-                    if h.frame_len().is_some() && h.sample_rate_hz == self.sample_rate {
+                    // Accept a table-bitrate sync on its derivable
+                    // length, or a free-format sync when this stream
+                    // was identified as free-format at open-time.
+                    let length_ok = h.frame_len().is_some()
+                        || (self.free_format_base_len.is_some() && h.is_free_format());
+                    if length_ok && h.sample_rate_hz == self.sample_rate {
                         self.cursor += i as u64;
                         return Ok(());
                     }
@@ -1082,6 +1214,116 @@ mod tests {
         assert_eq!(got, n_frames);
         // Repeat next_packet — should stay at EOF.
         assert!(matches!(d.next_packet(), Err(Error::Eof)));
+    }
+
+    /// Build a free-format (`bitrate_index == 0`) MPEG-1 L3 header
+    /// with the given padding bit. Free format carries no table
+    /// bitrate; the demuxer measures the frame length from the
+    /// distance to the next sync (§2.4.1.3).
+    fn free_format_l3_header(padding: bool) -> [u8; 4] {
+        let raw: u32 = (0xFFF << 20)
+            | (1 << 19)        // ID = 1 (MPEG-1)
+            | (0b01 << 17)     // Layer III
+            | (1 << 16)        // protection = 1 (no CRC)
+            | (0b0000 << 12)   // bitrate_index = 0 -> free format
+            | (0b00 << 10)     // sampling = 44.1 kHz
+            | (u32::from(padding) << 9)
+            | (0 << 8)         // private = 0
+            | (0b00 << 6)      // mode = stereo
+            | (0b00 << 4)      // mode_ext = 0
+            | (0 << 3)         // copyright = 0
+            | (1 << 2)         // original = 1
+            | 0b00; // emphasis = none
+        raw.to_be_bytes()
+    }
+
+    /// A free-format stream of N identical unpadded frames: the
+    /// demuxer measures the constant frame length from the first two
+    /// syncs and then walks all N frames.
+    #[test]
+    fn free_format_unpadded_emits_n_packets() {
+        let hdr = free_format_l3_header(false);
+        // Pick an arbitrary fixed body length (not on the bitrate
+        // ladder for 44.1 kHz). 521 bytes ≈ a ~160 kbit/s frame.
+        let frame_len = 521usize;
+        let mut frame = vec![0u8; frame_len];
+        frame[..4].copy_from_slice(&hdr);
+        let n_frames = 6usize;
+        let mut buf = Vec::with_capacity(n_frames * frame_len);
+        for _ in 0..n_frames {
+            buf.extend_from_slice(&frame);
+        }
+        let mut d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).expect("open free-format stream");
+        assert_eq!(d.streams().len(), 1);
+        let info = &d.streams()[0];
+        assert_eq!(info.params.sample_rate, Some(44_100));
+        // Effective bitrate derived from the measured body:
+        // 521 * 8 * 44100 / 1152 ≈ 159_600 bit/s.
+        let expected_br = (521u64 * 8 * 44_100) / 1152;
+        assert_eq!(info.params.bit_rate, Some(expected_br));
+
+        let mut got = 0;
+        let mut expected_pts = 0i64;
+        loop {
+            match d.next_packet() {
+                Ok(p) => {
+                    assert_eq!(p.pts, Some(expected_pts));
+                    assert_eq!(p.data.len(), frame_len);
+                    assert_eq!(p.duration, Some(1152));
+                    expected_pts += 1152;
+                    got += 1;
+                }
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        assert_eq!(got, n_frames);
+    }
+
+    /// A free-format stream whose first frame is **padded** but whose
+    /// later frames are not: the measured unpadded base must subtract
+    /// the first frame's own padding slot, and each later frame's
+    /// length follows its own padding bit.
+    #[test]
+    fn free_format_mixed_padding_lengths() {
+        let base = 521usize; // unpadded body
+                             // Frame 0: padded (+1 byte slot). Frame 1: unpadded.
+                             // Frame 2: padded. Frame 3: unpadded.
+        let pads = [true, false, true, false];
+        let mut buf = Vec::new();
+        let mut offsets = Vec::new();
+        for &p in &pads {
+            offsets.push(buf.len());
+            let len = base + usize::from(p); // Layer III slot = 1 byte
+            let mut frame = vec![0u8; len];
+            frame[..4].copy_from_slice(&free_format_l3_header(p));
+            buf.extend_from_slice(&frame);
+        }
+        let mut d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).expect("open mixed-padding free");
+        // The measured base must be the *unpadded* 521 (first frame
+        // is padded, so the raw inter-sync distance is 522).
+        assert_eq!(d.free_format_base_len, Some(base));
+
+        let mut lens = Vec::new();
+        loop {
+            match d.next_packet() {
+                Ok(p) => lens.push(p.data.len()),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        assert_eq!(lens, vec![base + 1, base, base + 1, base]);
+    }
+
+    /// A single free-format frame cannot be length-measured (there is
+    /// no second sync to bound it), so open() rejects it.
+    #[test]
+    fn free_format_single_frame_is_rejected() {
+        let hdr = free_format_l3_header(false);
+        let mut frame = vec![0u8; 521];
+        frame[..4].copy_from_slice(&hdr);
+        let err = Mp3Demuxer::open(Box::new(Cursor::new(frame))).err();
+        assert!(err.is_some(), "single free-format frame must not open");
     }
 
     /// Wrap the synthetic CBR stream in an ID3v2 header + ID3v1
