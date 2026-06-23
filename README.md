@@ -81,6 +81,22 @@ and the trailing gapless-playback extension (encoder delay / padding),
 so `trimmed_duration_samples()` reports the gapless sample count.
 Registered as a container alongside the codec.
 
+**Free-format streams** (`bitrate_index == 0`) are demuxed end-to-end.
+The standard (§2.4.1.3) fixes a free-format stream's bitrate but omits
+it from the header bitrate table, so the per-frame length is not
+derivable from the header. At open time the demuxer measures the
+constant **unpadded** frame body once — the byte distance between the
+first two frame syncs that agree on `(version, layer, sample_rate)`,
+minus the first frame's own padding slot — and stores it; every
+subsequent frame's length is that base plus its own padding bit
+(`Mp3FrameHeader::frame_len_free_format`). An effective constant
+bitrate (`base · 8 · sample_rate / samples_per_frame`) is derived so
+the duration estimate and the CBR/proportional seek path work on
+free-format input too. A single free-format frame (no second sync to
+measure against) is rejected. End-to-end mono + stereo demux→decode is
+byte-exact with the same stream demuxed as CBR
+(`tests/demuxer_free_format_roundtrip.rs`).
+
 ## MPEG-2.5 decode
 
 The `Decoder` trait wrapper accepts MPEG-1, MPEG-2 LSF, and all three

@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- demuxer: **free-format (`bitrate_index == 0`) stream iteration** (r363).
+  Free format fixes the bitrate but omits it from the header table, so a
+  frame's length is not derivable from its header (§2.4.1.3) — the
+  demuxer previously rejected such streams ("free-format MPEG audio frame
+  at start"). `open()` now measures the constant **unpadded** frame body
+  once (`measure_free_format_base_len`): the byte distance between the
+  first two frame syncs agreeing on `(version, layer, sample_rate)`,
+  minus the first frame's own padding slot. The base is stored, and
+  `next_packet` / `resync_to_frame` derive each frame's length as
+  `base + padding · slot_bytes` via the new
+  `Mp3FrameHeader::frame_len_free_format` (+ `slot_bytes`, §2.4.2.1:
+  4 bytes Layer I, 1 byte Layers II/III). An effective constant bitrate
+  (`base · 8 · sample_rate / samples_per_frame`) is derived so the
+  duration estimator and the CBR/proportional seek path work on
+  free-format input. `locate_first_frame` accepts a free-format first
+  sync; a single free-format frame (no second sync) is rejected. New
+  `tests/demuxer_free_format_roundtrip.rs` proves the full demux→decode
+  pipeline byte-exact against CBR for mono + stereo (CBR encoded then
+  every frame's `bitrate_index` rewritten to 0, leaving the padding bit
+  and main-data slot untouched), plus the derived bitrate/duration.
+
 - encoder: **named psychoacoustic `QualityPreset` quality knob** (r355).
   New `quality` module + [`Mp3Encoder::with_quality_preset`] collapse the
   §C.1.5 / Annex D perceptual toggles (the §C.1.5.4.3 outer loop's per-band
