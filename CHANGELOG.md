@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- demuxer: **`seek_to` now reports the landed frame's exact PTS** (r367).
+  Both the Xing-TOC and the CBR/proportional seek paths positioned the
+  read cursor on a *byte estimate* (the percentile offset or the
+  `pts · bitrate / (8 · sample_rate)` proportional offset), snapped it
+  forward to the next real frame syncword via `resync_to_frame`, but then
+  reported — and stamped on the first emitted packet — the **requested**
+  PTS rather than the PTS of the frame the cursor actually landed on.
+  Because the snap moves the cursor by up to one frame, the returned
+  value and the first packet's `pts` disagreed with the rest of the
+  stream's timeline, breaking monotonicity for any seek target that did
+  not happen to fall on a frame boundary. New
+  `Mp3Demuxer::pts_at_cursor` walks the frame *headers* from
+  `first_audio_frame_offset` to the post-resync cursor, summing each
+  frame's exact length (table-bitrate or free-format), to recover the
+  true frame index; `seek_to` sets `next_pts = frame_index ·
+  samples_per_frame`. The seek now returns a whole-frame-aligned PTS that
+  matches the PTS later stamped on the next packet and keeps the stream
+  strictly monotone — accurate for CBR, VBR (Xing TOC), and free-format
+  alike. Covered by the strengthened
+  `seek_lands_on_frame_aligned_pts_and_stays_monotone` unit test
+  (off-boundary CBR request) and the end-to-end
+  `vbr_xing_toc_seeks_via_demuxer` test (real encoder-produced VBR
+  stream: a ~50 % TOC seek lands on a real interior frame boundary and
+  the following packets carry monotone frame-exact PTS). This is the
+  "§2.4.3 … seeking accuracy" milestone work.
+
 ### Added
 
 - demuxer: **free-format (`bitrate_index == 0`) stream iteration** (r363).

@@ -1039,9 +1039,16 @@ impl Demuxer for Mp3Demuxer {
                     let off = self.first_audio_frame_offset + (frac * bytes_total as f64) as u64;
                     let off = off.min(self.audio_end_offset.saturating_sub(4));
                     self.cursor = off;
-                    self.next_pts = pts;
                     self.finished = false;
                     self.resync_to_frame()?;
+                    // The cursor now sits on a real frame boundary that
+                    // generally differs from the percentile estimate.
+                    // Report the *actual* landed PTS (the frame's own
+                    // PTS) rather than the requested one, so the value
+                    // returned here and the PTS later stamped on the
+                    // first emitted packet agree and stay monotone with
+                    // the rest of the stream (§2.4.3 gapless/seek).
+                    self.next_pts = self.pts_at_cursor();
                     return Ok(self.next_pts);
                 }
             }
@@ -1057,9 +1064,13 @@ impl Demuxer for Mp3Demuxer {
                 ((pts as u128) * (br as u128) / (8u128 * self.sample_rate as u128)) as u64;
             let target = self.first_audio_frame_offset + bytes_into_audio;
             self.cursor = target.min(self.audio_end_offset.saturating_sub(4));
-            self.next_pts = pts;
             self.finished = false;
             self.resync_to_frame()?;
+            // Snap the reported PTS to the frame the cursor actually
+            // landed on (counted from the first audio frame), so the
+            // returned value matches the PTS stamped on the next packet
+            // instead of the proportional estimate.
+            self.next_pts = self.pts_at_cursor();
             return Ok(self.next_pts);
         }
 
@@ -1108,6 +1119,79 @@ impl Mp3Demuxer {
         // No sync in the window — leave the cursor alone; the next
         // `next_packet` call will return `Eof` if nothing remains.
         Ok(())
+    }
+
+    /// Exact PTS of the frame the cursor currently sits on, in
+    /// `time_base = 1 / sample_rate` units.
+    ///
+    /// After a byte-offset seek and [`Self::resync_to_frame`], the
+    /// cursor is on a real frame boundary, but the requested PTS was a
+    /// proportional / percentile *estimate* that generally lands a few
+    /// frames off. The true PTS is `frame_index · samples_per_frame`,
+    /// where `frame_index` is the number of whole frames between
+    /// `first_audio_frame_offset` and the cursor. We recover it by
+    /// walking the frames from the first audio frame, summing each
+    /// frame's exact length (table-bitrate or free-format), and
+    /// counting how many fully precede the cursor. This is robust for
+    /// CBR, VBR, and free-format alike: it reads only frame *headers*
+    /// (4 bytes each), and the count is bounded by the seek distance.
+    ///
+    /// On any read/parse hiccup it falls back to `0` (start of audio),
+    /// which is always a valid, monotone PTS.
+    fn pts_at_cursor(&mut self) -> i64 {
+        let target = self.cursor;
+        if target <= self.first_audio_frame_offset {
+            return 0;
+        }
+        let mut off = self.first_audio_frame_offset;
+        let mut frame_index: i64 = 0;
+        // Bound the walk so a corrupt stream can't spin forever: at
+        // most one iteration per frame between the first audio frame
+        // and the cursor (every frame is >= 4 bytes -> length-bounded).
+        let max_frames = (target - self.first_audio_frame_offset) / 4 + 1;
+        for _ in 0..=max_frames {
+            if off >= target {
+                break;
+            }
+            if off + 4 > self.audio_end_offset {
+                break;
+            }
+            if self.input.seek(SeekFrom::Start(off)).is_err() {
+                return frame_index.saturating_mul(self.samples_per_frame as i64);
+            }
+            let mut hdr = [0u8; 4];
+            match read_up_to(self.input.as_mut(), &mut hdr) {
+                Ok(4) => {}
+                _ => break,
+            }
+            let header = match parse_header(&hdr) {
+                Ok(h) => h,
+                Err(_) => break,
+            };
+            let len = match header.frame_len() {
+                Some(l) => l,
+                None => match self
+                    .free_format_base_len
+                    .and_then(|base| header.frame_len_free_format(base))
+                {
+                    Some(l) => l,
+                    None => break,
+                },
+            };
+            if len < 4 {
+                break;
+            }
+            let next = off + len as u64;
+            // A frame counts as preceding the cursor only if it ends at
+            // or before it; the frame the cursor sits *on* is the one
+            // we land on (its PTS is `frame_index`).
+            if next > target {
+                break;
+            }
+            off = next;
+            frame_index += 1;
+        }
+        frame_index.saturating_mul(self.samples_per_frame as i64)
     }
 }
 
@@ -1557,8 +1641,46 @@ mod tests {
         let actual = d.seek_to(0, 5_760).unwrap();
         // CBR seek lands within one frame of the request.
         assert!((actual - 5_760).abs() <= 1152);
+        // The returned PTS is now the *exact* PTS of the frame the
+        // cursor landed on (a whole multiple of samples_per_frame),
+        // and the next packet carries that same PTS.
+        assert_eq!(actual % 1152, 0);
         let pkt = d.next_packet().unwrap();
         assert_eq!(pkt.pts, Some(actual));
+    }
+
+    /// After a CBR seek the reported PTS equals the landed frame's PTS,
+    /// the next packet carries it, and the stream stays strictly
+    /// monotone from there — i.e. the proportional estimate no longer
+    /// leaks into the emitted timestamps.
+    #[test]
+    fn seek_lands_on_frame_aligned_pts_and_stays_monotone() {
+        let raw: u32 =
+            (0xFFF << 20) | (1 << 19) | (0b01 << 17) | (1 << 16) | (0b1001 << 12) | (0b00 << 10);
+        let hdr = raw.to_be_bytes();
+        let frame_len = 417usize;
+        let mut buf = Vec::new();
+        for _ in 0..32 {
+            buf.extend_from_slice(&hdr);
+            buf.extend(std::iter::repeat_n(0u8, frame_len - 4));
+        }
+        let mut d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).unwrap();
+        // Request a PTS that does NOT fall on a frame boundary. The
+        // proportional byte offset (3107) lands inside frame 7's body;
+        // resync snaps the cursor forward to the next sync, frame 8 at
+        // byte 3336.
+        let actual = d.seek_to(0, 8_564).unwrap();
+        // Landed PTS is the exact PTS of the frame the cursor snapped
+        // to (frame 8), not the requested 8564.
+        assert_eq!(actual, 8 * 1152);
+        // The next four packets carry strictly increasing, frame-exact
+        // PTS values starting at the landed one.
+        let mut expect = actual;
+        for _ in 0..4 {
+            let pkt = d.next_packet().unwrap();
+            assert_eq!(pkt.pts, Some(expect));
+            expect += 1152;
+        }
     }
 
     /// `lame_magic_offset` reflects the staged-doc all-flags layout

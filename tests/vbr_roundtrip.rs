@@ -323,10 +323,9 @@ fn vbr_xing_toc_bytes_field_matches_audio_region() {
 fn vbr_xing_toc_seeks_via_demuxer() {
     // The demuxer's seek path uses the Xing TOC. Drive a VBR stream
     // through `Mp3Demuxer::open` and verify a TOC-based seek to
-    // ~50% playback lands close to the middle audio frame (not the
-    // first or last). We don't decode the resulting packet, we just
-    // sanity-check that the demuxer doesn't reject the TOC the
-    // encoder just emitted.
+    // ~50% playback lands on a real audio-frame boundary, reports the
+    // frame's *exact* PTS, and that the next packet carries the same
+    // PTS and the stream stays monotone from there.
     let pcm = mixed_content_pcm(10, 10); // ~520 ms of audio.
     let mut enc = Mp3Encoder::new(320, SR, ChannelMode::SingleChannel).unwrap();
     enc.enable_vbr(64, 192).expect("vbr enable");
@@ -343,10 +342,31 @@ fn vbr_xing_toc_seeks_via_demuxer() {
     enc.finish(&mut bytes).unwrap();
 
     let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(bytes));
-    let demux = Mp3Demuxer::open(cursor).expect("Mp3Demuxer::open");
-    let xing = demux.xing().expect("demuxer reports xing tag");
+    let mut demux = Mp3Demuxer::open(cursor).expect("Mp3Demuxer::open");
+    let xing = demux.xing().expect("demuxer reports xing tag").clone();
     assert!(xing.toc.is_some(), "TOC missing from demuxer view");
     assert_eq!(xing.flags & xing_flag_bit::TOC, xing_flag_bit::TOC);
+
+    let total = demux.streams()[0]
+        .duration
+        .expect("VBR duration from Xing frame count");
+    let spf = 1152i64; // MPEG-1 Layer III samples per frame.
+
+    // Seek to ~50% of playback.
+    let landed = demux.seek_to(0, total / 2).expect("TOC seek");
+    // The landed PTS is a whole-frame multiple (the demuxer snapped to
+    // a real frame boundary and re-derived its exact PTS), and it sits
+    // strictly inside the stream — not clamped to the first or last.
+    assert_eq!(landed % spf, 0, "landed PTS not frame-aligned: {landed}");
+    assert!(landed > 0, "TOC seek collapsed to the start");
+    assert!(landed < total, "TOC seek overran the duration");
+
+    // The next packet carries exactly the landed PTS and the stream
+    // continues monotonically.
+    let pkt = demux.next_packet().expect("packet after TOC seek");
+    assert_eq!(pkt.pts, Some(landed));
+    let pkt2 = demux.next_packet().expect("second packet after TOC seek");
+    assert_eq!(pkt2.pts, Some(landed + spf));
 }
 
 #[test]
