@@ -81,6 +81,20 @@ and the trailing gapless-playback extension (encoder delay / padding),
 so `trimmed_duration_samples()` reports the gapless sample count.
 Registered as a container alongside the codec.
 
+**Seeking** is frame-accurate. The Xing-TOC path (VBR) and the
+proportional bitrate path (CBR / free-format) position the cursor on a
+byte estimate, snap it forward to the next real frame syncword, then
+re-derive the **exact** PTS of the frame they landed on by counting
+whole frames from the first audio frame — so `seek_to` returns a
+whole-frame-aligned timestamp that matches the PTS later stamped on the
+next packet and keeps the stream strictly monotone (no leaked estimate).
+Each emitted packet's **keyframe flag** reflects the §2.4.2.7 bit
+reservoir: a Layer III frame is a random-access point only when its
+`main_data_begin` back-pointer is zero (it borrows no main data from
+earlier frames); frames with a non-zero back-pointer are flagged
+non-keyframe so a seeker doesn't treat them as safe entry points.
+Layers I/II carry no reservoir, so every frame is a keyframe.
+
 **Free-format streams** (`bitrate_index == 0`) are demuxed end-to-end.
 The standard (§2.4.1.3) fixes a free-format stream's bitrate but omits
 it from the header bitrate table, so the per-frame length is not
