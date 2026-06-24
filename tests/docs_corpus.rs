@@ -183,6 +183,43 @@ fn cbr_320k_stereo_44100_traverses_all_frames() {
 }
 
 #[test]
+fn cbr_320k_seek_lands_on_frame_exact_pts() {
+    // Exercise the seek-accuracy fix against real encoder output: a
+    // mid-stream seek must land on a whole-frame PTS, return the PTS the
+    // next packet then carries, and keep the timeline monotone.
+    let Some((mut d, _trace)) = open_fixture("layer3-cbr-320kbps-stereo-44100") else {
+        return;
+    };
+    let total = d.streams()[0].duration.expect("CBR duration");
+    let spf = 1152i64; // MPEG-1 Layer III.
+
+    // Seek to ~40% of playback (deliberately off any frame boundary).
+    let target = (total * 2) / 5 + 137;
+    let landed = d.seek_to(0, target).expect("seek_to");
+    assert_eq!(landed % spf, 0, "landed PTS not frame-aligned: {landed}");
+    // CBR: the landed frame is close to the proportional target. The
+    // proportional byte estimate carries up to one frame of rounding
+    // slop, and the forward resync-snap to the next real syncword can
+    // add another, so allow a two-frame window.
+    assert!(
+        (landed - target).abs() <= 2 * spf,
+        "CBR seek landed {landed} too far from {target}"
+    );
+
+    // The next packet carries exactly the landed PTS, then the stream
+    // continues monotonically and frame-exactly.
+    let p0 = d.next_packet().expect("packet after seek");
+    assert_eq!(p0.pts, Some(landed));
+    let mut prev = landed;
+    for _ in 0..3 {
+        let p = d.next_packet().expect("subsequent packet");
+        let pts = p.pts.unwrap();
+        assert_eq!(pts, prev + spf, "post-seek PTS not contiguous");
+        prev = pts;
+    }
+}
+
+#[test]
 fn vbr_q5_stereo_44100_uses_xing_for_duration() {
     let Some((d, trace)) = open_fixture("layer3-vbr-q5-stereo-44100") else {
         return;

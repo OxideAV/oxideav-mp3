@@ -928,6 +928,36 @@ fn measure_free_format_base_len(
     ))
 }
 
+/// Extract a Layer III frame's `main_data_begin` reservoir back-pointer
+/// (§2.4.1.7 / §2.4.2.7) from the start of its side-information region.
+///
+/// The back-pointer is the first field of the side info: a 9-bit value
+/// for MPEG-1, an 8-bit value for MPEG-2 / 2.5 (LSF). It sits
+/// immediately after the 4-byte header and the optional 2-byte CRC
+/// slot. We only need this one field to decide whether the frame is an
+/// independently-decodable random-access point, so we read it directly
+/// rather than parsing the whole side info.
+///
+/// Returns `None` for non-Layer-III frames (Layers I/II have no
+/// reservoir — every frame is self-contained) or when the buffer is too
+/// short to hold the field.
+fn frame_main_data_begin(header: &crate::frame::Mp3FrameHeader, frame: &[u8]) -> Option<u16> {
+    if header.layer != Layer::LayerIII {
+        return None;
+    }
+    let crc_bytes = if header.crc_protected { 2 } else { 0 };
+    let si_start = 4 + crc_bytes;
+    if header.version.is_lsf() {
+        // 8-bit field: one whole byte at `si_start`.
+        frame.get(si_start).map(|&b| u16::from(b))
+    } else {
+        // 9-bit field: byte `si_start` (high 8) + top bit of the next.
+        let hi = *frame.get(si_start)?;
+        let lo = *frame.get(si_start + 1)?;
+        Some((u16::from(hi) << 1) | u16::from(lo >> 7))
+    }
+}
+
 impl Demuxer for Mp3Demuxer {
     fn format_name(&self) -> &str {
         FORMAT_NAME
@@ -1001,11 +1031,22 @@ impl Demuxer for Mp3Demuxer {
             let pts = self.next_pts;
             self.next_pts = self.next_pts.saturating_add(self.samples_per_frame as i64);
             self.cursor += len as u64;
+            // A Layer III frame is a true random-access point (keyframe)
+            // only when its `main_data_begin` back-pointer is zero — i.e.
+            // its main data is wholly contained in its own slot and does
+            // not borrow from the bit reservoir of earlier frames
+            // (§2.4.2.7). A frame with `main_data_begin > 0` cannot be
+            // decoded in isolation, so a seeker must not treat it as a
+            // safe landing point. Layers I/II carry no reservoir, so
+            // every frame is self-contained.
+            let keyframe = frame_main_data_begin(&header, &data)
+                .map(|m| m == 0)
+                .unwrap_or(true);
             let pkt = Packet::new(0, self.streams[0].time_base, data)
                 .with_pts(pts)
                 .with_dts(pts)
                 .with_duration(self.samples_per_frame as i64)
-                .with_keyframe(true);
+                .with_keyframe(keyframe);
             return Ok(pkt);
         }
     }
@@ -1653,6 +1694,67 @@ mod tests {
     /// the next packet carries it, and the stream stays strictly
     /// monotone from there — i.e. the proportional estimate no longer
     /// leaks into the emitted timestamps.
+    /// `frame_main_data_begin` extracts the same 9-bit (MPEG-1) /
+    /// 8-bit (LSF) reservoir back-pointer as the full side-info parser,
+    /// across both bit widths and the CRC-slot offset.
+    #[test]
+    fn frame_main_data_begin_matches_side_info_parser() {
+        use crate::frame::ChannelMode;
+        use crate::side_info::parse_side_info;
+        // MPEG-1 mono Layer III, 128 kbps, 44.1 kHz, no CRC. The header
+        // is 4 bytes; side info begins at byte 4.
+        let raw: u32 =
+            (0xFFF << 20) | (1 << 19) | (0b01 << 17) | (1 << 16) | (0b1001 << 12) | (0b11 << 6);
+        let hdr = raw.to_be_bytes();
+        let h = parse_header(&hdr).unwrap();
+        assert_eq!(h.mode, ChannelMode::SingleChannel);
+        // Try several 9-bit main_data_begin values; encode them MSB-first
+        // into the first 2 side-info bytes, zero the rest of a mono
+        // side-info region, and confirm both extractors agree.
+        for mdb in [0u16, 1, 7, 255, 256, 300, 511] {
+            let mut frame = vec![0u8; 4 + SIDE_INFO_BYTES_MONO + 8];
+            frame[..4].copy_from_slice(&hdr);
+            // 9 bits MSB-first at byte 4: high 8 -> frame[4], low 1 ->
+            // top bit of frame[5].
+            frame[4] = (mdb >> 1) as u8;
+            frame[5] = ((mdb & 1) << 7) as u8;
+            let via_helper = frame_main_data_begin(&h, &frame).unwrap();
+            let si = parse_side_info(&h, &frame[4..]).unwrap();
+            assert_eq!(via_helper, mdb, "helper mismatch for {mdb}");
+            assert_eq!(si.main_data_begin, mdb, "parser mismatch for {mdb}");
+        }
+    }
+
+    /// A frame carrying a non-zero `main_data_begin` is *not* a keyframe
+    /// (it borrows from the bit reservoir and cannot be decoded in
+    /// isolation); a zero back-pointer frame is.
+    #[test]
+    fn keyframe_flag_tracks_main_data_begin() {
+        let raw: u32 =
+            (0xFFF << 20) | (1 << 19) | (0b01 << 17) | (1 << 16) | (0b1001 << 12) | (0b11 << 6);
+        let hdr = raw.to_be_bytes();
+        let h = parse_header(&hdr).unwrap();
+        let frame_len = h.frame_len().unwrap();
+        let make = |mdb: u16| {
+            let mut buf = vec![0u8; frame_len * 3];
+            for f in 0..3 {
+                let off = f * frame_len;
+                buf[off..off + 4].copy_from_slice(&hdr);
+                buf[off + 4] = (mdb >> 1) as u8;
+                buf[off + 5] = ((mdb & 1) << 7) as u8;
+            }
+            buf
+        };
+
+        // mdb == 0 -> keyframe.
+        let mut d0 = Mp3Demuxer::open(Box::new(Cursor::new(make(0)))).unwrap();
+        assert!(d0.next_packet().unwrap().is_keyframe());
+
+        // mdb == 9 -> not a keyframe.
+        let mut d1 = Mp3Demuxer::open(Box::new(Cursor::new(make(9)))).unwrap();
+        assert!(!d1.next_packet().unwrap().is_keyframe());
+    }
+
     #[test]
     fn seek_lands_on_frame_aligned_pts_and_stays_monotone() {
         let raw: u32 =

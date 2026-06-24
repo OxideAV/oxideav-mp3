@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- demuxer: **packet keyframe flag now reflects the bit reservoir**
+  (r367). `next_packet` previously stamped *every* emitted packet with
+  `keyframe = true`. A Layer III frame is only an independently-decodable
+  random-access point when its `main_data_begin` back-pointer is zero —
+  a frame with `main_data_begin > 0` borrows main data from the reservoir
+  of earlier frames (§2.4.2.7) and cannot be decoded in isolation, so a
+  seeker landing on it produces corrupt audio until the reservoir
+  refills. The demuxer now reads the back-pointer directly from the
+  start of the side-information region (the new `frame_main_data_begin`
+  helper — 9 bits for MPEG-1, 8 bits for MPEG-2 / 2.5 LSF, after the
+  4-byte header and optional 2-byte CRC slot) and sets
+  `keyframe = (main_data_begin == 0)`. Layers I/II carry no reservoir, so
+  every frame stays a keyframe. The helper is cross-validated against the
+  full `parse_side_info` parser across both field widths
+  (`frame_main_data_begin_matches_side_info_parser`), and
+  `keyframe_flag_tracks_main_data_begin` proves a non-zero back-pointer
+  frame is flagged non-keyframe. Combined with the exact-PTS landing
+  above, a seeker can now both target the right frame *and* tell whether
+  that frame is a safe entry point.
+
 - demuxer: **`seek_to` now reports the landed frame's exact PTS** (r367).
   Both the Xing-TOC and the CBR/proportional seek paths positioned the
   read cursor on a *byte estimate* (the percentile offset or the
