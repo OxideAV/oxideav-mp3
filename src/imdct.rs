@@ -123,44 +123,145 @@ impl ImdctState {
     }
 }
 
+/// Compute one §2.4.3.4.10.2 IMDCT cosine coefficient
+/// `cos( (pi/(2n)) · (2i + 1 + n/2) · (2k + 1) )` for output index `i`,
+/// input index `k`, transform size `n`.
+///
+/// The argument is assembled in the *exact* same evaluation order the
+/// naive per-sample loop used (`scale * a * b` where `scale = pi/(2n)`,
+/// `a = 2i+1+n/2`, `b = 2k+1`), so a precomputed table of these values
+/// carries the bit-identical `f64` that the inline `.cos()` produced.
+#[must_use]
+fn imdct_cos(n: usize, i: usize, k: usize) -> f64 {
+    let half = n / 2;
+    let scale = core::f64::consts::PI / (2.0 * n as f64);
+    let a = (2 * i + 1 + half) as f64;
+    let b = (2 * k + 1) as f64;
+    (scale * a * b).cos()
+}
+
+/// Precomputed IMDCT cosine matrix for the long transform (`n = 36`):
+/// `LONG_COS[i][k] = imdct_cos(36, i, k)`, `i = 0..36`, `k = 0..18`.
+///
+/// The transform coefficients depend only on the constant index pair
+/// `(i, k)` and never on the input data, so every `cos()` is evaluated
+/// exactly once at first use and the inner IMDCT loop becomes a plain
+/// table lookup. Each entry holds the identical `f64` bit pattern the
+/// inline cosine produced, and the products are summed in the same
+/// `k = 0..18` order, so the transform result is bit-for-bit identical
+/// to evaluating the cosine per sample.
+static LONG_COS: std::sync::LazyLock<[[f64; LONG_N / 2]; LONG_N]> =
+    std::sync::LazyLock::new(|| {
+        let mut m = [[0.0f64; LONG_N / 2]; LONG_N];
+        for (i, row) in m.iter_mut().enumerate() {
+            for (k, slot) in row.iter_mut().enumerate() {
+                *slot = imdct_cos(LONG_N, i, k);
+            }
+        }
+        m
+    });
+
+/// Precomputed IMDCT cosine matrix for the short transform (`n = 12`):
+/// `SHORT_COS[i][k] = imdct_cos(12, i, k)`, `i = 0..12`, `k = 0..6`.
+/// Same bit-identical / same-summation-order guarantee as [`LONG_COS`].
+static SHORT_COS: std::sync::LazyLock<[[f64; SHORT_N / 2]; SHORT_N]> =
+    std::sync::LazyLock::new(|| {
+        let mut m = [[0.0f64; SHORT_N / 2]; SHORT_N];
+        for (i, row) in m.iter_mut().enumerate() {
+            for (k, slot) in row.iter_mut().enumerate() {
+                *slot = imdct_cos(SHORT_N, i, k);
+            }
+        }
+        m
+    });
+
 /// The §2.4.3.4.10.2 IMDCT: transform `n/2` input lines `xk` (`n` = 36 or
 /// 12) into `n` output samples.
 ///
 /// `xk` must hold exactly `n / 2` values. Returns `n` outputs.
 /// Computation is in `f64`; callers downcast to `f32` after windowing.
+///
+/// The two transform sizes the codec actually uses (36 and 12) look the
+/// cosine coefficients up from the precomputed [`LONG_COS`] / [`SHORT_COS`]
+/// tables — the products are accumulated in the identical `k` order, so
+/// the output is bit-for-bit identical to evaluating each `.cos()` inline.
+/// Any other `n` (only reachable from tests) falls back to the direct
+/// per-sample cosine evaluation.
 #[must_use]
 pub fn imdct(xk: &[f64], n: usize) -> Vec<f64> {
     debug_assert_eq!(xk.len(), n / 2, "imdct: xk must have n/2 entries");
-    let half = n / 2;
-    let nn = n as f64;
-    // pi / (2n) factored out of the cosine argument.
-    let scale = core::f64::consts::PI / (2.0 * nn);
     let mut out = vec![0.0f64; n];
-    for (i, o) in out.iter_mut().enumerate() {
-        // (2i + 1 + n/2): the per-output phase offset.
-        let a = (2 * i + 1 + half) as f64;
-        let mut acc = 0.0f64;
-        for (k, &x) in xk.iter().enumerate() {
-            let b = (2 * k + 1) as f64;
-            acc += x * (scale * a * b).cos();
+    match n {
+        LONG_N => {
+            let cos = &*LONG_COS;
+            for (o, c_row) in out.iter_mut().zip(cos.iter()) {
+                let mut acc = 0.0f64;
+                for (&ck, &x) in c_row.iter().zip(xk.iter()) {
+                    acc += x * ck;
+                }
+                *o = acc;
+            }
         }
-        *o = acc;
+        SHORT_N => {
+            let cos = &*SHORT_COS;
+            for (o, c_row) in out.iter_mut().zip(cos.iter()) {
+                let mut acc = 0.0f64;
+                for (&ck, &x) in c_row.iter().zip(xk.iter()) {
+                    acc += x * ck;
+                }
+                *o = acc;
+            }
+        }
+        _ => {
+            for (i, o) in out.iter_mut().enumerate() {
+                let mut acc = 0.0f64;
+                for (k, &x) in xk.iter().enumerate() {
+                    acc += x * imdct_cos(n, i, k);
+                }
+                *o = acc;
+            }
+        }
     }
     out
 }
 
+/// Precomputed long-block window table:
+/// `LONG_WINDOW[i] = sin( (pi/36)·(i + 1/2) )`, `i = 0..36`
+/// (§2.4.3.4.10.3 a). Each entry is the identical `f64` the inline
+/// `.sin()` produced from the same argument, so windowing is bit-exact.
+static LONG_WINDOW: std::sync::LazyLock<[f64; LONG_N]> = std::sync::LazyLock::new(|| {
+    let mut w = [0.0f64; LONG_N];
+    for (i, slot) in w.iter_mut().enumerate() {
+        *slot = (core::f64::consts::PI / 36.0) * (i as f64 + 0.5);
+        *slot = slot.sin();
+    }
+    w
+});
+
+/// Precomputed short-window table:
+/// `SHORT_WINDOW[i] = sin( (pi/12)·(i + 1/2) )`, `i = 0..12`
+/// (§2.4.3.4.10.3 d). Bit-identical to the inline `.sin()`.
+static SHORT_WINDOW: std::sync::LazyLock<[f64; SHORT_N]> = std::sync::LazyLock::new(|| {
+    let mut w = [0.0f64; SHORT_N];
+    for (i, slot) in w.iter_mut().enumerate() {
+        *slot = (core::f64::consts::PI / 12.0) * (i as f64 + 0.5);
+        *slot = slot.sin();
+    }
+    w
+});
+
 /// Long-block (`n = 36`) window value at position `i` (§2.4.3.4.10.3 a):
-/// `sin( (pi/36)·(i + 1/2) )`.
+/// `sin( (pi/36)·(i + 1/2) )`. Reads the precomputed [`LONG_WINDOW`]
+/// table (bit-identical to the inline `.sin()` for every `i`).
 fn long_window(i: usize) -> f64 {
-    let arg = (core::f64::consts::PI / 36.0) * (i as f64 + 0.5);
-    arg.sin()
+    LONG_WINDOW[i]
 }
 
 /// Short-window value at sub-block position `i = 0..12`
-/// (§2.4.3.4.10.3 d): `sin( (pi/12)·(i + 1/2) )`.
+/// (§2.4.3.4.10.3 d): `sin( (pi/12)·(i + 1/2) )`. Reads the precomputed
+/// [`SHORT_WINDOW`] table (bit-identical to the inline `.sin()`).
 fn short_window(i: usize) -> f64 {
-    let arg = (core::f64::consts::PI / 12.0) * (i as f64 + 0.5);
-    arg.sin()
+    SHORT_WINDOW[i]
 }
 
 /// Window the 36 IMDCT outputs of a non-short block into `z[0..36]` per
@@ -176,11 +277,10 @@ fn window_long_family(x: &[f64], block_type: BlockType) -> [f64; LONG_N] {
                 *zi = match i {
                     0..=17 => x[i] * long_window(i),
                     18..=23 => x[i],
-                    // sin( (pi/12)·(i - 18 + 1/2) )
-                    24..=29 => {
-                        let arg = (core::f64::consts::PI / 12.0) * ((i - 18) as f64 + 0.5);
-                        x[i] * arg.sin()
-                    }
+                    // sin( (pi/12)·(i - 18 + 1/2) ) = short_window(i - 18);
+                    // the argument is identical to the SHORT_WINDOW table's,
+                    // so this stays bit-exact.
+                    24..=29 => x[i] * short_window(i - 18),
                     // 30..=35
                     _ => 0.0,
                 };
@@ -191,11 +291,9 @@ fn window_long_family(x: &[f64], block_type: BlockType) -> [f64; LONG_N] {
             for (i, zi) in z.iter_mut().enumerate() {
                 *zi = match i {
                     0..=5 => 0.0,
-                    // sin( (pi/12)·(i - 6 + 1/2) )
-                    6..=11 => {
-                        let arg = (core::f64::consts::PI / 12.0) * ((i - 6) as f64 + 0.5);
-                        x[i] * arg.sin()
-                    }
+                    // sin( (pi/12)·(i - 6 + 1/2) ) = short_window(i - 6);
+                    // identical argument to the SHORT_WINDOW table, bit-exact.
+                    6..=11 => x[i] * short_window(i - 6),
                     12..=17 => x[i],
                     // 18..=35
                     _ => x[i] * long_window(i),
