@@ -191,6 +191,112 @@ fn short_window_table_byte_exact() {
     }
 }
 
+// -- §2.4.3.4.10.2 IMDCT cosine-table memoization (bit-exact guard) --
+//
+// The decode hot path looks the IMDCT cosine coefficients up from the
+// precomputed LONG_COS / SHORT_COS tables and the sine windows up from
+// LONG_WINDOW / SHORT_WINDOW instead of evaluating the transcendental on
+// every sample. These tests pin the tables to the inline computation at
+// the *bit* level (`f64::to_bits` equality) so any future refactor that
+// silently perturbs an argument — reassociating the `scale·a·b` product,
+// changing a summation order, or swapping the table population loop — is
+// caught immediately. Bit equality (not an epsilon) is the round's core
+// correctness claim: decoded PCM must stay byte-identical.
+
+#[test]
+fn imdct_long_cos_table_is_bit_exact_vs_inline() {
+    // LONG_COS[i][k] must equal the inline cos((pi/72)·(2i+1+18)·(2k+1))
+    // to the bit, for every (i, k) the long transform ever indexes.
+    for i in 0..LONG_N {
+        for k in 0..(LONG_N / 2) {
+            let scale = core::f64::consts::PI / (2.0 * LONG_N as f64);
+            let a = (2 * i + 1 + LONG_N / 2) as f64;
+            let b = (2 * k + 1) as f64;
+            let inline = (scale * a * b).cos();
+            assert_eq!(
+                LONG_COS[i][k].to_bits(),
+                inline.to_bits(),
+                "LONG_COS[{i}][{k}] must be bit-identical to inline cos"
+            );
+        }
+    }
+}
+
+#[test]
+fn imdct_short_cos_table_is_bit_exact_vs_inline() {
+    for i in 0..SHORT_N {
+        for k in 0..(SHORT_N / 2) {
+            let scale = core::f64::consts::PI / (2.0 * SHORT_N as f64);
+            let a = (2 * i + 1 + SHORT_N / 2) as f64;
+            let b = (2 * k + 1) as f64;
+            let inline = (scale * a * b).cos();
+            assert_eq!(
+                SHORT_COS[i][k].to_bits(),
+                inline.to_bits(),
+                "SHORT_COS[{i}][{k}] must be bit-identical to inline cos"
+            );
+        }
+    }
+}
+
+#[test]
+fn imdct_window_tables_are_bit_exact_vs_inline() {
+    for i in 0..LONG_N {
+        let inline = ((core::f64::consts::PI / 36.0) * (i as f64 + 0.5)).sin();
+        assert_eq!(
+            LONG_WINDOW[i].to_bits(),
+            inline.to_bits(),
+            "LONG_WINDOW[{i}] must be bit-identical to inline sin"
+        );
+    }
+    for i in 0..SHORT_N {
+        let inline = ((core::f64::consts::PI / 12.0) * (i as f64 + 0.5)).sin();
+        assert_eq!(
+            SHORT_WINDOW[i].to_bits(),
+            inline.to_bits(),
+            "SHORT_WINDOW[{i}] must be bit-identical to inline sin"
+        );
+    }
+}
+
+#[test]
+fn imdct_table_path_matches_direct_cosine_bit_for_bit() {
+    // The memoized `imdct(&xk, n)` must produce, for both transform sizes
+    // the codec uses, output bit-identical to a fresh per-sample cosine
+    // evaluation over a non-trivial input — proof that the table lookup +
+    // preserved k-summation order changed nothing observable.
+    for &n in &[LONG_N, SHORT_N] {
+        let half = n / 2;
+        // Deterministic mixed-sign, mixed-magnitude input.
+        let xk: Vec<f64> = (0..half)
+            .map(|k| ((k as f64) * 0.618_033_988 - 3.0).sin() * (k as f64 + 1.0))
+            .collect();
+
+        // Reference: direct per-sample cosine, no table.
+        let scale = core::f64::consts::PI / (2.0 * n as f64);
+        let mut reference = vec![0.0f64; n];
+        for (i, r) in reference.iter_mut().enumerate() {
+            let a = (2 * i + 1 + half) as f64;
+            let mut acc = 0.0f64;
+            for (k, &x) in xk.iter().enumerate() {
+                let b = (2 * k + 1) as f64;
+                acc += x * (scale * a * b).cos();
+            }
+            *r = acc;
+        }
+
+        let got = imdct(&xk, n);
+        assert_eq!(got.len(), reference.len());
+        for (i, (&g, &r)) in got.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                r.to_bits(),
+                "imdct(n={n})[{i}] must be bit-identical to the direct cosine path"
+            );
+        }
+    }
+}
+
 #[test]
 fn long_window_squared_sum_two_halves_is_18() {
     // For the long block (block_type 0): sum_{i=0..35} w(i)^2. Computed
