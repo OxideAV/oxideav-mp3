@@ -225,6 +225,44 @@ pub fn imdct(xk: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
+/// Allocation-free long (`n = 36`) IMDCT into a stack array.
+///
+/// Bit-identical to `imdct(xk, 36)` — same [`LONG_COS`] table, same
+/// `k = 0..18` accumulation order — but with no `Vec` allocation for the
+/// input gather or the output, so the per-subband IMDCT of a long-family
+/// granule runs entirely on the stack.
+#[must_use]
+fn imdct_long(xk: &[f64; LONG_N / 2]) -> [f64; LONG_N] {
+    let cos = &*LONG_COS;
+    let mut out = [0.0f64; LONG_N];
+    for (o, c_row) in out.iter_mut().zip(cos.iter()) {
+        let mut acc = 0.0f64;
+        for (&ck, &x) in c_row.iter().zip(xk.iter()) {
+            acc += x * ck;
+        }
+        *o = acc;
+    }
+    out
+}
+
+/// Allocation-free short (`n = 12`) IMDCT into a stack array.
+///
+/// Bit-identical to `imdct(xk, 12)` — same [`SHORT_COS`] table, same
+/// `k = 0..6` accumulation order.
+#[must_use]
+fn imdct_short(xk: &[f64; SHORT_N / 2]) -> [f64; SHORT_N] {
+    let cos = &*SHORT_COS;
+    let mut out = [0.0f64; SHORT_N];
+    for (o, c_row) in out.iter_mut().zip(cos.iter()) {
+        let mut acc = 0.0f64;
+        for (&ck, &x) in c_row.iter().zip(xk.iter()) {
+            acc += x * ck;
+        }
+        *o = acc;
+    }
+    out
+}
+
 /// Precomputed long-block window table:
 /// `LONG_WINDOW[i] = sin( (pi/36)·(i + 1/2) )`, `i = 0..36`
 /// (§2.4.3.4.10.3 a). Each entry is the identical `f64` the inline
@@ -367,9 +405,14 @@ fn windowed_block(lines: &[f32], gc: &GranuleChannel, subband: usize) -> [f64; L
 
     if use_long {
         // Single 36-point IMDCT over the 18 lines (n/2 = 18 = subband
-        // size); n = 36.
-        let xk: Vec<f64> = lines.iter().map(|&v| f64::from(v)).collect();
-        let x = imdct(&xk, LONG_N);
+        // size); n = 36. The gather + transform run entirely on the
+        // stack (no per-subband Vec allocation) and are bit-identical to
+        // `imdct(&xk, 36)`.
+        let mut xk = [0.0f64; LONG_N / 2];
+        for (slot, &v) in xk.iter_mut().zip(lines.iter()) {
+            *slot = f64::from(v);
+        }
+        let x = imdct_long(&xk);
         // A mixed block's long subbands use the normal window
         // (block_type 0); a pure long/start/end block uses its own.
         let bt = if is_short {
@@ -407,12 +450,10 @@ fn xkk_assign(dst: &mut f64, lines: &[f32], idx: usize) {
 }
 
 /// A fixed-size 12-point IMDCT (`n = 12`) returning a `[f64; 12]`, used
-/// for the three short sub-blocks. Wraps [`imdct`] with a stack array.
+/// for the three short sub-blocks. Delegates to the allocation-free
+/// [`imdct_short`] (bit-identical to `imdct(xk, 12)`).
 fn imdct12(xk: &[f64; SHORT_N / 2]) -> [f64; SHORT_N] {
-    let v = imdct(xk, SHORT_N);
-    let mut out = [0.0f64; SHORT_N];
-    out.copy_from_slice(&v);
-    out
+    imdct_short(xk)
 }
 
 /// Run the full §2.4.3.4.10 IMDCT → windowing → overlap-add →
