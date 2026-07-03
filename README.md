@@ -1,5 +1,7 @@
 # oxideav-mp3
 
+[![CI](https://github.com/OxideAV/oxideav-mp3/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mp3/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mp3.svg)](https://crates.io/crates/oxideav-mp3) [![docs.rs](https://docs.rs/oxideav-mp3/badge.svg)](https://docs.rs/oxideav-mp3) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A pure-Rust **MPEG-1 / MPEG-2 Audio Layer III** (MP3) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework —
 decoder, CBR/VBR encoder, and a stream demuxer.
