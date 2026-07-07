@@ -163,7 +163,7 @@ pub fn decode_huffman(
         };
         let tbl_idx = gc.table_select[region];
         let table = big_table(tbl_idx)?;
-        let (x, y) = decode_big_pair(reader, table)?;
+        let (x, y) = decode_big_pair(reader, tbl_idx, table)?;
         is[line] = x;
         is[line + 1] = y;
         line += 2;
@@ -192,13 +192,113 @@ pub fn decode_huffman(
     Ok(is)
 }
 
+/// A direct-mapped **canonical prefix decode table** for one big-values
+/// codebook.
+///
+/// Layer III Huffman codebooks are prefix codes, so the next `bits`
+/// (`= max_len`, the table's longest codeword) uniquely identify the
+/// codeword: every stream prefix that starts with codeword `c` of length
+/// `len` lands in the `2^(bits-len)` contiguous slots whose top `len`
+/// bits are `c`. `slots[prefix]` therefore records `(x, y, len)` for the
+/// codeword that is a prefix of `prefix`; a `len == 0` slot is one no
+/// codeword covers (a corrupt-stream prefix), matching the old scan's
+/// `InvalidCode`.
+///
+/// Decoding then peeks `bits`, indexes once, and consumes exactly `len`
+/// bits — O(1) versus the former O(entries × max_len) linear scan, and
+/// bit-for-bit identical: the `(x, y)` returned and the bits consumed are
+/// the same prefix code as before.
+struct FastTable {
+    /// Prefix width used to index `slots` (the table's `max_len`).
+    bits: u8,
+    /// `2^bits` slots of `(x, y, len)`; `len == 0` marks an unmatched
+    /// prefix (invalid codeword).
+    slots: Vec<(u8, u8, u8)>,
+}
+
+impl FastTable {
+    /// Build the canonical prefix table from a codebook's flat entries.
+    fn build(table: &BigTable) -> Self {
+        let max_len = table.entries.iter().map(|e| e.len).max().unwrap_or(0);
+        // `max_len == 0` is only Table 0's single zero-bit (0,0) entry;
+        // a 1-slot table with a zero-length code decodes (0,0) consuming
+        // nothing, handled by the caller before peeking.
+        let bits = max_len;
+        let size = 1usize << bits;
+        let mut slots = vec![(0u8, 0u8, 0u8); size.max(1)];
+        let xl = usize::from(table.xlen);
+        for (idx, ent) in table.entries.iter().enumerate() {
+            if ent.len == 0 {
+                continue;
+            }
+            let x = (idx / xl) as u8;
+            let y = (idx % xl) as u8;
+            // The code occupies the top `ent.len` bits; fill every
+            // lower-bit completion so any prefix starting with this code
+            // resolves to it.
+            let shift = bits - ent.len;
+            let base = usize::from(ent.code) << shift;
+            for slot in slots.iter_mut().skip(base).take(1usize << shift) {
+                *slot = (x, y, ent.len);
+            }
+        }
+        FastTable { bits, slots }
+    }
+}
+
+/// Per-codebook-index (`0..32`) canonical prefix decode tables, built
+/// once at first use. Indices 4 and 14 are unused (Table 3-B.7) and get
+/// an empty placeholder that is never consulted (the caller resolves
+/// `big_table` first, which rejects them).
+static FAST_TABLES: std::sync::LazyLock<Vec<Option<FastTable>>> = std::sync::LazyLock::new(|| {
+    (0u8..32)
+        .map(|idx| big_table(idx).ok().map(FastTable::build))
+        .collect()
+});
+
+/// Decode one big-values codeword through the canonical prefix table for
+/// codebook `tbl_idx`, returning the `(x, y)` magnitude pair. Bit-exact
+/// with [`match_big_code`]: same code, same bits consumed.
+fn match_big_code_fast(
+    reader: &mut MainDataReader<'_>,
+    tbl_idx: u8,
+    table: &BigTable,
+) -> Result<(u8, u8), HuffmanError> {
+    let fast = match FAST_TABLES
+        .get(usize::from(tbl_idx))
+        .and_then(|t| t.as_ref())
+    {
+        Some(f) => f,
+        // Should be unreachable (caller resolved big_table already), but
+        // fall back to the scanning matcher rather than panic.
+        None => return match_big_code(reader, table),
+    };
+    if fast.bits == 0 {
+        // Table 0: the single zero-bit (0,0) entry consumes nothing.
+        return Ok((0, 0));
+    }
+    let prefix = reader.peek(u32::from(fast.bits)) as usize;
+    let (x, y, len) = fast.slots[prefix];
+    if len == 0 {
+        // No codeword covers this prefix: consume the full max_len (as
+        // the scanning matcher did before erroring) and report the same
+        // InvalidCode.
+        let _ = reader.read(u32::from(fast.bits));
+        return Err(HuffmanError::InvalidCode);
+    }
+    // Consume exactly the codeword length.
+    let _ = reader.read(u32::from(len));
+    Ok((x, y))
+}
+
 /// Decode one big-values `(x, y)` pair: match a codeword, apply the
 /// `linbits` ESC extension on magnitude-15 symbols, then the sign bits.
 fn decode_big_pair(
     reader: &mut MainDataReader<'_>,
+    tbl_idx: u8,
     table: &BigTable,
 ) -> Result<(i32, i32), HuffmanError> {
-    let (mut x, mut y) = match_big_code(reader, table)?;
+    let (mut x, mut y) = match_big_code_fast(reader, tbl_idx, table)?;
     let mut xv = i32::from(x);
     let mut yv = i32::from(y);
     let linbits = u32::from(table.linbits);

@@ -6,6 +6,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- huffman: **big-values decode now uses an O(1) canonical-prefix table**.
+  The big-values matcher previously scanned every codebook entry for each
+  candidate length, walking the bitstream one bit at a time
+  (O(entries × max_len) per pair). It now peeks the codebook's longest
+  codeword width once and indexes a direct-mapped table that records
+  `(x, y, len)` for the codeword covering that prefix, then consumes
+  exactly the codeword's length — the standard canonical-prefix decode.
+  Because the Table 3-B.7 codebooks are prefix-free, every prefix beginning
+  with codeword `c` of length `len` lands in the `2^(maxlen−len)`
+  contiguous slots whose top `len` bits are `c`, so the `(x, y)` returned
+  and the bits consumed are bit-for-bit identical to the former scan; a
+  slot no codeword covers reproduces the same `InvalidCode`. The per-table
+  prefix tables are built once via a `LazyLock`. A new
+  `fast_table_matches_scan_for_every_codeword` test cross-checks the fast
+  path against the retained reference scan for every codeword of every
+  selectable codebook (same `(x, y)`, same bits consumed). Adds a
+  non-advancing `MainDataReader::peek(n)` primitive that reproduces the
+  identical bits (and `exhausted` transition on the follow-up `read`) as
+  the former bit-at-a-time accumulation.
+
 ### Fixed
 
 - demuxer: **packet keyframe flag now reflects the bit reservoir**

@@ -1044,4 +1044,55 @@ mod tests {
         assert_eq!(best2, 0);
         assert_eq!(bits2, 0);
     }
+
+    /// The O(1) FastTable canonical-prefix decode must be bit-identical
+    /// to the reference bit-at-a-time scanning matcher: for every
+    /// codeword of every selectable Table 3-B.7 codebook, both must
+    /// return the same `(x, y)` magnitude pair and consume exactly the
+    /// codeword's length in bits. This pins the fast path against ever
+    /// diverging from the scan it replaces.
+    #[test]
+    fn fast_table_matches_scan_for_every_codeword() {
+        for &idx in SELECTABLE_BIG_TABLES.iter() {
+            let table = big_table(idx).unwrap();
+            let xl = usize::from(table.xlen);
+            for (ent_idx, ent) in table.entries.iter().enumerate() {
+                // A zero-length entry is either Table 0's single (0,0)
+                // code or an unused rectangular corner — no codeword to
+                // match here (Table 0's zero-bit path is covered
+                // separately by the fast.bits == 0 early return).
+                if ent.len == 0 {
+                    continue;
+                }
+                // The codeword followed by 20 filler bits, so both
+                // matchers see a full max_len peek window; a prefix code
+                // must consume exactly `len` and ignore the filler.
+                let bytes = pack(&[
+                    (u32::from(ent.code), u32::from(ent.len)),
+                    (0b1_0101, 20),
+                ]);
+                let want = ((ent_idx / xl) as u8, (ent_idx % xl) as u8);
+
+                let mut rd_scan = MainDataReader::new(&bytes);
+                let scan = match_big_code(&mut rd_scan, table).unwrap();
+                let scan_bits = rd_scan.bit_pos();
+
+                let mut rd_fast = MainDataReader::new(&bytes);
+                let fast = match_big_code_fast(&mut rd_fast, idx, table).unwrap();
+                let fast_bits = rd_fast.bit_pos();
+
+                assert_eq!(scan, want, "table {idx} entry {ent_idx}: scan (x,y)");
+                assert_eq!(fast, scan, "table {idx} entry {ent_idx}: fast (x,y) != scan");
+                assert_eq!(
+                    fast_bits, scan_bits,
+                    "table {idx} entry {ent_idx}: bits consumed differ"
+                );
+                assert_eq!(
+                    fast_bits,
+                    usize::from(ent.len),
+                    "table {idx} entry {ent_idx}: consumed != codeword len"
+                );
+            }
+        }
+    }
 }

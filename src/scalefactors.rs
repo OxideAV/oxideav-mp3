@@ -334,6 +334,32 @@ impl<'a> MainDataReader<'a> {
         self.exhausted = false;
     }
 
+    /// Peek `n` bits (`0 ≤ n ≤ 32`) MSB-first as an unsigned integer
+    /// **without** advancing the bit position or touching the `exhausted`
+    /// flag. Bits past the end of the buffer read as zero.
+    ///
+    /// Used by the Huffman decoder to look up a codeword by its
+    /// fixed-width prefix and then consume exactly the codeword's length
+    /// with [`MainDataReader::read`]; peek+read reproduces the identical
+    /// bits (and identical `exhausted` transition on read) as the former
+    /// bit-at-a-time accumulation.
+    #[must_use]
+    pub fn peek(&self, n: u32) -> u32 {
+        let mut value: u32 = 0;
+        for i in 0..n as usize {
+            let pos = self.bit_pos + i;
+            let byte_idx = pos >> 3;
+            let bit = if byte_idx < self.bytes.len() {
+                let shift = 7 - (pos & 7);
+                (self.bytes[byte_idx] >> shift) & 1
+            } else {
+                0
+            };
+            value = (value << 1) | u32::from(bit);
+        }
+        value
+    }
+
     /// Read `n` bits (`0 ≤ n ≤ 32`) MSB-first as an unsigned integer.
     ///
     /// Reading zero bits returns `0`. Reading past the end yields the
