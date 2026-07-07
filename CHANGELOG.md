@@ -56,6 +56,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- bench: **whole-stream encode benchmark harness** (`benches/encode.rs`,
+  r398). A depth-mode Criterion harness times the full PCM → Layer III
+  encode — analysis polyphase filterbank, forward MDCT with
+  long/short/mixed windowing, the psychoacoustic threshold model, the
+  nested inner rate loop and outer distortion loop, Huffman table
+  selection + emission, and side-info / main-data / reservoir assembly.
+  Five self-contained scenarios (mono tone / noise / log-sweep at 44.1 /
+  48 / 32 kHz plus a mixed stereo clip) each synthesise their PCM in
+  setup and are timed both **direct** (bare `Mp3Encoder`) and **trait**
+  (the registered `oxideav_core::Encoder` object). No behaviour change,
+  no fixture committed. Measured medians and an encode-vs-decode cost
+  analysis are documented in `BENCHMARKS.md` (§ Encoder benchmarks):
+  encode runs ≈ 5× the cost of decode (≈ 668 K samples/s, ≈ 15×
+  real-time mono at 44.1 kHz), input-shape-sensitive (wide-spectrum
+  noise ≈ 1.5× a steady tone), with the trait wrapper adding no
+  measurable overhead.
+
 - demuxer: **free-format (`bitrate_index == 0`) stream iteration** (r363).
   Free format fixes the bitrate but omits it from the header table, so a
   frame's length is not derivable from its header (§2.4.1.3) — the

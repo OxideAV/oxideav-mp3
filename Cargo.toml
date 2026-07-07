@@ -39,3 +39,13 @@ harness = false
 [[bench]]
 name = "decode_stages"
 harness = false
+
+# `encode` times the whole Layer III encode of an in-bench PCM clip two
+# ways: through the bare `Mp3Encoder` (`push_samples`/`finish`) and
+# through the registered `Encoder` trait object (`send_frame`/`flush`).
+# Covers mono tone / noise / sweep at three sample rates plus a mixed
+# stereo clip, so the analysis filterbank, forward MDCT, psychoacoustic
+# model, inner/outer loops and Huffman selection are all exercised.
+[[bench]]
+name = "encode"
+harness = false

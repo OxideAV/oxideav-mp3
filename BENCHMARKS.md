@@ -1,14 +1,20 @@
-# oxideav-mp3 — Decode Benchmarks
+# oxideav-mp3 — Benchmarks
 
 Criterion benchmarks for the MPEG-1 Audio Layer III **decode** hot
-path, landed in Round 290 (depth-mode). The goal of this round was a
-measurement harness plus a ranked hotspot map — **no behaviour
-change**: decoded PCM is byte-identical to the pre-round decoder.
+path, landed in Round 290 (depth-mode), and the **encode** hot path,
+added in Round 398 (depth-mode). Both rounds are measurement-only —
+**no behaviour change**: decoded PCM is byte-identical to the pre-round
+decoder, and the encoded byte streams are byte-identical to the
+pre-round encoder.
 
 ```
-cargo bench -p oxideav-mp3 --bench decode          # whole-stream
-cargo bench -p oxideav-mp3 --bench decode_stages   # per-stage
+cargo bench -p oxideav-mp3 --bench decode          # decode whole-stream
+cargo bench -p oxideav-mp3 --bench decode_stages   # decode per-stage
+cargo bench -p oxideav-mp3 --bench encode          # encode whole-stream
 ```
+
+The decode half is documented first; the [encoder
+benchmarks](#encoder-benchmarks-round-398) section follows.
 
 Every benchmark is self-contained: each scenario synthesises its input
 PCM from a deterministic in-bench source (sine / log-sweep / xorshift
@@ -120,3 +126,61 @@ side-info — sums to under 7 %.
 
 These are **suggestions for a later round**, not work done here. This
 round's deliverable is the harness above and this ranking.
+
+## Encoder benchmarks (Round 398)
+
+The `encode` bench times the whole PCM → Layer III encode — the crate's
+heaviest path (analysis polyphase filterbank, forward MDCT with
+long/short/mixed windowing, the psychoacoustic threshold model, the
+nested inner rate loop and outer distortion loop, Huffman table
+selection + code emission, and side-info / main-data / reservoir
+assembly). Each scenario synthesises its input PCM in setup (nothing is
+timed in setup, no fixture committed) and is timed two ways:
+
+* **direct** — the bare `Mp3Encoder` (`new` → `push_samples` →
+  `finish`), the whole encode chain with no trait dispatch.
+* **trait** — the same PCM through the registered `Encoder` trait
+  object (`send_frame` with i16-LE `AudioFrame` bytes → `flush` → drain
+  `receive_packet`), as a muxer would drive it.
+
+### Whole-stream (`encode`, median time for 0.5 s of audio)
+
+| scenario                        | trait     | direct    | trait overhead |
+| ------------------------------- | --------- | --------- | -------------- |
+| `tone_mono_44k1_500ms`          | 33.1 ms   | 35.1 ms   | within noise   |
+| `noise_mono_44k1_500ms`         | 51.5 ms   | 52.8 ms   | within noise   |
+| `sweep_mono_48k_500ms`          | 36.3 ms   | 36.9 ms   | within noise   |
+| `tone_mono_32k_500ms`           | 22.5 ms   | 22.6 ms   | within noise   |
+| `mixed_stereo_44k1_500ms`       | 84.0 ms   | 84.2 ms   | within noise   |
+
+Measured on the same host as the decode tables above (medians; the
+±spread is a few %). As on the decode side, the `Encoder` trait wrapper
+(`send_frame` / `flush` dispatch + `AudioFrame` handling + LE-byte
+packing) costs nothing measurable over the bare chain — the DSP and the
+rate/distortion loops dominate entirely.
+
+### Observations
+
+* **Encode is ~5× the cost of decode.** A mono 44.1 kHz tone decodes in
+  ~6.4 ms (table above) but encodes in ~33 ms of the same 0.5 s clip:
+  ≈ 668 K PCM samples/s, ≈ 15× real-time mono. The asymmetry is the
+  analysis-plus-search cost the decoder never pays — the psychoacoustic
+  threshold model and the two nested quantization loops (each inner
+  iteration re-counts every granule's Huffman bits) run on the encode
+  side only.
+* **Input shape dominates.** Wide-spectrum noise (52.8 ms) costs ≈ 1.5×
+  the steady tone (35.1 ms) at the same rate: more nonzero big-values
+  lines lengthen every inner-loop Huffman re-count, and the attack
+  detector trips short / mixed granules whose per-window MDCT + reorder
+  is heavier than a single long block. The log sweep sits between the
+  two. The 32 kHz tone is the cheapest per clip — fewer samples per
+  0.5 s and a tighter per-frame budget that the inner loop settles
+  quickly.
+* **Stereo ≈ 2× mono, as expected** — each channel runs the full
+  independent per-channel encode; the 84 ms mixed-stereo clip is
+  essentially the tone-channel cost plus the noise-channel cost.
+
+A per-stage encode ranking (analysis / MDCT / psychoacoustic / inner
+loop / outer loop / Huffman-select) is the natural next depth step,
+mirroring `decode_stages`; the whole-stream harness above is this
+round's deliverable.
