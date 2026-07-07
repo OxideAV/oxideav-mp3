@@ -49,3 +49,11 @@ harness = false
 [[bench]]
 name = "encode"
 harness = false
+
+# `encode_stages` isolates the encode front-half stages (analysis
+# filterbank, long-block forward MDCT, and the inner rate loop) over the
+# same captured granule batch so BENCHMARKS.md can rank the encode
+# hotspots, mirroring `decode_stages`.
+[[bench]]
+name = "encode_stages"
+harness = false

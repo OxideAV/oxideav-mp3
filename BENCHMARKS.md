@@ -11,6 +11,7 @@ pre-round encoder.
 cargo bench -p oxideav-mp3 --bench decode          # decode whole-stream
 cargo bench -p oxideav-mp3 --bench decode_stages   # decode per-stage
 cargo bench -p oxideav-mp3 --bench encode          # encode whole-stream
+cargo bench -p oxideav-mp3 --bench encode_stages   # encode per-stage
 ```
 
 The decode half is documented first; the [encoder
@@ -180,7 +181,47 @@ rate/distortion loops dominate entirely.
   independent per-channel encode; the 84 ms mixed-stereo clip is
   essentially the tone-channel cost plus the noise-channel cost.
 
-A per-stage encode ranking (analysis / MDCT / psychoacoustic / inner
-loop / outer loop / Huffman-select) is the natural next depth step,
-mirroring `decode_stages`; the whole-stream harness above is this
-round's deliverable.
+### Per-stage (`encode_stages`, median over a 38-granule batch)
+
+Isolates the encode front-half stages over the **same** captured batch
+(0.5 s mixed mono → 38 long granules; each granule's `subband_time` and
+`xr` captured once in setup). The stateful stages get a fresh state per
+iteration and stream the whole batch, as a real encode would.
+
+| stage        | unit    | batch time | per granule |
+| ------------ | ------- | ---------- | ----------- |
+| `inner_loop` | granule | 41.4 ms    | **1.09 ms** |
+| `filterbank` | granule | 3.70 ms    | 97.3 µs     |
+| `mdct_long`  | granule | 1.78 ms    | 47.0 µs     |
+
+`inner_loop` here is the bare `search_bit_budget` at a representative
+128 kbps per-granule budget; the whole-stream encode additionally runs
+the outer distortion loop *around* it, so the real rate/distortion
+search cost is even larger than the figure above.
+
+### Ranked encode hotspot map
+
+Per-granule cost of the measured front-half stages:
+
+| rank | stage        | per granule | vs. next |
+| ---- | ------------ | ----------- | -------- |
+| 1    | **inner_loop** (rate search) | 1.09 ms | **≈ 11×** |
+| 2    | filterbank   | 97.3 µs     | ≈ 2×      |
+| 3    | mdct_long    | 47.0 µs     | —         |
+
+**The inner rate loop dominates encode by an order of magnitude.** Each
+candidate `global_gain` the search walks re-quantizes all 576 lines and
+re-counts their Huffman bits; a wide-spectrum granule (more nonzero
+lines) both lengthens every count and, at a tight budget, forces the
+search across more gains — exactly the input-shape sensitivity the
+whole-stream table shows (noise ≈ 1.5× a tone). This is the first place
+any future encode-speed round should look: the front-end DSP
+(filterbank + MDCT, ≈ 144 µs/granule combined) is under 15 % of the
+inner-loop cost, and the psychoacoustic model + outer loop wrap *around*
+this search rather than replacing it.
+
+Observations only — **no behaviour change was made this round**; the
+encoded byte streams are byte-identical to before. The harness plus this
+ranking are the deliverable; the outer-loop / psychoacoustic / Huffman-
+select stages and a short-block MDCT variant are the natural next depth
+steps.

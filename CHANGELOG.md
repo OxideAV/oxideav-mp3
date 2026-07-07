@@ -73,6 +73,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   noise ≈ 1.5× a steady tone), with the trait wrapper adding no
   measurable overhead.
 
+- bench: **per-stage encode benchmark harness** (`benches/encode_stages.rs`,
+  r398). Isolates the encode front-half stages — the analysis polyphase
+  filterbank (`analyze_granule`), the long-block forward MDCT
+  (frequency inversion → `forward_overlap` → `window_long_family_analysis`
+  → `mdct`, the exact production sequence), and the §C.1.5.4.4 inner
+  rate loop (`search_bit_budget`) — over one captured 38-granule batch,
+  mirroring `decode_stages`. Result (documented in `BENCHMARKS.md`,
+  § Encoder benchmarks): the **inner rate loop dominates encode by an
+  order of magnitude** — ≈ 1.09 ms/granule versus ≈ 97 µs for the
+  filterbank and ≈ 47 µs for the MDCT — because each candidate
+  `global_gain` re-quantizes all 576 lines and re-counts their Huffman
+  bits. No behaviour change.
+
 - demuxer: **free-format (`bitrate_index == 0`) stream iteration** (r363).
   Free format fixes the bitrate but omits it from the header table, so a
   frame's length is not derivable from its header (§2.4.1.3) — the
