@@ -22,6 +22,14 @@ long / short / mixed / auto / auto+mixed block types, tone and
 wideband noise — all ≤ 8e-5 on four independent deployed decoders,
 `tests/validator_decode_sweep.rs`).
 
+Both directions are benchmarked and optimized (r409, output-invariant
+— encoded bytes and decoded PCM bit-for-bit unchanged, every optimized
+path pinned by an equivalence test): whole-stream encode is 3–13×
+faster than the r398 ranking baseline (≈ 150× real-time for a mono
+44.1 kHz tone, ≈ 30× for wide-spectrum noise) and whole-stream decode
+≈ 2× (≈ 1650× real-time mono). See `BENCHMARKS.md` for the per-stage
+before/after tables.
+
 ## Decoder
 
 The full Layer III decode pipeline is implemented:
