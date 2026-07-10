@@ -220,10 +220,23 @@ fn quantize_long_range(
     let starts = long_band_starts(sample_rate_hz, version);
     let gain = pow2_quarter(global - GAIN_BIAS);
 
-    let mut sfb = 0usize;
-    for i in lo..hi {
-        while sfb + 1 < starts.len() && i >= starts[sfb + 1] {
-            sfb += 1;
+    // The §2.4.3.4.7.1 gain factor is constant across a scalefactor
+    // band (it depends only on `sfb`, never on the line index), so it is
+    // computed once per band and reused for every line of the band — the
+    // same `gain * sf_term` expression, on the same inputs, as evaluating
+    // it per line, hence bit-identical `is[]` output
+    // (`quantize_hoisted_band_factor_matches_per_line` pins this).
+    // Band 21 is the tail region above the last transmitted scalefactor
+    // (scalefac = 0), running to the end of the range.
+    for sfb in 0..starts.len() {
+        let band_lo = starts[sfb].max(lo);
+        let band_hi = if sfb + 1 < starts.len() {
+            starts[sfb + 1].min(hi)
+        } else {
+            hi
+        };
+        if band_lo >= band_hi {
+            continue;
         }
         let scalefac = if sfb < 21 {
             let pre = if sf.preflag {
@@ -237,7 +250,9 @@ fn quantize_long_range(
         };
         let sf_term = (-(mult * scalefac as f32)).exp2();
         let factor = gain * sf_term;
-        is[i] = quantize_line(xr[i], factor);
+        for i in band_lo..band_hi {
+            is[i] = quantize_line(xr[i], factor);
+        }
     }
 }
 

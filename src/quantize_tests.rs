@@ -323,3 +323,111 @@ fn arbitrary_target_quantization_error_is_bounded() {
         );
     }
 }
+
+/// Straightforward per-line reference for [`quantize_long_range`]: walks
+/// the scalefactor band per line and evaluates `gain * sf_term` per line
+/// — exactly the pre-hoist form of the production loop. Pins the
+/// per-band-hoisted factor computation to the straightforward form
+/// bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+fn quantize_long_range_per_line_reference(
+    is: &mut [i32; NUM_LINES],
+    xr: &[f32; NUM_LINES],
+    sf: &ScaleFactors,
+    lo: usize,
+    hi: usize,
+    global: i32,
+    mult: f32,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) {
+    let starts = long_band_starts(sample_rate_hz, version);
+    let gain = pow2_quarter(global - GAIN_BIAS);
+    let mut sfb = 0usize;
+    for i in lo..hi {
+        while sfb + 1 < starts.len() && i >= starts[sfb + 1] {
+            sfb += 1;
+        }
+        let scalefac = if sfb < 21 {
+            let pre = if sf.preflag {
+                u32::from(PRETAB[sfb])
+            } else {
+                0
+            };
+            u32::from(sf.long[sfb]) + pre
+        } else {
+            0
+        };
+        let sf_term = (-(mult * scalefac as f32)).exp2();
+        let factor = gain * sf_term;
+        is[i] = quantize_line(xr[i], factor);
+    }
+}
+
+fn xorshift32_test(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
+}
+
+/// The hoisted per-band factor loop must produce bit-identical `is[]`
+/// to the straightforward per-line evaluation, across every band table
+/// (MPEG-1 / LSF / MPEG-2.5 rates), random scalefactor configurations
+/// (preflag / scalefac_scale on and off), the full gain range, and a
+/// wide dynamic range of `xr` values including zeros.
+#[test]
+fn quantize_hoisted_band_factor_matches_per_line() {
+    let rates: &[(u32, MpegVersion)] = &[
+        (32_000, MpegVersion::Mpeg1),
+        (44_100, MpegVersion::Mpeg1),
+        (48_000, MpegVersion::Mpeg1),
+        (16_000, MpegVersion::Mpeg2),
+        (22_050, MpegVersion::Mpeg2),
+        (24_000, MpegVersion::Mpeg2),
+        (8_000, MpegVersion::Mpeg25),
+        (11_025, MpegVersion::Mpeg25),
+        (12_000, MpegVersion::Mpeg25),
+    ];
+    let mut rng: u32 = 0xdead_beef;
+    for &(rate, version) in rates {
+        for case in 0..8 {
+            let mut sf = ScaleFactors {
+                preflag: case % 2 == 1,
+                ..ScaleFactors::default()
+            };
+            for b in sf.long.iter_mut() {
+                *b = (xorshift32_test(&mut rng) % 16) as u8;
+            }
+            let scalefac_scale = case % 3 == 1;
+            let mult = scalefac_multiplier(scalefac_scale);
+            let global = i32::from((xorshift32_test(&mut rng) % 256) as u8);
+            let mut xr = [0.0f32; NUM_LINES];
+            for v in xr.iter_mut() {
+                let r = xorshift32_test(&mut rng);
+                if r % 5 == 0 {
+                    *v = 0.0;
+                } else {
+                    // Magnitudes spanning ~2^-20 .. 2^+20, both signs.
+                    let mag = ((r >> 8) & 0xFFFF) as f32 / 65536.0;
+                    let exp = ((r % 41) as i32 - 20) as f32;
+                    *v = mag * exp.exp2() * if r & 1 == 0 { 1.0 } else { -1.0 };
+                }
+            }
+            // Whole range and a mid-range sub-range (mixed-block shape).
+            for &(lo, hi) in &[(0usize, NUM_LINES), (0, 72), (36, 400)] {
+                let mut got = [0i32; NUM_LINES];
+                let mut want = [0i32; NUM_LINES];
+                quantize_long_range(&mut got, &xr, &sf, lo, hi, global, mult, rate, version);
+                quantize_long_range_per_line_reference(
+                    &mut want, &xr, &sf, lo, hi, global, mult, rate, version,
+                );
+                assert_eq!(
+                    got[..],
+                    want[..],
+                    "hoisted long-range quantize diverged (rate {rate}, case {case}, range {lo}..{hi})"
+                );
+            }
+        }
+    }
+}

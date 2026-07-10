@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- quantize: **the §2.4.3.4.7.1 gain factor is hoisted to one evaluation
+  per scalefactor band** (r409, bench axis). The long-range quantizer
+  previously re-derived `sf_term = 2^(−mult·scalefac)` and
+  `factor = gain · sf_term` for every one of the 576 lines even though
+  both depend only on the band index; the loop now walks the Table 3-B.8
+  band boundaries and computes the factor once per band — the identical
+  expression on the identical inputs, so the quantized `is[]` is
+  bit-for-bit unchanged (pinned by
+  `quantize_hoisted_band_factor_matches_per_line`, which compares the
+  hoisted loop against the straightforward per-line evaluation across
+  all nine sample rates, random scalefactor/preflag/scalefac_scale
+  configurations, the full gain range, and sub-range invocations).
+  Encoded streams are byte-identical; the inner rate loop — which calls
+  the quantizer once per candidate `global_gain` — drops ~27% on the
+  `encode_stage_inner_loop` criterion bench (41.9 ms → 30.7 ms per
+  38-granule batch on the development host).
+
+### Changed
+
 - huffman: **big-values decode now uses an O(1) canonical-prefix table**.
   The big-values matcher previously scanned every codebook entry for each
   candidate length, walking the bitstream one bit at a time
