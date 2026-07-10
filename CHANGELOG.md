@@ -30,6 +30,71 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- tables: **MPEG-2.5 11.025 / 12 kHz scalefactor-band tables corrected
+  to the deployed de-facto layout — the 16 kHz LSF table pair** (r405).
+  MPEG-2.5 is a proprietary extension with no ISO table; the staged
+  derivation doc (`docs/audio/mp3/mpeg2.5-scalefactor-bands.md`,
+  #147/#151) hypothesised per-rate half-rate-sibling reuse (11.025 →
+  22.05 kHz tables, 12 → 24 kHz tables, long + short). r405
+  observer-trace against two independent black-box decoder binaries
+  refutes half of that mapping: encoder-produced streams at 12 kHz
+  (long blocks) and at both 11.025 / 12 kHz (wideband short blocks)
+  decoded to a *different* waveform on both validators (nrmse 0.45–1.4
+  vs our own decode). The deployed layout was then measured exactly —
+  per spectral line — with crafted single-line probe streams whose
+  staircase scalefactors make a validator's output amplitude reveal
+  its band index for every position: **both 11.025 kHz and 12 kHz use
+  the ISO/IEC 13818-3 16 kHz LSF long *and* short tables** (the 16 kHz
+  long table is byte-identical to the 22.05 kHz one, which is why long
+  blocks at 11.025 kHz always agreed). The 8 kHz Fraunhofer tables
+  from the staged doc were read back verbatim by the same probe
+  (including the width-2 fillers) and are confirmed. Both dispatch
+  functions (`requantize::{long,short}_band_starts`) now carry the
+  measured mapping with full provenance; `requantize_tests` pins the
+  deployed pair and the refuted assignments. After the fix all
+  encoder-produced MPEG-2.5 streams (long, short, auto block-type,
+  tone and wideband noise, mono and stereo, all three rates) decode on
+  both external validators in the float-rounding regime
+  (nrmse ≤ 8e-5). The staged doc needs a corrigendum (docs ask
+  recorded in the round report).
+
+- huffman/encoder: **short-block Huffman region 0 is band-relative,
+  not a hardcoded 36 lines** (r405). §2.4.2.7 sets the window-switched
+  short-block default `region0_count = 8` counted in window-bands
+  ("each scale factor band is counted three times"), i.e. region 0
+  ends at interleaved line `3 · short_starts[3]`. Both the decoder's
+  `region_boundaries` and the encoder's table-select assignment
+  hardcoded the evaluated form `36` — correct for every ISO table
+  (`short_starts[3] = 12`) but wrong for the MPEG-2.5 8 kHz Fraunhofer
+  table (`short_starts[3] = 24` → region 0 = 72 lines). Deployed
+  decoders apply the band-relative rule, so every 8 kHz short-block
+  stream this encoder produced desynchronized their Huffman table
+  regions outright (measured NCC ≈ 0.05 — noise). Both sides now
+  compute `3 · short_starts[3]` (mixed granules keep the 36-line
+  long/short split per the `region0_count = 7` default); 8 kHz
+  forced-short and auto-block-type streams now decode on both
+  validators at nrmse ≤ 5e-6.
+
+- decoder/encoder: **short-block band 12 (the no-scalefactor tail) is
+  now requantized, reordered, and quantized instead of silently
+  dropped** (r405). The short-block band walk stopped at band 11 in
+  four places — `requantize_short_range` (decode: lines above
+  `3·starts[12]` stayed zero), `reorder` (decode: band 12 left in
+  native interleave), `quantize` (encode: band-12 lines never coded),
+  and `short_block::forward_reorder` (encode mirror). The §2.4.3.4.7.1
+  band structure has 13 short bands; band 12 carries frequency lines
+  requantized with scalefactor 0, exactly like the long path's band
+  21 (which was handled correctly). The bug was self-cancelling in
+  encode→own-decode round-trips (both sides dropped the same lines)
+  and invisible on the fixture corpus (no fixture carries audible
+  short band-12 energy), but the r405 per-line observer-trace probe
+  exposed it immediately: deployed decoders render band 12
+  (per-window lines `starts[12]..192`), this decoder returned silence
+  there, and encoder output discarded the top of the spectrum of
+  every short granule — at 12 kHz auto-block-type that measured
+  nrmse ≈ 2e-2 vs both validators, now 6e-6. All four walks now cover
+  13 bands with scalefactor 0 on the tail.
+
 - demuxer: **packet keyframe flag now reflects the bit reservoir**
   (r367). `next_packet` previously stamped *every* emitted packet with
   `keyframe = true`. A Layer III frame is only an independently-decodable
@@ -77,6 +142,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   "§2.4.3 … seeking accuracy" milestone work.
 
 ### Added
+
+- tests: **black-box validator decode sweep of encoder output**
+  (`tests/validator_decode_sweep.rs`, r405). Encodes PCM at every
+  supported rate — MPEG-1 (32 / 44.1 / 48 kHz), MPEG-2 LSF (16 /
+  22.05 / 24 kHz), and all three MPEG-2.5 rates (8 / 11.025 /
+  12 kHz) — mono and stereo, long and forced-short (tone and wideband
+  noise), hands each produced stream to an external black-box decoder
+  binary, and asserts (a) the validator reports the exact sample rate
+  and channel count (pinning the header version / sample-rate-index
+  dispatch, including the MPEG-2.5 `id`-bit layout, against deployed
+  decoders) and (b) the validator's PCM tracks this crate's own
+  decode of the same bytes in the float-rounding regime (25 cases,
+  all nrmse ≤ 8e-5 after the r405 fixes). The validator is injected
+  via the `OXIDEAV_MP3_VALIDATOR_DECODE` environment variable (a
+  shell command template with `{IN}` / `{OUT}` placeholders producing
+  a 16-bit RIFF/WAVE file); the test skips with a log line when the
+  variable is unset, so CI stays hermetic while the sweep runs
+  locally against real deployed decoders. This sweep is what caught
+  the MPEG-2.5 band-table, region-0, and short-band-12 defects fixed
+  in this release.
 
 - tests: **corpus-wide differential decode sweep**
   (`tests/corpus_reference_pcm.rs`, r405). Every Layer III fixture under

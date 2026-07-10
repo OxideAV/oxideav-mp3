@@ -99,17 +99,32 @@ pub(crate) fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'s
     // (16 / 22.05 / 24 kHz): ISO/IEC 13818-3:1997 Table B.2 ("Layer III
     // scalefactor bands", long blocks).
     //
-    // MPEG-2.5 rates (8 / 11.025 / 12 kHz) — `docs/audio/mp3/`
-    // `mpeg2.5-scalefactor-bands.md` (#147/#151): the 11.025 / 12 kHz
-    // tables are *byte-identical* to the 13818-3 22.05 / 24 kHz LSF long
-    // tables (the half-rate sibling reuse, fully grounded in the in-repo
-    // 13818-3 PDF), so they share the LSF constants below. 8 kHz is a
-    // distinct Fraunhofer-defined table whose top long bands collapse to
-    // width 2 (`LONG_STARTS_MPEG25_8`).
+    // MPEG-2.5 rates (8 / 11.025 / 12 kHz): MPEG-2.5 is a proprietary
+    // extension with no ISO table, so the de-facto tables are pinned by
+    // observer-trace against deployed decoders (2026-07, r405): the
+    // crate's encoder produced single-band-layout streams at each rate
+    // and two independent black-box decoder binaries were run over
+    // them; a candidate layout counts as *the* deployed layout when
+    // both validators' PCM tracks this crate's decode in the
+    // float-rounding regime (normalized RMS error ~1e-5; a wrong band
+    // table decorrelates the waveform outright, so the discrimination
+    // is unambiguous). Result for long blocks: **both** 11.025 kHz and
+    // 12 kHz use the shared 13818-3 16 / 22.05 kHz LSF long table —
+    // 12 kHz does NOT use the 24 kHz table that the half-rate sibling
+    // hypothesis in `docs/audio/mp3/mpeg2.5-scalefactor-bands.md`
+    // (#147/#151) predicts (that assignment measured nrmse ≈ 0.8 /
+    // NCC ≈ 0.56 against both validators; the 16/22.05 kHz table
+    // measures ≈ 7e-6 / 1.0000). Combined with the short-table
+    // readout (see [`short_band_starts`]) the deployed rule has a
+    // compact form: MPEG-2.5 11.025 / 12 kHz reuse the **16 kHz LSF
+    // table pair**. 8 kHz is the distinct Fraunhofer-defined table
+    // whose top long bands collapse to width 2
+    // (`LONG_STARTS_MPEG25_8`), staged in the same doc and confirmed
+    // by the same observer-trace.
     let _ = version;
     match sample_rate_hz {
-        16000 | 22050 | 11025 => &LONG_STARTS_LSF_16_22,
-        24000 | 12000 => &LONG_STARTS_LSF_24,
+        16000 | 22050 | 11025 | 12000 => &LONG_STARTS_LSF_16_22,
+        24000 => &LONG_STARTS_LSF_24,
         32000 => &LONG_STARTS_32,
         48000 => &LONG_STARTS_48,
         8000 => &LONG_STARTS_MPEG25_8,
@@ -127,15 +142,35 @@ pub(crate) fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'s
 pub(crate) fn short_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 13] {
     // Same per-rate provenance split as [`long_band_starts`]: MPEG-1
     // rates from 11172-3 Table B.8, LSF rates from 13818-3 Table B.2
-    // (short blocks). MPEG-2.5 (`mpeg2.5-scalefactor-bands.md`): the
-    // 11.025 / 12 kHz short tables are byte-identical to the 22.05 / 24
-    // kHz LSF short tables; 8 kHz is the distinct Fraunhofer short table
-    // (`SHORT_STARTS_MPEG25_8`).
+    // (short blocks).
+    //
+    // MPEG-2.5 rates — measured per spectral line by the r405
+    // observer-trace readout: crafted single-line probe streams (one
+    // frame per position, staircase scalefactors, distinct per band)
+    // make a black-box validator's output amplitude reveal its band
+    // index for every position, so the deployed boundaries are read
+    // back exactly rather than fitted. Result: **both** 11.025 kHz
+    // and 12 kHz use the 13818-3 **16 kHz** LSF short table
+    // (per-window starts 0,4,8,12,18,26,36,48,62,80,104,134,174 read
+    // back verbatim). Together with the long-table result (see
+    // [`long_band_starts`]) the deployed rule is compact: MPEG-2.5
+    // 11.025 / 12 kHz reuse the **16 kHz LSF table pair**, NOT the
+    // per-rate half-rate siblings hypothesised in
+    // `docs/audio/mp3/mpeg2.5-scalefactor-bands.md` (22.05 / 24 kHz
+    // pairs; those diverge under wideband short-block content —
+    // nrmse ≈ 0.85 vs both validators — because the 22.05 / 24 kHz
+    // short tables differ from the 16 kHz one in bands 11/12).
+    // 8 kHz uses the distinct Fraunhofer short table
+    // (`SHORT_STARTS_MPEG25_8`), read back verbatim by the same
+    // per-line probe (including the 160/162/164 width-2 fillers and
+    // the 166-start final band), once the §2.4.2.7 band-relative
+    // short-block region-0 boundary is honoured (see `huffman.rs`
+    // `region_boundaries`).
     let _ = version;
     match sample_rate_hz {
-        16000 => &SHORT_STARTS_LSF_16,
-        22050 | 11025 => &SHORT_STARTS_LSF_22,
-        24000 | 12000 => &SHORT_STARTS_LSF_24,
+        16000 | 12000 | 11025 => &SHORT_STARTS_LSF_16,
+        22050 => &SHORT_STARTS_LSF_22,
+        24000 => &SHORT_STARTS_LSF_24,
         32000 => &SHORT_STARTS_32,
         48000 => &SHORT_STARTS_48,
         8000 => &SHORT_STARTS_MPEG25_8,
@@ -405,11 +440,19 @@ fn requantize_short_range(
         pow2_quarter(global - GAIN_BIAS - 8 * i32::from(gc.subblock_gain[2])),
     ];
 
-    for sfb in first_sfb..12 {
+    // 13 bands: the 12 scalefactor-carrying bands plus band 12 — the
+    // lines above the last transmitted scalefactor, which requantize
+    // with scalefactor 0 exactly like the long path handles band 21
+    // (§2.4.3.4.7.1). r405 observer-trace: deployed decoders render
+    // short band 12; this loop previously stopped at band 11 and
+    // silently zeroed per-window lines `starts[12]..192`.
+    for sfb in first_sfb..13 {
         let win_start = starts[sfb];
-        let win_width = starts[sfb + 1] - starts[sfb];
+        let win_end = if sfb < 12 { starts[sfb + 1] } else { 192 };
+        let win_width = win_end - win_start;
         for (win, &gain) in win_gain.iter().enumerate() {
-            let sf_term = (-(mult * f32::from(sf.short[sfb][win]))).exp2();
+            let sf_value = if sfb < 12 { sf.short[sfb][win] } else { 0 };
+            let sf_term = (-(mult * f32::from(sf_value))).exp2();
             let factor = gain * sf_term;
             // Interleaved base: bands below sfb contributed 3*win_start
             // lines; window `win` of this band starts after `win` blocks

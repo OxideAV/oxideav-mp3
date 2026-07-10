@@ -184,9 +184,12 @@ pub fn forward_reorder(
         0
     };
     let starts = short_band_starts(sample_rate_hz, version);
-    for sfb in first_sfb..12 {
+    // 13 bands including band 12 — the exact inverse of the decoder's
+    // `reorder::reorder` (r405; both previously stopped at band 11).
+    for sfb in first_sfb..13 {
         let s = starts[sfb];
-        let w = starts[sfb + 1] - starts[sfb];
+        let e = if sfb < 12 { starts[sfb + 1] } else { 192 };
+        let w = e - s;
         let base = 3 * s;
         for win in 0..3 {
             for k in 0..w {
@@ -215,8 +218,10 @@ pub fn forward_reorder(
 /// off-by-one band counts, so `region0_count = 7`, `region1_count = 36`.
 /// The `36` exceeds the 3-bit `region1_count` field width (max 7) so the
 /// encoder clamps to `7`; the decoder ignores the value either way and
-/// uses its own §C.1.5.4.4.6 short-block rule (`r0 = 36`, `r1 =
-/// big_values * 2`, no region 2). Returning `(8, 7)` keeps the on-wire
+/// uses its own §2.4.2.7 short-block rule (`r0 = 3 · short_starts[3]`
+/// interleaved lines — 36 for every ISO table, 72 for the MPEG-2.5
+/// 8 kHz table — and `r1 = big_values * 2`, no region 2; see
+/// `huffman.rs` `region_boundaries`). Returning `(8, 7)` keeps the on-wire
 /// value at a deterministic spec-derived sentinel without affecting
 /// rendering.
 ///

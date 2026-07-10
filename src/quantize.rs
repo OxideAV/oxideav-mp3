@@ -256,11 +256,18 @@ fn quantize_short_range(
         pow2_quarter(global - GAIN_BIAS - 8 * i32::from(gc.subblock_gain[2])),
     ];
 
-    for sfb in first_sfb..12 {
+    // 13 bands: the 12 scalefactor-carrying bands plus band 12 (the
+    // lines above the last transmitted scalefactor, quantized with
+    // scalefactor 0 — mirrors `requantize_short_range`, which renders
+    // them; r405). Stopping at band 11 silently discarded per-window
+    // lines `starts[12]..192` from every short granule.
+    for sfb in first_sfb..13 {
         let win_start = starts[sfb];
-        let win_width = starts[sfb + 1] - starts[sfb];
+        let win_end = if sfb < 12 { starts[sfb + 1] } else { 192 };
+        let win_width = win_end - win_start;
         for (win, &gain) in win_gain.iter().enumerate() {
-            let sf_term = (-(mult * f32::from(sf.short[sfb][win]))).exp2();
+            let sf_value = if sfb < 12 { sf.short[sfb][win] } else { 0 };
+            let sf_term = (-(mult * f32::from(sf_value))).exp2();
             let factor = gain * sf_term;
             let base = 3 * win_start + win * win_width;
             for k in 0..win_width {

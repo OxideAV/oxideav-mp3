@@ -115,9 +115,15 @@ fn reorder_short_region(
     version: MpegVersion,
 ) {
     let starts = short_band_starts(sample_rate_hz, version);
-    for sfb in first_sfb..12 {
+    // 13 bands: band 12 (per-window lines `starts[12]..192`, no
+    // transmitted scalefactor) is short-window data like any other and
+    // must be reordered from the native `(sfb, window, freqline)`
+    // interleave too (r405; the loop previously stopped at band 11,
+    // leaving band 12 in native order).
+    for sfb in first_sfb..13 {
         let s = starts[sfb];
-        let w = starts[sfb + 1] - starts[sfb];
+        let e = if sfb < 12 { starts[sfb + 1] } else { 192 };
+        let w = e - s;
         // Native span of this band: 3 runs of `w` lines starting at 3·s.
         let base = 3 * s;
         for win in 0..3 {

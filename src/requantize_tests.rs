@@ -410,34 +410,46 @@ fn mpeg25_8khz_short_table_exact() {
 }
 
 #[test]
-fn mpeg25_11025_reuses_lsf_22050() {
-    // docs key result: 11.025 kHz tables are byte-identical to the
-    // in-repo 13818-3 22.05 kHz LSF tables (long + short).
-    assert_eq!(
-        long_band_starts(11025, MpegVersion::Mpeg25),
-        long_band_starts(22050, MpegVersion::Mpeg2),
-        "11.025 kHz long == 22.05 kHz LSF long"
-    );
-    assert_eq!(
-        short_band_starts(11025, MpegVersion::Mpeg25),
-        short_band_starts(22050, MpegVersion::Mpeg2),
-        "11.025 kHz short == 22.05 kHz LSF short"
-    );
-}
-
-#[test]
-fn mpeg25_12000_reuses_lsf_24000() {
-    // docs key result: 12 kHz tables are byte-identical to the in-repo
-    // 13818-3 24 kHz LSF tables (long + short).
-    assert_eq!(
+fn mpeg25_low_rates_share_deployed_table_pair() {
+    // r405 observer-trace key result (see `long_band_starts` /
+    // `short_band_starts` provenance comments): deployed MPEG-2.5
+    // decoding shares ONE table pair for both 11.025 kHz and 12 kHz —
+    // the 13818-3 **16 kHz** LSF pair (whose long table is
+    // byte-identical to the 22.05 kHz long table). This refutes the
+    // per-rate half-rate-sibling hypothesis of
+    // `docs/audio/mp3/mpeg2.5-scalefactor-bands.md` (11.025 → 22.05,
+    // 12 → 24 for both block families), which two independent
+    // black-box validators reject at the 12 kHz long and both short
+    // assignments.
+    for &rate in &[11_025u32, 12_000] {
+        assert_eq!(
+            long_band_starts(rate, MpegVersion::Mpeg25),
+            long_band_starts(16000, MpegVersion::Mpeg2),
+            "{rate} Hz long == 16 kHz LSF long"
+        );
+        assert_eq!(
+            short_band_starts(rate, MpegVersion::Mpeg25),
+            short_band_starts(16000, MpegVersion::Mpeg2),
+            "{rate} Hz short == 16 kHz LSF short"
+        );
+    }
+    // The refuted assignments, pinned so a regression back to the doc
+    // mapping fails loudly: 12 kHz is NOT the 24 kHz pair and
+    // 11.025 kHz short is NOT the 22.05 kHz short table.
+    assert_ne!(
         long_band_starts(12000, MpegVersion::Mpeg25),
         long_band_starts(24000, MpegVersion::Mpeg2),
-        "12 kHz long == 24 kHz LSF long"
+        "12 kHz long must not use the 24 kHz LSF long table"
     );
-    assert_eq!(
+    assert_ne!(
         short_band_starts(12000, MpegVersion::Mpeg25),
         short_band_starts(24000, MpegVersion::Mpeg2),
-        "12 kHz short == 24 kHz LSF short"
+        "12 kHz short must not use the 24 kHz LSF short table"
+    );
+    assert_ne!(
+        short_band_starts(11025, MpegVersion::Mpeg25),
+        short_band_starts(22050, MpegVersion::Mpeg2),
+        "11.025 kHz short must not use the 22.05 kHz LSF short table"
     );
 }
 

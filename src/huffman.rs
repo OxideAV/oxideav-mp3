@@ -418,22 +418,45 @@ fn match_quad_a(reader: &mut MainDataReader<'_>) -> (u32, u32, u32, u32) {
 ///
 /// For long blocks the boundaries are aligned to scalefactor-band
 /// edges from Table 3-B.8: region 0 covers bands `0..=region0_count`,
-/// region 1 the following `region1_count + 1` bands. For short /
-/// window-switched blocks the spec fixes region 0 at the first
-/// 36 lines and region 1 to the rest of big_values, so we return
-/// `(36, big_values*2)`-style boundaries (region 2 empty).
+/// region 1 the following `region1_count + 1` bands. For
+/// window-switched short blocks the §2.4.2.7 defaults apply
+/// (`region0_count = 8`, `region1_count = 63`) with short-block band
+/// counting: "in the case of short blocks, each scale factor band is
+/// counted three times, once for each short window", so the nine
+/// region-0 window-bands are short scalefactor bands 0..=2 across the
+/// three windows and region 0 ends at interleaved line
+/// `3 · short_starts[3]`; region 1 covers the rest of big_values
+/// (region 2 empty).
 fn region_boundaries(
     gc: &GranuleChannel,
     sample_rate_hz: u32,
     version: MpegVersion,
 ) -> (usize, usize) {
     if gc.window_switching_flag && gc.block_type == BlockType::Short {
-        // Window-switched short blocks: region0 is the first 36 lines
-        // (the default region0_count of 8 short triple-bands → band 3
-        // → start index 36 at 44.1 kHz long mapping is not used here;
-        // the spec fixes region0 to the lowest 36 lines for short
-        // blocks). Region 1 extends to big_values*2; region 2 empty.
-        let r0 = 36usize.min(usize::from(gc.big_values) * 2);
+        // Window-switched short blocks. Pure short: the §2.4.2.7
+        // default `region0_count = 8` counts nine window-bands = short
+        // sfb 0..=2 × 3 windows, i.e. region 0 ends at interleaved
+        // line `3 · short_starts[3]`. Every short band table in
+        // ISO/IEC 11172-3 / 13818-3 has `short_starts[3] = 12`
+        // (region 0 = 36 lines — the value this branch used to
+        // hardcode), but the MPEG-2.5 8 kHz Fraunhofer table has
+        // `short_starts[3] = 24` (region 0 = 72 lines): the
+        // band-relative form is required for deployed-decoder
+        // agreement at 8 kHz (r405 observer-trace; the hardcoded 36
+        // measured NCC ≈ 0.05 against two independent black-box
+        // validators, while the band-relative boundary decodes in the
+        // float-rounding regime).
+        //
+        // Mixed short blocks keep the 36-line boundary: §2.4.2.7 sets
+        // `region0_count = 7` for them, and the mixed band sequence
+        // opens with the long bands of the 36-line long region, so
+        // the eight-band region 0 ends at the long/short split line.
+        let r0_lines = if gc.mixed_block_flag {
+            36usize
+        } else {
+            3 * short_band_starts(sample_rate_hz, version)[3]
+        };
+        let r0 = r0_lines.min(usize::from(gc.big_values) * 2);
         let r1 = usize::from(gc.big_values) * 2;
         return (r0, r1);
     }
@@ -460,6 +483,15 @@ fn region_boundaries(
 /// disagree on band boundaries.
 fn long_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 22] {
     crate::requantize::long_band_starts(sample_rate_hz, version)
+}
+
+/// The short-block per-window scalefactor-band *start* line indices
+/// for the active sampling rate. Delegates to
+/// [`crate::requantize::short_band_starts`] — the single in-crate
+/// transcription — so the §2.4.2.7 short-block region-0 boundary and
+/// the §2.4.3.4.7 requantizer can never disagree on band boundaries.
+fn short_band_starts(sample_rate_hz: u32, version: MpegVersion) -> &'static [usize; 13] {
+    crate::requantize::short_band_starts(sample_rate_hz, version)
 }
 
 /// Maximum unsigned magnitude that big-values codebook `idx` can encode

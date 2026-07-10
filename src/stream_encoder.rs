@@ -4847,24 +4847,33 @@ impl Mp3Encoder {
                             && gc_template.block_type == BlockType::Short)
                     {
                         // §C.1.5.4.4.6 + huffman::region_boundaries:
-                        // short and mixed blocks hardcode region 0 to
-                        // the first 36 lines and region 1 to the rest of
-                        // big_values (region 2 empty). The transmitted
-                        // region0_count / region1_count are not on the
-                        // wire (encoder::write_granule_channel writes
-                        // the window-switched branch which omits them);
-                        // keep the spec-default sentinels from the
-                        // short / mixed template intact.
+                        // for window-switched short-family granules
+                        // the region counts are not on the wire
+                        // (encoder::write_granule_channel writes the
+                        // window-switched branch which omits them), so
+                        // the encoder must use exactly the boundaries
+                        // every decoder reconstructs from the §2.4.2.7
+                        // defaults: pure short blocks put nine
+                        // window-bands (short sfb 0..=2 × 3 windows)
+                        // in region 0, i.e. region 0 ends at
+                        // interleaved line `3 · short_starts[3]` — 36
+                        // lines for every ISO table, 72 lines for the
+                        // MPEG-2.5 8 kHz Fraunhofer table
+                        // (`short_starts[3] = 24`; r405
+                        // observer-trace) — and region 1 runs to the
+                        // rest of big_values (region 2 empty). Keep
+                        // the spec-default sentinels from the short /
+                        // mixed template intact.
                         //
-                        // Mixed-block detail: the §2.4.2.7 fixed
-                        // region 0 covers exactly the 36 long-region
-                        // lines (subbands 0..1), so the region-0
-                        // boundary aligns naturally with the long /
-                        // short split inside the granule. Region 1
-                        // then carries all big_values that fall in the
-                        // short region (subbands 2..31), already
-                        // re-ordered into `[sfb][win][k]` native order
-                        // by `forward_reorder` above.
+                        // Mixed-block detail: §2.4.2.7 sets
+                        // `region0_count = 7` for mixed granules; the
+                        // mixed band sequence opens with the long
+                        // bands of the 36-line long region, so the
+                        // eight-band region 0 ends at the long/short
+                        // split line 36. Region 1 then carries all
+                        // big_values that fall in the short region,
+                        // already re-ordered into `[sfb][win][k]`
+                        // native order by `forward_reorder` above.
                         //
                         // The auto-block-type path
                         // ([`Mp3Encoder::enable_auto_block_type`]) may
@@ -4873,7 +4882,12 @@ impl Mp3Encoder {
                         // gate to any window-switched short-family
                         // template — the wire layout and the §2.4.4.5
                         // bit-cost check are then consistent.
-                        r0_end = 36usize.min(bv2);
+                        let r0_lines = if gc_template.mixed_block_flag {
+                            36usize
+                        } else {
+                            3 * short_band_starts_for(self.sample_rate_hz)[3]
+                        };
+                        r0_end = r0_lines.min(bv2);
                         r1_end = bv2;
                     } else {
                         let (r0e, r1e, r0c, r1c) =
