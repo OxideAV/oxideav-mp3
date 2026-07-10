@@ -918,7 +918,26 @@ fn measure_free_format_base_len(
                             "free-format measured frame length is smaller than its padding slot",
                         ));
                     }
-                    return Ok(padded - pad);
+                    let base = padded - pad;
+                    // Structural floor: a frame must at least hold its
+                    // 4-byte header, the optional 2-byte CRC, and the
+                    // fixed-size side information (§2.4.1.3). A hostile
+                    // stream can place a second sync pattern 1..3 bytes
+                    // after the first, which would otherwise "measure"
+                    // a frame shorter than its own header (r405 fuzz
+                    // finding: the header copy into the first-frame
+                    // buffer then sliced out of range and panicked).
+                    let crc_bytes = if first_header.crc_protected { 2 } else { 0 };
+                    let min_len = 4
+                        + crc_bytes
+                        + side_info_len(first_header.version, first_header.channel_count());
+                    if base < min_len {
+                        return Err(Error::invalid(format!(
+                            "free-format measured frame length {base} is smaller than the \
+                             header + side-info minimum {min_len}"
+                        )));
+                    }
+                    return Ok(base);
                 }
             }
         }
@@ -1255,6 +1274,24 @@ mod tests {
         let buf: Vec<u8> = vec![0xFF];
         let err = Mp3Demuxer::open(Box::new(Cursor::new(buf))).err();
         assert!(err.is_some(), "1-byte input should not open");
+    }
+
+    /// r405 fuzz regression: a hostile free-format stream can place a
+    /// second matching sync 1..3 bytes after the first, "measuring" a
+    /// frame shorter than its own header + side info. `open()` must
+    /// reject it (previously the header copy into the first-frame
+    /// buffer sliced out of range and panicked).
+    #[test]
+    fn rejects_free_format_frame_shorter_than_header() {
+        // The minimized fuzz artifact's stream body: a valid MPEG-2.5
+        // Layer III free-format sync at offset 0 whose next matching
+        // sync lands 3 bytes later.
+        let buf: Vec<u8> = vec![0xFF, 0xFF, 0x01, 0xFF, 0xFF, 0x00, 0xFF];
+        let err = Mp3Demuxer::open(Box::new(Cursor::new(buf))).err();
+        assert!(
+            err.is_some(),
+            "sub-header-size free-format measurement must be rejected"
+        );
     }
 
     /// `synchsafe_size` reads the four 7-bit groups in MSB-first

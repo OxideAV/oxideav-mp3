@@ -30,6 +30,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- demuxer: **hostile free-format streams can no longer "measure" a
+  frame shorter than its own header** (r405, found by the new `demux`
+  fuzz target within minutes). `measure_free_format_base_len` takes
+  the byte distance between the first two matching syncs as the frame
+  length; a crafted stream can place a second valid sync pattern 1..3
+  bytes after the first, and the subsequent
+  `first_frame_buf[..4].copy_from_slice(&hdr)` sliced out of range
+  and panicked. The measurement now enforces the §2.4.1.3 structural
+  floor — 4-byte header + optional 2-byte CRC + fixed-size side
+  information — and rejects the stream as invalid below it.
+  Regression-tested (`rejects_free_format_frame_shorter_than_header`)
+  and the minimized fuzz artifact replays clean.
+
 - alias/mixed: **mixed-block granules now get the single `sb == 1`
   alias-reduction butterfly on both the decode and encode sides**
   (r405). §2.4.3.4.10.1's two scope statements are written for the
@@ -198,6 +211,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   "§2.4.3 … seeking accuracy" milestone work.
 
 ### Added
+
+- fuzz: **`demux` fuzz target — the container surface under
+  attacker-controlled bytes** (r405). Third `cargo-fuzz` lane
+  alongside `decode` / `granule`: drives `Mp3Demuxer::open` (ID3v2
+  skip, Xing / Info / VBRI / LAME parsing, free-format frame-length
+  measurement), bounded `next_packet` drains, every metadata accessor,
+  and a seek schedule (front / attacker-chosen interior /
+  far-past-EOF) through the TOC and proportional seek paths plus the
+  post-seek exact-PTS frame recount. Half the iterations plant a
+  structurally valid attacker-parameterised first header so `open`
+  reaches the deep parse paths; the rest probe the resync / reject
+  paths raw. Panic-freedom contract; the three targets ran locally
+  this round — decode 1.28 M execs and granule 4.16 M execs clean;
+  demux found the free-format sub-header-length panic (see Fixed)
+  within minutes, then ran 19 M execs clean after the fix.
 
 - tests: **black-box validator decode sweep of encoder output**
   (`tests/validator_decode_sweep.rs`, r405). Encodes PCM at every

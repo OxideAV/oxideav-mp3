@@ -9,10 +9,17 @@ decoder, CBR/VBR encoder, and a stream demuxer.
 ## Status
 
 Clean-room implementation. Every numeric constant is transcribed from
-ISO/IEC 11172-3:1993 and ISO/IEC 13818-3:1997 and from no other source.
-The decoder produces PCM end-to-end for MPEG-1, MPEG-2 LSF, and all three
-MPEG-2.5 rates (8 / 11.025 / 12 kHz), mono and stereo. The encoder
-produces valid CBR and VBR MP3 streams.
+ISO/IEC 11172-3:1993 and ISO/IEC 13818-3:1997, the staged clean-room
+docs, and observer-trace measurements of black-box decoder binaries —
+and from no other source. The decoder produces PCM end-to-end for
+MPEG-1, MPEG-2 LSF, and all three MPEG-2.5 rates (8 / 11.025 /
+12 kHz), mono and stereo; a corpus-wide differential sweep tracks the
+staged reference PCM for all 16 fixtures in the float-rounding regime
+(normalized RMS error ≤ 1.6e-5). The encoder produces valid CBR and
+VBR MP3 streams whose decode is verified against external black-box
+validator binaries across a 32-case matrix (every rate, mono/stereo,
+long / short / mixed / auto block types, tone and wideband noise —
+all ≤ 8e-5, `tests/validator_decode_sweep.rs`).
 
 ## Decoder
 
@@ -64,13 +71,20 @@ cross-frame bit-reservoir scheduling. Additional capabilities:
   through the shared band-boundary functions, so quantization, the
   inner/outer loops, reorder, stereo, and the psychoacoustic
   threshold-in-quiet path all use the correct band layout at the
-  MPEG-2.5 rates. Per `mpeg2.5-scalefactor-bands.md`, the 11.025 / 12 kHz
-  tables reuse the ISO/IEC 13818-3 22.05 / 24 kHz LSF tables verbatim and
-  8 kHz is the distinct Fraunhofer table. Encode→self-decode round-trips
-  cover all three rates (including 8 kHz long *and* forced-short
-  blocks), and the `threshold_in_quiet` psychoacoustic vector is
-  verified band-aligned (finite-positive, non-uniform bowl) over each
-  rate's band partitioning.
+  MPEG-2.5 rates. The tables carry the **deployed de-facto layout**,
+  measured per spectral line by r405 observer-trace probes against two
+  independent black-box decoder binaries: 11.025 / 12 kHz reuse the
+  ISO/IEC 13818-3 **16 kHz LSF table pair** (long + short) — not the
+  per-rate half-rate siblings hypothesised in
+  `mpeg2.5-scalefactor-bands.md` — and 8 kHz uses the distinct
+  Fraunhofer tables from that doc (read back verbatim by the probe).
+  The §2.4.2.7 short-block region-0 boundary is band-relative
+  (`3·short_starts[3]` — 72 lines at 8 kHz), and mixed blocks are
+  refused at 8 kHz (the 8 kHz short table has no boundary at the
+  36-line long/short split; deployed decoders disagree there).
+  Encoder output at all three rates — long, short, auto block-type,
+  tone and wideband noise, mono and stereo — decodes on both external
+  validators in the float-rounding regime.
 
 The encoder is reachable through the `oxideav_core::Encoder` trait and
 several direct `make_encoder*` factory variants.
@@ -178,8 +192,12 @@ surface which path was taken.
 
 ## Robustness
 
-A `cargo-fuzz` harness (`decode` and `granule` targets) drives
-attacker-controlled bytes through the decode surface for panic-freedom.
+A `cargo-fuzz` harness drives attacker-controlled bytes through the
+attack surfaces for panic-freedom: `decode` (multi-packet decoder
+sessions with crafted valid-sync headers, reservoir / reset / flush
+state transitions), `granule` (the per-granule decode primitives), and
+`demux` (container open with ID3v2 / Xing / VBRI / LAME parsing,
+packet iteration, and the TOC / proportional seek paths).
 
 ## License
 

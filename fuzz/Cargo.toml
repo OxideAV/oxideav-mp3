@@ -79,3 +79,17 @@ name = "granule"
 path = "fuzz_targets/granule.rs"
 test = false
 doc = false
+
+# Target 3 — `demux`. Drives attacker-controlled bytes through the
+# `Mp3Demuxer` container surface: open (ID3v2 skip, Xing / Info /
+# VBRI / LAME parse, free-format length measurement), bounded
+# next_packet drains, the metadata accessors, and a seek schedule
+# (front / interior / far-past-EOF) exercising the TOC and
+# proportional seek paths plus the post-seek exact-PTS recount.
+# Panic-freedom contract, same as the other targets.
+[[bin]]
+name = "demux"
+path = "fuzz_targets/demux.rs"
+test = false
+doc = false
+bench = false
