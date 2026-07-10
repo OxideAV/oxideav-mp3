@@ -57,11 +57,10 @@ use crate::mdct::{mdct, window_short_analysis, MdctState, LONG_N, SHORT_N};
 use crate::requantize::short_band_starts;
 use crate::side_info::{BlockType, GranuleChannel};
 
-/// In a mixed block the two lowest polyphase subbands (36 lines,
-/// interleaved line `3·12 = 36`) are coded long; the short reorder
-/// begins at short scalefactor band 3 (per-window line 12). Matches
-/// `requantize`'s `MIXED_LONG_LINES` / `MIXED_FIRST_SHORT_SFB`, exposed
-/// here so the forward reorder applies the same boundary.
+/// In a mixed block the short reorder begins at short scalefactor
+/// band 3; everything below the coding split `3·short_starts[3]` is
+/// long-coded (see `requantize::mixed_long_lines`). Matches the
+/// decoder-side boundary so the forward reorder is its exact inverse.
 const MIXED_FIRST_SHORT_SFB: usize = 3;
 
 /// Short-block IMDCT Princen-Bradley scale (`n / 4` for `n = 12`).
@@ -176,9 +175,10 @@ pub fn forward_reorder(
 
     let mut out = *xr_sub;
     let first_sfb = if gc.mixed_block_flag {
-        // Mixed: long region (lines 0..36) is already frequency-ordered
-        // and copied verbatim by `out = *xr_sub`; only short bands
-        // 3..12 are reordered.
+        // Mixed: the long-coded region (lines below
+        // `3·short_starts[3]`) is already frequency-ordered and copied
+        // verbatim by `out = *xr_sub`; only short bands 3..12 are
+        // reordered.
         MIXED_FIRST_SHORT_SFB
     } else {
         0

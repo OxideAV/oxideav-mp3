@@ -447,15 +447,21 @@ fn region_boundaries(
         // validators, while the band-relative boundary decodes in the
         // float-rounding regime).
         //
-        // Mixed short blocks keep the 36-line boundary: §2.4.2.7 sets
-        // `region0_count = 7` for them, and the mixed band sequence
-        // opens with the long bands of the 36-line long region, so
-        // the eight-band region 0 ends at the long/short split line.
-        let r0_lines = if gc.mixed_block_flag {
-            36usize
-        } else {
-            3 * short_band_starts(sample_rate_hz, version)[3]
-        };
+        // Mixed short blocks land on the SAME band-relative boundary
+        // by a different derivation: §2.4.2.7 sets `region0_count = 7`
+        // for them, the mixed band sequence opens with the transmitted
+        // long bands of the long-coded region, and the span of those
+        // long bands equals `3 · short_starts[3]` at every rate (36 at
+        // every ISO table, 72 at 8 kHz — see
+        // `requantize::mixed_long_lines`). This branch used to
+        // hardcode 36 for mixed granules; the r408 8 kHz observer
+        // probes (mixed granules carrying a value only one of the two
+        // region codebooks can represent, on either side of the
+        // candidate boundaries) refuted the fixed 36 — all four
+        // deployed black-box validators read line 50 of an 8 kHz
+        // mixed granule with the region-0 codebook — and confirmed
+        // the band-relative boundary decodes cleanly on all four.
+        let r0_lines = 3 * short_band_starts(sample_rate_hz, version)[3];
         let r0 = r0_lines.min(usize::from(gc.big_values) * 2);
         let r1 = usize::from(gc.big_values) * 2;
         return (r0, r1);

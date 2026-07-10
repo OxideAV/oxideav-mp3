@@ -89,12 +89,23 @@ cross-frame bit-reservoir scheduling. Additional capabilities:
   `mpeg2.5-scalefactor-bands.md` — and 8 kHz uses the distinct
   Fraunhofer tables from that doc (read back verbatim by the probe).
   The §2.4.2.7 short-block region-0 boundary is band-relative
-  (`3·short_starts[3]` — 72 lines at 8 kHz), and mixed blocks are
-  refused at 8 kHz (the 8 kHz short table has no boundary at the
-  36-line long/short split; deployed decoders disagree there).
-  Encoder output at all three rates — long, short, auto block-type,
-  tone and wideband noise, mono and stereo — decodes on both external
-  validators in the float-rounding regime.
+  (`3·short_starts[3]` — 72 lines at 8 kHz). Mixed blocks are still
+  refused at 8 kHz on the **encode** side: the r408 observer probes
+  resolved the coding layout (all four deployed validators requantize
+  wire lines 36..72 with the transmitted long scalefactor bands 3..5 —
+  the 8 kHz long table's six lowest bands span exactly
+  `0..3·short_starts[3] = 72`) but deployed decoders still split 3-1
+  on the window geometry, so emitted streams would render differently
+  on a quarter of them. The **decoder** renders foreign 8 kHz mixed
+  granules per the majority reading (long-coded to 72, two
+  long-windowed subbands; before r408 lines 36..72 were left silent).
+  The mixed Huffman region-0 boundary is a deployed grey zone
+  (validators split three ways at 8 kHz and 2-2 at the LSF rates), so
+  every mixed granule this encoder emits uses one codebook for both
+  big-values regions — every boundary interpretation consumes
+  identical bits. Encoder output at all three rates — long, short,
+  auto block-type, tone and wideband noise, mono and stereo — decodes
+  on the external validators in the float-rounding regime.
 
 The encoder is reachable through the `oxideav_core::Encoder` trait and
 several direct `make_encoder*` factory variants.

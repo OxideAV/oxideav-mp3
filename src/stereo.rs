@@ -106,9 +106,9 @@ const IS_POS_ILLEGAL: u8 = 7;
 /// Number of short-block scalefactor bands per window (`scalefac_s[..12]`).
 const SHORT_SFB: usize = 12;
 
-/// In a mixed block the lowest 36 lines are a long window; the short
-/// region begins at short scalefactor band 3. Matches `requantize` /
-/// `reorder`.
+/// In a mixed block the short region begins at short scalefactor
+/// band 3; lines below `3·short_starts[3]` are long-coded. Matches
+/// `requantize` / `reorder`.
 const MIXED_FIRST_SHORT_SFB: usize = 3;
 
 /// `1/sqrt(2)`, the MS-stereo normalization constant (§2.4.3.4.9.2) and
@@ -242,14 +242,25 @@ fn process_short(
 ) {
     let short_starts = short_band_starts(sample_rate_hz, version);
     let first_short_sfb = if right_gc.mixed_block_flag {
-        // Lowest 36 lines are a long window; process them with the long
-        // layout (they are below the intensity bound for any real stream,
-        // but MS still applies if enabled).
+        // The long-coded region — the lines below the mixed coding
+        // split `3 · short_starts[3]` (36 at every ISO table, 72 at
+        // the MPEG-2.5 8 kHz tables; see
+        // `requantize::mixed_long_lines`) — is processed with the
+        // long band layout (it is below the intensity bound for any
+        // real stream, but MS still applies if enabled). Walking the
+        // long bands **up to the split** (rather than a fixed count)
+        // matters twice: the LSF tables put only 6 long bands below
+        // 36 (a fixed 8-band walk would re-process lines 36..54 that
+        // the short walk below also covers, with untransmitted
+        // scalefactor slots doubling as bogus is_pos), and the 8 kHz
+        // tables put the split at 72 (6 bands of width 12).
         let long_starts = long_band_starts(sample_rate_hz, version);
-        let bound_sfb = long_intensity_bound_range(right, long_starts, 0, 36);
-        for sfb in 0..8 {
+        let split = 3 * short_starts[MIXED_FIRST_SHORT_SFB];
+        let bound_sfb = long_intensity_bound_range(right, long_starts, 0, split);
+        let mut sfb = 0usize;
+        while sfb + 1 < long_starts.len() && long_starts[sfb] < split {
             let lo = long_starts[sfb];
-            let hi = long_starts[sfb + 1];
+            let hi = long_starts[sfb + 1].min(split);
             if sfb < bound_sfb {
                 if ms {
                     apply_ms_range(left, right, lo, hi);
@@ -267,6 +278,7 @@ fn process_short(
                     version,
                 );
             }
+            sfb += 1;
         }
         MIXED_FIRST_SHORT_SFB
     } else {

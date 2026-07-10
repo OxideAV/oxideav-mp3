@@ -69,10 +69,16 @@ use crate::side_info::{BlockType, GranuleChannel};
 /// exponent (matches [`crate::requantize`]).
 const GAIN_BIAS: i32 = 210;
 
-/// Lines `[0, 36)` of a mixed block are encoded as a long block; the
-/// short region starts at short scalefactor band 3.
-const MIXED_LONG_LINES: usize = 36;
+/// The short-coded region of a mixed block starts at short scalefactor
+/// band 3; the lines below `3 * short_starts[3]` are encoded as a long
+/// block (36 at every ISO table, 72 at the MPEG-2.5 8 kHz tables --
+/// the exact inverse of the decoder's band-relative coding split; see
+/// the de-facto derivation on `requantize::mixed_long_lines`).
 const MIXED_FIRST_SHORT_SFB: usize = 3;
+
+fn mixed_long_lines(sample_rate_hz: u32, version: MpegVersion) -> usize {
+    3 * short_band_starts(sample_rate_hz, version)[MIXED_FIRST_SHORT_SFB]
+}
 
 /// `2^(x/4)` for an integer-quarter exponent (mirror of the decoder
 /// helper; reproduced here so the encoder module doesn't reach into a
@@ -163,7 +169,7 @@ pub fn quantize(
             xr,
             sf,
             0,
-            MIXED_LONG_LINES,
+            mixed_long_lines(sample_rate_hz, version),
             global,
             mult,
             sample_rate_hz,

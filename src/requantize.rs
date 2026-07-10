@@ -251,16 +251,49 @@ const SHORT_STARTS_LSF_24: [usize; 13] = [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 1
 /// sibling.
 const SHORT_STARTS_MPEG25_8: [usize; 13] = [0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166];
 
-/// In a mixed block the two lowest polyphase subbands (36 lines) are
-/// coded as a long block; the remainder uses short windows (§2.4.2.7,
-/// "mixed_block_flag"). 36 lines correspond to long-block scalefactor
-/// bands 0..8 (whose widths sum to 36 at every sampling rate) and short
-/// scalefactor bands 3..12 (which begin at per-window line 12, i.e.
-/// interleaved line 36).
-const MIXED_LONG_LINES: usize = 36;
 /// The first short scalefactor band used in a mixed block (bands 0..3
-/// are absorbed by the long-window portion).
+/// are absorbed by the long-coded portion).
 const MIXED_FIRST_SHORT_SFB: usize = 3;
+
+/// The mixed-block **coding split**: the first line of the
+/// short-coded region, `3 · short_starts[3]` (short scalefactor bands
+/// 3..12 in `(sfb, window, freqline)` interleave start there). Lines
+/// below it are **long-coded**: linear frequency order, long
+/// scalefactor bands, the long gain formula (no `subblock_gain`).
+///
+/// At every ISO table (`short_starts[3] = 12`) this is 36 lines,
+/// coinciding with the transmitted long scalefactor bands (MPEG-1
+/// mixed transmits long sfb 0..8, `long_starts[8] = 36`; LSF mixed
+/// transmits long sfb 0..6, `long_starts[6] = 36`) **and** with the
+/// §2.4.2.7 window split (the two long-windowed lowest polyphase
+/// subbands). At the MPEG-2.5 8 kHz Fraunhofer tables the two
+/// band-relative spans still agree with each other — `long_starts[6]
+/// = 72 = 3 · short_starts[3]` — but no longer with the 36-line
+/// window split. The deployed de-facto resolution (r408 single-line
+/// observer probes with staircase long scalefactors and
+/// subblock-gain discriminators, four independent black-box
+/// decoders) is:
+///
+/// * **coding split = 72** at 8 kHz — all four validators requantize
+///   lines 36..72 with the transmitted **long** scalefactor bands
+///   3..5 (attenuation follows `scalefac_l[3..6]` exactly) and the
+///   long gain formula (`subblock_gain` does not touch them);
+/// * **window split stays 36** (two long-windowed subbands, §2.4.2.7)
+///   on three of the four validators — the long-coded lines 36..72
+///   pass through the reorder unchanged and are consumed by the
+///   short IMDCT of subbands 2..3 in its native `[3·k + win]`
+///   interleave (the fourth validator long-windows the whole 0..72
+///   region — the minority reading; the encoder keeps refusing to
+///   *emit* 8 kHz mixed because of that split);
+/// * the mixed Huffman region-0 boundary stays at the fixed 36 lines
+///   on all four (see `huffman::region_boundaries`).
+///
+/// Before r408 this crate hardcoded the coding split to 36 and
+/// started the short walk at band 3 (line 72 at 8 kHz), silently
+/// zeroing lines 36..72 of every foreign 8 kHz mixed granule.
+fn mixed_long_lines(sample_rate_hz: u32, version: MpegVersion) -> usize {
+    3 * short_band_starts(sample_rate_hz, version)[MIXED_FIRST_SHORT_SFB]
+}
 
 /// `2^(x/4)` for an integer-quarter exponent. Implemented via `exp2`
 /// (`f32::powi`-free) so the long-block gain term `2^((global_gain-210)/4)`
@@ -331,13 +364,15 @@ pub fn requantize(
     // Short / window-switched block. The long-block gain term has no
     // subblock_gain; the short term subtracts 8*subblock_gain[window].
     if gc.mixed_block_flag {
-        // Lowest 36 lines are a long block (§2.4.2.7), then short.
+        // The long-coded region (36 lines at every ISO table, 72 at
+        // the MPEG-2.5 8 kHz tables — see `mixed_long_lines`), then
+        // the short-coded region from short sfb 3.
         requantize_long_range(
             &mut xr,
             is,
             sf,
             0,
-            MIXED_LONG_LINES,
+            mixed_long_lines(sample_rate_hz, version),
             global,
             mult,
             sample_rate_hz,

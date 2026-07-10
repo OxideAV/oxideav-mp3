@@ -587,3 +587,57 @@ fn force_mixed_plus_outer_loop_demuxer_accepts_stream() {
         "demuxer surfaced zero frames on force-mixed-outer-loop stream",
     );
 }
+
+/// **r408 — mixed granules use ONE codebook for both big-values
+/// regions.** The §2.4.2.7 mixed region-0 boundary is a deployed
+/// grey zone: r408 observer probes measured four independent
+/// black-box validators splitting 2-2 at the LSF rates (two put the
+/// boundary at `3·short_starts[3]`, two at the end of the literal
+/// eight-entry mixed band sequence) and three ways at 8 kHz. With
+/// `table_select[0] == table_select[1]` every interpretation
+/// consumes identical bits, so no deployed decoder can desynchronise
+/// on an emitted mixed granule regardless of which boundary it
+/// reconstructs.
+#[test]
+fn mixed_granules_use_one_table_for_both_big_value_regions() {
+    // Wideband noise maximises table diversity pressure (a tonal
+    // input often picks the same table anyway).
+    let mut state = 0x1357_9bdfu32;
+    let n = SR as usize;
+    let pcm: Vec<i16> = (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = f64::from((state >> 16) as i32 - 32768) / 32768.0;
+            (v * 0.4 * f64::from(i16::MAX)) as i16
+        })
+        .collect();
+    for sr in [44_100u32, 22_050] {
+        let br = if sr == 44_100 { 128 } else { 48 };
+        let mut enc = Mp3Encoder::new(br, sr, ChannelMode::SingleChannel).expect("encoder");
+        enc.force_mixed_blocks_for_testing(true)
+            .expect("force mixed");
+        enc.push_samples(&pcm[..(sr as usize)]).expect("push");
+        let mut bytes = Vec::new();
+        enc.finish(&mut bytes).expect("finish");
+        let mut mixed_seen = 0usize;
+        for frame in FrameWalker::new(&bytes) {
+            let hdr = parse_header(&frame.data[..4]).expect("header");
+            let si = parse_side_info(&hdr, &frame.data[4..]).expect("side info");
+            for gr in 0..si.granule_count as usize {
+                let gc = &si.granules[gr][0];
+                if gc.window_switching_flag
+                    && gc.block_type == BlockType::Short
+                    && gc.mixed_block_flag
+                {
+                    mixed_seen += 1;
+                    assert_eq!(
+                        gc.table_select[0], gc.table_select[1],
+                        "{sr} Hz: mixed granule with differing region tables \
+                         (boundary-interpretation hazard, r408)"
+                    );
+                }
+            }
+        }
+        assert!(mixed_seen > 0, "{sr} Hz: no mixed granules emitted");
+    }
+}

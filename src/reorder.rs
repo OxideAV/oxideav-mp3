@@ -41,11 +41,12 @@
 //!
 //! Long blocks (`block_type != 2`) are already in increasing-frequency
 //! order (§2.4.2.7) and pass through unchanged. A **mixed** block
-//! (`block_type == 2 && mixed_block_flag`) codes the lowest 36 lines as a
-//! long window and the remainder as short windows (§2.4.2.7); only the
-//! short region (short scalefactor bands 3..12, interleaved lines from
-//! `3·12 = 36` upward) is reordered, the long region 0..36 passes
-//! through.
+//! (`block_type == 2 && mixed_block_flag`) codes the lines below the
+//! coding split `3·short_starts[3]` (36 at every ISO table, 72 at the
+//! MPEG-2.5 8 kHz tables — see `requantize::mixed_long_lines`) as a
+//! long block; only the short region (short scalefactor bands 3..12,
+//! interleaved lines from `3·short_starts[3]` upward) is reordered,
+//! the long-coded region passes through.
 //!
 //! Every band boundary used here is read from the same Table B.8 columns
 //! as the requantize stage; this module re-uses those start tables via
@@ -55,10 +56,10 @@ use crate::frame::MpegVersion;
 use crate::requantize::{short_band_starts, NUM_LINES};
 use crate::side_info::{BlockType, GranuleChannel};
 
-/// In a mixed block the two lowest polyphase subbands (36 lines,
-/// interleaved line `3·12 = 36`) are coded long; the short reorder begins
-/// at short scalefactor band 3 (per-window line 12). Matches
-/// `requantize`'s `MIXED_LONG_LINES` / `MIXED_FIRST_SHORT_SFB`.
+/// In a mixed block the short reorder begins at short scalefactor
+/// band 3; everything below `3·short_starts[3]` is long-coded and
+/// passes through. Matches `requantize`'s `mixed_long_lines` /
+/// `MIXED_FIRST_SHORT_SFB`.
 const MIXED_FIRST_SHORT_SFB: usize = 3;
 
 /// Reorder the requantized frequency lines of one granule-channel from
@@ -92,9 +93,10 @@ pub fn reorder(
 
     let mut out = *xr;
     let first_sfb = if gc.mixed_block_flag {
-        // The long region (lines 0..36) is already frequency-ordered and
-        // copied verbatim by the `out = *xr` initialisation above; only
-        // short bands 3..12 are reordered.
+        // The long-coded region (lines below `3·short_starts[3]`) is
+        // already frequency-ordered and copied verbatim by the
+        // `out = *xr` initialisation above; only short bands 3..12
+        // are reordered.
         MIXED_FIRST_SHORT_SFB
     } else {
         0

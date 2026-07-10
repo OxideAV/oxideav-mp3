@@ -497,3 +497,100 @@ fn mpeg25_8khz_band_boundaries_select_correct_scalefactor() {
     approx(xr[23], 0.5);
     approx(xr[24], 0.25);
 }
+
+#[test]
+fn mixed_coding_split_is_band_relative() {
+    // The mixed long-coded region ends at `3 * short_starts[3]`: 36 at
+    // every ISO table, 72 at the MPEG-2.5 8 kHz Fraunhofer tables
+    // (where it coincides with the span of the six transmitted LSF
+    // long scalefactor bands, `long_starts[6] = 72`). r408 observer
+    // probes: all four deployed black-box validators requantize 8 kHz
+    // mixed lines 36..72 with the transmitted LONG scalefactor bands
+    // 3..5 and the long gain formula.
+    assert_eq!(mixed_long_lines(44_100, MpegVersion::Mpeg1), 36);
+    assert_eq!(mixed_long_lines(32_000, MpegVersion::Mpeg1), 36);
+    assert_eq!(mixed_long_lines(48_000, MpegVersion::Mpeg1), 36);
+    assert_eq!(mixed_long_lines(16_000, MpegVersion::Mpeg2), 36);
+    assert_eq!(mixed_long_lines(22_050, MpegVersion::Mpeg2), 36);
+    assert_eq!(mixed_long_lines(24_000, MpegVersion::Mpeg2), 36);
+    assert_eq!(mixed_long_lines(11_025, MpegVersion::Mpeg25), 36);
+    assert_eq!(mixed_long_lines(12_000, MpegVersion::Mpeg25), 36);
+    assert_eq!(mixed_long_lines(8_000, MpegVersion::Mpeg25), 72);
+    // The two band-relative spans agree at every rate: the long-coded
+    // region is exactly the span of the transmitted long scalefactor
+    // bands (8 for MPEG-1 mixed, 6 for LSF mixed).
+    assert_eq!(
+        long_band_starts(8_000, MpegVersion::Mpeg25)[6],
+        mixed_long_lines(8_000, MpegVersion::Mpeg25)
+    );
+    assert_eq!(
+        long_band_starts(44_100, MpegVersion::Mpeg1)[8],
+        mixed_long_lines(44_100, MpegVersion::Mpeg1)
+    );
+    assert_eq!(
+        long_band_starts(22_050, MpegVersion::Mpeg2)[6],
+        mixed_long_lines(22_050, MpegVersion::Mpeg2)
+    );
+}
+
+#[test]
+fn mpeg25_8khz_mixed_lines_36_to_72_use_long_bands_and_gain() {
+    // r408: a foreign 8 kHz mixed granule's lines 36..72 are
+    // long-coded — requantized with long scalefactor bands 3..5
+    // (lines 36..48 / 48..60 / 60..72) and the long gain formula
+    // (no subblock_gain). Before the fix this range was silently
+    // zeroed (the short walk started at band 3 = line 72 while the
+    // long walk stopped at 36).
+    let mut gc = short_gc(210, [0, 5, 0], false);
+    gc.mixed_block_flag = true;
+    let mut sf = ScaleFactors::default();
+    sf.long[3] = 2; // 2^-1 over lines 36..48
+    sf.long[5] = 4; // 2^-2 over lines 60..72
+    sf.short[3] = [2, 0, 0]; // short band 3 window 0 (wire 72..96)
+    let mut is = [0i32; NUM_LINES];
+    is[30] = 1; // long band 2 (control, sf 0)
+    is[40] = 1; // long band 3
+    is[47] = 1; // long band 3 (last line)
+    is[50] = 1; // long band 4 (sf 0)
+    is[64] = 1; // long band 5
+    is[71] = 1; // long band 5 (last line)
+    is[72] = 1; // short band 3, window 0, first line
+    let xr = requantize(&is, &gc, &sf, 8000, MpegVersion::Mpeg25);
+    approx(xr[30], 1.0);
+    approx(xr[40], 0.5);
+    approx(xr[47], 0.5);
+    approx(xr[50], 1.0);
+    approx(xr[64], 0.25);
+    approx(xr[71], 0.25);
+    // Wire 72 opens the short region: short band 3 window 0 carries
+    // scalefactor 2 (2^-1); subblock_gain[1] = 5 must NOT apply to
+    // window 0, and must not have applied anywhere in 36..72.
+    approx(xr[72], 0.5);
+    // Window 1 of short band 3 (per-window width 12: win0 = wire
+    // 72..84, win1 = 84..96): subblock_gain[1] = 5 applies there,
+    // 2^(-8*5/4) = 2^-10.
+    let mut is2 = [0i32; NUM_LINES];
+    is2[84] = 1;
+    let xr2 = requantize(&is2, &gc, &sf, 8000, MpegVersion::Mpeg25);
+    approx(xr2[84], (2.0f32).powi(-10));
+}
+
+#[test]
+fn standard_rate_mixed_split_unchanged_at_36() {
+    // Control: at 44.1 kHz the mixed long-coded region still ends at
+    // 36 and the short walk still begins at wire 36 (band 3,
+    // per-window line 12).
+    let mut gc = short_gc(210, [0, 0, 0], false);
+    gc.mixed_block_flag = true;
+    let mut sf = ScaleFactors::default();
+    sf.long[3] = 2; // long band 3 = lines 12..16 at 44.1 kHz
+    sf.short[3] = [2, 0, 0];
+    let mut is = [0i32; NUM_LINES];
+    is[13] = 1; // long band 3
+    is[35] = 1; // last long-coded line (band 7, sf 0)
+    is[36] = 1; // short band 3 window 0 first line
+    let xr = requantize(&is, &gc, &sf, 44_100, MpegVersion::Mpeg1);
+    approx(xr[13], 0.5);
+    approx(xr[35], 1.0);
+    approx(xr[36], 0.5);
+}

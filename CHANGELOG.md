@@ -30,6 +30,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- decoder: **foreign MPEG-2.5 8 kHz mixed-block granules no longer
+  render lines 36..72 silent** (r408) — the second r405-recorded
+  defect. The mixed decode hardcoded a 36-line long-coded region and
+  started the short walk at short scalefactor band 3, which at the
+  8 kHz Fraunhofer tables begins at per-window line 24 = wire line 72
+  — so wire lines 36..72 of every foreign 8 kHz mixed granule were
+  silently zeroed. r408 single-line observer probes (crafted with the
+  crate's own low-level frame assembly; staircase long scalefactors
+  and subblock-gain discriminators; four independent black-box
+  validators) resolved the de-facto layout:
+  - **coding split = `3 · short_starts[3]`** (36 at every ISO table,
+    **72 at 8 kHz**, where it coincides with the span of the six
+    transmitted LSF long scalefactor bands, `long_starts[6] = 72`):
+    all four validators requantize wire lines 36..72 with **long**
+    bands 3..5 (attenuation follows `scalefac_l[3..6]` exactly) and
+    the long gain formula — `subblock_gain` does not apply there.
+    `requantize` (and the encoder's `quantize` inverse) now use the
+    band-relative split; behaviour at every other rate is unchanged.
+  - **window split stays 36 lines** (§2.4.2.7's two lowest polyphase
+    subbands) on three of the four validators: the long-coded lines
+    36..72 pass through the reorder and are consumed by the short
+    IMDCT of subbands 2..3 in native `[3·k + win]` interleave —
+    exactly what this crate's pipeline produces once the requantizer
+    covers the range. (The fourth validator long-windows the whole
+    72-line region; with a 3-1 deployed split on window geometry the
+    encoder's 8 kHz mixed *emit* refusal stands.)
+  - the mixed Huffman **region-0 boundary is a deployed grey zone**:
+    the old fixed 36 is refuted by all four validators; beyond that
+    they split three ways at 8 kHz (72 / 96 / >100) and 2-2 at
+    22.05 kHz (36 vs 48 — the band-relative reading vs the literal
+    eight-entry mixed band sequence). The decoder now uses the
+    band-relative `3 · short_starts[3]` (the primary validator's
+    reading, identical at every rate but 8 kHz), and the encoder
+    hardens every emitted mixed granule with `table_select[0] ==
+    table_select[1]`, so every boundary interpretation consumes
+    identical bits and **no** deployed decoder can desynchronise on
+    our mixed output (35-case sweep re-verified float-perfect on all
+    four validators).
+  - the mixed long-band walk of the intensity-stereo path is now
+    band-relative too, which also fixes a latent LSF bug: the fixed
+    8-band walk re-processed lines 36..54 of an LSF mixed granule
+    (only 6 long bands exist below 36 there) with untransmitted
+    scalefactor slots doubling as bogus intensity positions.
+  New tests: `tests/mixed_8k_foreign_decode.rs` (foreign-stream
+  probes pin non-silence, the long-band scalefactor mapping, and the
+  subblock-gain scope), requantize unit tests for the band-relative
+  split, and `mixed_granules_use_one_table_for_both_big_value_regions`.
+
 - encoder/decoder: **mixed bursts now carry `mixed_block_flag` on the
   flanking `Start` / `End` granules** (r408) — this closes the r405
   "second validator diverges on 44.1 kHz auto+mixed transition
@@ -156,15 +204,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - encoder: **mixed blocks are refused at 8 kHz**
   (`StreamEncodeError::MixedBlocks8kUnsupported`, r405). The deployed
   8 kHz Fraunhofer short table (per-window starts 0, 8, 16, 24, …)
-  has no band boundary at per-window line 12, so the §2.4.2.7 mixed
-  carve-out's 36-line long/short split is structurally undefined at
-  8 kHz — and the r405 observer-trace found the two black-box
-  validators render 8 kHz mixed granules differently from each other
-  (no de-facto behaviour to conform to; this crate's decoder leaves
-  the ill-defined lines 36..72 silent). `force_mixed_blocks_for_testing`
-  and `enable_auto_block_type_with_mixed` now reject at 8 kHz; pure
-  short blocks and the plain auto block-type path are fully supported
-  there (validator-verified at ≤ 6e-6).
+  has no band boundary at per-window line 12, and the r405
+  observer-trace found deployed black-box validators render 8 kHz
+  mixed granules differently from each other.
+  `force_mixed_blocks_for_testing` and
+  `enable_auto_block_type_with_mixed` reject at 8 kHz; pure short
+  blocks and the plain auto block-type path are fully supported there
+  (validator-verified at ≤ 6e-6). (The r408 probes later resolved the
+  disagreement precisely — the CODING layout is unanimous, the WINDOW
+  geometry splits 3-1 — and fixed the decode side, which had left
+  lines 36..72 of foreign 8 kHz mixed granules silent; see the r408
+  entry above. The emit refusal stands.)
 
 - tables: **MPEG-2.5 11.025 / 12 kHz scalefactor-band tables corrected
   to the deployed de-facto layout — the 16 kHz LSF table pair** (r405).

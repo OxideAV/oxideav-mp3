@@ -235,13 +235,21 @@ pub enum StreamEncodeError {
     /// subbands (36 lines) and starts the short region at the short
     /// band whose tripled start index is 36; the deployed 8 kHz
     /// Fraunhofer short table (per-window starts 0, 8, 16, 24, …) has
-    /// **no** band boundary at per-window line 12, so the mixed
-    /// geometry is structurally undefined at 8 kHz — and the r405
-    /// observer-trace found the two black-box validators render 8 kHz
-    /// mixed granules *differently from each other* (no de-facto
-    /// behaviour to conform to). The encoder therefore refuses to emit
-    /// mixed granules at 8 kHz; pure short blocks (and the plain auto
-    /// block-type path) are fully supported there.
+    /// **no** band boundary at per-window line 12. The r408
+    /// observer probes resolved the CODING layout — all four deployed
+    /// black-box validators requantize an 8 kHz mixed granule with a
+    /// 72-line long-coded region (`3·short_starts[3]`, matching the
+    /// six transmitted LSF long scalefactor bands; see
+    /// `requantize::mixed_long_lines`) — but the deployed world still
+    /// splits 3-1 on the WINDOW geometry (three validators keep the
+    /// §2.4.2.7 two-subband / 36-line window split; one long-windows
+    /// the whole 72-line region), so an emitted 8 kHz mixed stream
+    /// would render differently on a quarter of deployed decoders.
+    /// The encoder therefore refuses to emit mixed granules at 8 kHz;
+    /// pure short blocks (and the plain auto block-type path) are
+    /// fully supported there. The DECODER renders foreign 8 kHz mixed
+    /// granules per the majority reading (r408; previously lines
+    /// 36..72 were left silent).
     MixedBlocks8kUnsupported,
     /// [`Mp3Encoder::enable_auto_block_type_model2`] was called on an
     /// encoder that does not have the §C.1.5.3.2.1 automatic Model 2
@@ -289,7 +297,9 @@ impl core::fmt::Display for StreamEncodeError {
                 "this block-type toggle is not supported with intensity-stereo coupling armed (mixed-promotion auto and Model-2-driven auto remain unavailable; force-short / force-mixed and signal-driven auto block-type — MS-joint or intensity-only — are supported)",
             ),
             StreamEncodeError::MixedBlocks8kUnsupported => f.write_str(
-                "mixed blocks are not supported at 8 kHz: the MPEG-2.5 8 kHz short band                  table has no boundary at the 36-line long/short split, and deployed                  decoders disagree on the resulting geometry (use pure short blocks)",
+                "mixed blocks are not supported at 8 kHz: deployed decoders disagree on \
+                 the window geometry of the MPEG-2.5 8 kHz mixed carve-out (use pure \
+                 short blocks)",
             ),
             StreamEncodeError::Model2AnalysisUnsupported { sample_rate_hz } => {
                 if *sample_rate_hz == 0 {
@@ -1121,10 +1131,11 @@ impl Mp3Encoder {
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
         if enabled && self.sample_rate_hz == 8000 {
-            // The 8 kHz Fraunhofer short table has no band boundary at
-            // the 36-line long/short split, so the mixed carve-out is
-            // structurally undefined there and deployed decoders
-            // disagree on it (r405 observer-trace) — refuse to emit.
+            // Deployed decoders split 3-1 on the WINDOW geometry of
+            // the 8 kHz mixed carve-out (r408 observer probes; the
+            // coding layout itself is resolved — see
+            // [`StreamEncodeError::MixedBlocks8kUnsupported`]) —
+            // refuse to emit.
             return Err(StreamEncodeError::MixedBlocks8kUnsupported);
         }
         if enabled && self.intensity_start_sfb.is_some() && self.ms_joint_stereo_active() {
@@ -1373,10 +1384,11 @@ impl Mp3Encoder {
         attack_threshold: f64,
         mixed_low_band_stability: f64,
     ) -> Result<(), StreamEncodeError> {
-        // The mixed carve-out is structurally undefined at 8 kHz (see
-        // [`StreamEncodeError::MixedBlocks8kUnsupported`]); the plain
-        // [`Self::enable_auto_block_type`] path (long/start/short/stop)
-        // is the supported auto configuration there.
+        // Deployed decoders disagree on the 8 kHz mixed window
+        // geometry (see [`StreamEncodeError::MixedBlocks8kUnsupported`]);
+        // the plain [`Self::enable_auto_block_type`] path
+        // (long/start/short/stop) is the supported auto configuration
+        // there.
         if self.sample_rate_hz == 8000 {
             return Err(StreamEncodeError::MixedBlocks8kUnsupported);
         }
@@ -5013,10 +5025,13 @@ impl Mp3Encoder {
                         //
                         // Mixed-block detail: §2.4.2.7 sets
                         // `region0_count = 7` for mixed granules; the
-                        // mixed band sequence opens with the long
-                        // bands of the 36-line long region, so the
-                        // eight-band region 0 ends at the long/short
-                        // split line 36. Region 1 then carries all
+                        // mixed band sequence opens with the
+                        // transmitted long bands of the long-coded
+                        // region, whose span equals
+                        // `3 · short_starts[3]` at every rate, so the
+                        // mixed region 0 ends at the same
+                        // band-relative line as the pure-short one
+                        // (r408). Region 1 then carries all
                         // big_values that fall in the short region,
                         // already re-ordered into `[sfb][win][k]`
                         // native order by `forward_reorder` above.
@@ -5051,7 +5066,15 @@ impl Mp3Encoder {
                         // and the §2.4.4.5 bit-cost check are then
                         // consistent.
                         let r0_lines = match gc_template.block_type {
-                            BlockType::Short if gc_template.mixed_block_flag => 36usize,
+                            // Pure short AND mixed both end region 0
+                            // at `3 · short_starts[3]` (36 lines at
+                            // every ISO table; 72 at the 8 kHz
+                            // Fraunhofer tables — mixed is refused at
+                            // 8 kHz but the formulas stay unified;
+                            // r408 observer probes confirmed the
+                            // band-relative mixed boundary on all
+                            // four deployed validators, see
+                            // huffman::region_boundaries).
                             BlockType::Short => 3 * short_band_starts_for(self.sample_rate_hz)[3],
                             // Start / End: §2.4.2.7 default
                             // region0_count = 7 in long-band units.
@@ -5067,8 +5090,27 @@ impl Mp3Encoder {
                         gc.region0_count = r0c;
                         gc.region1_count = r1c;
                     }
-                    t0 = best_table_or(&is, 0, r0_end);
-                    t1 = best_table_or(&is, r0_end, r1_end);
+                    if gc_template.block_type == BlockType::Short && gc_template.mixed_block_flag {
+                        // Mixed granules: one codebook for BOTH
+                        // big-values regions (r408). The §2.4.2.7
+                        // mixed region-0 boundary is a deployed grey
+                        // zone — the r408 observer probes measured
+                        // four black-box validators splitting 2-2 at
+                        // the LSF rates (two put it at
+                        // `3·short_starts[3]`, two at the end of the
+                        // literal eight-entry mixed band sequence)
+                        // and three ways at 8 kHz. With
+                        // `table_select[0] == table_select[1]` every
+                        // boundary interpretation consumes identical
+                        // bits, so the ambiguity cannot desynchronise
+                        // any deployed decoder. Costs a few bits on
+                        // mixed granules only.
+                        t0 = best_table_or(&is, 0, r1_end);
+                        t1 = t0;
+                    } else {
+                        t0 = best_table_or(&is, 0, r0_end);
+                        t1 = best_table_or(&is, r0_end, r1_end);
+                    }
                     t2 = best_table_or(&is, r1_end, bv2);
                     gc.table_select = [t0, t1, t2];
                     let c1s = bv2;
