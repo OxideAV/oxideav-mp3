@@ -1344,6 +1344,25 @@ impl Mp3Encoder {
     /// extension* — callers using `enable_auto_block_type` keep the
     /// pre-r161 pure-short behaviour.
     ///
+    /// **Rate scope of the promotion (r408):** mixed bursts are put on
+    /// the wire only at the MPEG-1 rates (32 / 44.1 / 48 kHz). A mixed
+    /// burst's flanking `Start` / `End` granules must carry the
+    /// §2.4.2.7 `mixed_block_flag` for the low-subband §2.4.3.4
+    /// overlap-add to cancel, and while that combination is conformant
+    /// at every rate (the ISO/IEC 13818-3 main_data syntax scopes the
+    /// mixed scalefactor layout to `block_type == '10'`, and its
+    /// scalefac_compress partition tables mark the flag don't-care for
+    /// block types '00'/'01'/'11'), r408 black-box measurements found
+    /// deployed LSF decoders split 2-2 on it — two track the spec
+    /// reading float-perfectly, two desynchronise on the burst. At the
+    /// LSF / MPEG-2.5 rates the scheduler therefore demotes mixed
+    /// bursts to pure-short (identically decoded everywhere); the
+    /// classifier still runs and the toggle is still accepted, but no
+    /// mixed granule reaches the wire from the auto path at those
+    /// rates. [`Self::force_mixed_blocks_for_testing`] (steady mixed
+    /// streams, no transition flanks) remains available at every rate
+    /// except 8 kHz.
+    ///
     /// # Errors
     ///
     /// Returns `Ok` for every channel layout this round; the
@@ -3262,6 +3281,32 @@ impl Mp3Encoder {
             //   L↔R: an attack on either channel triggers the
             //   transition for both.
             let mut out: [[BlockType; 2]; GRANULES] = [[BlockType::Long; 2]; GRANULES];
+            // Mixed-burst promotion is emitted on the wire only at the
+            // MPEG-1 rates (r408). A mixed burst needs its flanking
+            // Start / End granules to carry the §2.4.2.7
+            // `mixed_block_flag` (normal window on the two lowest
+            // subbands, so the §2.4.3.4 low-subband overlap-add
+            // cancels across the whole burst). At the MPEG-1 rates
+            // every deployed black-box validator decodes that wire
+            // combination float-perfectly. At the LSF / MPEG-2.5
+            // rates the combination is CONFORMANT — the ISO/IEC
+            // 13818-3 main_data syntax scopes the mixed scalefactor
+            // layout to `block_type == '10'`, and its
+            // scalefac_compress partition tables mark
+            // mixed_block_flag as don't-care ('x') for block types
+            // '00'/'01'/'11' — but the r408 observer measurements
+            // found the deployed world split 2-2: two independent
+            // black-box decoders track the spec reading
+            // float-perfectly while two others desynchronise on the
+            // whole burst (nrmse ≈ 0.4–1.3, consistent with reading a
+            // different scalefactor partition for the flagged
+            // Start / End). With no de-facto consensus to conform to,
+            // the auto scheduler demotes mixed bursts to pure-short
+            // at the non-MPEG-1 rates (pure-short transitions decode
+            // identically on every validator); `force_mixed_blocks`
+            // — steady mixed streams without transition flanks —
+            // remains available at every rate except 8 kHz.
+            let mixed_promotion_wire_safe = self.version == MpegVersion::Mpeg1;
             // Generalised over `ngr ∈ {1, 2}`: the §C.1.5.2 walk
             // builds, per channel, an attack flag for each of this
             // frame's `ngr` granules plus one lookahead granule
@@ -3328,24 +3373,36 @@ impl Mp3Encoder {
                         }
                     }
                     // Lookahead granule (`g == ngr`): peek
-                    // non-destructively (clone the detector) so the
-                    // zero-padded or borrowed next-frame PCM never
-                    // perturbs the ambient estimate. Empty lookahead
-                    // (end-of-stream) → `next_attack = false`.
+                    // non-destructively (clone the detector /
+                    // classifier) so the zero-padded or borrowed
+                    // next-frame PCM never perturbs the ambient / LP
+                    // state. Empty lookahead (end-of-stream) →
+                    // `next_attack = false`, `next mixed = false`.
                     let (slab, present) =
                         grab_granule(per_ch_frame_pcm, per_ch_lookahead_pcm, ch, ngr);
                     if present {
                         let mut det_peek = cfg.detector[ch].clone();
                         attack[ngr] |= det_peek.classify(&slab);
+                        if let Some(ref classifiers) = cfg.mixed_classifier {
+                            let mut cls_peek = classifiers[ch].clone();
+                            mixed[ngr] |= cls_peek.classify_mixed(&slab);
+                        }
                     }
                 }
                 // Single shared scheduler (channel-0's slot;
                 // channel-1's scheduler is left at default and
                 // carries no state in the MS-stereo regime). Mirror
                 // each emission across both channels of the granule.
+                // `mixed[g + 1]` is the lookahead granule's mixed
+                // preference — the scheduler latches it as the
+                // burst's mixed-ness when it commits a Start (the
+                // lookahead granule is the burst's first Short).
                 for g in 0..ngr {
-                    let (bt, mx) =
-                        cfg.scheduler[0].step_with_mixed(attack[g], attack[g + 1], mixed[g]);
+                    let (bt, mx) = cfg.scheduler[0].step_with_mixed(
+                        attack[g],
+                        attack[g + 1],
+                        mixed[g + 1] && mixed_promotion_wire_safe,
+                    );
                     out[g][0] = bt;
                     out[g][1] = bt;
                     mixed_per_gc[g][0] = mx;
@@ -3388,6 +3445,10 @@ impl Mp3Encoder {
                         grab_granule(per_ch_frame_pcm, per_ch_lookahead_pcm, ch, ngr);
                     attack[ngr] = if present {
                         let mut det_peek = cfg.detector[ch].clone();
+                        if let Some(ref classifiers) = cfg.mixed_classifier {
+                            let mut cls_peek = classifiers[ch].clone();
+                            mixed[ngr] = cls_peek.classify_mixed(&slab);
+                        }
                         det_peek.classify(&slab)
                     } else {
                         false
@@ -3395,9 +3456,16 @@ impl Mp3Encoder {
                     // Feed the scheduler in granule-major order;
                     // granule `g`'s companion is granule `g + 1`'s
                     // attack flag (the lookahead for the last one).
+                    // `mixed[g + 1]` is the lookahead granule's mixed
+                    // preference — latched as the burst's mixed-ness
+                    // when the scheduler commits a Start (the
+                    // lookahead granule is the burst's first Short).
                     for g in 0..ngr {
-                        let (bt, mx) =
-                            cfg.scheduler[ch].step_with_mixed(attack[g], attack[g + 1], mixed[g]);
+                        let (bt, mx) = cfg.scheduler[ch].step_with_mixed(
+                            attack[g],
+                            attack[g + 1],
+                            mixed[g + 1] && mixed_promotion_wire_safe,
+                        );
                         out[g][ch] = bt;
                         mixed_per_gc[g][ch] = mx;
                     }
@@ -3646,6 +3714,23 @@ impl Mp3Encoder {
                             );
                         }
                         BlockType::Long | BlockType::Start | BlockType::End => {
+                            // A Start / End granule that flanks a
+                            // **mixed** burst carries
+                            // `mixed_block_flag = 1` (§2.4.2.7: for any
+                            // window-switched granule the flag means
+                            // the two lowest polyphase subbands are
+                            // transformed with the normal window while
+                            // the remaining 30 follow the block type).
+                            // Keeping subbands 0..2 on the normal
+                            // analysis window across the whole burst is
+                            // what makes the low-subband §2.4.3.4
+                            // overlap-add cancel — a start/end window
+                            // against the mixed granule's normal window
+                            // leaves uncancelled aliasing there
+                            // (measured as a low-band divergence on an
+                            // independent black-box validator, r408).
+                            let mixed_transition = mixed_per_gc[gr][ch]
+                                && matches!(auto_bt, BlockType::Start | BlockType::End);
                             for sb in 0..32 {
                                 let mut current = [0.0f64; LONG_N / 2];
                                 for (t, slot) in current.iter_mut().enumerate() {
@@ -3653,16 +3738,22 @@ impl Mp3Encoder {
                                 }
                                 let frame36 =
                                     forward_overlap(&current, &mut self.mdct_state[ch][sb]);
-                                let windowed = window_long_family_analysis(&frame36, auto_bt);
+                                let window_bt = if mixed_transition && sb < 2 {
+                                    BlockType::Long
+                                } else {
+                                    auto_bt
+                                };
+                                let windowed = window_long_family_analysis(&frame36, window_bt);
                                 let bins = mdct(&windowed, LONG_N);
                                 for (k, &b) in bins.iter().enumerate() {
                                     xr[sb * 18 + k] = (b / 9.0) as f32;
                                 }
                             }
                             // Alias reduction is applied by the decoder
-                            // for block_type != Short, so we invert it
-                            // here just as the all-long default path
-                            // does.
+                            // for block_type != Short (all 32 subbands
+                            // are 36-point long-family transforms, mixed
+                            // flag or not), so we invert it here just as
+                            // the all-long default path does.
                             xr_pre_per_gc[gr][ch] = inverse_alias_reduce(&xr);
                         }
                     }
@@ -4380,7 +4471,20 @@ impl Mp3Encoder {
                         match block_type_per_gc[gr][ch] {
                             BlockType::Long => default_long_gc(),
                             BlockType::Start | BlockType::End => {
-                                default_transition_gc(block_type_per_gc[gr][ch])
+                                let mut gc = default_transition_gc(block_type_per_gc[gr][ch]);
+                                // A Start / End flanking a mixed burst
+                                // carries the §2.4.2.7 mixed_block_flag
+                                // (normal window on the two lowest
+                                // subbands — see the forward-MDCT
+                                // dispatch above). The flag changes
+                                // ONLY the synthesis window choice:
+                                // spectral layout, scalefactor
+                                // partitions, requantization, and the
+                                // §2.4.2.7 region defaults all key on
+                                // `block_type == 2`, so the long-family
+                                // coding path below is untouched.
+                                gc.mixed_block_flag = mixed_per_gc[gr][ch];
+                                gc
                             }
                             BlockType::Short if mixed_per_gc[gr][ch] => default_mixed_gc(),
                             BlockType::Short => default_short_gc(),
@@ -4436,6 +4540,12 @@ impl Mp3Encoder {
                 // primitive with a relaxed debug_assert. No block-type
                 // ever falls back to the fixed-gain inner-loop-only
                 // path while the outer loop is enabled.
+                // Start / End are eligible with or without the
+                // mixed_block_flag: the flag on a long-family granule
+                // selects only the synthesis window of subbands 0..2
+                // (§2.4.2.7) — part2 wire layout, requantize formula,
+                // and region split are the plain long-family ones
+                // either way.
                 let outer_loop_eligible = matches!(
                     (
                         gc_template.window_switching_flag,
@@ -4444,8 +4554,8 @@ impl Mp3Encoder {
                     ),
                     (false, BlockType::Long, _)
                         | (true, BlockType::Short, _)
-                        | (true, BlockType::Start, false)
-                        | (true, BlockType::End, false)
+                        | (true, BlockType::Start, _)
+                        | (true, BlockType::End, _)
                 );
                 let (mut sf, initial_gain, scalefac_scale_outer, subblock_gain_outer) =
                     match self.outer_loop_threshold {

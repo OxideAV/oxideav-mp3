@@ -17,9 +17,10 @@ MPEG-1, MPEG-2 LSF, and all three MPEG-2.5 rates (8 / 11.025 /
 staged reference PCM for all 16 fixtures in the float-rounding regime
 (normalized RMS error ≤ 1.6e-5). The encoder produces valid CBR and
 VBR MP3 streams whose decode is verified against external black-box
-validator binaries across a 32-case matrix (every rate, mono/stereo,
-long / short / mixed / auto block types, tone and wideband noise —
-all ≤ 8e-5, `tests/validator_decode_sweep.rs`).
+validator binaries across a 35-case matrix (every rate, mono/stereo,
+long / short / mixed / auto / auto+mixed block types, tone and
+wideband noise — all ≤ 8e-5 on four independent deployed decoders,
+`tests/validator_decode_sweep.rs`).
 
 ## Decoder
 
@@ -63,7 +64,16 @@ cross-frame bit-reservoir scheduling. Additional capabilities:
   auto MS/LR picker.
 - Forward short-block and mixed-block MDCT paths, plus a signal-driven
   attack detector and the `LONG → START → SHORT → STOP → LONG` block-type
-  state machine (opt-in auto block typing).
+  state machine (opt-in auto block typing). Mixed bursts are
+  burst-coherent (r408): the flanking `Start` / `End` granules carry
+  the §2.4.2.7 `mixed_block_flag` so the two lowest polyphase subbands
+  stay normal-windowed across the whole burst and the §2.4.3.4
+  low-subband overlap-add cancels exactly — verified float-perfect on
+  four independent deployed black-box decoders at the MPEG-1 rates. At
+  the LSF / MPEG-2.5 rates deployed decoders split 2-2 on that
+  (conformant) wire combination, so the auto scheduler demotes mixed
+  bursts to pure-short there; steady force-mixed streams stay
+  available at every rate except 8 kHz.
 - True-VBR per-frame bitrate, opt-in Xing / Info VBR information-frame
   emission with auto-filled TOC, and opt-in CRC-16 protection.
 - MPEG-2.5 frame header writing and sample-rate dispatch, with the

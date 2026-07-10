@@ -30,6 +30,73 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- encoder/decoder: **mixed bursts now carry `mixed_block_flag` on the
+  flanking `Start` / `End` granules** (r408) — this closes the r405
+  "second validator diverges on 44.1 kHz auto+mixed transition
+  sequences" defect. §2.4.2.7 scopes the flag to *every*
+  window-switched granule ("If window_switching_flag==1, then the
+  mixed_block_flag indicates whether lower frequency polyphase filter
+  subbands are coded using normal window type"), so a conformant mixed
+  burst keeps its two lowest subbands on the normal window from the
+  `Start` through every `Short` to the `End` — the only window lattice
+  whose §2.4.3.4 low-subband overlap-adds cancel. The auto+mixed
+  scheduler previously emitted `Start(mixed=0) → Short(mixed=1) →
+  End(mixed=0)`: the start/end window tail against the mixed granule's
+  normal-window head left **uncancelled aliasing in subbands 0..2** of
+  every transition. The defect was invisible in self-decode and on
+  validators that reproduce the stream's literal window sequence
+  (three of four deployed black-box decoders tracked our decode at
+  ≤ 7e-5) but a fourth deployed decoder rendered the low band
+  differently — nrmse 3.1e-2 (click-train) to 7.6e-2 (attack-tone) at
+  44.1 kHz, localized by a per-subband DFT of the diff to exactly
+  polyphase subbands 0/1 across `Start → Mixed → End` frames. Fixes:
+  - `BlockTypeStateMachine::step_with_mixed` now **latches the
+    burst's mixed-ness at the `Start` commit** (from the lookahead
+    granule's classifier preference) and applies it to the whole
+    burst — `Start`, every `Short`, and the closing `End` share one
+    flag (mixed-ness cannot change inside a burst; a `normal ↔
+    short-stack` low-subband pairing would not cancel either). The
+    lookahead granule's mixed preference is peeked with a cloned
+    classifier exactly like the attack lookahead.
+  - The encoder's forward MDCT windows subbands 0/1 of a mixed-burst
+    `Start` / `End` with the **normal analysis window** (upper 30
+    subbands keep the transition window); the granule template
+    carries the flag; the long-family outer loop accepts it (the flag
+    on a long-family granule changes only the synthesis window —
+    spectral layout, part2 wire format, requantize formula, and
+    §2.4.2.7 region defaults all key on `block_type == 2`).
+  - The decoder's `windowed_block` now honours `mixed_block_flag` on
+    **any** window-switched granule (previously only on `Short`), so
+    foreign `Start`/`End`+mixed granules render per the spec.
+  After the fix, all four deployed black-box validators decode
+  auto+mixed streams in the float-rounding regime (44.1 kHz:
+  ≤ 4.6e-5 on the formerly-diverging decoder, ≤ 6e-6 on the two
+  float-perfect ones; 32 kHz / 22.05 kHz equivalent). New sweep cases
+  (`mpeg1-44100-automixed`, `mpeg1-32000-automixed`,
+  `mpeg2-22050-automixed`), a burst-coherence regression test
+  (`mixed_burst_flags_flanking_transition_granules`), and an IMDCT
+  window unit test pin the behaviour.
+
+- encoder: **auto-path mixed bursts are demoted to pure-short at the
+  LSF / MPEG-2.5 rates** (r408). The flagged-flank wire combination
+  above is conformant at LSF too — the ISO/IEC 13818-3 main_data
+  syntax scopes the mixed scalefactor layout to `block_type == '10'`,
+  and its scalefac_compress partition tables mark `mixed_block_flag`
+  as don't-care ('x') for block types '00'/'01'/'11' — but r408
+  black-box measurements found deployed LSF decoders **split 2-2** on
+  it: two track the spec reading float-perfectly (≤ 6e-6), two
+  desynchronise on the whole burst (nrmse 0.42 / 1.27, consistent
+  with reading a different scalefactor partition for a flagged
+  `Start`/`End`). With no de-facto consensus to conform to, the
+  scheduler emits pure-short bursts at the non-MPEG-1 rates (decoded
+  identically on every validator); the toggle is still accepted and
+  Short geometry still engages. `force_mixed_blocks_for_testing`
+  (steady mixed streams, no transition flanks — all validators agree)
+  remains available at every rate except 8 kHz. Pinned by
+  `lsf_auto_mixed_demotes_to_pure_short_on_the_wire` and the
+  `mpeg2-22050-automixed` sweep case (float-perfect on all four
+  validators).
+
 - demuxer: **hostile free-format streams can no longer "measure" a
   frame shorter than its own header** (r405, found by the new `demux`
   fuzz target within minutes). `measure_free_format_base_len` takes

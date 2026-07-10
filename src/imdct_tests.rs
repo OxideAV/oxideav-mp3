@@ -778,3 +778,69 @@ fn zero_input_zero_output() {
         assert_eq!(st.overlap[sb], [0.0; SAMPLES_PER_SUBBAND]);
     }
 }
+
+#[test]
+fn mixed_flag_on_start_end_uses_normal_window_in_low_subbands() {
+    // §2.4.2.7: "If window_switching_flag==1, then the mixed_block_flag
+    // indicates whether lower frequency polyphase filter subbands are
+    // coded using normal window type" — for EVERY window-switched block
+    // type. A Start / End granule flanking a mixed burst carries the
+    // flag, and its two lowest subbands must be windowed with the
+    // normal (block_type 0) window while subbands >= 2 keep the
+    // start / end window (r408; before the fix the flag was honoured
+    // only on block_type == Short).
+    for bt in [BlockType::Start, BlockType::End] {
+        let mut gc_mixed = switched_gc(bt);
+        gc_mixed.mixed_block_flag = true;
+
+        // Same 18 lines in subbands 0, 1, and 2.
+        let mut xr = [0.0f32; NUM_LINES];
+        for sb in 0..3 {
+            for k in 0..SAMPLES_PER_SUBBAND {
+                xr[sb * SAMPLES_PER_SUBBAND + k] = (k as f32 + 1.0) * 0.05;
+            }
+        }
+
+        let mut st = ImdctState::default();
+        let out = imdct_granule(&xr, &gc_mixed, &mut st);
+
+        // Reference A: the same lines through a plain Long granule —
+        // subbands 0 and 1 of the mixed Start/End must match its
+        // normal-window output exactly.
+        let mut st_long = ImdctState::default();
+        let out_long = imdct_granule(&xr, &long_gc(), &mut st_long);
+        for sb in 0..2 {
+            for t in 0..SAMPLES_PER_SUBBAND {
+                assert!(
+                    (out[sb][t] - out_long[sb][t]).abs() < EPS_F32,
+                    "{bt:?}+mixed sb{sb} t={t}: {} vs normal-window {}",
+                    out[sb][t],
+                    out_long[sb][t]
+                );
+            }
+        }
+
+        // Reference B: the same lines through a non-mixed Start/End —
+        // subband 2 keeps the transition window (identical), while
+        // subbands 0/1 must differ from it (the whole point of the
+        // flag). The start/end windows differ from the normal window
+        // on i = 18..35, which the overlap store carries; compare the
+        // saved second halves.
+        let mut st_plain = ImdctState::default();
+        let out_plain = imdct_granule(&xr, &switched_gc(bt), &mut st_plain);
+        for t in 0..SAMPLES_PER_SUBBAND {
+            assert!(
+                (out[2][t] - out_plain[2][t]).abs() < EPS_F32,
+                "{bt:?}+mixed sb2 t={t} must keep the {bt:?} window"
+            );
+        }
+        let differs = (0..SAMPLES_PER_SUBBAND).any(|t| {
+            (st.overlap[0][t] - st_plain.overlap[0][t]).abs() > EPS_F32
+                || (out[0][t] - out_plain[0][t]).abs() > EPS_F32
+        });
+        assert!(
+            differs,
+            "{bt:?}+mixed sb0 output/overlap identical to non-mixed {bt:?} — flag not honoured"
+        );
+    }
+}

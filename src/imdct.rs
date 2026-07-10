@@ -398,10 +398,21 @@ fn window_short(sub: &[[f64; SHORT_N]; 3]) -> [f64; LONG_N] {
 fn windowed_block(lines: &[f32], gc: &GranuleChannel, subband: usize) -> [f64; LONG_N] {
     let is_short = gc.window_switching_flag && gc.block_type == BlockType::Short;
 
-    // A mixed block codes its two lowest subbands (0 and 1) with the long
-    // window and the rest as short (§2.4.2.7). For those two subbands the
-    // long-family path (normal window) is used.
-    let use_long = !is_short || (gc.mixed_block_flag && subband < 2);
+    // §2.4.2.7 `mixed_block_flag`: "If window_switching_flag==1, then
+    // the mixed_block_flag indicates whether lower frequency polyphase
+    // filter subbands are coded using normal window type. … the
+    // frequency lines corresponding to the two lowest frequency
+    // polyphase subbands are transformed with normal window
+    // (block_type==0), while the remaining 30 subbands are transformed
+    // as block_type[gr][ch]." The flag applies to EVERY window-switched
+    // block type — Start (1) and End (3) carry it across a mixed
+    // transition so the low subbands stay normal-windowed through the
+    // whole burst (the §2.4.3.4 overlap-add only cancels between
+    // complementary window halves; a start/end window tail against a
+    // normal-window head in subbands 0..2 would leave uncancelled
+    // aliasing).
+    let mixed_low = gc.window_switching_flag && gc.mixed_block_flag && subband < 2;
+    let use_long = !is_short || mixed_low;
 
     if use_long {
         // Single 36-point IMDCT over the 18 lines (n/2 = 18 = subband
@@ -413,9 +424,10 @@ fn windowed_block(lines: &[f32], gc: &GranuleChannel, subband: usize) -> [f64; L
             *slot = f64::from(v);
         }
         let x = imdct_long(&xk);
-        // A mixed block's long subbands use the normal window
-        // (block_type 0); a pure long/start/end block uses its own.
-        let bt = if is_short {
+        // A mixed granule's two lowest subbands use the normal window
+        // (block_type 0) regardless of the transmitted block type;
+        // a non-mixed long/start/end block uses its own.
+        let bt = if mixed_low {
             BlockType::Long
         } else {
             gc.block_type

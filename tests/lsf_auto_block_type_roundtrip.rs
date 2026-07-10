@@ -254,6 +254,86 @@ fn lsf_auto_block_type_with_mixed_click_train_engages_short() {
     assert!(!recon[0].is_empty());
 }
 
+/// **r408 — the auto path demotes mixed bursts to pure-short at the
+/// LSF rates.**
+///
+/// A mixed burst's flanking `Start` / `End` granules must carry the
+/// §2.4.2.7 `mixed_block_flag` for the low-subband §2.4.3.4
+/// overlap-add to cancel. That wire combination is conformant at LSF
+/// — the ISO/IEC 13818-3 main_data syntax scopes the mixed
+/// scalefactor layout to `block_type == '10'`, and the
+/// scalefac_compress partition tables mark the flag as don't-care
+/// ('x') for block types '00' / '01' / '11' — but r408 black-box
+/// measurements found deployed LSF decoders split 2-2 on it (two
+/// track the spec reading float-perfectly, two desynchronise on the
+/// whole burst). With no de-facto consensus, the scheduler emits
+/// pure-short bursts at the LSF / MPEG-2.5 rates: the toggle is
+/// accepted and Short geometry engages, but **no granule carries the
+/// mixed flag**.
+#[test]
+fn lsf_auto_mixed_demotes_to_pure_short_on_the_wire() {
+    // The r408 stimulus family that DOES promote to mixed at the
+    // MPEG-1 rates: a low-band 50 Hz carrier (classifier-stable) with
+    // Nyquist-alternation clicks on top (fires the attack detector).
+    const SR: u32 = 22_050;
+    let n = SR as usize;
+    let mut pcm: Vec<i16> = (0..n)
+        .map(|i| {
+            let t = i as f32 / SR as f32;
+            ((2.0 * PI * 50.0 * t).sin() * 0.05 * i16::MAX as f32) as i16
+        })
+        .collect();
+    let mut pos = 3300usize;
+    while pos + 64 < n {
+        for j in 0..64 {
+            let hf = if j % 2 == 0 { 30_000i32 } else { -30_000i32 };
+            pcm[pos + j] = (i32::from(pcm[pos + j]) + hf)
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        }
+        pos += 3300;
+    }
+
+    let mut enc = Mp3Encoder::new(64, SR, ChannelMode::SingleChannel).expect("encoder build");
+    // Relaxed stability threshold — at 44.1 kHz this same
+    // configuration promotes granules to mixed (see
+    // `tests/auto_block_type_mixed_roundtrip.rs`).
+    enc.enable_auto_block_type_with_mixed(DEFAULT_ATTACK_THRESHOLD, 8.0)
+        .expect("enable auto+mixed on LSF");
+    enc.push_samples(&pcm).expect("push pcm");
+    let mut bytes = Vec::new();
+    let _ = enc.finish(&mut bytes).expect("finish");
+
+    let mut saw_short = false;
+    let mut frames = 0usize;
+    for frame in FrameWalker::new(&bytes) {
+        frames += 1;
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        let si_start = 4 + if hdr.crc_protected { 2 } else { 0 };
+        let si = parse_side_info(&hdr, &frame.data[si_start..]).expect("side info");
+        for gr in 0..si.granule_count as usize {
+            let gc = &si.granules[gr][0];
+            if gc.window_switching_flag && gc.block_type == BlockType::Short {
+                saw_short = true;
+            }
+            assert!(
+                !gc.mixed_block_flag,
+                "LSF auto path put mixed_block_flag on the wire \
+                 (block_type {:?}) — r408 demotes mixed bursts to pure-short at LSF",
+                gc.block_type
+            );
+        }
+    }
+    assert!(frames > 0, "no frames emitted");
+    assert!(
+        saw_short,
+        "stimulus engaged no Short geometry — the demotion assertion was vacuous"
+    );
+
+    // The demoted stream still self-decodes.
+    let recon = decode_lsf_stream(&bytes);
+    assert!(!recon[0].is_empty());
+}
+
 #[test]
 fn lsf_auto_block_type_independent_stereo_roundtrips() {
     // Independent (non-MS) LSF stereo: each channel runs its own

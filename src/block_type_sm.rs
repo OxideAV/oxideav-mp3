@@ -80,12 +80,29 @@ use crate::side_info::BlockType;
 
 /// Stateful block-type scheduler. Holds the previously-emitted
 /// [`BlockType`] (the carry that determines what's geometrically
-/// allowable next).
+/// allowable next) and the burst's mixed-ness latch.
 #[derive(Debug, Clone, Copy)]
 pub struct BlockTypeStateMachine {
     /// The block type emitted on the previous granule. Determines
     /// what the current granule is allowed to emit.
     prev: BlockType,
+    /// Whether the burst currently in flight is a **mixed** burst.
+    /// Latched when the `Start` window is committed (from the
+    /// lookahead granule's mixed preference) and held until the
+    /// closing `End` window has been emitted, so every granule of one
+    /// burst — `Start`, each `Short`, and the `End` — carries the
+    /// same `mixed_block_flag`. §2.4.2.7 scopes the flag to
+    /// `window_switching_flag == 1` (any of block types 1 / 2 / 3):
+    /// with the flag set, the two lowest polyphase subbands are
+    /// transformed with the normal window while the remaining 30
+    /// follow the block type. Keeping the flag constant across the
+    /// burst keeps the low-subband window sequence
+    /// `normal → normal → … → normal`, the only lattice whose
+    /// §2.4.3.4 overlap-adds cancel (a mixed granule's normal-window
+    /// low subbands cannot splice against a start/end window tail or
+    /// a short-window stack — those pairings leave uncancelled
+    /// aliasing in subbands 0..2).
+    burst_mixed: bool,
 }
 
 impl BlockTypeStateMachine {
@@ -96,12 +113,14 @@ impl BlockTypeStateMachine {
     pub fn new() -> Self {
         Self {
             prev: BlockType::Long,
+            burst_mixed: false,
         }
     }
 
     /// Reset the scheduler to the initial `Long` state.
     pub fn reset(&mut self) {
         self.prev = BlockType::Long;
+        self.burst_mixed = false;
     }
 
     /// The block type the scheduler last emitted.
@@ -124,7 +143,7 @@ impl BlockTypeStateMachine {
     /// internal state in-place.
     ///
     /// This is the legacy entry point that never emits the mixed
-    /// flag (every short emission is pure-short). The
+    /// flag (every emission is non-mixed). The
     /// [`Self::step_with_mixed`] method extends the scheduler with a
     /// mixed-vs-pure-short signal on the same transition geometry.
     pub fn step(&mut self, cur_attack: bool, next_attack: bool) -> BlockType {
@@ -132,30 +151,47 @@ impl BlockTypeStateMachine {
     }
 
     /// Advance the scheduler by one granule with an optional
-    /// mixed-vs-pure-short preference.
+    /// mixed-vs-pure-short preference for the burst the **lookahead**
+    /// granule opens.
     ///
     /// Identical to [`Self::step`] in transition geometry — the
     /// §C.1.5.2 `LONG → START → SHORT → STOP → LONG` envelope is
-    /// unchanged — except that when the scheduler emits
-    /// [`BlockType::Short`] **and** `prefer_mixed` is `true`, the
-    /// returned `mixed_flag` companion bool is set. Callers wire
-    /// this into the encoder's `mixed_block_flag` side-info field
-    /// (§2.4.2.7) which selects the §2.4.3.4.10.3 mixed-block
-    /// scalefactor-band layout (lowest 2 subbands long, the rest
-    /// short).
+    /// unchanged — but the returned `mixed_flag` companion bool
+    /// implements the §2.4.2.7 `mixed_block_flag` semantics over the
+    /// whole burst:
     ///
-    /// The mixed flag is **always** `false` for any non-Short
-    /// emission: the §2.4.2.7 spec scopes `mixed_block_flag` to
-    /// `block_type == 2`, so a Long / Start / End granule cannot
-    /// carry it regardless of `prefer_mixed`. This keeps the
-    /// scheduler honest with the wire syntax.
+    /// * When a `Start` window is committed (`prev == Long` with
+    ///   `next_attack`), `next_prefer_mixed` — the mixed preference of
+    ///   the lookahead granule, i.e. the burst's first `Short` — is
+    ///   **latched** as the burst's mixed-ness, and the `Start`
+    ///   emission itself carries the latched flag.
+    /// * Every `Short` emission of the burst carries the latched
+    ///   flag (per-granule preferences of later burst granules are
+    ///   intentionally ignored — see below).
+    /// * The closing `End` emission carries the latched flag, then
+    ///   the latch clears.
+    /// * `Long` emissions never carry the flag.
+    ///
+    /// §2.4.2.7 scopes `mixed_block_flag` to any window-switched
+    /// granule (block types 1, 2 and 3): with the flag set, the two
+    /// lowest polyphase subbands are transformed with the normal
+    /// window while the remaining 30 subbands follow the block type.
+    /// The burst-level latch is a **window-geometry requirement**,
+    /// not a preference: the low-subband window sequence must be
+    /// `normal → normal → …` for the §2.4.3.4 overlap-add to cancel,
+    /// so mixed-ness cannot change inside a burst, and the flanking
+    /// `Start` / `End` granules of a mixed burst must carry the flag
+    /// too (a start/end window tail against a normal-window head in
+    /// subbands 0..2 leaves uncancelled aliasing — observed as a
+    /// low-band divergence on an independent black-box validator
+    /// before this rule was enforced, r408).
     ///
     /// Returns `(block_type, mixed_flag)` for the current granule.
     pub fn step_with_mixed(
         &mut self,
         cur_attack: bool,
         next_attack: bool,
-        prefer_mixed: bool,
+        next_prefer_mixed: bool,
     ) -> (BlockType, bool) {
         let emitted = match self.prev {
             BlockType::Long => {
@@ -164,6 +200,9 @@ impl BlockTypeStateMachine {
                 // jump directly to Short — that would require a
                 // Start first.
                 if next_attack {
+                    // Committing the burst: latch its mixed-ness from
+                    // the lookahead granule (the burst's first Short).
+                    self.burst_mixed = next_prefer_mixed;
                     BlockType::Start
                 } else {
                     // cur_attack with no next_attack: the burst is
@@ -203,12 +242,18 @@ impl BlockTypeStateMachine {
             }
         };
         self.prev = emitted;
-        // Per §2.4.2.7, `mixed_block_flag` is meaningful only when
-        // `block_type == 2` (Short). Suppress the flag on every
-        // other emission regardless of the caller's preference so
-        // the scheduler never produces a syntactically invalid
-        // (block_type, mixed_flag) pair.
-        let mixed_flag = prefer_mixed && matches!(emitted, BlockType::Short);
+        // The whole burst — Start, every Short, and the closing End —
+        // carries the mixed-ness latched when the Start was committed
+        // (see the method docs for the §2.4.2.7 / §2.4.3.4 rationale).
+        // Long emissions never carry the flag; an emitted Long also
+        // clears the latch (the burst, if any, is over).
+        let mixed_flag = match emitted {
+            BlockType::Start | BlockType::Short | BlockType::End => self.burst_mixed,
+            BlockType::Long => {
+                self.burst_mixed = false;
+                false
+            }
+        };
         (emitted, mixed_flag)
     }
 }
@@ -360,41 +405,42 @@ mod tests {
         }
     }
 
-    /// `step_with_mixed(_, _, true)` propagates the mixed flag onto
-    /// every Short emission and suppresses it on every other
-    /// emission (Long / Start / End). This is the syntactic
-    /// invariant §2.4.2.7 requires: `mixed_block_flag` is only
-    /// meaningful for `block_type == 2`.
+    /// A mixed burst carries the flag on **every** window-switched
+    /// emission — the Start that opens it, each Short, and the End
+    /// that closes it — and never on a Long. §2.4.2.7 scopes
+    /// `mixed_block_flag` to `window_switching_flag == 1` (block
+    /// types 1 / 2 / 3); flagging the flanking Start / End keeps the
+    /// low-subband window sequence normal-windowed across the whole
+    /// burst (r408).
     #[test]
-    fn step_with_mixed_true_sets_flag_only_on_short() {
+    fn step_with_mixed_true_flags_whole_burst() {
         let mut sm = BlockTypeStateMachine::new();
-        // Long → Start (flag must be false; Start is not Short)
+        // Long → Start: the lookahead granule prefers mixed, so the
+        // burst is latched mixed and the Start itself is flagged.
         let (bt, mixed) = sm.step_with_mixed(false, true, true);
         assert_eq!(bt, BlockType::Start);
-        assert!(!mixed);
-        // Start → Short (flag must be true — caller asked for mixed)
-        let (bt, mixed) = sm.step_with_mixed(true, false, true);
+        assert!(mixed, "Start of a mixed burst must carry the flag");
+        // Start → Short (flag from the burst latch)
+        let (bt, mixed) = sm.step_with_mixed(true, false, false);
         assert_eq!(bt, BlockType::Short);
         assert!(mixed);
-        // Short → End (flag must be false again)
-        let (bt, mixed) = sm.step_with_mixed(false, false, true);
+        // Short → End (flag from the burst latch)
+        let (bt, mixed) = sm.step_with_mixed(false, false, false);
         assert_eq!(bt, BlockType::End);
-        assert!(!mixed);
-        // End → Long (flag must be false)
-        let (bt, mixed) = sm.step_with_mixed(false, false, true);
+        assert!(mixed, "End of a mixed burst must carry the flag");
+        // End → Long (flag must be false; latch cleared)
+        let (bt, mixed) = sm.step_with_mixed(false, false, false);
         assert_eq!(bt, BlockType::Long);
         assert!(!mixed);
     }
 
-    /// A sustained burst with prefer_mixed=true emits Start, then
-    /// several Short-with-mixed, then End — each Short carries the
-    /// flag, Start and End do not.
+    /// A sustained mixed burst flags Start, every Short, and End.
     #[test]
-    fn step_with_mixed_sustained_burst_flags_each_short() {
+    fn step_with_mixed_sustained_burst_flags_every_emission() {
         let mut sm = BlockTypeStateMachine::new();
         let (bt, mixed) = sm.step_with_mixed(false, true, true);
         assert_eq!(bt, BlockType::Start);
-        assert!(!mixed);
+        assert!(mixed);
         for _ in 0..3 {
             let (bt, mixed) = sm.step_with_mixed(true, true, true);
             assert_eq!(bt, BlockType::Short);
@@ -405,28 +451,84 @@ mod tests {
         assert!(mixed);
         let (bt, mixed) = sm.step_with_mixed(false, false, true);
         assert_eq!(bt, BlockType::End);
-        assert!(!mixed);
+        assert!(mixed);
     }
 
-    /// `prefer_mixed` can vary per call, so the flag tracks the
-    /// preference of the call that *emits* the Short, not any
-    /// committed earlier setting.
+    /// The burst's mixed-ness is **latched at the Start commit** from
+    /// the lookahead preference; per-call preferences on later burst
+    /// granules are ignored (mixed-ness cannot change inside a burst
+    /// — the low-subband window lattice would not cancel).
     #[test]
-    fn step_with_mixed_per_call_preference() {
+    fn step_with_mixed_latches_at_start_commit() {
+        // Pure burst: no mixed preference at Start commit → the whole
+        // burst is pure even if later calls ask for mixed.
         let mut sm = BlockTypeStateMachine::new();
-        // prefer_mixed=false on the Start call → no flag on Start
-        // (trivially — Start is never flagged).
         let (bt, mixed) = sm.step_with_mixed(false, true, false);
         assert_eq!(bt, BlockType::Start);
         assert!(!mixed);
-        // prefer_mixed=true on the Short call → flag set on Short.
         let (bt, mixed) = sm.step_with_mixed(true, true, true);
         assert_eq!(bt, BlockType::Short);
-        assert!(mixed);
-        // prefer_mixed=false on the next Short call → flag NOT set.
-        let (bt, mixed) = sm.step_with_mixed(true, false, false);
+        assert!(!mixed, "pure burst must stay pure (latch dominates)");
+        let (bt, mixed) = sm.step_with_mixed(true, false, true);
         assert_eq!(bt, BlockType::Short);
         assert!(!mixed);
+        let (bt, mixed) = sm.step_with_mixed(false, false, true);
+        assert_eq!(bt, BlockType::End);
+        assert!(!mixed);
+
+        // Mixed burst: preference at Start commit → the whole burst
+        // is mixed even if later calls ask for pure.
+        let mut sm = BlockTypeStateMachine::new();
+        let (bt, mixed) = sm.step_with_mixed(false, false, false);
+        assert_eq!(bt, BlockType::Long);
+        assert!(!mixed);
+        let (bt, mixed) = sm.step_with_mixed(false, true, true);
+        assert_eq!(bt, BlockType::Start);
+        assert!(mixed);
+        let (bt, mixed) = sm.step_with_mixed(true, false, false);
+        assert_eq!(bt, BlockType::Short);
+        assert!(mixed, "mixed burst must stay mixed (latch dominates)");
+        let (bt, mixed) = sm.step_with_mixed(false, false, false);
+        assert_eq!(bt, BlockType::End);
+        assert!(mixed);
+    }
+
+    /// Two consecutive bursts latch independently: a mixed burst
+    /// followed (after the mandatory Long gap) by a pure burst.
+    #[test]
+    fn step_with_mixed_relatch_per_burst() {
+        let mut sm = BlockTypeStateMachine::new();
+        // Mixed burst.
+        assert_eq!(
+            sm.step_with_mixed(false, true, true),
+            (BlockType::Start, true)
+        );
+        assert_eq!(
+            sm.step_with_mixed(true, false, false),
+            (BlockType::Short, true)
+        );
+        assert_eq!(
+            sm.step_with_mixed(false, false, false),
+            (BlockType::End, true)
+        );
+        // Long gap clears the latch.
+        assert_eq!(
+            sm.step_with_mixed(false, false, false),
+            (BlockType::Long, false)
+        );
+        // Pure burst.
+        assert_eq!(
+            sm.step_with_mixed(false, true, false),
+            (BlockType::Start, false)
+        );
+        assert_eq!(
+            sm.step_with_mixed(true, false, true),
+            (BlockType::Short, false)
+        );
+        assert_eq!(
+            sm.step_with_mixed(false, false, true),
+            (BlockType::End, false)
+        );
     }
 
     /// After Stop, the next granule MUST be Long — even if the

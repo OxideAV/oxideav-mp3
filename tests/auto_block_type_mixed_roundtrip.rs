@@ -441,3 +441,119 @@ fn mixed_auto_combines_with_outer_loop_and_roundtrips() {
     }
     assert!(packets > 0);
 }
+
+/// **r408 — mixed bursts carry `mixed_block_flag` on the flanking
+/// `Start` / `End` granules, and mixed-ness is constant within a
+/// burst.**
+///
+/// §2.4.2.7 scopes `mixed_block_flag` to every window-switched
+/// granule (block types 1 / 2 / 3): with the flag set, the two lowest
+/// polyphase subbands are transformed with the normal window while
+/// the remaining 30 follow the block type. The §2.4.3.4 overlap-add
+/// only cancels between complementary window halves, so the low
+/// subbands of a mixed burst must be normal-windowed from the `Start`
+/// through every `Short` to the `End` — a `Start(mixed=0) →
+/// Short(mixed=1)` pairing leaves uncancelled low-band aliasing in
+/// subbands 0..2 (observed before the fix as an nrmse ≈ 3e-2..8e-2
+/// low-band divergence on an independent black-box validator, while
+/// validators that reproduce the stream's literal window sequence
+/// agreed with our own decode — internal consistency masking a
+/// non-conformant stream).
+#[test]
+fn mixed_burst_flags_flanking_transition_granules() {
+    let n = SR as usize; // 1 s
+    let pcm = lf_dc_with_hf_click_train(n, /*click_period=*/ 6600);
+
+    let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("mono encoder build");
+    enc.enable_auto_block_type_with_mixed(DEFAULT_ATTACK_THRESHOLD, 8.0)
+        .expect("enable mixed-auto");
+    enc.push_samples(&pcm).expect("push pcm");
+    let mut bytes = Vec::new();
+    enc.finish(&mut bytes).expect("encoder finish");
+
+    // Flatten the stream into one granule-major sequence of
+    // (block_type, window_switching_flag, mixed_block_flag).
+    let mut seq: Vec<(BlockType, bool, bool)> = Vec::new();
+    for frame in FrameWalker::new(&bytes) {
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side info");
+        for gr in 0..si.granule_count as usize {
+            let gc = &si.granules[gr][0];
+            seq.push((gc.block_type, gc.window_switching_flag, gc.mixed_block_flag));
+        }
+    }
+    assert!(!seq.is_empty(), "no granules");
+
+    let mut mixed_bursts = 0usize;
+    for (i, &(bt, wsf, mixed)) in seq.iter().enumerate() {
+        // The flag never appears on a non-window-switched granule.
+        if !wsf {
+            assert!(
+                !mixed,
+                "granule {i}: mixed_block_flag on a non-switched Long"
+            );
+            continue;
+        }
+        match bt {
+            BlockType::Short => {
+                // Every neighbour of a Short inside the burst must
+                // carry the same mixed-ness: predecessor is Start or
+                // Short, successor is Short or End (the §C.1.5.2
+                // geometry), and both share this granule's flag.
+                let prev = seq[i - 1];
+                assert!(
+                    matches!(prev.0, BlockType::Start | BlockType::Short) && prev.1,
+                    "granule {i}: Short not preceded by Start/Short"
+                );
+                assert_eq!(
+                    prev.2, mixed,
+                    "granule {i}: mixed-ness changed inside a burst \
+                     (prev {:?} mixed={}, cur Short mixed={mixed})",
+                    prev.0, prev.2
+                );
+                if let Some(&next) = seq.get(i + 1) {
+                    assert!(
+                        matches!(next.0, BlockType::Short | BlockType::End) && next.1,
+                        "granule {i}: Short not followed by Short/End"
+                    );
+                    assert_eq!(
+                        next.2, mixed,
+                        "granule {i}: mixed-ness changed inside a burst \
+                         (cur Short mixed={mixed}, next {:?} mixed={})",
+                        next.0, next.2
+                    );
+                }
+                if mixed {
+                    mixed_bursts += 1;
+                }
+            }
+            BlockType::Start | BlockType::End => {
+                // A flanking transition granule's flag always equals
+                // its burst's Short flag — checked from the Short side
+                // above; here just confirm a flagged Start/End is
+                // actually adjacent to a mixed Short.
+                if mixed {
+                    let adjacent = if bt == BlockType::Start {
+                        seq.get(i + 1)
+                    } else {
+                        seq.get(i - 1)
+                    };
+                    if let Some(&(abt, awsf, amixed)) = adjacent {
+                        assert!(
+                            abt == BlockType::Short && awsf && amixed,
+                            "granule {i}: {bt:?} carries mixed_block_flag but its burst \
+                             Short is ({abt:?}, mixed={amixed})"
+                        );
+                    }
+                }
+            }
+            BlockType::Long => {
+                assert!(!mixed, "granule {i}: window-switched Long with mixed flag");
+            }
+        }
+    }
+    assert!(
+        mixed_bursts > 0,
+        "stimulus engaged no mixed burst — the invariant above was vacuous"
+    );
+}

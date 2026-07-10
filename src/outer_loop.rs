@@ -455,9 +455,14 @@ pub fn outer_loop_search_long_per_band(
         gc_template.block_type,
         gc_template.window_switching_flag,
     );
-    // Mixed-block flag is meaningful only for `block_type == Short`;
-    // for the long-family it must be off.
-    debug_assert!(!gc_template.mixed_block_flag);
+    // A Start / End granule flanking a mixed burst may carry
+    // `mixed_block_flag = 1` (§2.4.2.7: on a window-switched
+    // long-family granule the flag selects the normal window for the
+    // two lowest subbands — a synthesis-window choice only; spectral
+    // layout, part2 wire format, requantize formula, and region split
+    // are the plain long-family ones either way). Only a
+    // non-window-switched Long can never carry the flag.
+    debug_assert!(gc_template.window_switching_flag || !gc_template.mixed_block_flag);
 
     // §C.1.5.4.2.1: init scalefactors to zero, preflag off, scalefac_scale 0.
     let mut sf = ScaleFactors::default();
