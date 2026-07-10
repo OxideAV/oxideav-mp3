@@ -73,12 +73,22 @@ pub const U_LEN: usize = 512;
 /// start state.
 #[derive(Debug, Clone)]
 pub struct SynthState {
+    /// Physical ring storage. Logical `V[i]` lives at
+    /// `v[(pos + i) & (V_LEN - 1)]`; the Figure A.2 "Shifting" step is a
+    /// 64-slot rotation of `pos` instead of moving 960 values. The
+    /// stored values are the identical `f64`s the moving-shift form
+    /// holds, so all downstream arithmetic is bit-exact.
     v: [f64; V_LEN],
+    /// Ring origin of logical index 0; always a multiple of 64.
+    pos: usize,
 }
 
 impl Default for SynthState {
     fn default() -> Self {
-        SynthState { v: [0.0; V_LEN] }
+        SynthState {
+            v: [0.0; V_LEN],
+            pos: 0,
+        }
     }
 }
 
@@ -89,11 +99,11 @@ impl SynthState {
         Self::default()
     }
 
-    /// Read a single `V[i]` value (debug / test helper).
+    /// Read a single logical `V[i]` value (debug / test helper).
     #[must_use]
     pub fn v(&self, i: usize) -> f64 {
         if i < V_LEN {
-            self.v[i]
+            self.v[(self.pos + i) & (V_LEN - 1)]
         } else {
             0.0
         }
@@ -110,25 +120,26 @@ pub fn n_coefficient(i: usize, k: usize) -> f64 {
     arg.cos()
 }
 
-/// Precomputed matrixing matrix `N[i][k] = n_coefficient(i, k)` for the
-/// 64 `V[]` outputs × 32 subband inputs of the §2.4.3.2.2 matrixing step.
+/// Precomputed matrixing coefficients, transposed:
+/// `N_MATRIX_T[k][i] = n_coefficient(i, k)` for the 64 `V[]` outputs ×
+/// 32 subband inputs of the §2.4.3.2.2 matrixing step.
 ///
 /// The coefficients depend only on the constant index pair `(i, k)`, so
-/// every `cos()` is evaluated exactly once at first use and reused for
-/// every `synth_row` call thereafter — the inner matrixing loop becomes a
-/// plain table lookup. Each `N_MATRIX[i][k]` holds the identical `f64` bit
-/// pattern that `n_coefficient(i, k)` returns, and the per-`k` products are
-/// accumulated in the same `k = 0..32` order as before, so the matrixing
-/// result is bit-for-bit identical to evaluating the cosine per sample.
-static N_MATRIX: std::sync::LazyLock<[[f64; NUM_SUBBANDS]; 64]> = std::sync::LazyLock::new(|| {
-    let mut m = [[0.0f64; NUM_SUBBANDS]; 64];
-    for (i, row) in m.iter_mut().enumerate() {
-        for (k, slot) in row.iter_mut().enumerate() {
-            *slot = n_coefficient(i, k);
+/// every `cos()` is evaluated exactly once at first use; each entry
+/// holds the identical `f64` bit pattern `n_coefficient(i, k)` returns.
+/// The transpose lays the table out so the matrixing loop can run with
+/// `k` outermost (see [`synth_row`]) and touch 64 consecutive
+/// coefficients per input sample.
+static N_MATRIX_T: std::sync::LazyLock<[[f64; 64]; NUM_SUBBANDS]> =
+    std::sync::LazyLock::new(|| {
+        let mut m = [[0.0f64; 64]; NUM_SUBBANDS];
+        for (k, row) in m.iter_mut().enumerate() {
+            for (i, slot) in row.iter_mut().enumerate() {
+                *slot = n_coefficient(i, k);
+            }
         }
-    }
-    m
-});
+        m
+    });
 
 /// Run one pass of the Figure A.2 polyphase synthesis filter: consume 32
 /// subband samples `s[0..32]` and produce 32 PCM samples (returned).
@@ -140,48 +151,64 @@ static N_MATRIX: std::sync::LazyLock<[[f64; NUM_SUBBANDS]; 64]> = std::sync::Laz
 #[must_use]
 pub fn synth_row(s: &[f64; NUM_SUBBANDS], state: &mut SynthState) -> [f64; NUM_SUBBANDS] {
     // Step 1: Shifting — for i = 1023 down to 64 do V[i] = V[i-64].
-    // `copy_within` performs the shift correctly (LLVM lowers to memmove,
-    // which preserves overlapping semantics for descending indices).
-    state.v.copy_within(0..(V_LEN - 64), 64);
+    // Realised as a ring rotation: logical index 0 moves back 64 slots,
+    // so every stored value's logical index grows by 64 without moving
+    // any data (`V_LEN` is a power of two; `pos` stays 64-aligned). The
+    // slots at logical 0..64 (about to be overwritten by the matrixing
+    // below) hold the stale values logical 960..1024 just discarded.
+    state.pos = (state.pos + V_LEN - 64) & (V_LEN - 1);
+    let pos = state.pos;
 
     // Step 2: Matrixing — V[i] = sum_{k=0..31} N[i,k] * S[k] for i = 0..64.
-    // `N_MATRIX` is the per-`(i,k)` cosine table computed once at first use;
-    // the products are summed in the same `k = 0..32` order as the original
-    // per-sample `n_coefficient` call, so the result is bit-identical.
-    let n_matrix = &*N_MATRIX;
-    for (slot, n_row) in state.v[..64].iter_mut().zip(n_matrix.iter()) {
-        let mut acc = 0.0f64;
-        for (&nk, &sk) in n_row.iter().zip(s.iter()) {
-            acc += nk * sk;
+    // Run with `k` outermost over the transposed coefficient table: every
+    // output accumulator `acc[i]` still receives the products
+    // `N[i,k] · S[k]` in the identical ascending-`k` order (each `+=` adds
+    // the same `f64` product to the same running sum), so each `V[i]` is
+    // bit-for-bit the value the `i`-outer form produces — but the inner
+    // loop now walks 64 consecutive coefficients with a broadcast `S[k]`,
+    // which the compiler can vectorize across the independent `i` lanes
+    // (pinned by `synth_row_interchanged_matrixing_matches_reference`).
+    let n_matrix_t = &*N_MATRIX_T;
+    let mut acc = [0.0f64; 64];
+    for (nt_row, &sk) in n_matrix_t.iter().zip(s.iter()) {
+        for (a, &nik) in acc.iter_mut().zip(nt_row.iter()) {
+            *a += nik * sk;
         }
-        *slot = acc;
     }
+    state.v[pos..pos + 64].copy_from_slice(&acc);
 
     // Step 3: Build a 512-values vector U[].
     //   for i = 0..8, for j = 0..32:
     //     U[64*i + j]      = V[128*i + j]
     //     U[64*i + 32 + j] = V[128*i + 96 + j]
+    // Each logical 32-run starts 32-aligned in the ring (pos and 128·i
+    // are 64-aligned; +96 keeps 32-alignment), so a run never crosses
+    // the wrap and can be copied as one contiguous slice.
     let mut u = [0.0f64; U_LEN];
     for i in 0..8 {
-        let v_base = 128 * i;
+        let b0 = (pos + 128 * i) & (V_LEN - 1);
+        let b1 = (pos + 128 * i + 96) & (V_LEN - 1);
         let u_base = 64 * i;
-        for j in 0..32 {
-            u[u_base + j] = state.v[v_base + j];
-            u[u_base + 32 + j] = state.v[v_base + 96 + j];
-        }
+        u[u_base..u_base + 32].copy_from_slice(&state.v[b0..b0 + 32]);
+        u[u_base + 32..u_base + 64].copy_from_slice(&state.v[b1..b1 + 32]);
     }
 
     // Step 4: Window — W[i] = U[i] * D[i]. (We fold W into the summation
     // step rather than materialising it.)
     // Step 5: Sum — S_out[j] = sum_{i=0..16} W[j + 32*i] for j = 0..32.
+    // Run with `i` outermost: each `out[j]` accumulates the identical
+    // products `U[j+32i] · D[j+32i]` in the identical ascending-`i`
+    // order (bit-exact vs. the `j`-outer form), while the inner loop
+    // walks 32 consecutive `u` / `D_TABLE` values — vectorizable across
+    // the independent `j` lanes.
     let mut out = [0.0f64; NUM_SUBBANDS];
-    for (j, slot) in out.iter_mut().enumerate() {
-        let mut acc = 0.0f64;
-        for i in 0..16 {
-            let idx = j + 32 * i;
-            acc += u[idx] * D_TABLE[idx];
+    for i in 0..16 {
+        let base = 32 * i;
+        let u_row = &u[base..base + NUM_SUBBANDS];
+        let d_row = &D_TABLE[base..base + NUM_SUBBANDS];
+        for ((slot, &uv), &dv) in out.iter_mut().zip(u_row.iter()).zip(d_row.iter()) {
+            *slot += uv * dv;
         }
-        *slot = acc;
     }
     out
 }

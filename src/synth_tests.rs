@@ -505,3 +505,98 @@ fn pcm_clips_out_of_range_inputs() {
     assert_eq!(pcm_f32_to_i16(2.0), i16::MAX);
     assert_eq!(pcm_f32_to_i16(-2.0), i16::MIN);
 }
+
+// ---------------------------------------------------------------------
+// r409 loop-interchange pinning: the k-outer matrixing and i-outer
+// window summation must be bit-for-bit identical to the straightforward
+// Figure A.2 per-output forms.
+// ---------------------------------------------------------------------
+
+fn xorshift32_r409(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
+}
+
+fn random_f64_r409(rng: &mut u32) -> f64 {
+    let a = xorshift32_r409(rng);
+    let mag = f64::from(a & 0xFFFFFF) / f64::from(0xFFFFFFu32);
+    let exp = f64::from((a >> 24) % 24) - 12.0;
+    let v = mag * exp.exp2();
+    if a & 0x8000 != 0 {
+        -v
+    } else {
+        v
+    }
+}
+
+/// Straightforward Figure A.2 reference row: per-output `i`-outer
+/// matrixing with the inline `n_coefficient` cosine, the U build, and
+/// the per-output `j`-outer windowed sum — the pre-r409 form.
+fn synth_row_reference(s: &[f64; NUM_SUBBANDS], state: &mut SynthState) -> [f64; NUM_SUBBANDS] {
+    state.v.copy_within(0..(V_LEN - 64), 64);
+    for i in 0..64 {
+        let mut acc = 0.0f64;
+        for (k, &sk) in s.iter().enumerate() {
+            acc += n_coefficient(i, k) * sk;
+        }
+        state.v[i] = acc;
+    }
+    let mut u = [0.0f64; U_LEN];
+    for i in 0..8 {
+        let v_base = 128 * i;
+        let u_base = 64 * i;
+        for j in 0..32 {
+            u[u_base + j] = state.v[v_base + j];
+            u[u_base + 32 + j] = state.v[v_base + 96 + j];
+        }
+    }
+    let mut out = [0.0f64; NUM_SUBBANDS];
+    for (j, slot) in out.iter_mut().enumerate() {
+        let mut acc = 0.0f64;
+        for i in 0..16 {
+            let idx = j + 32 * i;
+            acc += u[idx] * D_TABLE[idx];
+        }
+        *slot = acc;
+    }
+    out
+}
+
+/// The production `synth_row` (transposed-table `k`-outer matrixing +
+/// `i`-outer windowed sum) must produce bit-identical PCM and `V[]`
+/// state to the straightforward reference across a long streamed run
+/// (so the shift register history diverges if anything is off).
+#[test]
+fn synth_row_interchanged_matrixing_matches_reference() {
+    let mut rng: u32 = 0x5e17_b09a;
+    let mut state_prod = SynthState::new();
+    let mut state_ref = SynthState::new();
+    for row in 0..200 {
+        let mut s = [0.0f64; NUM_SUBBANDS];
+        for v in s.iter_mut() {
+            if xorshift32_r409(&mut rng) % 6 != 0 {
+                *v = random_f64_r409(&mut rng);
+            }
+        }
+        let got = synth_row(&s, &mut state_prod);
+        let want = synth_row_reference(&s, &mut state_ref);
+        for j in 0..NUM_SUBBANDS {
+            assert_eq!(
+                got[j].to_bits(),
+                want[j].to_bits(),
+                "row {row} output {j}: {} != {}",
+                got[j],
+                want[j]
+            );
+        }
+        for i in 0..V_LEN {
+            assert_eq!(
+                state_prod.v(i).to_bits(),
+                state_ref.v(i).to_bits(),
+                "row {row} V[{i}] diverged"
+            );
+        }
+    }
+}

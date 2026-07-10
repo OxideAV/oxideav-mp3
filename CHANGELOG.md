@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- synth: **vectorizable matrixing + windowed sum, and a ring-buffer
+  shift register** (r409, bench axis). The Figure A.2 matrixing ran one
+  output at a time (64 independent 32-term dependent-chain sums); it now
+  runs with `k` outermost over a transposed coefficient table, so each
+  accumulator still receives its products in the identical ascending-`k`
+  order (bit-exact per output) while the inner loop walks 64 consecutive
+  coefficients with a broadcast `S[k]` — a form the compiler vectorizes.
+  The 512-tap windowed sum is interchanged the same way (`i` outer, 32
+  consecutive `U`/`D` lanes inner, identical per-output order). The
+  "Shifting" step no longer moves 960 `f64`s per row: `V[]` is a
+  power-of-two ring and the shift is a 64-slot rotation of the origin
+  (`V[i]` ↦ `v[(pos+i) & 1023]`), with the `U` build reading 32-value
+  runs that stay wrap-free by 32-alignment. Pure data-movement /
+  summation-order-preserving changes — decoded PCM and the `V[]`
+  history are bit-for-bit unchanged, pinned by
+  `synth_row_interchanged_matrixing_matches_reference` (200 streamed
+  rows against the straightforward per-output reference, comparing
+  every output and every `V[]` slot by bit pattern). `stage_synth`
+  drops 50% (321.9 µs → 161.2 µs per 40-granule batch).
+
+### Changed
+
 - huffman: **single-pass region costing for the encoder's codebook
   chooser** (r409, bench axis). `choose_best_table_for_region` costed
   the region once per selectable codebook (30 passes, each re-deriving
