@@ -78,6 +78,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- tests: **corpus-wide differential decode sweep**
+  (`tests/corpus_reference_pcm.rs`, r405). Every Layer III fixture under
+  `docs/audio/mp3/fixtures/` — all 16 of them: MPEG-1 mono/stereo at
+  32 / 44.1 / 48 kHz, CBR 320, VBR, joint stereo (MS and intensity),
+  short and mixed blocks, ID3v2 / Xing / VBRI frontmatter, the padding
+  byte cycle, MPEG-2 LSF 22.05 kHz, and MPEG-2.5 11.025 kHz — is now
+  decoded through the *production* chain (`Mp3Demuxer` → registered
+  `Decoder`) and compared against its staged black-box reference PCM
+  (`expected.wav`), aligned by peak normalized cross-correlation.
+  Measured result: all 16 fixtures track their reference in the
+  float-rounding regime (steady-state normalized RMS error ≤ 1.6e-5,
+  alignment NCC = 1.0000) at the canonical 1105-sample codec-delay lag;
+  the test pins nrmse < 2e-4, NCC > 0.999, and the exact 1105 lag per
+  fixture. This generalizes the two single-fixture reference tests
+  (`lsf_reference_pcm.rs`, `mpeg25_reference_pcm.rs`) to the whole
+  corpus and to the demuxer + trait-decoder path a real player uses.
+  Skips with a log line when the docs corpus is absent (standalone
+  CI checkout).
+
 - bench: **whole-stream encode benchmark harness** (`benches/encode.rs`,
   r398). A depth-mode Criterion harness times the full PCM → Layer III
   encode — analysis polyphase filterbank, forward MDCT with
