@@ -303,13 +303,42 @@ fn pow2_quarter(quarter_numerator: i32) -> f32 {
     (quarter_numerator as f32 * 0.25).exp2()
 }
 
+/// Largest magnitude the Table 3-B.7 codebooks can deliver: the
+/// `linbits = 13` ESC tables reach `15 + 2^13 − 1 = 8206`, so every
+/// `is[]` line a conforming bitstream can carry is `≤ 8206` in
+/// magnitude and the power-law table below covers the whole decodable
+/// range. (Out-of-range magnitudes — only reachable through the public
+/// `requantize` API with hand-built buffers — fall back to the direct
+/// `powf`.)
+const POW43_TABLE_LEN: usize = 8207;
+
+/// Precomputed `mag^(4/3)` for every decodable magnitude
+/// `0..=8206`: each entry is `(mag as f32).powf(4.0 / 3.0)` — the
+/// identical expression [`signed_pow43`] evaluates, so the looked-up
+/// value carries the identical `f32` bit pattern.
+static POW43_TABLE: std::sync::LazyLock<Vec<f32>> = std::sync::LazyLock::new(|| {
+    (0..POW43_TABLE_LEN)
+        .map(|mag| (mag as f32).powf(4.0 / 3.0))
+        .collect()
+});
+
 /// `|is|^(4/3)` with the sign of `is` reapplied. `is == 0` maps to
 /// `0.0` exactly.
+///
+/// Magnitudes in the decodable range (`≤ 8206`) read the precomputed
+/// [`POW43_TABLE`] (identical bit pattern to the direct `powf`, which
+/// remains the fallback for out-of-range magnitudes; pinned by
+/// `signed_pow43_table_matches_direct_powf`).
 fn signed_pow43(is: i32) -> f32 {
     if is == 0 {
         return 0.0;
     }
-    let mag = (is.unsigned_abs() as f32).powf(4.0 / 3.0);
+    let umag = is.unsigned_abs() as usize;
+    let mag = if umag < POW43_TABLE_LEN {
+        POW43_TABLE[umag]
+    } else {
+        (is.unsigned_abs() as f32).powf(4.0 / 3.0)
+    };
     if is < 0 {
         -mag
     } else {
@@ -424,11 +453,25 @@ fn requantize_long_range(
     // Long-block global gain term: 2^((global_gain - 210)/4).
     let gain = pow2_quarter(global - GAIN_BIAS);
 
-    let mut sfb = 0usize;
-    for i in lo..hi {
-        // Advance the band cursor so `i` lies in [starts[sfb], starts[sfb+1]).
-        while sfb + 1 < starts.len() && i >= starts[sfb + 1] {
-            sfb += 1;
+    // The per-band term `sf_term = 2^(−mult·scalefac)` depends only on
+    // the band index, so it is computed once per band and reused for
+    // every line of the band — the same expression on the same inputs
+    // as evaluating it per line, and the per-line product keeps the
+    // exact `signed_pow43(is[i]) * gain * sf_term` association, so the
+    // output is bit-identical (pinned by
+    // `requantize_hoisted_band_term_matches_per_line`). Band 21 is the
+    // tail above the highest band: scalefactor zero (§2.4.2.7: "the
+    // scale factor for frequency lines above the highest line ... is
+    // zero").
+    for sfb in 0..starts.len() {
+        let band_lo = starts[sfb].max(lo);
+        let band_hi = if sfb + 1 < starts.len() {
+            starts[sfb + 1].min(hi)
+        } else {
+            hi
+        };
+        if band_lo >= band_hi {
+            continue;
         }
         let scalefac = if sfb < 21 {
             let pre = if sf.preflag {
@@ -438,13 +481,12 @@ fn requantize_long_range(
             };
             u32::from(sf.long[sfb]) + pre
         } else {
-            // Lines above the highest band have scalefactor zero
-            // (§2.4.2.7: "the scale factor for frequency lines above the
-            // highest line ... is zero").
             0
         };
         let sf_term = (-(mult * scalefac as f32)).exp2();
-        xr[i] = signed_pow43(is[i]) * gain * sf_term;
+        for i in band_lo..band_hi {
+            xr[i] = signed_pow43(is[i]) * gain * sf_term;
+        }
     }
 }
 

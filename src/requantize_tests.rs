@@ -594,3 +594,142 @@ fn standard_rate_mixed_split_unchanged_at_36() {
     approx(xr[35], 1.0);
     approx(xr[36], 0.5);
 }
+
+// ---------------------------------------------------------------------
+// r409 pinning: hoisted per-band term + pow-4/3 magnitude table.
+// ---------------------------------------------------------------------
+
+fn xorshift32_r409(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
+}
+
+/// Every table entry (and the negative side) must carry the identical
+/// bit pattern of the direct `powf` expression; out-of-range magnitudes
+/// take the fallback and must match too.
+#[test]
+fn signed_pow43_table_matches_direct_powf() {
+    for mag in 0..POW43_TABLE_LEN as i32 {
+        let direct = if mag == 0 {
+            0.0f32
+        } else {
+            (mag as f32).powf(4.0 / 3.0)
+        };
+        assert_eq!(
+            signed_pow43(mag).to_bits(),
+            direct.to_bits(),
+            "pow43 table diverged at {mag}"
+        );
+        if mag != 0 {
+            // (i32 has no negative zero; is == 0 maps to +0.0 exactly,
+            // as it always has.)
+            assert_eq!(
+                signed_pow43(-mag).to_bits(),
+                (-direct).to_bits(),
+                "pow43 table diverged at -{mag}"
+            );
+        }
+    }
+    // Beyond the decodable range: the powf fallback.
+    for &mag in &[8207i32, 20000, 1 << 20] {
+        let direct = (mag as f32).powf(4.0 / 3.0);
+        assert_eq!(signed_pow43(mag).to_bits(), direct.to_bits());
+    }
+}
+
+/// Straightforward per-line reference for `requantize_long_range` (the
+/// pre-r409 form: band cursor walk + per-line `sf_term`, identical
+/// `pow43 * gain * sf_term` association).
+#[allow(clippy::too_many_arguments)]
+fn requantize_long_range_per_line_reference(
+    xr: &mut [f32; NUM_LINES],
+    is: &[i32; NUM_LINES],
+    sf: &ScaleFactors,
+    lo: usize,
+    hi: usize,
+    global: i32,
+    mult: f32,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) {
+    let starts = long_band_starts(sample_rate_hz, version);
+    let gain = pow2_quarter(global - GAIN_BIAS);
+    let mut sfb = 0usize;
+    for i in lo..hi {
+        while sfb + 1 < starts.len() && i >= starts[sfb + 1] {
+            sfb += 1;
+        }
+        let scalefac = if sfb < 21 {
+            let pre = if sf.preflag {
+                u32::from(PRETAB[sfb])
+            } else {
+                0
+            };
+            u32::from(sf.long[sfb]) + pre
+        } else {
+            0
+        };
+        let sf_term = (-(mult * scalefac as f32)).exp2();
+        xr[i] = signed_pow43(is[i]) * gain * sf_term;
+    }
+}
+
+/// The hoisted per-band loop must produce bit-identical `xr[]` to the
+/// straightforward per-line evaluation across band tables, scalefactor
+/// configurations, gains, and sub-ranges.
+#[test]
+fn requantize_hoisted_band_term_matches_per_line() {
+    let rates: &[(u32, MpegVersion)] = &[
+        (32_000, MpegVersion::Mpeg1),
+        (44_100, MpegVersion::Mpeg1),
+        (48_000, MpegVersion::Mpeg1),
+        (16_000, MpegVersion::Mpeg2),
+        (22_050, MpegVersion::Mpeg2),
+        (24_000, MpegVersion::Mpeg2),
+        (8_000, MpegVersion::Mpeg25),
+        (11_025, MpegVersion::Mpeg25),
+        (12_000, MpegVersion::Mpeg25),
+    ];
+    let mut rng: u32 = 0x4e9a_0409;
+    for &(rate, version) in rates {
+        for case in 0..8 {
+            let mut sf = ScaleFactors {
+                preflag: case % 2 == 1,
+                ..ScaleFactors::default()
+            };
+            for b in sf.long.iter_mut() {
+                *b = (xorshift32_r409(&mut rng) % 16) as u8;
+            }
+            let mult = scalefac_multiplier(case % 3 == 1);
+            let global = i32::from((xorshift32_r409(&mut rng) % 256) as u8);
+            let mut is = [0i32; NUM_LINES];
+            for v in is.iter_mut() {
+                let r = xorshift32_r409(&mut rng);
+                *v = match r % 5 {
+                    0 => 0,
+                    1 => ((r >> 8) % 3) as i32 - 1,
+                    2 => ((r >> 8) % 30) as i32 - 15,
+                    3 => ((r >> 8) % 500) as i32 - 250,
+                    _ => ((r >> 8) % 16413) as i32 - 8206,
+                };
+            }
+            for &(lo, hi) in &[(0usize, NUM_LINES), (0, 72), (36, 400)] {
+                let mut got = [0.0f32; NUM_LINES];
+                let mut want = [0.0f32; NUM_LINES];
+                requantize_long_range(&mut got, &is, &sf, lo, hi, global, mult, rate, version);
+                requantize_long_range_per_line_reference(
+                    &mut want, &is, &sf, lo, hi, global, mult, rate, version,
+                );
+                for i in 0..NUM_LINES {
+                    assert_eq!(
+                        got[i].to_bits(),
+                        want[i].to_bits(),
+                        "hoisted requantize diverged at line {i} (rate {rate}, case {case}, range {lo}..{hi})"
+                    );
+                }
+            }
+        }
+    }
+}

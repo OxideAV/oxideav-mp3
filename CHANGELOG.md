@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- requantize: **per-band gain term hoisted + precomputed `mag^(4/3)`
+  table** (r409, bench axis). The decoder's long-range requantizer
+  re-derived `sf_term = 2^(−mult·scalefac)` per line (it depends only
+  on the band) and evaluated `|is|^(4/3)` with a `powf` per non-zero
+  line. The band term is now computed once per Table 3-B.8 band (same
+  expression, same inputs; the per-line product keeps the exact
+  `pow43 · gain · sf_term` association), and the power law reads a
+  precomputed table over the full decodable magnitude range 0..=8206
+  (the linbits-13 codebook ceiling) — each entry is the identical
+  expression's `f32`, with the direct `powf` retained as the
+  out-of-range fallback for hand-built API inputs. Decoded PCM is
+  bit-for-bit unchanged, pinned by
+  `signed_pow43_table_matches_direct_powf` (every magnitude, both
+  signs, plus fallback values) and
+  `requantize_hoisted_band_term_matches_per_line` (per-line reference
+  across all nine rates, random configurations, and sub-ranges).
+  `stage_requantize` drops 68% (76.7 µs → 23.5 µs per 40-granule
+  batch).
+
+### Changed
+
 - analysis / mdct: **precomputed kernel tables + vectorizable
   interchanged loops for the encoder front-end DSP** (r409, bench
   axis). The analysis filterbank re-evaluated the §C.1.3 matrixing
