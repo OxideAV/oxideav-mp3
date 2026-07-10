@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- analysis / mdct: **precomputed kernel tables + vectorizable
+  interchanged loops for the encoder front-end DSP** (r409, bench
+  axis). The analysis filterbank re-evaluated the §C.1.3 matrixing
+  cosine `M[i,k] = cos((2i+1)(k−16)π/64)` inline — 2048 `cos()` calls
+  per 32-sample row — and the forward MDCT re-evaluated its
+  §2.4.3.4.10.2 kernel cosine per (bin, sample) pair; both kernels are
+  now precomputed once (identical expressions, identical `f64` bit
+  patterns) and the matrixing / partial-calculation / transform loops
+  run with the reduction index outermost, so every output accumulates
+  its products in the identical ascending order (bit-exact per output)
+  over consecutive vectorizable lanes. The analysis window functions
+  get the same table treatment (the Start/End short half-window
+  arguments are exactly `analysis_short_window(i−18)` / `(i−6)`).
+  Pinned by `analyze_row_interchanged_matrixing_matches_reference`
+  (200 streamed rows vs the inline-cosine per-output reference,
+  outputs and `X[]` state compared by bit pattern) and
+  `mdct_fast_paths_match_generic_form` (n = 36 / 12 table paths vs the
+  retained generic inline-cosine form, plus window-table bit checks).
+  Encoded streams are byte-identical. `encode_stage_filterbank` drops
+  95.6% (3.82 ms → 168 µs) and `encode_stage_mdct_long` 89.6%
+  (1.86 ms → 193 µs). Cumulative r409 whole-stream **encode**: tone
+  −90%, noise −69%, sweep −87%, mixed stereo −76% (mono 44.1 kHz tone
+  now ≈ 3.3 ms per 0.5 s clip ≈ 150× real-time); whole-stream
+  **decode** is −36…−39% from the synth/imdct work (≈ 125× real-time
+  mono at 44.1 kHz).
+
+### Changed
+
 - imdct: **vectorizable k-outer transforms** (r409, bench axis). The
   stack IMDCTs (`n = 36` long, `n = 12` short) ran one output at a time
   (dependent-chain sums); they now run with `k` outermost over

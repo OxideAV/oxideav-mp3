@@ -72,6 +72,46 @@ pub const LONG_N: usize = 36;
 /// `n = 12`).
 pub const SHORT_N: usize = 12;
 
+/// Precomputed forward-MDCT cosine table for the long transform
+/// (`n = 36`): `MDCT_COS_LONG[i][k] = cos(scale · a · b)` with the
+/// argument assembled by the **identical expression** the generic
+/// [`mdct`] loop evaluates inline (`scale = π/(2n)`, `a = 2i+1+n/2`,
+/// `b = 2k+1`), so every entry carries the bit-identical `f64`. Row `i`
+/// holds the 18 per-bin coefficients of time sample `i`, letting the
+/// fast path run `i` outermost and touch consecutive `k` lanes.
+static MDCT_COS_LONG: std::sync::LazyLock<[[f64; LONG_N / 2]; LONG_N]> =
+    std::sync::LazyLock::new(|| {
+        let half = LONG_N / 2;
+        let scale = PI / (2.0 * LONG_N as f64);
+        let mut m = [[0.0f64; LONG_N / 2]; LONG_N];
+        for (i, row) in m.iter_mut().enumerate() {
+            let a = (2 * i + 1 + half) as f64;
+            for (k, slot) in row.iter_mut().enumerate() {
+                let b = (2 * k + 1) as f64;
+                *slot = (scale * a * b).cos();
+            }
+        }
+        m
+    });
+
+/// Precomputed forward-MDCT cosine table for the short transform
+/// (`n = 12`); same bit-identical-expression guarantee as
+/// [`MDCT_COS_LONG`].
+static MDCT_COS_SHORT: std::sync::LazyLock<[[f64; SHORT_N / 2]; SHORT_N]> =
+    std::sync::LazyLock::new(|| {
+        let half = SHORT_N / 2;
+        let scale = PI / (2.0 * SHORT_N as f64);
+        let mut m = [[0.0f64; SHORT_N / 2]; SHORT_N];
+        for (i, row) in m.iter_mut().enumerate() {
+            let a = (2 * i + 1 + half) as f64;
+            for (k, slot) in row.iter_mut().enumerate() {
+                let b = (2 * k + 1) as f64;
+                *slot = (scale * a * b).cos();
+            }
+        }
+        m
+    });
+
 /// Forward MDCT (§2.4.3.4.10.2 analysis): transform `n` time samples
 /// `xn` into `n/2` frequency bins.
 ///
@@ -98,22 +138,54 @@ pub const SHORT_N: usize = 12;
 pub fn mdct(xn: &[f64], n: usize) -> Vec<f64> {
     debug_assert_eq!(xn.len(), n, "mdct: xn must have n entries");
     let half = n / 2;
-    let nn = n as f64;
-    // pi / (2n) — the kernel's per-(i,k) outer factor, matching the
-    // §2.4.3.4.10.2 IMDCT exactly.
-    let scale = PI / (2.0 * nn);
     let mut out = vec![0.0f64; half];
-    for (k, ok) in out.iter_mut().enumerate() {
-        // (2k + 1): the per-output (per-bin) phase factor.
-        let b = (2 * k + 1) as f64;
-        let mut acc = 0.0f64;
-        for (i, &x) in xn.iter().enumerate() {
-            // (2i + 1 + n/2): the per-time-sample phase offset, the same
-            // expression the IMDCT uses for its output-side phase.
-            let a = (2 * i + 1 + half) as f64;
-            acc += x * (scale * a * b).cos();
+    match n {
+        // The two transform sizes the codec uses run `i` outermost over
+        // the precomputed cosine tables: every output bin `out[k]` still
+        // accumulates its products `x[i] · cos(...)` in the identical
+        // ascending-`i` order (each `+=` adds the same `f64` product to
+        // the same running sum), so each bin is bit-for-bit the value
+        // the generic per-bin form below produces (pinned by
+        // `mdct_fast_paths_match_generic_form`) — while the inner loop
+        // walks consecutive `k` lanes with a broadcast `x[i]`,
+        // vectorizable across the independent bins.
+        LONG_N => {
+            let cos = &*MDCT_COS_LONG;
+            for (c_row, &x) in cos.iter().zip(xn.iter()) {
+                for (ok, &ck) in out.iter_mut().zip(c_row.iter()) {
+                    *ok += x * ck;
+                }
+            }
         }
-        *ok = acc;
+        SHORT_N => {
+            let cos = &*MDCT_COS_SHORT;
+            for (c_row, &x) in cos.iter().zip(xn.iter()) {
+                for (ok, &ck) in out.iter_mut().zip(c_row.iter()) {
+                    *ok += x * ck;
+                }
+            }
+        }
+        _ => {
+            // Generic form for any other even `n` (tests / exploratory
+            // callers): per-bin accumulation with the inline cosine.
+            let nn = n as f64;
+            // pi / (2n) — the kernel's per-(i,k) outer factor, matching
+            // the §2.4.3.4.10.2 IMDCT exactly.
+            let scale = PI / (2.0 * nn);
+            for (k, ok) in out.iter_mut().enumerate() {
+                // (2k + 1): the per-output (per-bin) phase factor.
+                let b = (2 * k + 1) as f64;
+                let mut acc = 0.0f64;
+                for (i, &x) in xn.iter().enumerate() {
+                    // (2i + 1 + n/2): the per-time-sample phase offset,
+                    // the same expression the IMDCT uses for its
+                    // output-side phase.
+                    let a = (2 * i + 1 + half) as f64;
+                    acc += x * (scale * a * b).cos();
+                }
+                *ok = acc;
+            }
+        }
     }
     out
 }
@@ -154,6 +226,27 @@ pub fn analysis_short_window(i: usize) -> f64 {
     arg.sin()
 }
 
+/// Precomputed [`analysis_long_window`] values (`i = 0..36`): each entry
+/// is the identical `f64` the function returns for the same `i`.
+static ANALYSIS_LONG_WINDOW: std::sync::LazyLock<[f64; LONG_N]> = std::sync::LazyLock::new(|| {
+    let mut w = [0.0f64; LONG_N];
+    for (i, slot) in w.iter_mut().enumerate() {
+        *slot = analysis_long_window(i);
+    }
+    w
+});
+
+/// Precomputed [`analysis_short_window`] values (`i = 0..12`): each
+/// entry is the identical `f64` the function returns for the same `i`.
+static ANALYSIS_SHORT_WINDOW: std::sync::LazyLock<[f64; SHORT_N]> =
+    std::sync::LazyLock::new(|| {
+        let mut w = [0.0f64; SHORT_N];
+        for (i, slot) in w.iter_mut().enumerate() {
+            *slot = analysis_short_window(i);
+        }
+        w
+    });
+
 /// Apply the long-family analysis window (block_type 0 / 1 / 3) to the
 /// 36 forward-overlap input samples `xn[0..36]`, producing the 36
 /// windowed samples that feed the 36-point forward MDCT.
@@ -175,17 +268,20 @@ pub fn analysis_short_window(i: usize) -> f64 {
 /// sub-blocks; use [`window_short_analysis`] for that path.
 #[must_use]
 pub fn window_long_family_analysis(xn: &[f64; LONG_N], block_type: BlockType) -> [f64; LONG_N] {
+    // Window values come from the precomputed tables; every entry is the
+    // identical `f64` the inline `sin` produced (the Start/End short
+    // half-window arguments `(π/12)·((i−18)+0.5)` / `(π/12)·((i−6)+0.5)`
+    // are exactly `analysis_short_window(i−18)` / `(i−6)`).
+    let lw = &*ANALYSIS_LONG_WINDOW;
+    let sw = &*ANALYSIS_SHORT_WINDOW;
     let mut out = [0.0f64; LONG_N];
     match block_type {
         BlockType::Start => {
             for (i, oi) in out.iter_mut().enumerate() {
                 *oi = match i {
-                    0..=17 => xn[i] * analysis_long_window(i),
+                    0..=17 => xn[i] * lw[i],
                     18..=23 => xn[i],
-                    24..=29 => {
-                        let arg = (PI / 12.0) * ((i - 18) as f64 + 0.5);
-                        xn[i] * arg.sin()
-                    }
+                    24..=29 => xn[i] * sw[i - 18],
                     _ => 0.0, // 30..=35
                 };
             }
@@ -194,12 +290,9 @@ pub fn window_long_family_analysis(xn: &[f64; LONG_N], block_type: BlockType) ->
             for (i, oi) in out.iter_mut().enumerate() {
                 *oi = match i {
                     0..=5 => 0.0,
-                    6..=11 => {
-                        let arg = (PI / 12.0) * ((i - 6) as f64 + 0.5);
-                        xn[i] * arg.sin()
-                    }
+                    6..=11 => xn[i] * sw[i - 6],
                     12..=17 => xn[i],
-                    _ => xn[i] * analysis_long_window(i), // 18..=35
+                    _ => xn[i] * lw[i], // 18..=35
                 };
             }
         }
@@ -207,7 +300,7 @@ pub fn window_long_family_analysis(xn: &[f64; LONG_N], block_type: BlockType) ->
             // BlockType::Long (block_type 0) — and any other long-family
             // dispatch — use the plain sine window across all 36 samples.
             for (i, oi) in out.iter_mut().enumerate() {
-                *oi = xn[i] * analysis_long_window(i);
+                *oi = xn[i] * lw[i];
             }
         }
     }
@@ -248,11 +341,12 @@ pub fn window_long_family_analysis(xn: &[f64; LONG_N], block_type: BlockType) ->
 /// the 12-point [`mdct`].
 #[must_use]
 pub fn window_short_analysis(xn: &[f64; LONG_N]) -> [[f64; SHORT_N]; 3] {
+    let sw = &*ANALYSIS_SHORT_WINDOW;
     let mut out = [[0.0f64; SHORT_N]; 3];
     for (j, oj) in out.iter_mut().enumerate() {
         for (k, ok) in oj.iter_mut().enumerate() {
             let src_i = 6 + 6 * j + k;
-            *ok = xn[src_i] * analysis_short_window(k);
+            *ok = xn[src_i] * sw[k];
         }
     }
     out
@@ -1029,5 +1123,78 @@ mod tests_inner {
             "imdct(mdct(δ_0))[11] = {} expected 0",
             out[11],
         );
+    }
+
+    // -----------------------------------------------------------------
+    // r409 fast-path pinning
+    // -----------------------------------------------------------------
+
+    fn xorshift32_r409(state: &mut u32) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        *state
+    }
+
+    /// Generic per-bin inline-cosine form of the forward MDCT — the
+    /// pre-r409 body of `mdct()`, kept as the pinned reference.
+    fn mdct_generic_reference(xn: &[f64], n: usize) -> Vec<f64> {
+        let half = n / 2;
+        let nn = n as f64;
+        let scale = PI / (2.0 * nn);
+        let mut out = vec![0.0f64; half];
+        for (k, ok) in out.iter_mut().enumerate() {
+            let b = (2 * k + 1) as f64;
+            let mut acc = 0.0f64;
+            for (i, &x) in xn.iter().enumerate() {
+                let a = (2 * i + 1 + half) as f64;
+                acc += x * (scale * a * b).cos();
+            }
+            *ok = acc;
+        }
+        out
+    }
+
+    /// The n = 36 / n = 12 table fast paths (i-outer interchange) must
+    /// match the generic inline-cosine per-bin form bit-for-bit, and
+    /// the analysis window tables must match the window functions.
+    #[test]
+    fn mdct_fast_paths_match_generic_form() {
+        let mut rng: u32 = 0x3dc7_0409;
+        for case in 0..256 {
+            for &n in &[LONG_N, SHORT_N] {
+                let mut xn = vec![0.0f64; n];
+                for v in xn.iter_mut() {
+                    let a = xorshift32_r409(&mut rng);
+                    if a % 7 != 0 {
+                        let mag = f64::from(a & 0xFFFFFF) / f64::from(0xFFFFFFu32);
+                        let exp = f64::from((a >> 24) % 24) - 12.0;
+                        *v = mag * exp.exp2() * if a & 0x8000 != 0 { -1.0 } else { 1.0 };
+                    }
+                }
+                let got = mdct(&xn, n);
+                let want = mdct_generic_reference(&xn, n);
+                for (k, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "n={n} case {case} bin {k}: {g} != {w}"
+                    );
+                }
+            }
+        }
+        // Window tables carry the identical f64 the window fns return.
+        for i in 0..LONG_N {
+            assert_eq!(
+                ANALYSIS_LONG_WINDOW[i].to_bits(),
+                analysis_long_window(i).to_bits()
+            );
+        }
+        for i in 0..SHORT_N {
+            assert_eq!(
+                ANALYSIS_SHORT_WINDOW[i].to_bits(),
+                analysis_short_window(i).to_bits()
+            );
+        }
     }
 }

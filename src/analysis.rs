@@ -119,6 +119,27 @@ pub fn m_coefficient(i: usize, k: usize) -> f64 {
     arg.cos()
 }
 
+/// Precomputed analysis matrixing coefficients, transposed:
+/// `M_MATRIX_T[k][i] = m_coefficient(i, k)` for the 32 subband outputs ×
+/// 64 folded inputs of the §C.1.3 matrixing step.
+///
+/// The coefficients depend only on the constant index pair `(i, k)`, so
+/// every `cos()` is evaluated exactly once at first use; each entry
+/// holds the identical `f64` bit pattern [`m_coefficient`] returns. The
+/// transpose lays the table out so the matrixing loop can run with `k`
+/// outermost (see [`analyze_row`]) and touch 32 consecutive
+/// coefficients per folded input.
+static M_MATRIX_T: std::sync::LazyLock<[[f64; NUM_SUBBANDS]; 64]> =
+    std::sync::LazyLock::new(|| {
+        let mut m = [[0.0f64; NUM_SUBBANDS]; 64];
+        for (k, row) in m.iter_mut().enumerate() {
+            for (i, slot) in row.iter_mut().enumerate() {
+                *slot = m_coefficient(i, k);
+            }
+        }
+        m
+    });
+
 /// Per-channel polyphase shift register `X[0..512]` for the encoder
 /// analysis filterbank.
 ///
@@ -182,25 +203,35 @@ pub fn analyze_row(pcm: &[f64; NUM_SUBBANDS], state: &mut AnalysisState) -> [f64
     // Step 2: Window — Z[i] = C[i] · X[i]. (We fold Z into the partial-
     // calculation step rather than materialising it.)
     // Step 3: Partial calculation — Y[i] = sum_{j=0..7} Z[i + 64·j].
+    // Run with `j` outermost: each `Y[i]` accumulates the identical
+    // products `C[i+64j] · X[i+64j]` in the identical ascending-`j`
+    // order (bit-exact per output) while the inner loop walks 64
+    // consecutive table / register values — vectorizable across the
+    // independent `i` lanes.
     let mut y = [0.0f64; 64];
-    for (i, yi) in y.iter_mut().enumerate() {
-        let mut acc = 0.0f64;
-        for j in 0..8 {
-            let idx = i + 64 * j;
-            acc += C_TABLE[idx] * state.x[idx];
+    for j in 0..8 {
+        let base = 64 * j;
+        let c_row = &C_TABLE[base..base + 64];
+        let x_row = &state.x[base..base + 64];
+        for ((yi, &c), &xv) in y.iter_mut().zip(c_row.iter()).zip(x_row.iter()) {
+            *yi += c * xv;
         }
-        *yi = acc;
     }
 
     // Step 4: Matrixing — S[i] = sum_{k=0..63} M[i,k] · Y[k] for
-    // i = 0..32, with M[i,k] = cos((2i+1)·(k-16)·π/64).
+    // i = 0..32, with M[i,k] = cos((2i+1)·(k-16)·π/64). Run with `k`
+    // outermost over the transposed precomputed table: every output
+    // accumulator still receives its products in the identical
+    // ascending-`k` order (each `+=` adds the same `f64` product to the
+    // same running sum), so each `S[i]` is bit-for-bit the value the
+    // per-output inline-cosine form produces (pinned by
+    // `analyze_row_interchanged_matrixing_matches_reference`).
+    let m_matrix_t = &*M_MATRIX_T;
     let mut s = [0.0f64; NUM_SUBBANDS];
-    for (i, si) in s.iter_mut().enumerate() {
-        let mut acc = 0.0f64;
-        for (k, &yk) in y.iter().enumerate() {
-            acc += m_coefficient(i, k) * yk;
+    for (mt_row, &yk) in m_matrix_t.iter().zip(y.iter()) {
+        for (si, &mik) in s.iter_mut().zip(mt_row.iter()) {
+            *si += mik * yk;
         }
-        *si = acc;
     }
     s
 }
@@ -1186,6 +1217,88 @@ mod tests_inner {
     }
 
     // ----- analyze_granule shape contract -----
+
+    // -----------------------------------------------------------------
+    // r409 loop-interchange pinning
+    // -----------------------------------------------------------------
+
+    /// Straightforward Figure C.4 reference row: per-output partial
+    /// calculation and per-output matrixing with the inline
+    /// `m_coefficient` cosine — the pre-r409 form of `analyze_row`.
+    fn analyze_row_reference(
+        pcm: &[f64; NUM_SUBBANDS],
+        state: &mut AnalysisState,
+    ) -> [f64; NUM_SUBBANDS] {
+        state.x.copy_within(0..(X_LEN - 32), 32);
+        for (j, &p) in pcm.iter().enumerate() {
+            state.x[31 - j] = p;
+        }
+        let mut y = [0.0f64; 64];
+        for (i, yi) in y.iter_mut().enumerate() {
+            let mut acc = 0.0f64;
+            for j in 0..8 {
+                let idx = i + 64 * j;
+                acc += C_TABLE[idx] * state.x[idx];
+            }
+            *yi = acc;
+        }
+        let mut s = [0.0f64; NUM_SUBBANDS];
+        for (i, si) in s.iter_mut().enumerate() {
+            let mut acc = 0.0f64;
+            for (k, &yk) in y.iter().enumerate() {
+                acc += m_coefficient(i, k) * yk;
+            }
+            *si = acc;
+        }
+        s
+    }
+
+    fn xorshift32_r409(state: &mut u32) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        *state
+    }
+
+    /// The production `analyze_row` (j-outer partial calculation +
+    /// k-outer matrixing over the precomputed transposed table) must
+    /// produce bit-identical subband samples and `X[]` state to the
+    /// straightforward per-output reference across a long streamed run.
+    #[test]
+    fn analyze_row_interchanged_matrixing_matches_reference() {
+        let mut rng: u32 = 0xa11a_1f5e;
+        let mut state_prod = AnalysisState::new();
+        let mut state_ref = AnalysisState::new();
+        for row in 0..200 {
+            let mut pcm = [0.0f64; NUM_SUBBANDS];
+            for v in pcm.iter_mut() {
+                let a = xorshift32_r409(&mut rng);
+                if a % 6 != 0 {
+                    let mag = f64::from(a & 0xFFFFFF) / f64::from(0xFFFFFFu32);
+                    let exp = f64::from((a >> 24) % 16) - 8.0;
+                    *v = mag * exp.exp2() * if a & 0x8000 != 0 { -1.0 } else { 1.0 };
+                }
+            }
+            let got = analyze_row(&pcm, &mut state_prod);
+            let want = analyze_row_reference(&pcm, &mut state_ref);
+            for i in 0..NUM_SUBBANDS {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "row {row} subband {i}: {} != {}",
+                    got[i],
+                    want[i]
+                );
+            }
+            for i in 0..X_LEN {
+                assert_eq!(
+                    state_prod.x(i).to_bits(),
+                    state_ref.x(i).to_bits(),
+                    "row {row} X[{i}] diverged"
+                );
+            }
+        }
+    }
 
     #[test]
     fn analyze_granule_zero_input_yields_zero_subband_block() {
