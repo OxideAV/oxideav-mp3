@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- imdct: **vectorizable k-outer transforms** (r409, bench axis). The
+  stack IMDCTs (`n = 36` long, `n = 12` short) ran one output at a time
+  (dependent-chain sums); they now run with `k` outermost over
+  transposed cosine tables, so each output accumulator receives its
+  products in the identical ascending-`k` order (bit-exact per output)
+  while the inner loop walks 36 / 12 consecutive coefficients with a
+  broadcast input line — vectorizable across the independent output
+  lanes. The public `imdct()` keeps the straightforward per-output form
+  and serves as the reference: `interchanged_imdct_matches_reference`
+  pins both stack transforms against it by bit pattern over random
+  wide-dynamic-range inputs. Decoded PCM is bit-for-bit unchanged;
+  `stage_imdct` drops 39% (137.2 µs → 84.0 µs per 40-granule batch).
+
+### Changed
+
 - synth: **vectorizable matrixing + windowed sum, and a ring-buffer
   shift register** (r409, bench axis). The Figure A.2 matrixing ran one
   output at a time (64 independent 32-term dependent-chain sums); it now

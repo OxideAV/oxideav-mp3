@@ -844,3 +844,69 @@ fn mixed_flag_on_start_end_uses_normal_window_in_low_subbands() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// r409 loop-interchange pinning: the k-outer stack IMDCTs must be
+// bit-for-bit identical to the straightforward per-output `imdct()`.
+// ---------------------------------------------------------------------
+
+fn xorshift32_r409(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
+}
+
+fn random_f64_r409(rng: &mut u32) -> f64 {
+    let a = xorshift32_r409(rng);
+    let mag = f64::from(a & 0xFFFFFF) / f64::from(0xFFFFFFu32);
+    let exp = f64::from((a >> 24) % 24) - 12.0;
+    let v = mag * exp.exp2();
+    if a & 0x8000 != 0 {
+        -v
+    } else {
+        v
+    }
+}
+
+/// `imdct_long` / `imdct_short` (k-outer, transposed tables) vs the
+/// public `imdct()` (straightforward per-output form with the row-major
+/// tables): every output must match by bit pattern over random inputs
+/// spanning a wide dynamic range, zeros included.
+#[test]
+fn interchanged_imdct_matches_reference() {
+    let mut rng: u32 = 0x0409_2026;
+    for case in 0..256 {
+        let mut xk_long = [0.0f64; LONG_N / 2];
+        for v in xk_long.iter_mut() {
+            if xorshift32_r409(&mut rng) % 7 != 0 {
+                *v = random_f64_r409(&mut rng);
+            }
+        }
+        let got = imdct_long(&xk_long);
+        let want = imdct(&xk_long, LONG_N);
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "long IMDCT case {case} output {i}: {g} != {w}"
+            );
+        }
+
+        let mut xk_short = [0.0f64; SHORT_N / 2];
+        for v in xk_short.iter_mut() {
+            if xorshift32_r409(&mut rng) % 7 != 0 {
+                *v = random_f64_r409(&mut rng);
+            }
+        }
+        let got = imdct_short(&xk_short);
+        let want = imdct(&xk_short, SHORT_N);
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "short IMDCT case {case} output {i}: {g} != {w}"
+            );
+        }
+    }
+}

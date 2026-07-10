@@ -175,6 +175,33 @@ static SHORT_COS: std::sync::LazyLock<[[f64; SHORT_N / 2]; SHORT_N]> =
         m
     });
 
+/// [`LONG_COS`] transposed (`LONG_COS_T[k][i] = imdct_cos(36, i, k)`) —
+/// identical bit patterns, laid out so [`imdct_long`] can run with `k`
+/// outermost and touch 36 consecutive coefficients per input line.
+static LONG_COS_T: std::sync::LazyLock<[[f64; LONG_N]; LONG_N / 2]> =
+    std::sync::LazyLock::new(|| {
+        let mut m = [[0.0f64; LONG_N]; LONG_N / 2];
+        for (k, row) in m.iter_mut().enumerate() {
+            for (i, slot) in row.iter_mut().enumerate() {
+                *slot = imdct_cos(LONG_N, i, k);
+            }
+        }
+        m
+    });
+
+/// [`SHORT_COS`] transposed (`SHORT_COS_T[k][i] = imdct_cos(12, i, k)`)
+/// — identical bit patterns, `k`-outer layout for [`imdct_short`].
+static SHORT_COS_T: std::sync::LazyLock<[[f64; SHORT_N]; SHORT_N / 2]> =
+    std::sync::LazyLock::new(|| {
+        let mut m = [[0.0f64; SHORT_N]; SHORT_N / 2];
+        for (k, row) in m.iter_mut().enumerate() {
+            for (i, slot) in row.iter_mut().enumerate() {
+                *slot = imdct_cos(SHORT_N, i, k);
+            }
+        }
+        m
+    });
+
 /// The §2.4.3.4.10.2 IMDCT: transform `n/2` input lines `xk` (`n` = 36 or
 /// 12) into `n` output samples.
 ///
@@ -227,38 +254,46 @@ pub fn imdct(xk: &[f64], n: usize) -> Vec<f64> {
 
 /// Allocation-free long (`n = 36`) IMDCT into a stack array.
 ///
-/// Bit-identical to `imdct(xk, 36)` — same [`LONG_COS`] table, same
-/// `k = 0..18` accumulation order — but with no `Vec` allocation for the
-/// input gather or the output, so the per-subband IMDCT of a long-family
-/// granule runs entirely on the stack.
+/// Bit-identical to `imdct(xk, 36)` — same coefficients (via the
+/// transposed [`LONG_COS_T`]), same per-output `k = 0..18` accumulation
+/// order — but with no `Vec` allocation for the input gather or the
+/// output, so the per-subband IMDCT of a long-family granule runs
+/// entirely on the stack.
 #[must_use]
 fn imdct_long(xk: &[f64; LONG_N / 2]) -> [f64; LONG_N] {
-    let cos = &*LONG_COS;
+    // `k`-outer over the transposed table: every output accumulator
+    // still receives its products `x[k] · cos[i][k]` in the identical
+    // ascending-`k` order (each `+=` adds the same `f64` product to the
+    // same running sum), so each output is bit-for-bit the value the
+    // `i`-outer form produces — while the inner loop walks 36
+    // consecutive coefficients with a broadcast `x[k]`, which the
+    // compiler vectorizes across the independent `i` lanes (pinned by
+    // `interchanged_imdct_matches_reference`).
+    let cos_t = &*LONG_COS_T;
     let mut out = [0.0f64; LONG_N];
-    for (o, c_row) in out.iter_mut().zip(cos.iter()) {
-        let mut acc = 0.0f64;
-        for (&ck, &x) in c_row.iter().zip(xk.iter()) {
-            acc += x * ck;
+    for (c_row, &x) in cos_t.iter().zip(xk.iter()) {
+        for (o, &ck) in out.iter_mut().zip(c_row.iter()) {
+            *o += x * ck;
         }
-        *o = acc;
     }
     out
 }
 
 /// Allocation-free short (`n = 12`) IMDCT into a stack array.
 ///
-/// Bit-identical to `imdct(xk, 12)` — same [`SHORT_COS`] table, same
-/// `k = 0..6` accumulation order.
+/// Bit-identical to `imdct(xk, 12)` — same coefficients (via the
+/// transposed [`SHORT_COS_T`]), same per-output `k = 0..6` accumulation
+/// order.
 #[must_use]
 fn imdct_short(xk: &[f64; SHORT_N / 2]) -> [f64; SHORT_N] {
-    let cos = &*SHORT_COS;
+    // Same `k`-outer interchange as [`imdct_long`] — identical
+    // per-output accumulation order, bit-exact vs. the `i`-outer form.
+    let cos_t = &*SHORT_COS_T;
     let mut out = [0.0f64; SHORT_N];
-    for (o, c_row) in out.iter_mut().zip(cos.iter()) {
-        let mut acc = 0.0f64;
-        for (&ck, &x) in c_row.iter().zip(xk.iter()) {
-            acc += x * ck;
+    for (c_row, &x) in cos_t.iter().zip(xk.iter()) {
+        for (o, &ck) in out.iter_mut().zip(c_row.iter()) {
+            *o += x * ck;
         }
-        *o = acc;
     }
     out
 }
