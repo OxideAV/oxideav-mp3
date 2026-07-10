@@ -67,23 +67,23 @@ use crate::side_info::{BlockType, GranuleChannel};
 
 /// System constant subtracted from `global_gain` in the §2.4.3.4.7.1
 /// exponent (matches [`crate::requantize`]).
-const GAIN_BIAS: i32 = 210;
+pub(crate) const GAIN_BIAS: i32 = 210;
 
 /// The short-coded region of a mixed block starts at short scalefactor
 /// band 3; the lines below `3 * short_starts[3]` are encoded as a long
 /// block (36 at every ISO table, 72 at the MPEG-2.5 8 kHz tables --
 /// the exact inverse of the decoder's band-relative coding split; see
 /// the de-facto derivation on `requantize::mixed_long_lines`).
-const MIXED_FIRST_SHORT_SFB: usize = 3;
+pub(crate) const MIXED_FIRST_SHORT_SFB: usize = 3;
 
-fn mixed_long_lines(sample_rate_hz: u32, version: MpegVersion) -> usize {
+pub(crate) fn mixed_long_lines(sample_rate_hz: u32, version: MpegVersion) -> usize {
     3 * short_band_starts(sample_rate_hz, version)[MIXED_FIRST_SHORT_SFB]
 }
 
 /// `2^(x/4)` for an integer-quarter exponent (mirror of the decoder
 /// helper; reproduced here so the encoder module doesn't reach into a
 /// decoder-internal helper).
-fn pow2_quarter(quarter_numerator: i32) -> f32 {
+pub(crate) fn pow2_quarter(quarter_numerator: i32) -> f32 {
     (quarter_numerator as f32 * 0.25).exp2()
 }
 
@@ -109,7 +109,7 @@ fn quantize_magnitude(abs_xr_over_factor: f32) -> i32 {
 
 /// Quantize one frequency line: divide by the precomputed inverse-gain
 /// factor, take the `3/4` power, round, and reapply the sign of `xr`.
-fn quantize_line(xr: f32, factor: f32) -> i32 {
+pub(crate) fn quantize_line(xr: f32, factor: f32) -> i32 {
     if xr == 0.0 || factor == 0.0 {
         return 0;
     }

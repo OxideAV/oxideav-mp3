@@ -65,11 +65,13 @@
 
 use crate::frame::MpegVersion;
 use crate::huffman::{
-    choose_best_count1_table, choose_best_table_for_region, count_huffman_bits, partition_split,
-    PartitionSplit,
+    big_table_reach, choose_best_count1_table, choose_best_table_for_region, count_huffman_bits,
+    partition_split, PartitionSplit, SELECTABLE_BIG_TABLES,
 };
 use crate::quantize::quantize;
-use crate::requantize::NUM_LINES;
+use crate::requantize::{
+    long_band_starts, scalefac_multiplier, short_band_starts, NUM_LINES, PRETAB,
+};
 use crate::scalefactors::ScaleFactors;
 use crate::side_info::{BlockType, GranuleChannel};
 
@@ -418,6 +420,202 @@ fn quantize_at(
     quantize(xr, &gc, sf, sample_rate_hz, version)
 }
 
+/// Largest magnitude ANY selectable Table 3-B.7 big-values codebook can
+/// represent without truncation: `max` of [`big_table_reach`] over
+/// [`SELECTABLE_BIG_TABLES`] (8206, from the `linbits = 13` ESC tables
+/// 23 / 31: `15 + 2^13 − 1`). A quantized line whose magnitude exceeds
+/// this cannot be coded by any codebook, so
+/// [`choose_best_table_for_region`] returns `None` for its region and
+/// [`exact_bit_count`] / [`exact_bit_count_band_aligned`] return `None`
+/// for the whole granule.
+fn max_selectable_reach() -> u32 {
+    static REACH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *REACH.get_or_init(|| {
+        SELECTABLE_BIG_TABLES
+            .iter()
+            .map(|&t| big_table_reach(t))
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+/// One representative frequency line per constant-factor group of the
+/// §2.4.3.4.7.1 quantizer — the group's largest-|xr| line together with
+/// the gain-independent part of its quantization factor.
+///
+/// Within one scalefactor band (long) or one `(sfb, window)` cell
+/// (short), [`quantize`] divides every line by the **same** factor
+/// `gain(global_gain[, subblock_gain]) · sf_term`. Re-running
+/// [`crate::quantize::quantize_line`] on the stored line value with a
+/// factor assembled from the **identical expressions** therefore yields
+/// bit-for-bit the `is[]` entry the full quantizer produces for that
+/// line — no monotonicity or error-bound argument is needed; the probe
+/// value *is* one of the quantized lines.
+#[derive(Debug, Clone, Copy)]
+struct GainProbe {
+    /// The group's largest-magnitude `xr` line value (never `0.0`; an
+    /// all-zero group emits no probe).
+    xr: f32,
+    /// The gain-independent factor term `2^(−mult·scalefac)`, computed
+    /// with exactly the expression the quantizer uses for the group.
+    sf_term: f32,
+    /// Which gain expression scales the group: `0` = long
+    /// (`pow2_quarter(g − 210)`), `1..=3` = short window `w − 1`
+    /// (`pow2_quarter(g − 210 − 8·subblock_gain[w−1])`).
+    gain_sel: u8,
+}
+
+/// Collect the per-group [`GainProbe`]s of one granule-channel,
+/// mirroring the exact group structure (and factor expressions) of
+/// [`quantize`]: long bands over the long-coded range, per-window short
+/// bands over the short-coded range, with the mixed-block split at
+/// [`crate::quantize::mixed_long_lines`].
+fn build_gain_probes(
+    xr: &[f32; NUM_LINES],
+    gc: &GranuleChannel,
+    sf: &ScaleFactors,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) -> Vec<GainProbe> {
+    let mult = scalefac_multiplier(gc.scalefac_scale);
+    let is_short = gc.window_switching_flag && gc.block_type == BlockType::Short;
+    let mut probes = Vec::with_capacity(40);
+
+    let push_long_range = |lo: usize, hi: usize, probes: &mut Vec<GainProbe>| {
+        let starts = long_band_starts(sample_rate_hz, version);
+        for sfb in 0..starts.len() {
+            let band_lo = starts[sfb].max(lo);
+            let band_hi = if sfb + 1 < starts.len() {
+                starts[sfb + 1].min(hi)
+            } else {
+                hi
+            };
+            if band_lo >= band_hi {
+                continue;
+            }
+            // The band's largest-|xr| line (ties keep the first, which is
+            // irrelevant: any max-|xr| line quantizes to the same probe
+            // magnitude only up to sign, and only |value| is compared).
+            let mut best = 0.0f32;
+            for &v in &xr[band_lo..band_hi] {
+                if v.abs() > best.abs() {
+                    best = v;
+                }
+            }
+            if best == 0.0 {
+                continue;
+            }
+            // Identical scalefac / sf_term expressions to
+            // `quantize_long_range`.
+            let scalefac = if sfb < 21 {
+                let pre = if sf.preflag {
+                    u32::from(PRETAB[sfb])
+                } else {
+                    0
+                };
+                u32::from(sf.long[sfb]) + pre
+            } else {
+                0
+            };
+            let sf_term = (-(mult * scalefac as f32)).exp2();
+            probes.push(GainProbe {
+                xr: best,
+                sf_term,
+                gain_sel: 0,
+            });
+        }
+    };
+
+    if !is_short {
+        push_long_range(0, NUM_LINES, &mut probes);
+        return probes;
+    }
+
+    let first_sfb = if gc.mixed_block_flag {
+        push_long_range(
+            0,
+            crate::quantize::mixed_long_lines(sample_rate_hz, version),
+            &mut probes,
+        );
+        crate::quantize::MIXED_FIRST_SHORT_SFB
+    } else {
+        0
+    };
+
+    // Identical group structure to `quantize_short_range` (13 bands, the
+    // 12 transmitted ones plus the scalefac-0 band 12).
+    let starts = short_band_starts(sample_rate_hz, version);
+    for sfb in first_sfb..13 {
+        let win_start = starts[sfb];
+        let win_end = if sfb < 12 { starts[sfb + 1] } else { 192 };
+        let win_width = win_end - win_start;
+        for win in 0..3usize {
+            let sf_value = if sfb < 12 { sf.short[sfb][win] } else { 0 };
+            let sf_term = (-(mult * f32::from(sf_value))).exp2();
+            let base = 3 * win_start + win * win_width;
+            let mut best = 0.0f32;
+            for k in 0..win_width {
+                let i = base + k;
+                if i < NUM_LINES && xr[i].abs() > best.abs() {
+                    best = xr[i];
+                }
+            }
+            if best == 0.0 {
+                continue;
+            }
+            probes.push(GainProbe {
+                xr: best,
+                sf_term,
+                gain_sel: (win + 1) as u8,
+            });
+        }
+    }
+    probes
+}
+
+/// `true` when the probes **prove** that quantizing at `global_gain`
+/// produces at least one line no selectable codebook can represent
+/// (`|is| >` [`max_selectable_reach`]), so [`exact_bit_count`] /
+/// [`exact_bit_count_band_aligned`] would return `None` and any
+/// codability-respecting predicate is false — the full quantize + count
+/// for this gain can be skipped.
+///
+/// The proof is exact, not an estimate: each probe re-runs
+/// [`crate::quantize::quantize_line`] on a real line value with a factor
+/// assembled from the identical expressions [`quantize`] uses, so the
+/// probe result *is* the `is[]` entry of that line. A `false` return
+/// proves nothing (some other line could still be over reach — the
+/// caller then runs the full path, which re-checks everything), so a
+/// conservative miss costs only time, never correctness.
+fn probes_prove_uncodable(probes: &[GainProbe], gc: &GranuleChannel, global_gain: u8) -> bool {
+    if probes.is_empty() {
+        return false;
+    }
+    let reach = max_selectable_reach();
+    let global = i32::from(global_gain);
+    // The four gain expressions of `quantize`, computed identically.
+    let gains = [
+        crate::quantize::pow2_quarter(global - crate::quantize::GAIN_BIAS),
+        crate::quantize::pow2_quarter(
+            global - crate::quantize::GAIN_BIAS - 8 * i32::from(gc.subblock_gain[0]),
+        ),
+        crate::quantize::pow2_quarter(
+            global - crate::quantize::GAIN_BIAS - 8 * i32::from(gc.subblock_gain[1]),
+        ),
+        crate::quantize::pow2_quarter(
+            global - crate::quantize::GAIN_BIAS - 8 * i32::from(gc.subblock_gain[2]),
+        ),
+    ];
+    for p in probes {
+        let factor = gains[usize::from(p.gain_sel)] * p.sf_term;
+        let v = crate::quantize::quantize_line(p.xr, factor);
+        if v.unsigned_abs() > reach {
+            return true;
+        }
+    }
+    false
+}
+
 /// Generic binary search for the smallest `global_gain` in
 /// `[GAIN_MIN, GAIN_MAX]` whose quantized `is[]` satisfies `predicate`.
 ///
@@ -493,6 +691,21 @@ where
 /// first gain whose count fits. This helper mirrors that: it scans gains
 /// upward and returns the first satisfying one (the smallest gain that
 /// fits), making no monotonicity assumption.
+///
+/// # Predicate contract (codability)
+///
+/// `predicate(is)` **must** return `false` whenever any line of `is` has
+/// a magnitude above [`max_selectable_reach`] (a granule no codebook can
+/// code). Both callers gate on [`exact_bit_count`] /
+/// [`exact_bit_count_band_aligned`], which return `None` exactly then,
+/// so the contract holds. It lets the scan skip the full 576-line
+/// quantize + Huffman count at gains where a cheap per-band probe
+/// ([`probes_prove_uncodable`]) *proves* an over-reach line exists: the
+/// probe re-runs the quantizer's own per-line computation on the band's
+/// largest-|xr| line, so a skipped gain is one where the predicate is
+/// guaranteed `false` — the scan visits the exact same first-satisfying
+/// gain as the straightforward form (pinned by
+/// `search_bit_budget_matches_straightforward_scan`).
 fn search_linear<F>(
     xr: &[f32; NUM_LINES],
     gc_template: &GranuleChannel,
@@ -505,7 +718,13 @@ where
     F: Fn(&[i32; NUM_LINES]) -> bool,
 {
     let quant = |gain: u8| quantize_at(xr, gc_template, sf, sample_rate_hz, version, gain);
+    let probes = build_gain_probes(xr, gc_template, sf, sample_rate_hz, version);
     for g in u16::from(GAIN_MIN)..=u16::from(GAIN_MAX) {
+        if probes_prove_uncodable(&probes, gc_template, g as u8) {
+            // Proven uncodable at this gain: the predicate is false by
+            // its codability contract, so skip the full evaluation.
+            continue;
+        }
         let is = quant(g as u8);
         if predicate(&is) {
             let m = max_abs(&is);

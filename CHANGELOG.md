@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- inner_loop: **the budget gain scan skips provably-uncodable gains via
+  per-band probes** (r409, bench axis). `search_bit_budget` /
+  `search_bit_budget_band_aligned` walk `global_gain` upward from 0 (the
+  spec's `qquant + 1` step); at loud gains every candidate used to pay a
+  full 576-line quantize plus the Huffman table search only for the
+  count to come back `None` (a line above the 8206 linbits-13 codebook
+  ceiling is uncodable by every Table 3-B.7 codebook). The scan now
+  collects one probe per constant-factor quantizer group (the band's
+  largest-|xr| line plus its gain-independent `2^(-mult*scalefac)`
+  term, mirroring `quantize`'s long / short / mixed group structure)
+  and, per gain, re-runs the quantizer's own `quantize_line` on the
+  probes: if any probe magnitude exceeds the max selectable codebook
+  reach, that line IS one of the quantized lines (identical expressions
+  on identical inputs — an exact proof, not an estimate), the exact
+  count would be `None`, and the full evaluation is skipped. A probe
+  miss just falls through to the full path, so the scan returns the
+  identical first-satisfying gain. Pinned by
+  `search_bit_budget_matches_straightforward_scan` (production search
+  vs a no-skip reference scan over random spectra, block types,
+  budgets, rates) and `probe_skip_only_fires_on_truly_uncodable_gains`
+  (every skipped gain re-checked to be truly uncodable). Encoded
+  streams are byte-identical; `encode_stage_inner_loop` drops a further
+  ~49% (30.7 ms → 15.6 ms per 38-granule batch; cumulative −63% from
+  the r409 baseline).
+
+### Changed
+
 - quantize: **the §2.4.3.4.7.1 gain factor is hoisted to one evaluation
   per scalefactor band** (r409, bench axis). The long-range quantizer
   previously re-derived `sf_term = 2^(−mult·scalefac)` and

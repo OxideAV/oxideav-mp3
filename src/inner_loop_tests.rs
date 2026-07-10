@@ -962,3 +962,167 @@ fn band_aligned_search_gates_on_wire_partition() {
     assert_eq!(r.is, quantize(&xr, &chosen, &sf, SR, V));
 }
 
+
+// ---------------------------------------------------------------------
+// r409 probe-skip pinning: the gain-scan codability pre-check must be
+// invisible — the searches return exactly what a straightforward
+// gain-by-gain scan returns, and a skipped gain is provably uncodable.
+// ---------------------------------------------------------------------
+
+fn xorshift32_r409(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
+}
+
+/// Random wide-dynamic-range spectrum: zeros mixed with magnitudes
+/// spanning ~2^-12 .. 2^+18, both signs, optionally tapering off (so the
+/// partition split sees big-values / count1 / rzero regions).
+fn random_xr_r409(rng: &mut u32, amp_exp: i32) -> [f32; NUM_LINES] {
+    let mut xr = [0.0f32; NUM_LINES];
+    for (i, v) in xr.iter_mut().enumerate() {
+        let r = xorshift32_r409(rng);
+        if r % 4 == 0 || (i > 400 && r % 2 == 0) {
+            continue;
+        }
+        let mag = ((r >> 8) & 0xFFFF) as f32 / 65536.0;
+        let exp = ((r % 31) as i32 - 12 + amp_exp) as f32;
+        *v = mag * exp.exp2() * if r & 1 == 0 { 1.0 } else { -1.0 };
+    }
+    xr
+}
+
+/// Straightforward reference scan: quantize + exact count at EVERY gain
+/// from GAIN_MIN upward, no probe skip — the pre-r409 form of
+/// `search_bit_budget` / `search_bit_budget_band_aligned`.
+fn reference_budget_scan(
+    xr: &[f32; NUM_LINES],
+    gc: &GranuleChannel,
+    sf: &ScaleFactors,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+    budget: u64,
+    band_aligned: bool,
+) -> InnerLoopResult {
+    let quant = |gain: u8| quantize_at(xr, gc, sf, sample_rate_hz, version, gain);
+    for g in u16::from(GAIN_MIN)..=u16::from(GAIN_MAX) {
+        let is = quant(g as u8);
+        let fits = if band_aligned {
+            exact_bit_count_band_aligned(&is, gc, sample_rate_hz, version)
+                .is_some_and(|c| c.bits as u64 <= budget)
+        } else {
+            exact_bit_count(&is, gc).is_some_and(|c| c.bits as u64 <= budget)
+        };
+        if fits {
+            let m = max_abs(&is);
+            return InnerLoopResult {
+                global_gain: g as u8,
+                is,
+                max_abs: m,
+                satisfied: true,
+            };
+        }
+    }
+    let is = quant(GAIN_MAX);
+    let m = max_abs(&is);
+    InnerLoopResult {
+        global_gain: GAIN_MAX,
+        is,
+        max_abs: m,
+        satisfied: false,
+    }
+}
+
+/// The production searches (probe-skip scan) must return bit-identical
+/// results to the straightforward gain-by-gain scan, across block types,
+/// scalefactor configurations, budgets, and signal levels.
+#[test]
+fn search_bit_budget_matches_straightforward_scan() {
+    let mut rng: u32 = 0x0409_2026;
+    let rates: &[(u32, MpegVersion)] = &[
+        (44_100, MpegVersion::Mpeg1),
+        (32_000, MpegVersion::Mpeg1),
+        (22_050, MpegVersion::Mpeg2),
+        (11_025, MpegVersion::Mpeg25),
+    ];
+    for &(rate, version) in rates {
+        for case in 0..6 {
+            let mut gc = if case % 3 == 1 {
+                short_gc([0, 1, 2])
+            } else {
+                long_gc(case % 2 == 1)
+            };
+            if case % 3 == 2 {
+                // Mixed short block.
+                gc = short_gc([1, 0, 2]);
+                gc.mixed_block_flag = true;
+            }
+            let mut sf = ScaleFactors::default();
+            for b in sf.long.iter_mut() {
+                *b = (xorshift32_r409(&mut rng) % 8) as u8;
+            }
+            for band in sf.short.iter_mut() {
+                for w in band.iter_mut() {
+                    *w = (xorshift32_r409(&mut rng) % 8) as u8;
+                }
+            }
+            sf.preflag = case % 2 == 0 && !(gc.window_switching_flag);
+            let xr = random_xr_r409(&mut rng, (case % 3) * 6);
+            for &budget in &[0u64, 200, 1500, 6000] {
+                let got = search_bit_budget(&xr, &gc, &sf, rate, version, budget);
+                let want = reference_budget_scan(&xr, &gc, &sf, rate, version, budget, false);
+                assert_eq!(
+                    got, want,
+                    "search_bit_budget diverged (rate {rate}, case {case}, budget {budget})"
+                );
+                let got_ba =
+                    search_bit_budget_band_aligned(&xr, &gc, &sf, rate, version, budget);
+                let want_ba = reference_budget_scan(&xr, &gc, &sf, rate, version, budget, true);
+                assert_eq!(
+                    got_ba, want_ba,
+                    "band-aligned search diverged (rate {rate}, case {case}, budget {budget})"
+                );
+            }
+        }
+    }
+}
+
+/// Soundness of the skip itself: at EVERY gain the probes claim is
+/// uncodable, the full quantize + exact count really does return `None`
+/// (so any codability-respecting predicate is false there).
+#[test]
+fn probe_skip_only_fires_on_truly_uncodable_gains() {
+    let mut rng: u32 = 0xc0da_b111;
+    for case in 0..8 {
+        let gc = if case % 2 == 0 {
+            long_gc(false)
+        } else {
+            short_gc([0, 2, 1])
+        };
+        let sf = ScaleFactors::default();
+        let xr = random_xr_r409(&mut rng, 8);
+        let probes = build_gain_probes(&xr, &gc, &sf, 44_100, MpegVersion::Mpeg1);
+        for g in 0u16..=255 {
+            if probes_prove_uncodable(&probes, &gc, g as u8) {
+                let is = quantize_at(&xr, &gc, &sf, 44_100, MpegVersion::Mpeg1, g as u8);
+                assert!(
+                    exact_bit_count(&is, &gc).is_none(),
+                    "probe skipped gain {g} but exact_bit_count is Some (case {case})"
+                );
+                assert!(
+                    exact_bit_count_band_aligned(&is, &gc, 44_100, MpegVersion::Mpeg1).is_none(),
+                    "probe skipped gain {g} but band-aligned count is Some (case {case})"
+                );
+                let over = is.iter().any(|v| v.unsigned_abs() > max_selectable_reach());
+                assert!(over, "probe skipped gain {g} without an over-reach line");
+            }
+        }
+    }
+}
+
+/// The max selectable codebook reach is the §B.7 linbits-13 ESC ceiling.
+#[test]
+fn max_selectable_reach_is_8206() {
+    assert_eq!(max_selectable_reach(), 8206);
+}
