@@ -1096,3 +1096,176 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// r409 single-pass chooser pinning: the LUT-accumulated region costing
+// must reproduce the straightforward per-table costing exactly.
+// ---------------------------------------------------------------------
+
+fn xorshift32_r409(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
+}
+
+/// Straightforward per-table reference for the region chooser: cost every
+/// selectable codebook with `region_bits_with_table` after the reach
+/// filter — the pre-r409 form of `choose_best_table_for_region`.
+fn reference_choose_best_table(
+    is: &[i32; NUM_LINES],
+    start: usize,
+    end: usize,
+) -> Option<(u8, usize)> {
+    if start >= end {
+        return Some((0, 0));
+    }
+    let end_clamped = end.min(NUM_LINES);
+    let max_mag = is[start..end_clamped]
+        .iter()
+        .map(|v| v.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let mut best: Option<(u8, usize)> = None;
+    for &idx in SELECTABLE_BIG_TABLES.iter() {
+        if big_table_reach(idx) < max_mag {
+            continue;
+        }
+        if let Some(bits) = region_bits_with_table(is, start, end, idx) {
+            match best {
+                Some((_, b)) if bits >= b => {}
+                _ => best = Some((idx, bits)),
+            }
+        }
+    }
+    best
+}
+
+/// Reference two-pass count1 chooser (pre-r409 form).
+fn reference_choose_count1(is: &[i32; NUM_LINES], start: usize, end: usize) -> (bool, usize) {
+    let bits_a = count1_bits(is, start, end, false);
+    let bits_b = count1_bits(is, start, end, true);
+    if bits_b < bits_a {
+        (true, bits_b)
+    } else {
+        (false, bits_a)
+    }
+}
+
+/// The single-pass LUT chooser must agree with the per-table reference —
+/// same `(table_select, bits)` including tie-breaks and `None` — across
+/// random spectra spanning zeros, small magnitudes, ESC magnitudes, and
+/// beyond-reach magnitudes, over aligned, odd, empty, and clamped ranges.
+#[test]
+fn single_pass_chooser_matches_per_table_reference() {
+    let mut rng: u32 = 0x7ab1_e409;
+    for case in 0..64 {
+        let mut is = [0i32; NUM_LINES];
+        for v in is.iter_mut() {
+            let r = xorshift32_r409(&mut rng);
+            *v = match r % 8 {
+                0 | 1 => 0,
+                2 => (r as i32 >> 28).clamp(-1, 1),
+                3 => ((r >> 8) % 3) as i32 - 1,
+                4 => ((r >> 8) % 30) as i32 - 15,
+                5 => ((r >> 8) % 500) as i32 - 250,
+                6 => ((r >> 8) % 16000) as i32 - 8000,
+                // Occasionally beyond every codebook's reach (> 8206).
+                _ => ((r >> 8) % 40000) as i32 - 20000,
+            };
+        }
+        let ranges: &[(usize, usize)] = &[
+            (0, 0),
+            (0, 2),
+            (0, 100),
+            (1, 99),
+            (3, 8),
+            (0, 575),
+            (100, 101),
+            (200, 576),
+            (0, NUM_LINES),
+            (500, 600), // end past NUM_LINES exercises the clamp
+        ];
+        for &(start, end) in ranges {
+            assert_eq!(
+                choose_best_table_for_region(&is, start, end),
+                reference_choose_best_table(&is, start, end),
+                "chooser diverged (case {case}, range {start}..{end})"
+            );
+        }
+        // count1 chooser over quad-aligned ranges of small magnitudes.
+        let mut c1 = [0i32; NUM_LINES];
+        for v in c1.iter_mut() {
+            let r = xorshift32_r409(&mut rng);
+            *v = ((r >> 4) % 3) as i32 - 1;
+        }
+        for &(start, end) in &[(0usize, 0usize), (0, 4), (0, 128), (4, 576), (100, 104)] {
+            assert_eq!(
+                choose_best_count1_table(&c1, start, end),
+                reference_choose_count1(&c1, start, end),
+                "count1 chooser diverged (case {case}, range {start}..{end})"
+            );
+        }
+    }
+}
+
+/// The backward r_zero scan of `partition_split` must match a forward
+/// reference on assorted trailing-run shapes.
+#[test]
+fn partition_split_backward_scan_matches_forward_reference() {
+    let forward_split = |is: &[i32; NUM_LINES]| -> PartitionSplit {
+        let mut last_nonzero: isize = -1;
+        for (i, &v) in is.iter().enumerate() {
+            if v != 0 {
+                last_nonzero = i as isize;
+            }
+        }
+        if last_nonzero < 0 {
+            return PartitionSplit {
+                big_pairs: 0,
+                count1_quads: 0,
+            };
+        }
+        let nonzero_lines = (last_nonzero + 1) as usize;
+        let mut count1_end = nonzero_lines.div_ceil(4) * 4;
+        if count1_end > NUM_LINES {
+            count1_end = NUM_LINES;
+        }
+        let mut count1_start = count1_end;
+        let mut q = count1_end;
+        while q >= 4 {
+            let s = q - 4;
+            if is[s..s + 4].iter().all(|&v| v.abs() <= 1) {
+                count1_start = s;
+                q -= 4;
+            } else {
+                break;
+            }
+        }
+        PartitionSplit {
+            big_pairs: count1_start / 2,
+            count1_quads: (count1_end - count1_start) / 4,
+        }
+    };
+    let mut rng: u32 = 0x1357_9bdf;
+    for case in 0..64 {
+        let mut is = [0i32; NUM_LINES];
+        let fill = (xorshift32_r409(&mut rng) % 577) as usize;
+        for v in is.iter_mut().take(fill) {
+            let r = xorshift32_r409(&mut rng);
+            *v = match r % 4 {
+                0 => 0,
+                1 => ((r >> 8) % 3) as i32 - 1,
+                _ => ((r >> 8) % 200) as i32 - 100,
+            };
+        }
+        assert_eq!(
+            partition_split(&is),
+            forward_split(&is),
+            "partition_split diverged (case {case}, fill {fill})"
+        );
+    }
+    // All-zero and all-ones edges.
+    assert_eq!(partition_split(&[0; NUM_LINES]), forward_split(&[0; NUM_LINES]));
+    assert_eq!(partition_split(&[1; NUM_LINES]), forward_split(&[1; NUM_LINES]));
+}

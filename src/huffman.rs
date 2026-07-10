@@ -675,6 +675,66 @@ pub const SELECTABLE_BIG_TABLES: [u8; 30] = [
     28, 29, 30, 31,
 ];
 
+/// Per-cell codeword-length table across **all** selectable big-values
+/// codebooks, for the single-pass region costing in
+/// [`choose_best_table_for_region`].
+///
+/// `len[xi * 16 + yi][t]` is the Table 3-B.7 codeword length (in bits)
+/// of the magnitude-clamped cell `(xi, yi) = (min(15,|x|), min(15,|y|))`
+/// under `SELECTABLE_BIG_TABLES[t]`, or [`u8::MAX`] when the cell is not
+/// codable by that codebook (magnitude beyond a small table's index
+/// range, or an unused rectangular corner) — exactly the conditions
+/// under which [`big_pair_bits`] returns `None`. `linbits[t]` and
+/// `reach[t]` cache the per-table ESC width and [`big_table_reach`].
+///
+/// The per-pair §C.1.5.4.4.8 cost decomposes as
+/// `len + esc·linbits + signs` where the ESC condition (`|v| ≥ 15`) and
+/// the sign count (`v ≠ 0`) do **not** depend on the codebook, so a
+/// region's cost under every codebook can be accumulated in one pass
+/// over its pairs: per-table codeword-length sums, plus one shared ESC
+/// count scaled by each table's `linbits`, plus one shared sign count.
+/// Integer addition is order-independent, so the per-table totals are
+/// identical to summing [`big_pair_bits`] per table.
+struct BigTableCostLut {
+    /// Codeword length per clamped `(xi, yi)` cell per selectable table;
+    /// `u8::MAX` marks a not-codable cell.
+    len: [[u8; SELECTABLE_BIG_TABLES.len()]; 256],
+    /// `linbits` ESC width per selectable table.
+    linbits: [u8; SELECTABLE_BIG_TABLES.len()],
+    /// [`big_table_reach`] per selectable table.
+    reach: [u32; SELECTABLE_BIG_TABLES.len()],
+}
+
+static BIG_TABLE_COST_LUT: std::sync::LazyLock<BigTableCostLut> = std::sync::LazyLock::new(|| {
+    let mut lut = BigTableCostLut {
+        len: [[u8::MAX; SELECTABLE_BIG_TABLES.len()]; 256],
+        linbits: [0; SELECTABLE_BIG_TABLES.len()],
+        reach: [0; SELECTABLE_BIG_TABLES.len()],
+    };
+    for (t, &idx) in SELECTABLE_BIG_TABLES.iter().enumerate() {
+        let table = match big_table(idx) {
+            Ok(tb) => tb,
+            Err(_) => continue,
+        };
+        lut.linbits[t] = table.linbits;
+        lut.reach[t] = big_table_reach(idx);
+        let xl = usize::from(table.xlen);
+        for xi in 0..16usize {
+            for yi in 0..16usize {
+                if xi >= xl || yi >= xl {
+                    continue; // stays u8::MAX (not codable)
+                }
+                let ent = table.entries[xi * xl + yi];
+                if ent.len == 0 && (xi != 0 || yi != 0) {
+                    continue; // unused corner, stays u8::MAX
+                }
+                lut.len[xi * 16 + yi][t] = ent.len;
+            }
+        }
+    }
+    lut
+});
+
 /// §C.1.5.4.4.7 — choose the big-values codebook that codes the line
 /// range `is[start..end]` in the **fewest** bits, per §C.1.5.4.4.8.
 ///
@@ -712,7 +772,8 @@ pub fn choose_best_table_for_region(
         return Some((0, 0));
     }
     // §C.1.5.4.4.8 — find the range's peak magnitude so we can filter
-    // codebooks whose linbits cannot represent it.
+    // codebooks whose linbits cannot represent it. (Over the full line
+    // range, as the per-table costing loop below is over whole pairs.)
     let end_clamped = end.min(NUM_LINES);
     let max_mag = is[start..end_clamped]
         .iter()
@@ -720,19 +781,52 @@ pub fn choose_best_table_for_region(
         .max()
         .unwrap_or(0);
 
+    // Single pass over the region's pairs, accumulating every selectable
+    // codebook's codeword-length sum at once via the precomputed
+    // BIG_TABLE_COST_LUT, plus the table-independent ESC and sign counts.
+    // The per-table totals (length sum + esc·linbits + signs) are the
+    // identical integers `region_bits_with_table` produces per table —
+    // see the LUT's cost decomposition note — so the chosen table and
+    // bit count are unchanged (pinned by
+    // `single_pass_chooser_matches_per_table_reference`).
+    let lut = &*BIG_TABLE_COST_LUT;
+    const N: usize = SELECTABLE_BIG_TABLES.len();
+    let mut len_sum = [0u32; N];
+    let mut not_codable = [false; N];
+    let mut signs = 0u32;
+    let mut escs = 0u32;
+    let mut k = start;
+    while k + 1 < end && k + 1 < NUM_LINES {
+        let (x, y) = (is[k], is[k + 1]);
+        let ax = x.unsigned_abs();
+        let ay = y.unsigned_abs();
+        signs += u32::from(x != 0) + u32::from(y != 0);
+        escs += u32::from(ax >= 15) + u32::from(ay >= 15);
+        let cell = (ax.min(15) as usize) * 16 + (ay.min(15) as usize);
+        let row = &lut.len[cell];
+        for t in 0..N {
+            if row[t] == u8::MAX {
+                not_codable[t] = true;
+            } else {
+                len_sum[t] += u32::from(row[t]);
+            }
+        }
+        k += 2;
+    }
+
     let mut best: Option<(u8, usize)> = None;
-    for &idx in SELECTABLE_BIG_TABLES.iter() {
+    for t in 0..N {
         // Reach filter: drop codebooks that would truncate the largest
         // magnitude in the range. Table 0 has reach 0 and is selectable
         // only for an all-zero range; this falls out naturally.
-        if big_table_reach(idx) < max_mag {
+        if not_codable[t] || lut.reach[t] < max_mag {
             continue;
         }
-        if let Some(bits) = region_bits_with_table(is, start, end, idx) {
-            match best {
-                Some((_, b)) if bits >= b => {}
-                _ => best = Some((idx, bits)),
-            }
+        let bits =
+            len_sum[t] as usize + (escs as usize) * usize::from(lut.linbits[t]) + signs as usize;
+        match best {
+            Some((_, b)) if bits >= b => {}
+            _ => best = Some((SELECTABLE_BIG_TABLES[t], bits)),
         }
     }
     best
@@ -779,8 +873,21 @@ pub fn count1_bits(is: &[i32; NUM_LINES], start: usize, end: usize, table_b: boo
 /// field semantics: 0 → A, 1 → B).
 #[must_use]
 pub fn choose_best_count1_table(is: &[i32; NUM_LINES], start: usize, end: usize) -> (bool, usize) {
-    let bits_a = count1_bits(is, start, end, false);
-    let bits_b = count1_bits(is, start, end, true);
+    // One pass over the quadruples, accumulating both tables' totals
+    // (the two sums are the same integers the two `count1_bits` passes
+    // produce; integer addition is order-independent).
+    let mut bits_a = 0usize;
+    let mut bits_b = 0usize;
+    let mut k = start;
+    while k + 4 <= end && k + 4 <= NUM_LINES {
+        let nz = |c: i32| usize::from(c != 0);
+        let (v, w, x, y) = (is[k], is[k + 1], is[k + 2], is[k + 3]);
+        let signs = nz(v) + nz(w) + nz(x) + nz(y);
+        let pat = (nz(v) << 3) | (nz(w) << 2) | (nz(x) << 1) | nz(y);
+        bits_a += usize::from(QUAD_A[pat].0) + signs;
+        bits_b += 4 + signs;
+        k += 4;
+    }
     if bits_b < bits_a {
         (true, bits_b)
     } else {
@@ -817,20 +924,16 @@ pub struct PartitionSplit {
 /// they sit above the last `≥ 2`-magnitude line) rather than discarded.
 #[must_use]
 pub fn partition_split(is: &[i32; NUM_LINES]) -> PartitionSplit {
-    // §C.1.5.4.4.3: r_zero — locate the last non-zero line.
-    let mut last_nonzero: isize = -1;
-    for (i, &v) in is.iter().enumerate() {
-        if v != 0 {
-            last_nonzero = i as isize;
-        }
-    }
-    if last_nonzero < 0 {
+    // §C.1.5.4.4.3: r_zero — locate the last non-zero line (scanning
+    // from the top, where the zero run lives; same line the former
+    // forward scan found).
+    let Some(last_nonzero) = is.iter().rposition(|&v| v != 0) else {
         return PartitionSplit {
             big_pairs: 0,
             count1_quads: 0,
         };
-    }
-    let nonzero_lines = (last_nonzero + 1) as usize;
+    };
+    let nonzero_lines = last_nonzero + 1;
 
     // §C.1.5.4.4.4: count1 — the trailing run of quadruples whose four
     // magnitudes are all ≤ 1, scanning *down* from the end of the

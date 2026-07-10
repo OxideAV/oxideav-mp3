@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- huffman: **single-pass region costing for the encoder's codebook
+  chooser** (r409, bench axis). `choose_best_table_for_region` costed
+  the region once per selectable codebook (30 passes, each re-deriving
+  magnitudes and re-resolving the table). The §C.1.5.4.4.8 per-pair cost
+  decomposes as `codeword_len + esc·linbits + signs`, where the ESC
+  condition (`|v| ≥ 15`) and sign count are codebook-independent, so one
+  pass over the pairs now accumulates every codebook's codeword-length
+  sum at once through a precomputed 256-cell × 30-table length LUT
+  (`u8::MAX` marking not-codable cells), then adds the shared ESC / sign
+  counts scaled per table. Same integers, same ascending-index
+  tie-break, same reach filter and `None` semantics.
+  `choose_best_count1_table` similarly accumulates both quad tables in
+  one pass, and `partition_split` finds the last non-zero line with a
+  backward scan. All pinned by
+  `single_pass_chooser_matches_per_table_reference` and
+  `partition_split_backward_scan_matches_forward_reference` against the
+  straightforward per-table / forward-scan references. Encoded streams
+  are byte-identical; `encode_stage_inner_loop` drops a further ~18%
+  (15.6 ms → 12.8 ms per batch). Cumulative r409 whole-stream encode:
+  tone −75%, noise −56%, sweep −71%, mixed stereo −63%
+  (`encode` bench, direct path).
+
+### Changed
+
 - inner_loop: **the budget gain scan skips provably-uncodable gains via
   per-band probes** (r409, bench axis). `search_bit_budget` /
   `search_bit_budget_band_aligned` walk `global_gain` upward from 0 (the
