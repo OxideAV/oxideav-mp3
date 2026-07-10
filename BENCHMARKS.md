@@ -7,6 +7,15 @@ added in Round 398 (depth-mode). Both rounds are measurement-only —
 decoder, and the encoded byte streams are byte-identical to the
 pre-round encoder.
 
+**Round 409 turned the rankings into optimizations** — see
+[Round 409 — measured optimizations](#round-409--measured-optimizations)
+at the end for the current numbers. The absolute figures in the r290 /
+r398 sections below are the historical rankings from those rounds'
+hosts/toolchains; the r409 section carries the same-host before/after
+pairs. Every r409 change is output-invariant: encoded streams are
+byte-identical and decoded PCM bit-identical, each optimized path
+pinned by an in-tree equivalence test against its straightforward form.
+
 ```
 cargo bench -p oxideav-mp3 --bench decode          # decode whole-stream
 cargo bench -p oxideav-mp3 --bench decode_stages   # decode per-stage
@@ -225,3 +234,78 @@ encoded byte streams are byte-identical to before. The harness plus this
 ranking are the deliverable; the outer-loop / psychoacoustic / Huffman-
 select stages and a short-block MDCT variant are the natural next depth
 steps.
+
+## Round 409 — measured optimizations
+
+Round 409 (bench/profile depth axis) landed six output-invariant
+optimizations against the r290 / r398 rankings above. **Hard
+correctness guard held throughout**: encoded byte streams and decoded
+PCM are bit-for-bit unchanged (verified per commit against a 64-case
+encode/decode golden-hash matrix over every rate / block type / stereo
+mode / VBR / CRC / preset path plus the full staged fixture corpus,
+and by the 35-case 4-validator float-perfect sweep). Each optimized
+path is pinned by a committed equivalence test comparing it against
+the retained straightforward form.
+
+The optimizations, in landing order:
+
+1. **quantize** — the §2.4.3.4.7.1 gain factor (`gain · 2^(−mult·sf)`)
+   is evaluated once per scalefactor band instead of once per line.
+2. **inner_loop** — the §C.1.5.4.4 upward gain scan skips
+   provably-uncodable gains: one probe per constant-factor quantizer
+   group re-runs the quantizer's own per-line computation on the
+   group's largest-|xr| line; a probe magnitude above the 8206
+   codebook ceiling *is* one of the quantized lines, so the exact
+   count would be `None` and the 576-line quantize + Huffman count is
+   skipped. Misses fall through to the unchanged full path.
+3. **huffman (encode)** — single-pass region costing: one walk over a
+   region's pairs accumulates all 30 selectable codebooks' totals via
+   a precomputed 256-cell × 30-table length LUT (ESC and sign counts
+   are codebook-independent); count1 accumulates both quad tables in
+   one pass; `partition_split` scans backward for r_zero.
+4. **synth** — matrixing and the 512-tap windowed sum run with the
+   reduction index outermost (identical per-output accumulation order,
+   vectorizable lanes); the `V[]` shift register is a power-of-two
+   ring (64-slot rotation instead of moving 960 `f64`s per row).
+5. **imdct / analysis / mdct** — the IMDCT, the §C.1.3 analysis
+   matrixing (previously 2048 inline `cos()` per row), and the forward
+   MDCT kernel all read precomputed tables (identical expressions →
+   identical bit patterns) with the same reduction-outermost
+   interchange; analysis/synthesis window functions are tabled.
+6. **requantize** — per-band `2^(−mult·sf)` hoisted; `|is|^(4/3)` reads
+   a precomputed table over the decodable range 0..=8206.
+
+### Per-stage before/after (same host, r409 baseline vs final)
+
+| stage                    | before   | after    | change |
+| ------------------------ | -------- | -------- | ------ |
+| `encode_stage_inner_loop`| 41.87 ms | 13.09 ms | −69 %  |
+| `encode_stage_filterbank`| 3.82 ms  | 168 µs   | −95.6 %|
+| `encode_stage_mdct_long` | 1.86 ms  | 193 µs   | −89.6 %|
+| `stage_synth`            | 321.9 µs | 166.9 µs | −48 %  |
+| `stage_imdct`            | 137.2 µs | 82.6 µs  | −40 %  |
+| `stage_requantize`       | 76.7 µs  | 23.4 µs  | −68 %  |
+| `stage_huffman`          | 42.6 µs  | 43.9 µs  | within noise |
+
+(Batch scopes as defined in the r290 / r398 sections: encode stages
+over a 38-granule batch, decode stages over a 40-granule batch.)
+
+### Whole-stream before/after (direct path, 0.5 s clips)
+
+| scenario                    | encode before | encode after | Δ | decode before | decode after | Δ |
+| --------------------------- | ------------- | ------------ | ---- | ------------- | ------------ | ---- |
+| `tone_mono_44k1_500ms`      | 34.7 ms       | 3.32 ms      | −90 % | 561.7 µs     | 302.7 µs     | −46 % |
+| `noise_mono_44k1_500ms`     | 54.3 ms       | 16.7 ms      | −69 % | 612.0 µs     | 316.6 µs     | −49 % |
+| `sweep_mono_48k_500ms`      | 38.4 ms       | 5.02 ms      | −87 % | 629.4 µs     | 350.5 µs     | −44 % |
+| `tone_mono_32k_500ms`       | 23.6 ms       | 1.80 ms      | −92 % | 394.5 µs     | 209.5 µs     | −47 % |
+| `mixed_stereo_44k1_500ms`   | 89.2 ms       | 21.0 ms      | −76 % | —            | —            | —    |
+
+A mono 44.1 kHz tone now encodes ≈ 150× real-time and decodes ≈ 1650×
+real-time on the development host; wide-spectrum noise (the encoder's
+worst case — the rate loop's full evaluations dominate) encodes ≈ 30×
+real-time. The remaining encode hotspot is still the inner rate loop's
+full evaluations between the first codable gain and the budget-fitting
+gain (each pays a real 576-line quantize whose `powf` calls cannot be
+reordered without changing output bits); the remaining decode hotspot
+is the synthesis matrixing, whose per-output f64 accumulation order is
+likewise pinned by the bit-exactness guarantee.
