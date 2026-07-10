@@ -94,16 +94,37 @@ fn short_block_passes_through_unchanged() {
 }
 
 #[test]
-fn mixed_block_passes_through_unchanged() {
-    // A mixed block is still block_type == 2 under the spec's literal
-    // test, so it is not alias-reduced either.
+fn mixed_block_gets_single_sb1_butterfly() {
+    // A mixed block's two lowest subbands are long-windowed, so exactly
+    // one butterfly group applies — the sb == 1 boundary internal to
+    // the long region (lines 10..26). Everything at or above the
+    // long/short split (line 36) and the outer long lines pass through
+    // unchanged (`mp3-alias-reduction-clarification.md`; r405
+    // observer-trace confirmation).
     let gc = short_gc(true);
     let mut xr = [0.0f32; NUM_LINES];
     for (i, v) in xr.iter_mut().enumerate() {
         *v = (i as f32).sin();
     }
     let out = alias_reduce(&xr, &gc);
-    assert_eq!(out, xr);
+    // Lines untouched by the sb == 1 butterfly (0..10 and 26..576) pass
+    // through unchanged — in particular every line of the short region
+    // and the sb == 2 boundary at line 36.
+    for i in (0..10).chain(26..NUM_LINES) {
+        assert_eq!(out[i], xr[i], "line {i} must pass through");
+    }
+    // The sb == 1 butterfly matches the long-block formula on lines
+    // 10..26.
+    let cs = alias_cs();
+    let ca = alias_ca();
+    for i in 0..8 {
+        let lo = 18 - 1 - i;
+        let hi = 18 + i;
+        let exp_lo = xr[lo] * cs[i] - xr[hi] * ca[i];
+        let exp_hi = xr[hi] * cs[i] + xr[lo] * ca[i];
+        assert!((out[lo] - exp_lo).abs() < EPS, "butterfly {i} lo");
+        assert!((out[hi] - exp_hi).abs() < EPS, "butterfly {i} hi");
+    }
 }
 
 #[test]

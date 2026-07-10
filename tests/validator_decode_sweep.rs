@@ -55,6 +55,17 @@ struct Case {
     stereo: bool,
     force_short: bool,
     noise: bool,
+    /// Force every granule onto the §2.4.2.7 mixed-block path. Only
+    /// rates where both deployed validators agree on mixed geometry
+    /// are listed (8 kHz mixed is refused by the encoder; MPEG-2.5
+    /// 11.025 / 12 kHz mixed decodes bit-faithfully on the primary
+    /// deployed decoder but a second deployed decoder renders it
+    /// differently, so those stay out of the committed matrix).
+    force_mixed: bool,
+    /// Arm the §C.1.5.2 signal-driven auto block-type scheduler and
+    /// feed an attack-train signal, so the stream carries
+    /// LONG / START / SHORT / STOP transitions.
+    auto: bool,
 }
 
 const CASES: &[Case] = &[
@@ -66,6 +77,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg1-44100-mono-128",
@@ -74,6 +87,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg1-44100-stereo-192",
@@ -82,6 +97,8 @@ const CASES: &[Case] = &[
         stereo: true,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg1-48000-stereo-128",
@@ -90,6 +107,8 @@ const CASES: &[Case] = &[
         stereo: true,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     // MPEG-2 LSF
     Case {
@@ -99,6 +118,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg2-22050-mono-48",
@@ -107,6 +128,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg2-24000-stereo-64",
@@ -115,6 +138,8 @@ const CASES: &[Case] = &[
         stereo: true,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg2-16000-mono-32-short",
@@ -123,6 +148,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg2-22050-mono-48-short",
@@ -131,6 +158,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg2-24000-mono-48-short",
@@ -139,6 +168,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg1-44100-mono-128-short",
@@ -147,6 +178,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     // MPEG-2.5 — the Fraunhofer low-rate extension (the encode path
     // whose band tables come from mpeg2.5-scalefactor-bands.md).
@@ -157,6 +190,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-8000-mono-32-short",
@@ -165,6 +200,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-8000-stereo-64",
@@ -173,6 +210,8 @@ const CASES: &[Case] = &[
         stereo: true,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-11025-mono-32",
@@ -181,6 +220,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-11025-stereo-64",
@@ -189,6 +230,8 @@ const CASES: &[Case] = &[
         stereo: true,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-11025-mono-32-short",
@@ -197,6 +240,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-12000-mono-40",
@@ -205,6 +250,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-12000-stereo-64",
@@ -213,6 +260,8 @@ const CASES: &[Case] = &[
         stereo: true,
         force_short: false,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-12000-mono-40-short",
@@ -221,6 +270,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: false,
+        force_mixed: false,
+        auto: false,
     },
     // Wideband-noise forced-short cases: every band of the short
     // tables carries energy, pinning the full band layout (including
@@ -232,6 +283,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: true,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-11025-noise-short",
@@ -240,6 +293,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: true,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg25-12000-noise-short",
@@ -248,6 +303,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: true,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg2-22050-noise-short",
@@ -256,6 +313,8 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: true,
+        force_mixed: false,
+        auto: false,
     },
     Case {
         label: "mpeg1-44100-noise-short",
@@ -264,6 +323,84 @@ const CASES: &[Case] = &[
         stereo: false,
         force_short: true,
         noise: true,
+        force_mixed: false,
+        auto: false,
+    },
+    // Mixed-block cases (the §2.4.2.7 carve-out: 36-line long region +
+    // short remainder, single sb == 1 alias butterfly).
+    Case {
+        label: "mpeg1-44100-mixed",
+        sample_rate: 44_100,
+        bitrate_kbps: 128,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: true,
+        auto: false,
+    },
+    Case {
+        label: "mpeg1-32000-mixed",
+        sample_rate: 32_000,
+        bitrate_kbps: 64,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: true,
+        auto: false,
+    },
+    Case {
+        label: "mpeg2-22050-mixed",
+        sample_rate: 22_050,
+        bitrate_kbps: 48,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: true,
+        auto: false,
+    },
+    // Auto block-type cases: attack-train input drives the scheduler
+    // through LONG → START → SHORT → STOP cycles, so the stream
+    // carries window-switched transition granules (whose region
+    // counts / third codebook are not on the wire).
+    Case {
+        label: "mpeg1-44100-auto",
+        sample_rate: 44_100,
+        bitrate_kbps: 128,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: false,
+        auto: true,
+    },
+    Case {
+        label: "mpeg2-22050-auto",
+        sample_rate: 22_050,
+        bitrate_kbps: 48,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: false,
+        auto: true,
+    },
+    Case {
+        label: "mpeg25-12000-auto",
+        sample_rate: 12_000,
+        bitrate_kbps: 40,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: false,
+        auto: true,
+    },
+    Case {
+        label: "mpeg25-8000-auto",
+        sample_rate: 8_000,
+        bitrate_kbps: 32,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: false,
+        auto: true,
     },
 ];
 
@@ -275,6 +412,26 @@ const CASES: &[Case] = &[
 /// magnitude above. Before the fixes the bad configurations measured
 /// nrmse 0.4–1.4 here — this sweep is the test that caught them.
 const NRMSE_BOUND: f64 = 1e-3;
+
+/// Tone with periodic loud bursts (attacks) to drive the auto
+/// block-type scheduler through START / SHORT / STOP transitions.
+fn attack_pcm(n: usize, sample_rate: u32) -> Vec<i16> {
+    let sr = f64::from(sample_rate);
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let period = (sr * 0.09) as usize; // burst every 90 ms
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = i as f64 / sr;
+        let mut v = 0.08 * (two_pi * 330.0 * t).sin();
+        let ph = i % period.max(1);
+        if ph < (sr * 0.02) as usize {
+            let env = 1.0 - ph as f64 / (sr * 0.02);
+            v += env * 0.7 * (two_pi * 900.0 * t).sin();
+        }
+        out.push((v * f64::from(i16::MAX)) as i16);
+    }
+    out
+}
 
 /// Deterministic wideband noise (LCG), flat-ish spectrum.
 fn noise_pcm(n: usize, stereo: bool) -> Vec<i16> {
@@ -321,6 +478,13 @@ fn encode(case: &Case, pcm: &[i16]) -> Vec<u8> {
     if case.force_short {
         enc.force_short_blocks_for_testing(true)
             .expect("force short blocks");
+    }
+    if case.force_mixed {
+        enc.force_mixed_blocks_for_testing(true)
+            .expect("force mixed blocks");
+    }
+    if case.auto {
+        enc.enable_auto_block_type(2.0).expect("auto block type");
     }
     enc.push_samples(pcm).expect("push_samples");
     let mut bytes = Vec::new();
@@ -516,6 +680,8 @@ fn validator_decodes_encoder_output_at_every_rate() {
         let n = (case.sample_rate as usize * 12) / 10;
         let pcm = if case.noise {
             noise_pcm(n, case.stereo)
+        } else if case.auto {
+            attack_pcm(n, case.sample_rate)
         } else {
             tone_pcm(n, case.sample_rate, case.stereo)
         };

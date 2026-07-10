@@ -49,11 +49,19 @@
 //! granule through unchanged when `block_type == 2`.
 //!
 //! A **mixed** block (`block_type == 2 && mixed_block_flag`) codes its
-//! lowest two subbands with a long window but is still `block_type == 2`;
-//! the spec's literal `block_type`-only test therefore excludes it.
-//! ISO/IEC 11172-3:1993 does not state a separate rule for the long
-//! region of a mixed block, so this module follows the literal text and
-//! does not alias-reduce mixed blocks. See the module's reported spec gap.
+//! lowest two subbands with a long window but is still `block_type == 2`.
+//! The staged clarification
+//! `docs/audio/mp3/mp3-alias-reduction-clarification.md` resolves the
+//! scope: alias reduction applies only where **both sides of a subband
+//! boundary are long-windowed**, so a mixed block gets exactly **one**
+//! butterfly group — the `sb == 1` boundary internal to its two-subband
+//! long region (lines 10..26); boundaries at `sb >= 2` involve a short
+//! side and are skipped, as the "not applied for block-type == 2"
+//! sentence requires for the short region. r405 observer-trace
+//! (per-line probe streams against a black-box validator) confirms
+//! deployed decoders implement precisely this single-butterfly rule:
+//! before the fix the only diverging positions in a mixed granule were
+//! lines 14..21 — the high-coefficient taps of the sb == 1 butterfly.
 
 use crate::side_info::{BlockType, GranuleChannel};
 
@@ -105,8 +113,9 @@ pub fn alias_ca() -> [f32; NUM_BUTTERFLIES] {
 /// * `xr` is the `[f32; 576]` buffer in subband order — the output of
 ///   [`crate::reorder::reorder`] (or the requantized buffer directly for
 ///   long blocks, which reorder passes through unchanged).
-/// * `gc` supplies `block_type` (and `window_switching_flag`): a granule
-///   with `block_type == 2` (short or mixed) is returned unchanged; every
+/// * `gc` supplies `block_type` / `window_switching_flag` /
+///   `mixed_block_flag`: a pure short granule is returned unchanged; a
+///   mixed granule gets the single `sb == 1` butterfly group; every
 ///   other block type alias-reduces the whole spectrum (31 subband
 ///   boundaries × 8 butterflies).
 ///
@@ -117,17 +126,20 @@ pub fn alias_reduce(xr: &[f32; NUM_LINES], gc: &GranuleChannel) -> [f32; NUM_LIN
     let mut xar = *xr;
 
     let is_short = gc.window_switching_flag && gc.block_type == BlockType::Short;
-    if is_short {
+    if is_short && !gc.mixed_block_flag {
         // §2.4.3.4.10.1: alias reduction is not applied for granules with
-        // block-type == 2 (short block). The spec's test is on
-        // `block_type` only, so a mixed block (also block_type == 2) is
-        // excluded too.
+        // block-type == 2 (pure short block).
         return xar;
     }
 
     let cs = alias_cs();
     let ca = alias_ca();
-    for sb in 1..NUM_SUBBANDS {
+    // Mixed blocks: only the boundary internal to the two-subband long
+    // region (sb == 1) is long/long; every other boundary has a short
+    // side and is skipped (`mp3-alias-reduction-clarification.md`,
+    // confirmed by r405 observer-trace).
+    let sb_end = if is_short { 2 } else { NUM_SUBBANDS };
+    for sb in 1..sb_end {
         let boundary = LINES_PER_SUBBAND * sb;
         for i in 0..NUM_BUTTERFLIES {
             // `lo` is the line just below the boundary, `hi` just above.

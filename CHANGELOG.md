@@ -30,6 +30,62 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- alias/mixed: **mixed-block granules now get the single `sb == 1`
+  alias-reduction butterfly on both the decode and encode sides**
+  (r405). §2.4.3.4.10.1's two scope statements are written for the
+  pure cases; the staged clarification
+  (`docs/audio/mp3/mp3-alias-reduction-clarification.md`) resolves
+  mixed blocks to exactly one butterfly group — the boundary internal
+  to the two-subband long region (lines 10..26) — and the r405
+  per-line observer-trace probe confirmed deployed decoders implement
+  precisely that (before the fix, the only diverging positions of a
+  mixed granule were lines 14..21, the high-coefficient taps of the
+  sb == 1 butterfly). `alias::alias_reduce` previously followed the
+  literal `block_type == 2` reading and passed mixed granules through
+  unchanged, and the encoder emitted mixed granules without the
+  inverse butterfly: every mixed-block stream this encoder produced
+  decoded with an uncancelled butterfly on deployed decoders
+  (measured nrmse 1.9e-2 at 44.1 kHz up to 3.5e-1 at 32 kHz). Both
+  sides fixed (`alias_reduce` mixed arm + new
+  `inverse_alias_reduce_mixed` on the two mixed forward paths);
+  mixed-block encode now decodes on both external validators in the
+  float-rounding regime (≤ 7e-6) at 32 / 44.1 / 22.05 kHz and on the
+  primary validator at MPEG-2.5 11.025 / 12 kHz (the second deployed
+  decoder renders MPEG-2.5 mixed differently from the first — a
+  de-facto grey zone outside this crate's control).
+
+- encoder: **window-switched `Start` / `End` granules no longer route
+  through `choose_region_split`** (r405). The window-switched
+  side-info branch carries neither the region counts nor
+  `table_select[2]`, so every decoder reconstructs the §2.4.2.7
+  defaults (`region0_count = 7`, `region1_count = 63` → region 0 =
+  long bands 0..=7, region 1 = rest, region 2 empty) — but the
+  encoder optimized its own split and assigned codebooks to line
+  ranges no decoder would use, silently desynchronizing the Huffman
+  regions of any transition granule whose optimized split disagreed
+  with the defaults (sporadic bursts, e.g. nrmse 2e-2 on 44.1 kHz
+  auto block-type streams; self-cancelling in own-decode round-trips
+  because this decoder reconstructs the same defaults). The encoder
+  now uses exactly the decoder-reconstructible boundaries for every
+  window-switched granule (`long_starts[8]` for Start/End,
+  `3·short_starts[3]` for pure short, 36 for mixed), and
+  `default_transition_gc` carries the real §2.4.2.7 sentinels
+  (region1_count = 63; the emitter reads them). Auto block-type
+  streams now decode on both validators at ≤ 7e-6 at every rate.
+
+- encoder: **mixed blocks are refused at 8 kHz**
+  (`StreamEncodeError::MixedBlocks8kUnsupported`, r405). The deployed
+  8 kHz Fraunhofer short table (per-window starts 0, 8, 16, 24, …)
+  has no band boundary at per-window line 12, so the §2.4.2.7 mixed
+  carve-out's 36-line long/short split is structurally undefined at
+  8 kHz — and the r405 observer-trace found the two black-box
+  validators render 8 kHz mixed granules differently from each other
+  (no de-facto behaviour to conform to; this crate's decoder leaves
+  the ill-defined lines 36..72 silent). `force_mixed_blocks_for_testing`
+  and `enable_auto_block_type_with_mixed` now reject at 8 kHz; pure
+  short blocks and the plain auto block-type path are fully supported
+  there (validator-verified at ≤ 6e-6).
+
 - tables: **MPEG-2.5 11.025 / 12 kHz scalefactor-band tables corrected
   to the deployed de-facto layout — the 16 kHz LSF table pair** (r405).
   MPEG-2.5 is a proprietary extension with no ISO table; the staged

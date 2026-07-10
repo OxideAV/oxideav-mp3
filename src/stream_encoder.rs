@@ -228,6 +228,21 @@ pub enum StreamEncodeError {
         /// `0` when the failure was a granule-length mismatch.
         sample_rate_hz: u32,
     },
+    /// Mixed blocks were requested on an 8 kHz (MPEG-2.5) encoder —
+    /// [`Mp3Encoder::force_mixed_blocks_for_testing`] or
+    /// [`Mp3Encoder::enable_auto_block_type_with_mixed`]. The mixed
+    /// carve-out fixes the long region at the two lowest polyphase
+    /// subbands (36 lines) and starts the short region at the short
+    /// band whose tripled start index is 36; the deployed 8 kHz
+    /// Fraunhofer short table (per-window starts 0, 8, 16, 24, …) has
+    /// **no** band boundary at per-window line 12, so the mixed
+    /// geometry is structurally undefined at 8 kHz — and the r405
+    /// observer-trace found the two black-box validators render 8 kHz
+    /// mixed granules *differently from each other* (no de-facto
+    /// behaviour to conform to). The encoder therefore refuses to emit
+    /// mixed granules at 8 kHz; pure short blocks (and the plain auto
+    /// block-type path) are fully supported there.
+    MixedBlocks8kUnsupported,
     /// [`Mp3Encoder::enable_auto_block_type_model2`] was called on an
     /// encoder that does not have the §C.1.5.3.2.1 automatic Model 2
     /// psychoacoustics armed. The Model-2-driven block-type path reuses
@@ -272,6 +287,9 @@ impl core::fmt::Display for StreamEncodeError {
             ),
             StreamEncodeError::IntensityShortBlocksUnsupported => f.write_str(
                 "this block-type toggle is not supported with intensity-stereo coupling armed (mixed-promotion auto and Model-2-driven auto remain unavailable; force-short / force-mixed and signal-driven auto block-type — MS-joint or intensity-only — are supported)",
+            ),
+            StreamEncodeError::MixedBlocks8kUnsupported => f.write_str(
+                "mixed blocks are not supported at 8 kHz: the MPEG-2.5 8 kHz short band                  table has no boundary at the 36-line long/short split, and deployed                  decoders disagree on the resulting geometry (use pure short blocks)",
             ),
             StreamEncodeError::Model2AnalysisUnsupported { sample_rate_hz } => {
                 if *sample_rate_hz == 0 {
@@ -1102,6 +1120,13 @@ impl Mp3Encoder {
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
+        if enabled && self.sample_rate_hz == 8000 {
+            // The 8 kHz Fraunhofer short table has no band boundary at
+            // the 36-line long/short split, so the mixed carve-out is
+            // structurally undefined there and deployed decoders
+            // disagree on it (r405 observer-trace) — refuse to emit.
+            return Err(StreamEncodeError::MixedBlocks8kUnsupported);
+        }
         if enabled && self.intensity_start_sfb.is_some() && self.ms_joint_stereo_active() {
             // §2.4.3.4.10.3 mixed-block intensity coupling is wired for
             // the *intensity-only* (non-MS) path (r311): the carve-out's
@@ -1329,6 +1354,13 @@ impl Mp3Encoder {
         attack_threshold: f64,
         mixed_low_band_stability: f64,
     ) -> Result<(), StreamEncodeError> {
+        // The mixed carve-out is structurally undefined at 8 kHz (see
+        // [`StreamEncodeError::MixedBlocks8kUnsupported`]); the plain
+        // [`Self::enable_auto_block_type`] path (long/start/short/stop)
+        // is the supported auto configuration there.
+        if self.sample_rate_hz == 8000 {
+            return Err(StreamEncodeError::MixedBlocks8kUnsupported);
+        }
         // Mixed-block intensity coupling is not wired (the §2.4.3.4.10.3
         // mixed carve-out's long-lowest-subbands + short-rest split needs
         // a two-region intensity bound that this round does not derive).
@@ -3572,11 +3604,13 @@ impl Mp3Encoder {
                                 xr[base..base + 18].copy_from_slice(&bins);
                             }
                             let gc_mixed = default_mixed_gc();
-                            // No inverse alias reduction (same
-                            // rationale as the `force_mixed_blocks`
-                            // branch: `alias::alias_reduce` is gated
-                            // on `block_type == Short` only, and
-                            // returns unchanged for mixed too).
+                            // Inverse mixed alias reduction (r405):
+                            // the decoder applies the single sb == 1
+                            // butterfly to a mixed granule's long
+                            // region, so the encoder inverts it here
+                            // (lines 10..26 — inside the reorder's
+                            // long-region passthrough).
+                            let xr = inverse_alias_reduce_mixed(&xr);
                             xr_pre_per_gc[gr][ch] = crate::short_block::forward_reorder(
                                 &xr,
                                 &gc_mixed,
@@ -3711,12 +3745,15 @@ impl Mp3Encoder {
                     // subband-window-interleaved into native bitstream
                     // `[sfb][win][k]` order.
                     let gc_mixed = default_mixed_gc();
-                    // No inverse alias reduction. The decoder's
-                    // [`crate::alias::alias_reduce`] tests
-                    // `block_type == Short` only and returns unchanged
-                    // for both short and mixed granules, so applying
-                    // the inverse here would leave a residual butterfly
-                    // on the decode side that nothing reverses.
+                    // Inverse mixed alias reduction (r405): the
+                    // decoder applies the single sb == 1 butterfly to
+                    // a mixed granule's long region
+                    // (`mp3-alias-reduction-clarification.md`), so the
+                    // encoder inverts it here. The butterfly touches
+                    // lines 10..26 only — inside the long region the
+                    // reorder passes through unchanged, so applying it
+                    // before `forward_reorder` is exact.
+                    let xr = inverse_alias_reduce_mixed(&xr);
                     xr_pre_per_gc[gr][ch] = crate::short_block::forward_reorder(
                         &xr,
                         &gc_mixed,
@@ -4843,8 +4880,7 @@ impl Mp3Encoder {
                     gc.big_values = split.big_pairs as u16;
                     if self.force_short_blocks
                         || self.force_mixed_blocks
-                        || (gc_template.window_switching_flag
-                            && gc_template.block_type == BlockType::Short)
+                        || gc_template.window_switching_flag
                     {
                         // §C.1.5.4.4.6 + huffman::region_boundaries:
                         // for window-switched short-family granules
@@ -4875,17 +4911,41 @@ impl Mp3Encoder {
                         // already re-ordered into `[sfb][win][k]`
                         // native order by `forward_reorder` above.
                         //
+                        // Window-switched **long-family** granules
+                        // (`Start` / `End`, r405 fix): these take the
+                        // same 22-bit window-switched side-info branch
+                        // — region counts and `table_select[2]` are
+                        // NOT on the wire — so every decoder
+                        // reconstructs the §2.4.2.7 defaults
+                        // `region0_count = 7`, `region1_count = 63`:
+                        // region 0 = long bands 0..=7
+                        // (`long_starts[8]` lines), region 1 = the
+                        // rest of big_values, region 2 empty. This
+                        // arm previously routed Start / End through
+                        // `choose_region_split`, whose optimized
+                        // boundaries (and third table) can never
+                        // reach the decoder — any granule where the
+                        // chosen split disagreed with the defaults
+                        // desynchronized the Huffman regions of
+                        // every conforming decoder (observed as
+                        // sporadic transition-granule corruption in
+                        // the r405 black-box validator sweep, e.g.
+                        // nrmse 2e-2 bursts at 44.1 kHz auto
+                        // block-type).
+                        //
                         // The auto-block-type path
                         // ([`Mp3Encoder::enable_auto_block_type`]) may
-                        // also emit `BlockType::Short` granules without
-                        // setting either force-toggle, so we extend the
-                        // gate to any window-switched short-family
-                        // template — the wire layout and the §2.4.4.5
-                        // bit-cost check are then consistent.
-                        let r0_lines = if gc_template.mixed_block_flag {
-                            36usize
-                        } else {
-                            3 * short_band_starts_for(self.sample_rate_hz)[3]
+                        // emit any window-switched block type without
+                        // a force-toggle, so the gate covers every
+                        // window-switched template — the wire layout
+                        // and the §2.4.4.5 bit-cost check are then
+                        // consistent.
+                        let r0_lines = match gc_template.block_type {
+                            BlockType::Short if gc_template.mixed_block_flag => 36usize,
+                            BlockType::Short => 3 * short_band_starts_for(self.sample_rate_hz)[3],
+                            // Start / End: §2.4.2.7 default
+                            // region0_count = 7 in long-band units.
+                            _ => long_band_starts_for(self.sample_rate_hz)[8],
                         };
                         r0_end = r0_lines.min(bv2);
                         r1_end = bv2;
@@ -5875,12 +5935,10 @@ fn default_mixed_gc() -> GranuleChannel {
 /// `End` (block_type 3, "Stop"). Identical to
 /// [`default_long_gc`] except `window_switching_flag = true`,
 /// `block_type` is the carried value, and the region-count fields
-/// follow the §C.1.5.4.4.6 spec-default for window-switched long-family
-/// granules (`region0_count = 7` for `Start`/`End`, with `region1_count`
-/// = 36 to round out the big-values count; the parser regenerates the
-/// 4-bit-field default but the writer round-trips whatever we set).
-/// Used by the auto block-type path
-/// ([`Mp3Encoder::enable_auto_block_type`]).
+/// carry the §2.4.2.7 window-switched defaults every decoder
+/// reconstructs (`region0_count = 7`, `region1_count = 63` — not on
+/// the wire in the window-switched side-info branch). Used by the
+/// auto block-type path ([`Mp3Encoder::enable_auto_block_type`]).
 fn default_transition_gc(block_type: BlockType) -> GranuleChannel {
     debug_assert!(matches!(block_type, BlockType::Start | BlockType::End));
     GranuleChannel {
@@ -5893,15 +5951,15 @@ fn default_transition_gc(block_type: BlockType) -> GranuleChannel {
         mixed_block_flag: false,
         table_select: [0; 3],
         subblock_gain: [0; 3],
-        // For window-switched long-family blocks (Start/End) the
-        // §C.1.5.4.4.6 default region split is the same window-switched
-        // skeleton the parser regenerates for short blocks
-        // (region0_count = 7 covers SFB 0..7, the parser then
-        // reconstructs the rest). The decoder doesn't act on the
-        // carried value for window-switched granules; the writer just
-        // needs to emit a structurally legal field.
+        // §2.4.2.7 window-switched defaults. These fields are not
+        // transmitted for window-switched granules, but the in-memory
+        // values must match what `parse_side_info` reconstructs
+        // (region0_count = 7, region1_count = 63): the Huffman
+        // emitter's region mapping reads them, so a mismatched
+        // sentinel here silently assigns codebooks to line ranges no
+        // decoder will use (the r405 Start/End region fix).
         region0_count: 7,
-        region1_count: 7,
+        region1_count: 63,
         preflag: false,
         scalefac_scale: false,
         count1table_select: false,
@@ -6060,16 +6118,30 @@ fn clamp_above(is: &mut [i32; NUM_LINES], bound: i32) {
 /// Short blocks pass through unchanged (decoder skips alias_reduce when
 /// `block_type == Short`).
 fn inverse_alias_reduce(xr: &[f32; NUM_LINES]) -> [f32; NUM_LINES] {
+    inverse_alias_reduce_boundaries(xr, 32)
+}
+
+/// Inverse of the decoder's single-butterfly **mixed-block** alias
+/// reduction: only the `sb == 1` boundary internal to the two-subband
+/// long region is long/long, so only that butterfly group is inverted
+/// (`docs/audio/mp3/mp3-alias-reduction-clarification.md`; r405
+/// observer-trace). Mirrors `alias::alias_reduce` for
+/// `mixed_block_flag` granules.
+fn inverse_alias_reduce_mixed(xr: &[f32; NUM_LINES]) -> [f32; NUM_LINES] {
+    inverse_alias_reduce_boundaries(xr, 2)
+}
+
+fn inverse_alias_reduce_boundaries(xr: &[f32; NUM_LINES], sb_end: usize) -> [f32; NUM_LINES] {
     use crate::alias::{alias_ca, alias_cs};
     let cs = alias_cs();
     let ca = alias_ca();
     let mut out = *xr;
-    // Apply the inverse butterfly across each of the 31 subband
-    // boundaries (sb = 1..32). Source inputs come from `out` updated
+    // Apply the inverse butterfly across each covered subband
+    // boundary. Source inputs come from `out` updated
     // in place: each butterfly's `(lo, hi)` is a fresh pair so we can
     // read-then-write within the same loop iteration without cross-
     // contamination across butterflies of the same boundary.
-    for sb in 1..32 {
+    for sb in 1..sb_end {
         let boundary = 18 * sb;
         // Collect originals first so each butterfly reads pre-update
         // values (the §2.4.3.4.10.1 butterfly does the same on the
@@ -6090,6 +6162,30 @@ fn inverse_alias_reduce(xr: &[f32; NUM_LINES]) -> [f32; NUM_LINES] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mixed_blocks_rejected_at_8khz() {
+        // The 8 kHz Fraunhofer short table has no boundary at the
+        // 36-line long/short split, so mixed emission is refused
+        // (r405); pure short and plain auto stay available.
+        let mut enc = super::Mp3Encoder::new(32, 8_000, crate::ChannelMode::SingleChannel).unwrap();
+        assert!(matches!(
+            enc.force_mixed_blocks_for_testing(true),
+            Err(super::StreamEncodeError::MixedBlocks8kUnsupported)
+        ));
+        assert!(matches!(
+            enc.enable_auto_block_type_with_mixed(2.0, 6.0),
+            Err(super::StreamEncodeError::MixedBlocks8kUnsupported)
+        ));
+        assert!(enc.force_short_blocks_for_testing(true).is_ok());
+        let mut enc2 =
+            super::Mp3Encoder::new(32, 8_000, crate::ChannelMode::SingleChannel).unwrap();
+        assert!(enc2.enable_auto_block_type(2.0).is_ok());
+        // Mixed stays available at the other MPEG-2.5 rates.
+        let mut enc3 =
+            super::Mp3Encoder::new(40, 12_000, crate::ChannelMode::SingleChannel).unwrap();
+        assert!(enc3.force_mixed_blocks_for_testing(true).is_ok());
+    }
+
     use super::*;
     use crate::alias::alias_reduce;
     use crate::encode_silent_frame;
