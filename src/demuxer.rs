@@ -1140,7 +1140,15 @@ impl Demuxer for Mp3Demuxer {
     }
 
     fn duration_micros(&self) -> Option<i64> {
-        let dur = self.streams[0].duration?;
+        // Container-level duration is the PLAYABLE duration: when the
+        // Xing/Info trailer carries the gapless extension
+        // (encoder-delay / zero-padding trim), report the trimmed
+        // sample count -- that is the figure a gapless-aware player
+        // renders (r408). For streams without the extension
+        // `trimmed_duration_samples` equals the gross per-stream
+        // duration, so nothing changes there. The gross count stays
+        // available as `streams()[0].duration`.
+        let dur = self.trimmed_duration_samples.or(self.streams[0].duration)?;
         // duration ticks are in 1/sample_rate seconds.
         Some(((dur as i128) * 1_000_000 / self.sample_rate as i128) as i64)
     }
@@ -1957,6 +1965,11 @@ mod tests {
         assert_eq!(d.streams()[0].duration, Some(4 * 1152));
         // Trimmed duration honours the LAME-extension trim.
         assert_eq!(d.trimmed_duration_samples(), Some(4 * 1152 - 1729 - 722));
+        // The container-level duration reports the PLAYABLE (trimmed)
+        // figure when the gapless extension is present (r408) -- the
+        // duration a gapless-aware player renders.
+        let expected_micros = (i128::from(4i64 * 1152 - 1729 - 722) * 1_000_000 / 44_100) as i64;
+        assert_eq!(d.duration_micros(), Some(expected_micros));
     }
 
     #[test]

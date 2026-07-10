@@ -28,6 +28,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   identical bits (and `exhausted` transition on the follow-up `read`) as
   the former bit-at-a-time accumulation.
 
+### Changed
+
+- demuxer: **container-level `duration_micros` now reports the
+  playable (gapless-trimmed) duration** (r408). When the Xing/Info
+  trailer carries the gapless extension (encoder-delay /
+  zero-padding), `duration_micros` derives from
+  `trimmed_duration_samples()` — the figure a gapless-aware player
+  renders — instead of the gross frame-count duration. Streams
+  without the extension are unchanged (trimmed == gross there), and
+  the gross sample count remains available as
+  `streams()[0].duration`.
+
 ### Fixed
 
 - decoder: **foreign MPEG-2.5 8 kHz mixed-block granules no longer
