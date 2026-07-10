@@ -1986,8 +1986,8 @@ mod tests {
             res.stats.converged,
             res.stats.iterations,
             res.stats.bands_amplified,
-            &res.scalefactors.long,
-            &d_b,
+            res.scalefactors.long,
+            d_b,
         );
         // The loop terminated with last-good state. Bands that
         // amplified must still be within the §C.1.5.4.3.6 cap (the
@@ -2187,7 +2187,7 @@ mod tests {
             res.preflag,
             "preflag should have fired (sfb 17..=20 all over threshold), \
              got preflag={} sf={:?} converged={} iters={}",
-            res.preflag, &res.scalefactors.long, res.stats.converged, res.stats.iterations,
+            res.preflag, res.scalefactors.long, res.stats.converged, res.stats.iterations,
         );
         assert!(
             res.scalefactors.preflag,
@@ -2213,7 +2213,7 @@ mod tests {
             !res.preflag,
             "preflag must NOT fire if any of sfb 17..=20 is at zero distortion \
              (got preflag={} sf={:?})",
-            res.preflag, &res.scalefactors.long,
+            res.preflag, res.scalefactors.long,
         );
     }
 
@@ -2676,7 +2676,7 @@ mod tests {
             res.stats.converged,
             res.stats.iterations,
             res.stats.bands_amplified,
-            &res.scalefactors.short,
+            res.scalefactors.short,
         );
         // All cells must stay within the §C.1.5.4.3.6 cap.
         for (sfb, row) in res.scalefactors.short.iter().enumerate() {
@@ -3281,8 +3281,8 @@ mod tests {
             res.stats.converged,
             res.stats.iterations,
             res.stats.bands_amplified,
-            &res.scalefactors.short,
-            &res.scalefactors.long,
+            res.scalefactors.short,
+            res.scalefactors.long,
         );
         // All cells must stay within their respective caps.
         for sfb in 0..=MIXED_LAST_LONG_SFB {
