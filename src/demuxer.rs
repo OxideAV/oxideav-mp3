@@ -279,6 +279,7 @@ pub fn parse_xing_info(frame_payload: &[u8], side_info_bytes: usize) -> Option<X
 /// flag combinations the staged doc does not cover (DOCS-GAP — see
 /// the module-level comment).
 #[must_use]
+#[doc(hidden)] // internal: demuxer layout helper, public for tests only (not stable API)
 pub fn lame_magic_offset(
     header_bytes: usize,
     side_info_bytes: usize,
@@ -297,6 +298,7 @@ pub fn lame_magic_offset(
 /// and channel count, per the four `SIDE_INFO_BYTES_*` constants in
 /// [`crate::side_info`].
 #[must_use]
+#[doc(hidden)] // internal: demuxer layout helper, public for tests only (not stable API)
 pub fn side_info_len(version: MpegVersion, channels: u8) -> usize {
     // MPEG-2.5 inherits the LSF side-info layout per the
     // `MpegVersion::Mpeg25` doc-comment + `MPEG-2.5-GAP.md`.

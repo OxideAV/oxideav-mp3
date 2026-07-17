@@ -8,6 +8,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Internal public surface marked `#[doc(hidden)]`** (fleet policy):
+  the Layer III pipeline-stage modules and test-only helpers (huffman /
+  requantize / synthesis / psychoacoustic plumbing) are hidden from
+  rustdoc and from cargo-semver-checks' public-API view; attributes and
+  comments only — no signature, path, or behavior change, every item
+  remains importable, and the documented decode / encode / demux / seek
+  / Xing / registry surface is unchanged.
 - requantize: **per-band gain term hoisted + precomputed `mag^(4/3)`
   table** (r409, bench axis). The decoder's long-range requantizer
   re-derived `sf_term = 2^(−mult·scalefac)` per line (it depends only

@@ -166,6 +166,7 @@ fn emphasis_bits(emphasis: Emphasis) -> u32 {
 /// present (ISO/IEC 11172-3 §2.4.2.3 "redundancy added"), so
 /// `crc_protected == true` writes `protection_bit = 0`.
 #[must_use]
+#[doc(hidden)] // internal: encoder framing helper, public for tests only (not stable API)
 pub fn write_header(header: &Mp3FrameHeader) -> [u8; 4] {
     let protection = u32::from(!header.crc_protected);
     // Frame-sync: 11 bits `'1111 1111 111'` at positions 31..21
@@ -263,6 +264,7 @@ fn block_type_bits(bt: BlockType) -> u32 {
 ///
 /// The output is byte-aligned and exactly [`SideInfo::byte_len`] bytes.
 #[must_use]
+#[doc(hidden)] // internal: encoder framing helper, public for tests only (not stable API)
 pub fn write_side_info(si: &SideInfo) -> Vec<u8> {
     let nch = si.channels as usize;
     let mono = si.channels == 1;
@@ -366,6 +368,7 @@ impl std::error::Error for EncodeError {}
 /// the side info), all `scfsi` clear, and all `private_bits` zero.
 /// Granule / channel counts follow the header version and mode.
 #[must_use]
+#[doc(hidden)] // internal: encoder framing helper, public for tests only (not stable API)
 pub fn silent_side_info(header: &Mp3FrameHeader) -> SideInfo {
     let nch = header.channel_count();
     let lsf = header.version.is_lsf();

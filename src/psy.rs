@@ -571,6 +571,7 @@ impl XminThresholds {
 /// (a mid-spectrum band at 128 kbit/s) both sit within ~1 dex of each
 /// other, so the outer-loop convergence dynamics are preserved when
 /// the caller switches from the uniform path to the per-band path.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE: f64 = DEFAULT_OUTER_LOOP_THRESHOLD;
 
 /// Convert a threshold-in-quiet value in `dB` to the outer-loop
@@ -694,6 +695,7 @@ fn ltq_db_at_hz(hz: f64) -> f64 {
 /// constants — a tonal masker has a deeper masking floor than a
 /// non-tonal masker at the same SPL and Bark distance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub enum MaskerKind {
     /// Tonal masker (Step 4 selection: local maxima of the SPL
     /// spectrum surrounded by clearly lower neighbours). Carries
@@ -718,6 +720,7 @@ pub enum MaskerKind {
 /// implemented this round; see the module-level DOCS-GAP note on the
 /// PNG-only D.1 / D.2 tables).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Masker {
     /// Tonal / non-tonal classification per §D.1 Step 4.
     pub kind: MaskerKind,
@@ -732,11 +735,13 @@ pub struct Masker {
 /// contributes a non-`-inf` individual masking threshold (verbatim
 /// §D.1 Step 6: the `vf` piecewise function is defined for
 /// `-3 <= dz < 8`).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MASKING_FUNCTION_DZ_LO: f64 = -3.0;
 
 /// Upper bound (exclusive) of the Bark-distance window in which a
 /// masker contributes a non-`-inf` individual masking threshold
 /// (verbatim §D.1 Step 6).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MASKING_FUNCTION_DZ_HI: f64 = 8.0;
 
 /// §D.1 Step 6 masking index for a **tonal** masker at Bark
@@ -752,6 +757,7 @@ pub const MASKING_FUNCTION_DZ_HI: f64 = 8.0;
 /// because a tone is a more efficient masker than noise.)
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn masking_index_tonal(z_j_bark: f64) -> f64 {
     -1.525 - 0.275 * z_j_bark - 4.5
 }
@@ -770,6 +776,7 @@ pub fn masking_index_tonal(z_j_bark: f64) -> f64 {
 /// SPL non-tonal masker does.)
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn masking_index_non_tonal(z_j_bark: f64) -> f64 {
     -1.525 - 0.175 * z_j_bark - 0.5
 }
@@ -795,6 +802,7 @@ pub fn masking_index_non_tonal(z_j_bark: f64) -> f64 {
 /// itself returns the unattenuated masking-index + SPL.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn masking_function_vf(dz_bark: f64, x_db: f64) -> Option<f64> {
     // Out-of-range guard. The spec uses half-open `[-3, 8)`; preserve
     // that exactly so `dz = 8.0` produces `None`.
@@ -828,6 +836,7 @@ pub fn masking_function_vf(dz_bark: f64, x_db: f64) -> Option<f64> {
 /// threshold at this line.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn individual_masking_threshold_db(masker: &Masker, z_i_bark: f64) -> Option<f64> {
     let dz = z_i_bark - masker.z_bark;
     let vf = masking_function_vf(dz, masker.spl_db)?;
@@ -868,6 +877,7 @@ pub fn individual_masking_threshold_db(masker: &Masker, z_i_bark: f64) -> Option
 /// from [`ltq_db_at_hz`] after converting `z(i)` to a frequency via
 /// the Bark / Hz mapping table the caller supplies.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn global_masking_threshold_db(maskers: &[Masker], z_i_bark: f64, ltq_db: f64) -> f64 {
     // Threshold in quiet contributes 10^(LTq / 10) to the energy sum.
     let mut energy_sum = (10.0_f64).powf(ltq_db / 10.0);
@@ -940,6 +950,7 @@ pub fn global_masking_threshold_db(maskers: &[Masker], z_i_bark: f64, ltq_db: f6
 /// `[boundaries[k - 1].z_bark, boundaries[k].z_bark]` (the spec
 /// boundaries are right-closed in Bark).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CriticalBandBoundary {
     /// Critical-band index (`no` column in the spec table), zero-based
     /// per the spec's `no 0..` numbering.
@@ -985,12 +996,14 @@ impl CriticalBandBoundary {
 /// wrong). The marker stays `true` because the D.2e cell itself
 /// remains illegible in its render; the cross-table resolution is
 /// pinned by the `table_d1_agrees_with_d2_boundary_rows` unit test.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const D2E_BAND_17_BARK_IS_ILLEGIBLE: bool = true;
 
 /// Table D.2a — Layer I, Fs = 32 kHz (24 bands, `no` 0..=23).
 ///
 /// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.2a - Layer I, Fs = 32 kHz (24 bands, no 0..23)".
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const CRITICAL_BANDS_D2A: [CriticalBandBoundary; 24] = [
     CriticalBandBoundary::new(0, 1, 62.500, 0.617),
     CriticalBandBoundary::new(1, 3, 187.500, 1.842),
@@ -1027,6 +1040,7 @@ pub const CRITICAL_BANDS_D2A: [CriticalBandBoundary; 24] = [
 /// prints `17,904` / `20,971` / `24,573` here but `17,905` /
 /// `20,972` / `24,574` in the Table D.1b rows they cite (indices 50,
 /// 68, 106). See the matching note on [`CRITICAL_BANDS_D2E`].
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const CRITICAL_BANDS_D2B: [CriticalBandBoundary; 25] = [
     CriticalBandBoundary::new(0, 1, 86.133, 0.850),
     CriticalBandBoundary::new(1, 2, 172.266, 1.694),
@@ -1059,6 +1073,7 @@ pub const CRITICAL_BANDS_D2B: [CriticalBandBoundary; 25] = [
 ///
 /// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.2c - Layer I, Fs = 48 kHz (26 bands, no 0..25)".
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const CRITICAL_BANDS_D2C: [CriticalBandBoundary; 26] = [
     CriticalBandBoundary::new(0, 1, 93.750, 0.925),
     CriticalBandBoundary::new(1, 2, 187.500, 1.842),
@@ -1092,6 +1107,7 @@ pub const CRITICAL_BANDS_D2C: [CriticalBandBoundary; 26] = [
 ///
 /// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.2d - Layer II, Fs = 32 kHz (25 bands, no 0..24)".
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const CRITICAL_BANDS_D2D: [CriticalBandBoundary; 25] = [
     CriticalBandBoundary::new(0, 1, 31.250, 0.309),
     CriticalBandBoundary::new(1, 3, 93.750, 0.925),
@@ -1142,6 +1158,7 @@ pub const CRITICAL_BANDS_D2D: [CriticalBandBoundary; 25] = [
 /// inconsistency in the printed spec. The verbatim D.2e prints are
 /// kept here; the Table D.1 values are what the Step 4 → Bark
 /// bridge reads.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const CRITICAL_BANDS_D2E: [CriticalBandBoundary; 27] = [
     CriticalBandBoundary::new(0, 1, 43.066, 0.425),
     CriticalBandBoundary::new(1, 2, 86.133, 0.850),
@@ -1178,6 +1195,7 @@ pub const CRITICAL_BANDS_D2E: [CriticalBandBoundary; 27] = [
 ///
 /// Verbatim from `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.2f - Layer II, Fs = 48 kHz (27 bands, no 0..26)".
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const CRITICAL_BANDS_D2F: [CriticalBandBoundary; 27] = [
     CriticalBandBoundary::new(0, 1, 46.875, 0.463),
     CriticalBandBoundary::new(1, 2, 93.750, 0.925),
@@ -1260,6 +1278,7 @@ impl AnnexDSamplingRate {
 /// (`LayerI` or `LayerII`) explicitly per the Annex D scope).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn critical_band_boundaries(
     layer: crate::frame::Layer,
     fs: AnnexDSamplingRate,
@@ -1283,6 +1302,7 @@ pub fn critical_band_boundaries(
 /// (an FFT line above the audio band of the table).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn band_of_fft_line(boundaries: &[CriticalBandBoundary], fft_line_index: u16) -> Option<u16> {
     if fft_line_index == 0 {
         return None;
@@ -1343,6 +1363,7 @@ pub fn band_of_fft_line(boundaries: &[CriticalBandBoundary], fft_line_index: u16
 /// coordinate.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn masker_at_band(
     boundaries: &[CriticalBandBoundary],
     band_no: u16,
@@ -1368,6 +1389,7 @@ pub fn masker_at_band(
 /// `-8` (the lowest `z(j) - z(i)` displacement, exclusive — a masker
 /// 8 Bark below the line is the edge of the §D.1 Step 6 `vf`
 /// piecewise function's `dz < 8` upper branch, which is right-open).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE: f64 = -8.0;
 
 /// Upper bound (inclusive) of the §D.1 Step 7 "nearby-masker" Bark
@@ -1376,6 +1398,7 @@ pub const STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE: f64 = -8.0;
 /// highest `z(j) - z(i)` displacement (inclusive — the spec's
 /// `vf` lower branch is left-closed at `dz = -3`, so a masker
 /// exactly 3 Bark above the line is still in range).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE: f64 = 3.0;
 
 /// Predicate for the §D.1 Step 7 "nearby-masker" optimisation:
@@ -1401,6 +1424,7 @@ pub const STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE: f64 = 3.0;
 /// `Some`.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn masker_in_step7_window_of_line(masker: &Masker, z_i_bark: f64) -> bool {
     let dz_from_line = masker.z_bark - z_i_bark;
     dz_from_line > STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE
@@ -1466,6 +1490,7 @@ pub fn masker_in_step7_window_of_line(masker: &Masker, z_i_bark: f64) -> bool {
 /// are in the same cluster and collapse to the loudest member; the
 /// spec phrasing is "less than 0,5 Bark", which this constant
 /// captures as the strict upper bound.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const STEP5_TONAL_DECIMATION_WINDOW_BARK: f64 = 0.5;
 
 /// §D.1 Step 5(a) threshold-in-quiet screening predicate. Returns
@@ -1485,6 +1510,7 @@ pub const STEP5_TONAL_DECIMATION_WINDOW_BARK: f64 = 0.5;
 /// dispatches the masking-index `av` per kind.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn masker_above_threshold_in_quiet(masker: &Masker, ltq_db: f64) -> bool {
     masker.spl_db >= ltq_db
 }
@@ -1515,6 +1541,7 @@ pub fn masker_above_threshold_in_quiet(masker: &Masker, ltq_db: f64) -> bool {
 /// tonal maskers separated by exactly `0.5` Bark is therefore
 /// **not** in the same cluster and both survive.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn decimate_tonal_within_half_bark(maskers: &[Masker]) -> Vec<Masker> {
     // Fast path: nothing to do for the empty / singleton input.
     if maskers.len() < 2 {
@@ -1625,6 +1652,7 @@ pub fn decimate_tonal_within_half_bark(maskers: &[Masker]) -> Vec<Masker> {
 /// The threshold is a hard lower bound on the *linear* factor
 /// `10^(tmpy/10)`; spreading-function values at or below this
 /// threshold are clamped to exact zero by the spec procedure.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_SPREAD_LINEAR_MIN: f64 = 1.0e-6;
 
 /// §C.1.5.3.2.1 Layer III spreading-function dB value `tmpy(i, j)` —
@@ -1648,6 +1676,7 @@ pub const MODEL2_LAYER3_SPREAD_LINEAR_MIN: f64 = 1.0e-6;
 /// `MODEL2_LAYER3_SPREAD_LINEAR_MIN` clamp.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_spread_db(i: i32, j: i32) -> f64 {
     let dj = f64::from(j - i);
     if j >= i {
@@ -1679,6 +1708,7 @@ pub fn model2_layer3_spread_db(i: i32, j: i32) -> f64 {
 /// branch).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_spread_linear(i: i32, j: i32) -> f64 {
     let tmpy_db = model2_layer3_spread_db(i, j);
     let linear = (10.0_f64).powf(tmpy_db / 10.0);
@@ -1732,6 +1762,7 @@ pub fn model2_layer3_spread_linear(i: i32, j: i32) -> f64 {
 ///
 /// The comparison is strict (`<`) and tests `tmpy` alone — the
 /// parabolic `x` term does not participate in the cutoff decision.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_SPRDNGF_TMPY_CUTOFF_DB: f64 = -100.0;
 
 /// §D.2.3 temporary variable `tmpx = 1,05 * (j - i)` — the scaled
@@ -1743,6 +1774,7 @@ pub const MODEL2_SPRDNGF_TMPY_CUTOFF_DB: f64 = -100.0;
 /// downward spread.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_sprdngf_tmpx(i_bark: f64, j_bark: f64) -> f64 {
     1.05 * (j_bark - i_bark)
 }
@@ -1758,6 +1790,7 @@ pub fn model2_sprdngf_tmpx(i_bark: f64, j_bark: f64) -> f64 {
 /// negative value `8 * (1 - 2) = -8` dB at `tmpx = 1,5`.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_sprdngf_x_db(tmpx: f64) -> f64 {
     let u = tmpx - 0.5;
     8.0 * (u * u - 2.0 * u).min(0.0)
@@ -1773,6 +1806,7 @@ pub fn model2_sprdngf_x_db(tmpx: f64) -> f64 {
 /// masking skirt (upward masking reaches much farther than downward).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_sprdngf_tmpy_db(tmpx: f64) -> f64 {
     let v = tmpx + 0.474;
     15.811_389 + 7.5 * v - 17.5 * (1.0 + v * v).sqrt()
@@ -1793,6 +1827,7 @@ pub fn model2_sprdngf_tmpy_db(tmpx: f64) -> f64 {
 /// downward and ≈ 10,5 Bark upward.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_sprdngf(i_bark: f64, j_bark: f64) -> f64 {
     let tmpx = model2_sprdngf_tmpx(i_bark, j_bark);
     let tmpy = model2_sprdngf_tmpy_db(tmpx);
@@ -1866,11 +1901,13 @@ pub fn model2_sprdngf(i_bark: f64, j_bark: f64) -> f64 {
 /// §D.2.4 step a) analysis-window length — "Reconstruct 1 024 samples
 /// of the input signal" (and the §D.2.2 line domain ω ∈ 1..=513 is
 /// exactly this transform's half-spectrum).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_FFT_LEN: usize = 1024;
 
 /// Number of FFT spectral lines in the Model 2 line domain — §D.2.2
 /// verbatim: "An index of 1 corresponds to the DC term and an index
 /// of 513 corresponds to the spectral line at the Nyquist frequency."
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_FFT_LINES: usize = 513;
 
 /// §D.2.1 input a) shift-length constraint — verbatim "384<iblen<640"
@@ -1880,6 +1917,7 @@ pub const MODEL2_FFT_LINES: usize = 513;
 /// Hann window"); the standard table set assumes the in-range case.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const fn model2_iblen_in_range(iblen: usize) -> bool {
     384 < iblen && iblen < 640
 }
@@ -1893,6 +1931,7 @@ pub const fn model2_iblen_in_range(iblen: usize) -> bool {
 /// from DC to at least 3 kHz and preferably to 7kHz. An upper limit
 /// of less than 5,5kHz may considerably reduce performance … Best
 /// results will be obtained by calculating c_ω up to 20 kHz.")
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_CW_ABOVE_LIMIT: f64 = 0.3;
 
 /// §D.2.4 step a) — reconstruct the 1 024-sample analysis window from
@@ -1912,6 +1951,7 @@ pub const MODEL2_CW_ABOVE_LIMIT: f64 = 0.3;
 /// itself is well-defined for any `1 <= iblen <= 1 024` and is not
 /// artificially narrowed here.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_a_reconstruct(prev_window: &[f64], new_samples: &[f64]) -> Option<Vec<f64>> {
     let iblen = new_samples.len();
     if prev_window.len() != MODEL2_FFT_LEN || iblen == 0 || iblen > MODEL2_FFT_LEN {
@@ -1936,6 +1976,7 @@ pub fn model2_step_a_reconstruct(prev_window: &[f64], new_samples: &[f64]) -> Op
 /// downstream by the step l) [`model2_absthr_energy`] conversion
 /// ("after considering the FFT normalization actually used").
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_hann_window(i: usize) -> Option<f64> {
     if i == 0 || i > MODEL2_FFT_LEN {
         return None;
@@ -1950,6 +1991,7 @@ pub fn model2_hann_window(i: usize) -> Option<f64> {
 /// line `ω`. Also the carrier for the step c) predicted spectrum
 /// (`r̂_ω` / `f̂_ω`).
 #[derive(Debug, Clone, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Model2Polar {
     /// Magnitude per FFT line (`r_ω`, index `ω - 1`).
     pub r: Vec<f64>,
@@ -1991,6 +2033,7 @@ impl Model2Polar {
 /// reconstruction ([`model2_step_a_reconstruct`]) is the only
 /// supported producer; no padding or truncation is invented.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_b_spectrum(s: &[f64]) -> Option<Model2Polar> {
     if s.len() != MODEL2_FFT_LEN {
         return None;
@@ -2021,6 +2064,7 @@ pub fn model2_step_b_spectrum(s: &[f64]) -> Option<Model2Polar> {
 /// `x̂_ω = 2,0·x_ω(t-1) - x_ω(t-2)`.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_c_predict(prev: f64, prev2: f64) -> f64 {
     2.0 * prev - prev2
 }
@@ -2036,6 +2080,7 @@ pub fn model2_step_c_predict(prev: f64, prev2: f64) -> f64 {
 /// the `2·f(t-1) - f(t-2)` combination is invariant (mod 2π) to the
 /// principal-value branch cuts.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_c_predict_polar(prev: &Model2Polar, prev2: &Model2Polar) -> Option<Model2Polar> {
     if prev.r.len() != prev.f.len()
         || prev2.r.len() != prev2.f.len()
@@ -2073,6 +2118,7 @@ pub fn model2_step_c_predict_polar(prev: &Model2Polar, prev2: &Model2Polar) -> O
 /// predictable), keeping the downstream step e)/g) chain finite.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_d_cw(r: f64, f: f64, r_hat: f64, f_hat: f64) -> f64 {
     let den = r + r_hat.abs();
     if den == 0.0 {
@@ -2102,6 +2148,7 @@ pub fn model2_step_d_cw(r: f64, f: f64, r_hat: f64, f_hat: f64) -> f64 {
 /// (or either is internally inconsistent). Output index `ω - 1` holds
 /// line `ω`.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_d_cw_lines(
     cur: &Model2Polar,
     predicted: &Model2Polar,
@@ -2137,6 +2184,7 @@ pub fn model2_step_d_cw_lines(
 /// when `partitions` is empty or `r_lines` is too short to cover the
 /// last partition's `ωhigh`. One entry per partition, in table order.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_e_eb(r_lines: &[f64], partitions: &[Model2PartitionEntry]) -> Option<Vec<f64>> {
     if partitions.is_empty() || r_lines.len() < partitions.last()?.whigh as usize {
         return None;
@@ -2164,6 +2212,7 @@ pub fn model2_step_e_eb(r_lines: &[f64], partitions: &[Model2PartitionEntry]) ->
 /// cover the last partition's `ωhigh`. One entry per partition, in
 /// table order.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_e_cb(
     r_lines: &[f64],
     cw_lines: &[f64],
@@ -2209,6 +2258,7 @@ pub fn model2_step_e_cb(
 /// `None` when the two slices disagree in length; the output has one
 /// entry per partition, in slice order.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_f_spread(per_partition: &[f64], bval: &[f64]) -> Option<Vec<f64>> {
     if per_partition.len() != bval.len() {
         return None;
@@ -2238,6 +2288,7 @@ pub fn model2_step_f_spread(per_partition: &[f64], bval: &[f64]) -> Option<Vec<f
 /// simply runs over every provided partition, which satisfies both
 /// readings.) One entry per partition, in slice order.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_f_rnorm(bval: &[f64]) -> Vec<f64> {
     bval.iter()
         .map(|&bval_b| {
@@ -2260,6 +2311,7 @@ pub fn model2_step_f_rnorm(bval: &[f64]) -> Vec<f64> {
 /// too); this implementation defines `cb_b = 0` there so the
 /// downstream step g) tonality index stays finite.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_f_cb(ct: &[f64], ecb: &[f64]) -> Option<Vec<f64>> {
     if ct.len() != ecb.len() {
         return None;
@@ -2276,6 +2328,7 @@ pub fn model2_step_f_cb(ct: &[f64], ecb: &[f64]) -> Option<Vec<f64>> {
 ///
 /// Returns `None` on length mismatch.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_f_en(ecb: &[f64], rnorm: &[f64]) -> Option<Vec<f64>> {
     if ecb.len() != rnorm.len() {
         return None;
@@ -2304,6 +2357,7 @@ pub fn model2_step_f_en(ecb: &[f64], rnorm: &[f64]) -> Option<Vec<f64>> {
 /// measure `c_ω ≥ 0`).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_g_tonality(cb: f64) -> f64 {
     (-0.299 - 0.43 * cb.ln()).clamp(0.0, 1.0)
 }
@@ -2311,6 +2365,7 @@ pub fn model2_step_g_tonality(cb: f64) -> f64 {
 /// §D.2.4 step h) noise-masking-tone value: "`NMT_b = 5,5 dB` for
 /// all `b`. `NMT_b` is the value for noise masking tone (in dB) for
 /// the partition."
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_NMT_DB: f64 = 5.5;
 
 /// §D.2.4 step h) — required SNR for one calculation partition:
@@ -2331,6 +2386,7 @@ pub const MODEL2_NMT_DB: f64 = 5.5;
 /// All quantities are in dB.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_h_snr_db(tb: f64, minval_db: f64, tmn_db: f64) -> f64 {
     minval_db.max(tb * tmn_db + (1.0 - tb) * MODEL2_NMT_DB)
 }
@@ -2342,6 +2398,7 @@ pub fn model2_step_h_snr_db(tb: f64, minval_db: f64, tmn_db: f64) -> f64 {
 /// partition, in slice order. Returns `None` on length mismatch;
 /// one dB entry per partition otherwise.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_h_snr(tb: &[f64], partitions: &[Model2PartitionEntry]) -> Option<Vec<f64>> {
     if tb.len() != partitions.len() {
         return None;
@@ -2363,6 +2420,7 @@ pub fn model2_step_h_snr(tb: &[f64], partitions: &[Model2PartitionEntry]) -> Opt
 /// to `0 < bc_b ≤ 1`, monotone decreasing in `SNR_b`.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_i_bc(snr_db: f64) -> f64 {
     (10.0_f64).powf(-snr_db / 10.0)
 }
@@ -2374,6 +2432,7 @@ pub fn model2_step_i_bc(snr_db: f64) -> f64 {
 /// `bc` is the step i) power ratio per partition. Returns `None` on
 /// length mismatch.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_j_nb(en: &[f64], bc: &[f64]) -> Option<Vec<f64>> {
     if en.len() != bc.len() {
         return None;
@@ -2407,6 +2466,7 @@ pub fn model2_step_j_nb(en: &[f64], bc: &[f64]) -> Option<Vec<f64>> {
 /// Returns `None` when the two slices disagree in length or
 /// `partitions` is empty.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_k_nb_lines(nb: &[f64], partitions: &[Model2PartitionEntry]) -> Option<Vec<f64>> {
     if nb.len() != partitions.len() || partitions.is_empty() {
         return None;
@@ -2436,6 +2496,7 @@ pub fn model2_step_k_nb_lines(nb: &[f64], partitions: &[Model2PartitionEntry]) -
 /// point. The result is `10^((absthr_db + half_lsb_sine_level_db) / 10)`.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_absthr_energy(absthr_db: f64, half_lsb_sine_level_db: f64) -> f64 {
     (10.0_f64).powf((absthr_db + half_lsb_sine_level_db) / 10.0)
 }
@@ -2448,6 +2509,7 @@ pub fn model2_absthr_energy(absthr_db: f64, half_lsb_sine_level_db: f64) -> f64 
 /// Table D.4 dB prints).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_l_thr(nb_w: f64, absthr_w: f64) -> f64 {
     nb_w.max(absthr_w)
 }
@@ -2466,6 +2528,7 @@ pub fn model2_step_l_thr(nb_w: f64, absthr_w: f64) -> f64 {
 /// Step m) (pre-echo control) follows this step for Layer III only —
 /// "This step is omitted for Layers I and II."
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_l_thr_lines(nb: &[f64], absthr: &[f64]) -> Option<Vec<f64>> {
     if nb.len() != absthr.len() {
         return None;
@@ -2491,6 +2554,7 @@ pub fn model2_step_l_thr_lines(nb: &[f64], absthr: &[f64]) -> Option<Vec<f64>> {
 /// [`coder_partition_d5_spans`]). Returns `None` when `r_lines` is
 /// too short to cover `ωhigh_n`.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_n_epart(r_lines: &[f64], span: CoderPartitionD5Span) -> Option<f64> {
     let lines = r_lines.get(span.omega_low as usize - 1..span.omega_high as usize)?;
     Some(lines.iter().map(|&r| r * r).sum())
@@ -2520,6 +2584,7 @@ pub fn model2_step_n_epart(r_lines: &[f64], span: CoderPartitionD5Span) -> Optio
 /// step k)/l) line layout (slice index `ω - 1` holds line `ω`).
 /// Returns `None` when `thr_lines` is too short to cover `ωhigh_n`.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_n_npart(thr_lines: &[f64], span: CoderPartitionD5Span) -> Option<f64> {
     let lines = thr_lines.get(span.omega_low as usize - 1..span.omega_high as usize)?;
     Some(if span.width == 1 {
@@ -2550,6 +2615,7 @@ pub fn model2_step_n_npart(thr_lines: &[f64], span: CoderPartitionD5Span) -> Opt
 /// unmodified.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_n_smr_db(epart: f64, npart: f64) -> f64 {
     10.0 * (epart / npart).log10()
 }
@@ -2568,6 +2634,7 @@ pub fn model2_step_n_smr_db(epart: f64, npart: f64) -> f64 {
 /// the inclusive-on-both-ends reading of the printed boundary
 /// column).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_step_n_smr(r_lines: &[f64], thr_lines: &[f64]) -> Option<Vec<f64>> {
     coder_partition_d5_spans()
         .map(|span| {
@@ -2599,6 +2666,7 @@ pub fn model2_step_n_smr(r_lines: &[f64], thr_lines: &[f64]) -> Option<Vec<f64>>
 /// runs "two processes, each running with a fixed shift length",
 /// i.e. two independent `Model2State` values.
 #[derive(Debug, Clone, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Model2State {
     /// The preceding 1 024-sample FFT source data window (§D.2.4
     /// step a) reconstruction output of the previous call; all-zero
@@ -2739,6 +2807,7 @@ impl Model2State {
 /// itself a verbatim transcription of the PDF page render of
 /// printed p.139, PDF page 145).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5 {
     /// Coder-partition index `n`. Spec range: 0..=32.
     pub index: u16,
@@ -2816,6 +2885,7 @@ impl CoderPartitionD5 {
 /// `width_n` value. The rows are ordered by ascending partition
 /// index `n = 0..=32` and the boundary column is strictly monotonic
 /// in `n` by 16 lines per partition.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const CODER_PARTITION_TABLE_D5: [CoderPartitionD5; 33] = [
     CoderPartitionD5::new(0, 1, 0),
     CoderPartitionD5::new(1, 17, 0),
@@ -2858,6 +2928,7 @@ pub const CODER_PARTITION_TABLE_D5: [CoderPartitionD5; 33] = [
 /// transitions, so every partition spans 16 FFT lines (the
 /// `width_n` column records a separate orthogonal quantity per the
 /// spec text and is exposed unchanged on each row).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const CODER_PARTITION_D5_STRIDE: u16 = 16;
 
 /// Look up the Table D.5 row for partition index `n`. Returns
@@ -2873,6 +2944,7 @@ pub const CODER_PARTITION_D5_STRIDE: u16 = 16;
 /// table-level accessors.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5(n: u16) -> Option<CoderPartitionD5> {
     CODER_PARTITION_TABLE_D5.get(n as usize).copied()
 }
@@ -2895,6 +2967,7 @@ pub fn coder_partition_d5(n: u16) -> Option<CoderPartitionD5> {
 /// §"Table D.5 - Layer I and Layer II coder partition table".
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_omega_high(n: u16) -> Option<u16> {
     coder_partition_d5(n).map(CoderPartitionD5::omega_high)
 }
@@ -2919,6 +2992,7 @@ pub fn coder_partition_d5_omega_high(n: u16) -> Option<u16> {
 /// §"Table D.5 - Layer I and Layer II coder partition table".
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_omega_low(n: u16) -> Option<u16> {
     if n == 0 {
         return None;
@@ -2972,6 +3046,7 @@ pub fn coder_partition_d5_omega_low(n: u16) -> Option<u16> {
 /// §"Table D.5 - Layer I and Layer II coder partition table".
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_line_range(n: u16) -> Option<(u16, u16)> {
     let low = coder_partition_d5_omega_low(n)?;
     let high = coder_partition_d5_omega_high(n)?;
@@ -3002,6 +3077,7 @@ pub fn coder_partition_d5_line_range(n: u16) -> Option<(u16, u16)> {
 /// §"Table D.5 - Layer I and Layer II coder partition table".
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_width(n: u16) -> Option<u16> {
     coder_partition_d5(n).map(|r| r.width)
 }
@@ -3039,6 +3115,7 @@ pub fn coder_partition_d5_width(n: u16) -> Option<u16> {
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`
 /// §"Table D.5 - Layer I and Layer II coder partition table".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5Span {
     /// Partition number `n`. Spec range under this descriptor: 1..=32.
     pub index: u16,
@@ -3097,6 +3174,7 @@ pub struct CoderPartitionD5Span {
 /// already cite the same source.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_span(n: u16) -> Option<CoderPartitionD5Span> {
     let (omega_low, omega_high) = coder_partition_d5_line_range(n)?;
     let width = coder_partition_d5_width(n)?;
@@ -3168,6 +3246,7 @@ pub fn coder_partition_d5_span(n: u16) -> Option<CoderPartitionD5Span> {
 /// spec's, pinned by Phase 2 step 50 (r249).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn partition_n_contains_line(n: u16, omega: u16) -> Option<bool> {
     let span = coder_partition_d5_span(n)?;
     Some(span.omega_low <= omega && omega <= span.omega_high)
@@ -3222,6 +3301,7 @@ pub fn partition_n_contains_line(n: u16, omega: u16) -> Option<bool> {
 /// §"Table D.5 - Layer I and Layer II coder partition table" are
 /// consulted; the row-order walk is the spec table's own ordering.
 #[inline]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_spans() -> impl Iterator<Item = CoderPartitionD5Span> {
     // `1..=32` matches the descriptor's recoverable range exactly;
     // every `coder_partition_d5_span(n)` is `Some(_)` for that range
@@ -3297,6 +3377,7 @@ pub fn coder_partition_d5_spans() -> impl Iterator<Item = CoderPartitionD5Span> 
 /// row-order presentation, already pinned by Phase 2 steps 50 and 55.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn first_partition_containing_line(omega: u16) -> Option<u16> {
     coder_partition_d5_spans()
         .find(|s| s.omega_low <= omega && omega <= s.omega_high)
@@ -3372,6 +3453,7 @@ pub fn first_partition_containing_line(omega: u16) -> Option<u16> {
 /// pinned by Phase 2 step 50 (r249) and step 54 (r253).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_omega_iter(n: u16) -> Option<core::ops::RangeInclusive<u16>> {
     let (low, high) = coder_partition_d5_line_range(n)?;
     Some(low..=high)
@@ -3526,6 +3608,7 @@ pub fn coder_partition_d5_omega_iter(n: u16) -> Option<core::ops::RangeInclusive
 /// Model 1 reduction).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_ltg_min<F>(n: u16, ltg_per_line: F) -> Option<f64>
 where
     F: Fn(u16) -> f64,
@@ -3658,6 +3741,7 @@ where
 /// consulted. The row-order broadcast reading is the spec's per
 /// Annex D Step 8 (informative Model 1 reduction).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_ltg_min_row_order<F>(ltg_per_line: F) -> [f64; 32]
 where
     F: Fn(u16) -> f64,
@@ -3799,6 +3883,7 @@ where
 /// Annex D Step 8 (informative Model 1 reduction) row-by-row
 /// presentation.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_width_row_order() -> [u16; 32] {
     let mut out = [0u16; 32];
     for span in coder_partition_d5_spans() {
@@ -3885,6 +3970,7 @@ pub fn coder_partition_d5_width_row_order() -> [u16; 32] {
 /// time-dependent), the width column is a pure constant of the
 /// table.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5Reduction {
     /// Per-partition minimum global masking threshold `LTmin_n` (dB),
     /// as reduced by Phase 2 step 58's [`coder_partition_d5_ltg_min`]
@@ -3962,6 +4048,7 @@ pub struct CoderPartitionD5Reduction {
 /// consulted. The paired-row-order reading is the spec's per Annex D
 /// Step 8 (informative Model 1 reduction) row-by-row presentation.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_reduction_row_order<F>(ltg_per_line: F) -> [CoderPartitionD5Reduction; 32]
 where
     F: Fn(u16) -> f64,
@@ -4057,6 +4144,7 @@ where
 /// invariant is structural — pinned at construction by the split
 /// point (12) coming from Phase 2 step 60's row-order width vector.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5ReductionByWidth {
     /// The contiguous prefix of rows with `width_n = 0` (partitions
     /// `n ∈ 1..=12`, the lower FFT-line block). Twelve elements in
@@ -4134,6 +4222,7 @@ pub struct CoderPartitionD5ReductionByWidth {
 /// bit-allocation branch flag (Annex D informative Model 1
 /// reduction).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_reduction_row_order_by_width<F>(
     ltg_per_line: F,
 ) -> CoderPartitionD5ReductionByWidth
@@ -4230,6 +4319,7 @@ where
 /// preserved verbatim from Phase 2 step 62's `narrow_band` /
 /// `wide_band` lengths.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5LtminDbByWidth {
     /// Per-partition minimum global masking threshold `LTmin_n` (dB)
     /// for the contiguous prefix of rows with `width_n = 0`
@@ -4309,6 +4399,7 @@ pub struct CoderPartitionD5LtminDbByWidth {
 /// Layer I / Layer II bit-allocation branch flag (Annex D
 /// informative Model 1 reduction).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_ltmin_db_row_order_by_width<F>(
     ltg_per_line: F,
 ) -> CoderPartitionD5LtminDbByWidth
@@ -4381,6 +4472,7 @@ where
 /// indexing and the same split point (12) Table D.5's `width_n`
 /// column pins.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5LtminLinearByWidth {
     /// Per-partition minimum global masking threshold `LTmin_n`
     /// converted to linear energy `10^(LTmin_n / 10)` for the
@@ -4485,6 +4577,7 @@ pub struct CoderPartitionD5LtminLinearByWidth {
 /// and the Model 2 Layer III spread linearisation (line 1492); no
 /// external implementation was read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_ltmin_linear_row_order_by_width<F>(
     ltg_per_line: F,
 ) -> CoderPartitionD5LtminLinearByWidth
@@ -4555,6 +4648,7 @@ where
 /// row-order indexing and the same split point (12) Table D.5's
 /// `width_n` column pins.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5LtminLog2ByWidth {
     /// `log2(linear_n)` for the contiguous prefix of rows with
     /// `width_n = 0` (partitions `n ∈ 1..=12`, the lower FFT-line
@@ -4668,6 +4762,7 @@ pub struct CoderPartitionD5LtminLog2ByWidth {
 /// consulted. The `f64::log2` primitive is the in-tree standard
 /// library call.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_ltmin_log2_row_order_by_width<F>(
     ltg_per_line: F,
 ) -> CoderPartitionD5LtminLog2ByWidth
@@ -4806,6 +4901,7 @@ where
 /// §"Table D.5 - Layer I and Layer II coder partition table") is
 /// consulted. The reduction is plain `f64` addition.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total<F>(ltg_per_line: F) -> f64
 where
     F: Fn(u16) -> f64,
@@ -4956,6 +5052,7 @@ where
 /// §"Table D.5 - Layer I and Layer II coder partition table") is
 /// consulted. The reduction is plain `f64` addition.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total<F>(ltg_per_line: F) -> f64
 where
     F: Fn(u16) -> f64,
@@ -5097,6 +5194,7 @@ where
 /// §"Table D.5 - Layer I and Layer II coder partition table") is
 /// consulted. The reduction is plain `f64` addition.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_ltmin_log2_paired_bit_budget_totals<F>(ltg_per_line: F) -> (f64, f64)
 where
     F: Fn(u16) -> f64,
@@ -5176,6 +5274,7 @@ where
 /// up to the threshold is inaudible). Both signs are preserved
 /// without clipping.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5SmrByWidth {
     /// Per-partition signal-to-mask ratio `SMR_n` (dB) for the
     /// contiguous prefix of rows with `width_n = 0` (partitions
@@ -5250,6 +5349,7 @@ pub struct CoderPartitionD5SmrByWidth {
 /// §"Table D.5 — Layer I and Layer II coder partition table"). No
 /// external implementation was read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_smr_db_row_order_by_width<L, F>(
     lsb_per_partition: L,
     ltg_per_line: F,
@@ -5384,6 +5484,7 @@ where
 /// §"Table D.5 — Layer I and Layer II coder partition table"). No
 /// external implementation was read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_smr_db_row_order<L, F>(lsb_per_partition: L, ltg_per_line: F) -> [f64; 32]
 where
     L: Fn(u16) -> f64,
@@ -5449,6 +5550,7 @@ where
 /// (run-time-dependent), the width column is a pure constant of the
 /// table.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5Smr {
     /// Per-partition signal-to-mask ratio `SMR_n = Lsb(n) − LTmin_n`
     /// (dB), as computed by Phase 2 step 70's
@@ -5541,6 +5643,7 @@ pub struct CoderPartitionD5Smr {
 /// paired-row-order reading is the spec's per Annex D §D.1 Step 9
 /// (informative Model 1) row-by-row presentation.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_smr_row_order<L, F>(
     lsb_per_partition: L,
     ltg_per_line: F,
@@ -5622,6 +5725,7 @@ where
 /// preserved verbatim from step 71 (the loop re-uses it across
 /// iterations), and `width_n` is the static Table D.5 column.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5Mnr {
     /// Per-partition mask-to-noise ratio `MNR_n = SNR_n − SMR_n` (dB),
     /// per the §C.1.5.2.7 verbatim definition. A **larger** `MNR_n`
@@ -5714,6 +5818,7 @@ pub struct CoderPartitionD5Mnr {
 /// The Table C.5 `SNR_n` term is caller-injected (the table is behind
 /// the numeric-table transcription gap).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_mnr_row_order<S, L, F>(
     snr_per_partition: S,
     lsb_per_partition: L,
@@ -5758,6 +5863,7 @@ where
 /// one); `mnr_db`, `smr_db`, and `width_n` are that partition's
 /// [`CoderPartitionD5Mnr`] columns carried through verbatim.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5MinMnr {
     /// 1-based partition index `n ∈ 1..=32` of the subband holding the
     /// minimal `MNR_n` — the "subband with the minimal MNR" the
@@ -5821,6 +5927,7 @@ pub struct CoderPartitionD5MinMnr {
 /// [`coder_partition_d5_mnr_row_order`] vector it consumes are read; no
 /// external implementation was consulted.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn coder_partition_d5_min_mnr(mnr: &[CoderPartitionD5Mnr; 32]) -> CoderPartitionD5MinMnr {
     let mut best = 0usize;
     for (i, row) in mnr.iter().enumerate().skip(1) {
@@ -5856,6 +5963,7 @@ pub fn coder_partition_d5_min_mnr(mnr: &[CoderPartitionD5Mnr; 32]) -> CoderParti
 /// `prev_entry` unchanged); `advanced` is `true` iff a next-higher entry
 /// existed and was selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct BitAllocPromotion {
     /// 0-based subband index whose Table B.2 entry the loop tried to
     /// advance — the array slot of the §C.1.5.2.7 minimal-MNR subband.
@@ -5920,6 +6028,7 @@ pub struct BitAllocPromotion {
 /// are read. The Table B.2 column length is caller-injected (the table
 /// is behind the numeric-table transcription gap).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn bit_allocation_promote_entry(
     subband: u16,
     prev_entry: u16,
@@ -5962,6 +6071,7 @@ pub fn bit_allocation_promote_entry(
 /// step 74); `mnr_db` is the recomputed `MNR_n = SNR_n − SMR_n` (dB);
 /// `smr_db` is the carried-through psychoacoustic-model `SMR_n` (dB).
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct CoderPartitionD5RecomputedMnr {
     /// 0-based subband index whose `MNR_n` was recomputed after the
     /// step-74 next-higher-entry promotion — the array slot of the
@@ -6030,6 +6140,7 @@ pub struct CoderPartitionD5RecomputedMnr {
 /// The Table C.5 `SNR_n` term is caller-injected (the table is behind the
 /// numeric-table transcription gap).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn bit_allocation_recompute_mnr<S>(
     promotion: BitAllocPromotion,
     smr_db: f64,
@@ -6071,6 +6182,7 @@ where
 /// `bscf` are grown); `adb` is the recomputed available-data-bits left
 /// for samples and scalefactors after the §C.1.5.2.7 `adb` formula.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct BitAllocBudget {
     /// Running total of bits assigned to the subband **samples** (`bspl`)
     /// after this iteration's additional sample bits were added.
@@ -6108,6 +6220,7 @@ pub struct BitAllocBudget {
 /// and ancillary data is application-defined) rather than on any single
 /// numeric table behind the transcription gap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct BitAllocOverhead {
     /// Total available bits for the frame (`cb`).
     pub cb: u32,
@@ -6172,6 +6285,7 @@ pub struct BitAllocOverhead {
 /// are read. The Table B.2 / B.4 per-entry bit costs are caller-injected
 /// (behind the numeric-table transcription gap).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn bit_allocation_budget_update(
     prev: BitAllocBudget,
     extra_sample_bits: u32,
@@ -6240,6 +6354,7 @@ pub fn bit_allocation_budget_update(
 /// worst-case one-loop increase is caller-supplied (its per-entry bit
 /// costs are behind the numeric-table transcription gap).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn bit_allocation_should_iterate(adb: u32, max_possible_increase: u32) -> bool {
     adb >= max_possible_increase
 }
@@ -6249,6 +6364,7 @@ pub fn bit_allocation_should_iterate(adb: u32, max_possible_increase: u32) -> bo
 /// Annex D Model 1 Step 1 "FFT Analysis" (printed p.110) technical
 /// data: "transform length — Layer I: 512 samples". Frequency
 /// resolution is `sampling_frequency / 512`.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_FFT_LEN_LAYER1: usize = 512;
 
 /// §D.1 Step 1 FFT transform length for **Layer II** — 1 024 samples.
@@ -6260,6 +6376,7 @@ pub const MODEL1_FFT_LEN_LAYER1: usize = 512;
 /// keeps this 1 024-sample length (its half-spectrum lines `k ∈
 /// 0..=512` are exactly the 1-based ω ∈ 1..=513 lines that the Table
 /// D.5 coder-partition accessors above consume).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_FFT_LEN_LAYER2: usize = 1024;
 
 /// §D.1 Step 1 sound-pressure-level reference — 96 dB.
@@ -6267,6 +6384,7 @@ pub const MODEL1_FFT_LEN_LAYER2: usize = 1024;
 /// Verbatim (printed p.110): "A normalization to the reference level
 /// of 96 dB SPL (Sound Pressure Level) has to be done in such a way
 /// that the maximum value corresponds to 96 dB."
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_SPL_REFERENCE_DB: f64 = 96.0;
 
 /// §D.1 Step 1 Hann window coefficient `h(i)` (Phase 2 step 77 /
@@ -6293,6 +6411,7 @@ pub const MODEL1_SPL_REFERENCE_DB: f64 = 96.0;
 /// "FFT Analysis" (printed p.110) in
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_hann_window(i: usize, n: usize) -> Option<f64> {
     if n == 0 || i >= n {
         return None;
@@ -6396,6 +6515,7 @@ fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
 /// (printed p.110) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`
 /// are read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_power_density_spectrum(s: &[f64]) -> Option<Vec<f64>> {
     let n = s.len();
     if n != MODEL1_FFT_LEN_LAYER1 && n != MODEL1_FFT_LEN_LAYER2 {
@@ -6446,6 +6566,7 @@ pub fn model1_power_density_spectrum(s: &[f64]) -> Option<Vec<f64>> {
 /// (printed p.110) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`
 /// is read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_normalize_to_96db_spl(x: &mut [f64]) -> Option<f64> {
     let max = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !max.is_finite() {
@@ -6462,12 +6583,14 @@ pub fn model1_normalize_to_96db_spl(x: &mut [f64]) -> Option<f64> {
 ///
 /// The verbatim `Lsb(n)` formula's scalefactor term multiplies
 /// `scf_max(n)` by `32 768` before taking `20·log` (printed p.110).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_STEP2_FULL_SCALE: f64 = 32768.0;
 
 /// §D.1 Step 2 peak-to-RMS correction — 10 dB.
 ///
 /// Verbatim (printed p.110): "The '-10 dB' term corrects for the
 /// difference between peak and RMS level."
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_STEP2_PEAK_RMS_CORRECTION_DB: f64 = 10.0;
 
 /// §D.1 Step 2 scalefactor SPL term `20·log(scf_max(n)·32 768) − 10`
@@ -6498,6 +6621,7 @@ pub const MODEL1_STEP2_PEAK_RMS_CORRECTION_DB: f64 = 10.0;
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` are read; no
 /// external implementation was consulted.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step2_scf_term_db(scf_max: f64) -> f64 {
     20.0 * (scf_max * MODEL1_STEP2_FULL_SCALE).log10() - MODEL1_STEP2_PEAK_RMS_CORRECTION_DB
 }
@@ -6530,6 +6654,7 @@ pub fn model1_step2_scf_term_db(scf_max: f64) -> f64 {
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` are read; no
 /// external implementation was consulted.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step2_lsb_db(x_subband_db: f64, scf_max: f64) -> f64 {
     x_subband_db.max(model1_step2_scf_term_db(scf_max))
 }
@@ -6556,6 +6681,7 @@ pub fn model1_step2_lsb_db(x_subband_db: f64, scf_max: f64) -> f64 {
 /// transcribed from ISO/IEC 11172-3:1993 Annex D §D.1 Step 2 (printed
 /// p.111) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step2_xspl_db(lines_db: &[f64]) -> f64 {
     let linear_sum: f64 = lines_db.iter().map(|&db| 10.0_f64.powf(db / 10.0)).sum();
     10.0 * linear_sum.log10()
@@ -6585,6 +6711,7 @@ pub fn model1_step2_xspl_db(lines_db: &[f64]) -> f64 {
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`; no
 /// external implementation was consulted.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step2_subband_max_line_db(x: &[f64], n: u16) -> Option<f64> {
     if x.len() != MODEL1_FFT_LEN_LAYER2 / 2 + 1 {
         return None;
@@ -6617,6 +6744,7 @@ pub fn model1_step2_subband_max_line_db(x: &[f64], n: u16) -> Option<f64> {
 /// `docs/audio/mp3/mp3-annex-d-psychoacoustic-extracts.md`; no
 /// external implementation was consulted.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step2_subband_xspl_db(x: &[f64], n: u16) -> Option<f64> {
     if x.len() != MODEL1_FFT_LEN_LAYER2 / 2 + 1 {
         return None;
@@ -6706,6 +6834,7 @@ pub fn model1_step2_subband_xspl_db(x: &[f64], n: u16) -> Option<f64> {
 ///
 /// Verbatim (printed p.112): "A local maximum is put in the list of
 /// tonal components if X(k) - X(k+j) >= 7 dB".
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_STEP4_TONAL_DELTA_DB: f64 = 7.0;
 
 /// §D.1 Step 4(b) examined-neighbour offsets, shared first range
@@ -6757,6 +6886,7 @@ const MODEL1_STEP4_J_TOP_LAYER2: [i32; 22] = [
 /// ISO/IEC 11172-3:1993 Annex D §D.1 Step 4 (printed p.112) in
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step4_tonal_check_offsets(
     layer: crate::frame::Layer,
     k: usize,
@@ -6797,6 +6927,7 @@ pub fn model1_step4_tonal_check_offsets(
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step4_is_local_maximum(x: &[f64], k: usize) -> Option<bool> {
     if k == 0 || k + 1 >= x.len() {
         return None;
@@ -6830,6 +6961,7 @@ pub fn model1_step4_is_local_maximum(x: &[f64], k: usize) -> Option<bool> {
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` are read; no
 /// external implementation was consulted.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step4_is_tonal(x: &[f64], layer: crate::frame::Layer, k: usize) -> Option<bool> {
     let offsets = model1_step4_tonal_check_offsets(layer, k)?;
     let local_max = model1_step4_is_local_maximum(x, k)?;
@@ -6870,6 +7002,7 @@ pub fn model1_step4_is_tonal(x: &[f64], layer: crate::frame::Layer, k: usize) ->
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step4_tonal_spl_db(x: &[f64], k: usize) -> Option<f64> {
     if k == 0 || k + 1 >= x.len() {
         return None;
@@ -6890,6 +7023,7 @@ pub fn model1_step4_tonal_spl_db(x: &[f64], k: usize) -> Option<f64> {
 /// remains blocked on the PNG-only Tables D.1 transcription, so this
 /// carrier stays in the line-index domain.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Model1Step4Component {
     /// 0-based spectral-line index `k` of the component.
     pub k: u16,
@@ -6929,6 +7063,7 @@ pub struct Model1Step4Component {
 /// Provenance: only the §D.1 Step 4 operations (a)/(b) text (printed
 /// p.112) in `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` is read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step4_extract_tonal(
     x: &mut [f64],
     layer: crate::frame::Layer,
@@ -6971,6 +7106,7 @@ pub fn model1_step4_extract_tonal(
 /// `no` covers the inclusive 0-based step-77 lines `k_first ..=
 /// k_last`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Model1Step4BandSpan {
     /// Critical-band number (the Tables D.2 `no` column).
     pub no: u16,
@@ -7003,6 +7139,7 @@ pub struct Model1Step4BandSpan {
 /// §D.1 Step 4(c) prose (printed p.112) in
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf`.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step4_band_line_spans(
     layer: crate::frame::Layer,
     fs: AnnexDSamplingRate,
@@ -7059,6 +7196,7 @@ pub fn model1_step4_band_line_spans(
 /// `docs/audio/mp3/ISO_IEC_11172-3-MP3-1993.pdf` plus the in-repo
 /// Tables D.2 transcription are read.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step4_non_tonal_components(
     x: &[f64],
     layer: crate::frame::Layer,
@@ -7104,6 +7242,7 @@ pub fn model1_step4_non_tonal_components(
 ///
 /// Provenance: composition of the Step 4 primitives above.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step4_components(
     x: &[f64],
     layer: crate::frame::Layer,
@@ -7202,6 +7341,7 @@ pub fn model1_step4_components(
 /// implicit (slice position + 1); [`model1_d1_line_for_index`] maps it
 /// to the raw FFT-line index the step-77 spectrum uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Model1ThresholdEntry {
     /// `Frequency [Hz]` column (the FFT line-center frequency, printed
     /// to two decimals).
@@ -7234,6 +7374,7 @@ impl Model1ThresholdEntry {
 // The 6,28 dB threshold at 500 Hz is the spec's printed table value,
 // not an approximation of a mathematical constant.
 #[allow(clippy::approx_constant)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_THRESHOLD_D1A: [Model1ThresholdEntry; 108] = [
     Model1ThresholdEntry::new(62.50, 0.617, 33.44),
     Model1ThresholdEntry::new(125.00, 1.232, 19.20),
@@ -7349,6 +7490,7 @@ pub const MODEL1_THRESHOLD_D1A: [Model1ThresholdEntry; 108] = [
 ///
 /// Verbatim from
 /// `docs/audio/mp3/annex-d-renders/Table-D.1b-threshold-in-quiet-LayerI-44k1Hz-p117.png`.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_THRESHOLD_D1B: [Model1ThresholdEntry; 106] = [
     Model1ThresholdEntry::new(86.13, 0.850, 25.87),
     Model1ThresholdEntry::new(172.27, 1.694, 14.85),
@@ -7462,6 +7604,7 @@ pub const MODEL1_THRESHOLD_D1B: [Model1ThresholdEntry; 106] = [
 ///
 /// Verbatim from
 /// `docs/audio/mp3/annex-d-renders/Table-D.1c-threshold-in-quiet-LayerI-48kHz-p118.png`.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_THRESHOLD_D1C: [Model1ThresholdEntry; 102] = [
     Model1ThresholdEntry::new(93.75, 0.925, 24.17),
     Model1ThresholdEntry::new(187.50, 1.842, 13.87),
@@ -7578,6 +7721,7 @@ pub const MODEL1_THRESHOLD_D1C: [Model1ThresholdEntry; 102] = [
 // The 6,28 dB threshold at 500 Hz is the spec's printed table value,
 // not an approximation of a mathematical constant.
 #[allow(clippy::approx_constant)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_THRESHOLD_D1D: [Model1ThresholdEntry; 132] = [
     Model1ThresholdEntry::new(31.25, 0.309, 58.23),
     Model1ThresholdEntry::new(62.50, 0.617, 33.44),
@@ -7721,6 +7865,7 @@ pub const MODEL1_THRESHOLD_D1D: [Model1ThresholdEntry; 132] = [
 /// Rows 49.. print the same frequency / z / LTq values as the
 /// matching Layer I table's rows 25.. (the two line grids coincide
 /// there) — verified on the renders and pinned by a unit test.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_THRESHOLD_D1E: [Model1ThresholdEntry; 130] = [
     Model1ThresholdEntry::new(43.07, 0.425, 45.05),
     Model1ThresholdEntry::new(86.13, 0.850, 25.87),
@@ -7862,6 +8007,7 @@ pub const MODEL1_THRESHOLD_D1E: [Model1ThresholdEntry; 130] = [
 /// Rows 49.. print the same frequency / z / LTq values as the
 /// matching Layer I table's rows 25.. (the two line grids coincide
 /// there) — verified on the renders and pinned by a unit test.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL1_THRESHOLD_D1F: [Model1ThresholdEntry; 126] = [
     Model1ThresholdEntry::new(46.88, 0.463, 42.10),
     Model1ThresholdEntry::new(93.75, 0.925, 24.17),
@@ -7999,6 +8145,7 @@ pub const MODEL1_THRESHOLD_D1F: [Model1ThresholdEntry; 126] = [
 /// Layer explicitly.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_threshold_table(
     layer: crate::frame::Layer,
     fs: AnnexDSamplingRate,
@@ -8025,6 +8172,7 @@ pub fn model1_threshold_table(
 /// dispatch.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_d1_line_for_index(
     layer: crate::frame::Layer,
     fs: AnnexDSamplingRate,
@@ -8057,6 +8205,7 @@ pub fn model1_d1_line_for_index(
 /// (no extrapolation past the audio band the spec tabulates), and for
 /// a Layer III dispatch.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_d1_index_for_line(
     layer: crate::frame::Layer,
     fs: AnnexDSamplingRate,
@@ -8091,6 +8240,7 @@ pub fn model1_d1_index_for_line(
 /// conditions).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_d1_entry_for_line(
     layer: crate::frame::Layer,
     fs: AnnexDSamplingRate,
@@ -8110,6 +8260,7 @@ pub fn model1_d1_entry_for_line(
 /// above the table's last tabulated line) or for a Layer III dispatch.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_masker_from_component(
     component: &Model1Step4Component,
     layer: crate::frame::Layer,
@@ -8151,6 +8302,7 @@ pub fn model1_masker_from_component(
 /// printed p.112) with the Tables D.1 transcription above; no
 /// external implementation was consulted.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model1_step5_components(
     tonal: &[Model1Step4Component],
     non_tonal: &[Model1Step4Component],
@@ -8238,6 +8390,7 @@ pub fn model1_step5_components(
 /// One row of Annex D Table D.3 (calculation partition table). The
 /// 1-based `Index` column is implicit (slice position + 1).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Model2PartitionEntry {
     /// `ωlow` column — first 1-based FFT line of the partition.
     pub wlow: u16,
@@ -8272,6 +8425,7 @@ impl Model2PartitionEntry {
 ///
 /// Verbatim from
 /// `docs/audio/mp3/annex-d-renders/Table-D.3a-calc-partition-32kHz-p133.png`.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_PARTITION_D3A: [Model2PartitionEntry; 49] = [
     Model2PartitionEntry::new(1, 1, 0.00, 0.0, 24.5),
     Model2PartitionEntry::new(2, 4, 0.63, 0.0, 24.5),
@@ -8329,6 +8483,7 @@ pub const MODEL2_PARTITION_D3A: [Model2PartitionEntry; 49] = [
 ///
 /// Verbatim from
 /// `docs/audio/mp3/annex-d-renders/Table-D.3b-calc-partition-44k1Hz-p134.png`.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_PARTITION_D3B: [Model2PartitionEntry; 57] = [
     Model2PartitionEntry::new(1, 1, 0.00, 0.0, 24.5),
     Model2PartitionEntry::new(2, 2, 0.43, 0.0, 24.5),
@@ -8394,6 +8549,7 @@ pub const MODEL2_PARTITION_D3B: [Model2PartitionEntry; 57] = [
 ///
 /// Verbatim from
 /// `docs/audio/mp3/annex-d-renders/Table-D.3c-calc-partition-48kHz-p135.png`.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_PARTITION_D3C: [Model2PartitionEntry; 58] = [
     Model2PartitionEntry::new(1, 1, 0.00, 0.0, 24.5),
     Model2PartitionEntry::new(2, 2, 0.47, 0.0, 24.5),
@@ -8460,6 +8616,7 @@ pub const MODEL2_PARTITION_D3C: [Model2PartitionEntry; 58] = [
 /// are common to all Layers, so there is no Layer dimension.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_partition_table(fs: AnnexDSamplingRate) -> &'static [Model2PartitionEntry] {
     match fs {
         AnnexDSamplingRate::Hz32000 => &MODEL2_PARTITION_D3A,
@@ -8473,6 +8630,7 @@ pub fn model2_partition_table(fs: AnnexDSamplingRate) -> &'static [Model2Partiti
 /// §D.2.4 step f) reductions ([`model2_step_f_spread`] /
 /// [`model2_step_f_rnorm`]) take as `bval`.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_bval(fs: AnnexDSamplingRate) -> Vec<f64> {
     model2_partition_table(fs).iter().map(|e| e.bval).collect()
 }
@@ -8483,6 +8641,7 @@ pub fn model2_bval(fs: AnnexDSamplingRate) -> Vec<f64> {
 /// half-spectrum exactly: every table's first ωlow is 1 and last
 /// ωhigh is 513, with contiguous coverage in between).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_partition_index_for_line(fs: AnnexDSamplingRate, line: u16) -> Option<u16> {
     let table = model2_partition_table(fs);
     table
@@ -8499,6 +8658,7 @@ pub fn model2_partition_index_for_line(fs: AnnexDSamplingRate, line: u16) -> Opt
 /// the absolute threshold calculation of 96 dB below the energy of a
 /// sine wave of amplitude +-32 760."
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Model2AbsThrEntry {
     /// `index [line] lower` column — first 1-based FFT line.
     pub lower: u16,
@@ -8531,6 +8691,7 @@ impl Model2AbsThrEntry {
 // The 6,28 dB threshold at line 16 (500 Hz) is the spec's printed
 // table value, not an approximation of a mathematical constant.
 #[allow(clippy::approx_constant)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_ABSTHR_D4A: [Model2AbsThrEntry; 132] = [
     Model2AbsThrEntry::new(1, 1, 58.23),
     Model2AbsThrEntry::new(2, 2, 33.44),
@@ -8671,6 +8832,7 @@ pub const MODEL2_ABSTHR_D4A: [Model2AbsThrEntry; 132] = [
 ///
 /// Verbatim from
 /// `docs/audio/mp3/annex-d-renders/Table-D.4b-absolute-threshold-44k1Hz-p137.png`.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_ABSTHR_D4B: [Model2AbsThrEntry; 130] = [
     Model2AbsThrEntry::new(1, 1, 45.05),
     Model2AbsThrEntry::new(2, 2, 25.87),
@@ -8811,6 +8973,7 @@ pub const MODEL2_ABSTHR_D4B: [Model2AbsThrEntry; 130] = [
 /// `docs/audio/mp3/annex-d-renders/Table-D.4c-absolute-threshold-48kHz-p138.png`
 /// — including the printed 4-line group `329 | 332` (see the section
 /// comment).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_ABSTHR_D4C: [Model2AbsThrEntry; 126] = [
     Model2AbsThrEntry::new(1, 1, 42.10),
     Model2AbsThrEntry::new(2, 2, 24.17),
@@ -8944,6 +9107,7 @@ pub const MODEL2_ABSTHR_D4C: [Model2AbsThrEntry; 126] = [
 /// `fs` (common to all Layers, like the Table D.3 partition tables).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_absthr_table(fs: AnnexDSamplingRate) -> &'static [Model2AbsThrEntry] {
     match fs {
         AnnexDSamplingRate::Hz32000 => &MODEL2_ABSTHR_D4A,
@@ -8959,6 +9123,7 @@ pub fn model2_absthr_table(fs: AnnexDSamplingRate) -> &'static [Model2AbsThrEntr
 /// 464 / 428 at 32 / 44,1 / 48 kHz — the tables stop short of line
 /// 513), and the printed D.4a line-58 gap at 32 kHz.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_absthr_for_line(fs: AnnexDSamplingRate, line: u16) -> Option<f64> {
     model2_absthr_table(fs)
         .iter()
@@ -9018,79 +9183,95 @@ pub fn model2_absthr_for_line(fs: AnnexDSamplingRate, line: u16) -> Option<f64> 
 
 /// §C.1.5.3.2 / §C.1.5.3.2.1 long-path shift length — "a shift length
 /// of 576 samples" (one Layer III granule per call).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_SHIFT_LONG: usize = 576;
 
 /// §C.1.5.3.2.1 short-path shift length — "a shift length iblen of
 /// 192 samples (to be used with short blocks)"; three short shifts
 /// per 576-sample granule.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_SHIFT_SHORT: usize = 192;
 
 /// §C.1.5.3.2.1 short-path FFT block length — "For the shift length
 /// of 192 samples the block length of the FFT is changed to 256".
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_FFT_LEN_SHORT: usize = 256;
 
 /// Number of spectral lines of the short 256-point FFT (DC through
 /// Nyquist), mirroring the long path's [`MODEL2_FFT_LINES`].
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_FFT_LINES_SHORT: usize = 129;
 
 /// §C.1.5.3.2.1 unpredictability composition — number of low spectral
 /// lines taken from the long FFT (verbatim: "The unpredictability for
 /// the first 6 lines is calculated from the long FFT").
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_CW_LONG_LINES: usize = 6;
 
 /// §C.1.5.3.2.1 unpredictability composition — first spectral line
 /// *not* calculated (verbatim: "The unpredictability cw is calculated
 /// for the first 206 spectral lines. For the other spectral lines,
 /// the unpredictability is set to 0,4").
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_CW_CALC_LINES: usize = 206;
 
 /// §C.1.5.3.2.1 default unpredictability for spectral lines `w >= 206`
 /// (verbatim `0,4`; note this differs from the Layer I/II §D.2.4
 /// step d) partial-calculation default [`MODEL2_CW_ABOVE_LIMIT`] of
 /// `0,3`).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_CW_ABOVE: f64 = 0.4;
 
 /// §C.1.5.3.2.1 unpredictability→tonality conversion parameter
 /// (verbatim "conv1 = −0,299"). Numerically identical to the §D.2.4
 /// step g) constant term, so [`model2_step_g_tonality`] implements
 /// the Layer III conversion unchanged.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_CONV1: f64 = -0.299;
 
 /// §C.1.5.3.2.1 unpredictability→tonality conversion parameter
 /// (verbatim "conv2 = −0,43"); see [`MODEL2_LAYER3_CONV1`].
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_CONV2: f64 = -0.43;
 
 /// §C.1.5.3.2.1 noise-masking-tone parameter — verbatim: "The
 /// parameter NMT (noise masking tone) is set to 6,0 dB for all
 /// threshold calculation partions." (Replaces the Layer I/II
 /// [`MODEL2_NMT_DB`] of 5,5 dB.)
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_NMT_DB: f64 = 6.0;
 
 /// §C.1.5.3.2.1 tone-masking-noise parameter — verbatim: "The
 /// parameter TMN (tone masking noise) is set to 29,0 dB for all
 /// partitions." (Replaces the per-partition Table D.3 `TMN` column.)
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_TMN_DB: f64 = 29.0;
 
 /// §C.1.5.3.2.1 pre-echo-control constant (verbatim "rpelev = 2") —
 /// the factor applied to the previous block's partition threshold in
 /// the Figure C.6.b maximum.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_RPELEV: f64 = 2.0;
 
 /// §C.1.5.3.2.1 pre-echo-control constant (verbatim "rpelev2 = 16") —
 /// the factor applied to the partition threshold of the block before
 /// the previous block.
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const MODEL2_LAYER3_RPELEV2: f64 = 16.0;
 
 /// §C.1.5.3.2.1 window switching threshold — verbatim: "switching
 /// when the PE exceeds the value 1800".
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_PE_SWITCH_THRESHOLD: f64 = 1800.0;
 
 /// Number of long-block scalefactor bands in the Table C.8 conversion
 /// tables (rows `no. sb` 0..=20 in Tables C.8.a–c).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_SFB_CONV_LONG_BANDS: usize = 21;
 
 /// Number of short-block scalefactor bands in the Table C.8
 /// conversion tables (rows `no. sb` 0..=11 in Tables C.8.d–f).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_SFB_CONV_SHORT_BANDS: usize = 12;
 
 /// §C.1.5.3.2.1 short-path analysis window — the step b) Hann window
@@ -9100,6 +9281,7 @@ pub const LAYER3_SFB_CONV_SHORT_BANDS: usize = 12;
 /// [`model2_hann_window`] (same half-sample symmetry, no power
 /// prefactor).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_hann_window_short(i: usize) -> Option<f64> {
     if i == 0 || i > MODEL2_LAYER3_FFT_LEN_SHORT {
         return None;
@@ -9118,6 +9300,7 @@ pub fn model2_layer3_hann_window_short(i: usize) -> Option<f64> {
 /// Returns `None` when `prev_window.len() != 256` or `new_samples` is
 /// empty or longer than 256.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_step_a_reconstruct_short(
     prev_window: &[f64],
     new_samples: &[f64],
@@ -9142,6 +9325,7 @@ pub fn model2_layer3_step_a_reconstruct_short(
 ///
 /// Returns `None` unless `s.len() == 256`.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_step_b_spectrum_short(s: &[f64]) -> Option<Model2Polar> {
     if s.len() != MODEL2_LAYER3_FFT_LEN_SHORT {
         return None;
@@ -9183,6 +9367,7 @@ pub fn model2_layer3_step_b_spectrum_short(s: &[f64]) -> Option<Model2Polar> {
 /// `cw_long` has fewer than 6 entries or `cw_short_second` has fewer
 /// than 52 (the largest decimated index is `(205+2) DIV 4 = 51`).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_cw_compose(cw_long: &[f64], cw_short_second: &[f64]) -> Option<Vec<f64>> {
     let max_short_index = (MODEL2_LAYER3_CW_CALC_LINES - 1 + 2) / 4;
     if cw_long.len() < MODEL2_LAYER3_CW_LONG_LINES || cw_short_second.len() <= max_short_index {
@@ -9218,6 +9403,7 @@ pub fn model2_layer3_cw_compose(cw_long: &[f64], cw_short_second: &[f64]) -> Opt
 /// pre-echo maximum (energy units under the table's own FFT
 /// normalization convention).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Layer3PartitionLong {
     /// `FFT-lines` — number of spectral lines in this partition.
     pub lines: u16,
@@ -9254,6 +9440,7 @@ impl Layer3PartitionLong {
 /// `nbb(b) = ecbb(b)·norm(b)·10^(SNR(b)/10)` places the threshold
 /// below the spread energy).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Layer3PartitionShort {
     /// `FFT-lines` — number of spectral lines in this partition.
     pub lines: u16,
@@ -9283,6 +9470,7 @@ impl Layer3PartitionShort {
 /// 48 kHz **long** blocks (62 rows, printed p.82 / PDF p.88;
 /// transcribed from a 150-DPI page render with 300-DPI re-reads of
 /// every cell the text layer disagreed on).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_PARTITIONS_LONG_C7A: [Layer3PartitionLong; 62] = [
     Layer3PartitionLong::new(1, 24.5, 4.532, 0.970, 0.000),
     Layer3PartitionLong::new(1, 24.5, 4.532, 0.755, 0.469),
@@ -9350,6 +9538,7 @@ pub const LAYER3_PARTITIONS_LONG_C7A: [Layer3PartitionLong; 62] = [
 
 /// Table C.7.b — Layer III threshold calculation partitions,
 /// 44,1 kHz **long** blocks (63 rows, printed p.83 / PDF p.89).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_PARTITIONS_LONG_C7B: [Layer3PartitionLong; 63] = [
     Layer3PartitionLong::new(1, 24.5, 4.532, 0.951, 0.000),
     Layer3PartitionLong::new(1, 24.5, 4.532, 0.700, 0.431),
@@ -9418,6 +9607,7 @@ pub const LAYER3_PARTITIONS_LONG_C7B: [Layer3PartitionLong; 63] = [
 
 /// Table C.7.c — Layer III threshold calculation partitions,
 /// 32 kHz **long** blocks (59 rows, printed p.84 / PDF p.90).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_PARTITIONS_LONG_C7C: [Layer3PartitionLong; 59] = [
     Layer3PartitionLong::new(2, 24.5, 9.064, 0.997, 0.312),
     Layer3PartitionLong::new(2, 24.5, 9.064, 0.893, 0.937),
@@ -9482,6 +9672,7 @@ pub const LAYER3_PARTITIONS_LONG_C7C: [Layer3PartitionLong; 59] = [
 
 /// Table C.7.d — Layer III threshold calculation partitions,
 /// 48 kHz **short** blocks (38 rows, printed p.85 / PDF p.91).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_PARTITIONS_SHORT_C7D: [Layer3PartitionShort; 38] = [
     Layer3PartitionShort::new(1, 4.532, 0.970, -8.240, 0.000),
     Layer3PartitionShort::new(1, 0.904, 0.755, -8.240, 1.875),
@@ -9525,6 +9716,7 @@ pub const LAYER3_PARTITIONS_SHORT_C7D: [Layer3PartitionShort; 38] = [
 
 /// Table C.7.e — Layer III threshold calculation partitions,
 /// 44,1 kHz **short** blocks (39 rows, printed p.86 / PDF p.92).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_PARTITIONS_SHORT_C7E: [Layer3PartitionShort; 39] = [
     Layer3PartitionShort::new(1, 4.532, 0.952, -8.240, 0.000),
     Layer3PartitionShort::new(1, 0.904, 0.700, -8.240, 1.723),
@@ -9569,6 +9761,7 @@ pub const LAYER3_PARTITIONS_SHORT_C7E: [Layer3PartitionShort; 39] = [
 
 /// Table C.7.f — Layer III threshold calculation partitions,
 /// 32 kHz **short** blocks (42 rows, printed p.87 / PDF p.93).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_PARTITIONS_SHORT_C7F: [Layer3PartitionShort; 42] = [
     Layer3PartitionShort::new(1, 4.532, 0.997, -8.240, 0.000),
     Layer3PartitionShort::new(1, 0.904, 0.893, -8.240, 1.250),
@@ -9619,6 +9812,7 @@ pub const LAYER3_PARTITIONS_SHORT_C7F: [Layer3PartitionShort; 42] = [
 /// the Annex D Table D.3a–c rate order.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_partitions_long(fs: AnnexDSamplingRate) -> &'static [Layer3PartitionLong] {
     match fs {
         AnnexDSamplingRate::Hz48000 => &LAYER3_PARTITIONS_LONG_C7A,
@@ -9631,6 +9825,7 @@ pub fn layer3_partitions_long(fs: AnnexDSamplingRate) -> &'static [Layer3Partiti
 /// C.7.f = 32 kHz).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_partitions_short(fs: AnnexDSamplingRate) -> &'static [Layer3PartitionShort] {
     match fs {
         AnnexDSamplingRate::Hz48000 => &LAYER3_PARTITIONS_SHORT_C7D,
@@ -9644,6 +9839,7 @@ pub fn layer3_partitions_short(fs: AnnexDSamplingRate) -> &'static [Layer3Partit
 /// psychoacoustic-entropy formula and the accumulation strides of
 /// [`layer3_partition_eb`].
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_partition_widths_long(fs: AnnexDSamplingRate) -> Vec<u16> {
     layer3_partitions_long(fs).iter().map(|e| e.lines).collect()
 }
@@ -9651,6 +9847,7 @@ pub fn layer3_partition_widths_long(fs: AnnexDSamplingRate) -> Vec<u16> {
 /// Partition widths (`FFT-lines` column) for the Table C.7 short
 /// tables, in row order.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_partition_widths_short(fs: AnnexDSamplingRate) -> Vec<u16> {
     layer3_partitions_short(fs)
         .iter()
@@ -9673,6 +9870,7 @@ pub fn layer3_partition_widths_short(fs: AnnexDSamplingRate) -> Vec<u16> {
 /// Returns `None` when `widths` is empty or the widths overrun
 /// `r_lines`.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_partition_eb(r_lines: &[f64], widths: &[u16]) -> Option<Vec<f64>> {
     let total: usize = widths.iter().map(|&w| usize::from(w)).sum();
     if widths.is_empty() || total > r_lines.len() {
@@ -9695,6 +9893,7 @@ pub fn layer3_partition_eb(r_lines: &[f64], widths: &[u16]) -> Option<Vec<f64>> 
 /// composed [`model2_layer3_cw_compose`] vector. Returns `None` when
 /// the widths overrun either input.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_partition_cb(r_lines: &[f64], cw: &[f64], widths: &[u16]) -> Option<Vec<f64>> {
     let total: usize = widths.iter().map(|&w| usize::from(w)).sum();
     if widths.is_empty() || total > r_lines.len() || total > cw.len() {
@@ -9723,6 +9922,7 @@ pub fn layer3_partition_cb(r_lines: &[f64], cw: &[f64], widths: &[u16]) -> Optio
 /// piecewise `3,0(j−i)` / `1,5(j−i)` dB ramp with the printed
 /// greater-than-10⁻⁶ clamp).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_spread_partitions(per_partition: &[f64]) -> Vec<f64> {
     let n = per_partition.len();
     (0..n)
@@ -9748,6 +9948,7 @@ pub fn model2_layer3_spread_partitions(per_partition: &[f64]) -> Vec<f64> {
 /// are numerically the step g) coefficients).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_step_h_snr_db(tb: f64, minval_db: f64) -> f64 {
     minval_db.max(tb * MODEL2_LAYER3_TMN_DB + (1.0 - tb) * MODEL2_LAYER3_NMT_DB)
 }
@@ -9769,6 +9970,7 @@ pub fn model2_layer3_step_h_snr_db(tb: f64, minval_db: f64) -> f64 {
 /// short-block path [`model2_layer3_short_nb`].
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_long_nb(ecbb: f64, norm: f64, snr_db: f64) -> f64 {
     ecbb * norm * (10.0_f64).powf(snr_db / 10.0)
 }
@@ -9789,6 +9991,7 @@ pub fn model2_layer3_long_nb(ecbb: f64, norm: f64, snr_db: f64) -> f64 {
 /// non-negative step-h value).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_short_nb(ecbb: f64, norm: f64, snr_db: f64) -> f64 {
     ecbb * norm * (10.0_f64).powf(snr_db / 10.0)
 }
@@ -9818,6 +10021,7 @@ pub fn model2_layer3_short_nb(ecbb: f64, norm: f64, snr_db: f64) -> f64 {
 /// step to Layer III: "This step is omitted for Layers I and II."
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_step_m_thr(qthr: f64, nbb: f64, nb_last: f64, nb_before_last: f64) -> f64 {
     qthr.max(nbb)
         .max(MODEL2_LAYER3_RPELEV * nb_last)
@@ -9829,6 +10033,7 @@ pub fn model2_layer3_step_m_thr(qthr: f64, nbb: f64, nb_last: f64, nb_before_las
 /// memory in the short path).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_short_thr(qthr: f64, nbb: f64) -> f64 {
     qthr.max(nbb)
 }
@@ -9838,6 +10043,7 @@ pub fn model2_layer3_short_thr(qthr: f64, nbb: f64) -> f64 {
 /// first two [`Self::step`] calls therefore reduce to
 /// `max(qthr, nbb)` on the affected history slots).
 #[derive(Debug, Clone, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Model2Layer3PreEcho {
     nb_last: Vec<f64>,
     nb_before_last: Vec<f64>,
@@ -9896,6 +10102,7 @@ impl Model2Layer3PreEcho {
 /// partition energy; `widths` the Table C.7 `FFT-lines` column.
 /// Returns `None` on length mismatch.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn model2_layer3_pe(eb: &[f64], thr: &[f64], widths: &[u16]) -> Option<f64> {
     if eb.len() != thr.len() || eb.len() != widths.len() {
         return None;
@@ -9913,6 +10120,7 @@ pub fn model2_layer3_pe(eb: &[f64], thr: &[f64], widths: &[u16]) -> Option<f64> 
 /// the PE exceeds the value 1800" (strictly greater).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_pe_attack(pe: f64) -> bool {
     pe > LAYER3_PE_SWITCH_THRESHOLD
 }
@@ -9933,6 +10141,7 @@ pub fn layer3_pe_attack(pe: f64) -> bool {
 /// short (block_type=2), short, stop (block_type=3) is started."
 /// (`stop` is [`crate::side_info::BlockType::End`].)
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_window_state_next(
     cur: crate::side_info::BlockType,
     attack: bool,
@@ -9963,6 +10172,7 @@ pub fn layer3_window_state_next(
 /// emission regardless.
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_retrofit_start(
     prev: crate::side_info::BlockType,
     cur: crate::side_info::BlockType,
@@ -9986,6 +10196,7 @@ pub fn layer3_retrofit_start(
 /// explicit lookahead): this type *is* the Annex C psychoacoustic
 /// coupling — PE in, delayed block type out.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Layer3WindowSwitcher {
     state: crate::side_info::BlockType,
     pending: Option<crate::side_info::BlockType>,
@@ -10042,6 +10253,7 @@ impl Layer3WindowSwitcher {
 /// carried as printed (it is informative; the reduction is fully
 /// determined by `bu`/`bo`/`w1`/`w2`).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub struct Layer3SfbConversion {
     /// `cbw` — printed partition count for this band.
     pub cbw: u16,
@@ -10069,6 +10281,7 @@ impl Layer3SfbConversion {
 
 /// Table C.8.a — 48 kHz **long** blocks (21 scalefactor bands,
 /// printed p.88 / PDF p.94).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_SFB_CONVERSION_LONG_C8A: [Layer3SfbConversion; 21] = [
     Layer3SfbConversion::new(3, 0, 4, 1.000, 0.056),
     Layer3SfbConversion::new(3, 4, 7, 0.944, 0.611),
@@ -10095,6 +10308,7 @@ pub const LAYER3_SFB_CONVERSION_LONG_C8A: [Layer3SfbConversion; 21] = [
 
 /// Table C.8.b — 44,1 kHz **long** blocks (21 bands, printed p.88 /
 /// PDF p.94).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_SFB_CONVERSION_LONG_C8B: [Layer3SfbConversion; 21] = [
     Layer3SfbConversion::new(3, 0, 4, 1.000, 0.056),
     Layer3SfbConversion::new(3, 4, 7, 0.944, 0.611),
@@ -10121,6 +10335,7 @@ pub const LAYER3_SFB_CONVERSION_LONG_C8B: [Layer3SfbConversion; 21] = [
 
 /// Table C.8.c — 32 kHz **long** blocks (21 bands, printed p.89 /
 /// PDF p.95).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_SFB_CONVERSION_LONG_C8C: [Layer3SfbConversion; 21] = [
     Layer3SfbConversion::new(1, 0, 2, 1.000, 0.528),
     Layer3SfbConversion::new(2, 2, 4, 0.472, 0.305),
@@ -10147,6 +10362,7 @@ pub const LAYER3_SFB_CONVERSION_LONG_C8C: [Layer3SfbConversion; 21] = [
 
 /// Table C.8.d — 48 kHz **short** blocks (12 bands, printed p.89 /
 /// PDF p.95).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_SFB_CONVERSION_SHORT_C8D: [Layer3SfbConversion; 12] = [
     Layer3SfbConversion::new(2, 0, 3, 1.000, 0.167),
     Layer3SfbConversion::new(2, 3, 5, 0.833, 0.833),
@@ -10164,6 +10380,7 @@ pub const LAYER3_SFB_CONVERSION_SHORT_C8D: [Layer3SfbConversion; 12] = [
 
 /// Table C.8.e — 44,1 kHz **short** blocks (12 bands, printed p.90 /
 /// PDF p.96).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_SFB_CONVERSION_SHORT_C8E: [Layer3SfbConversion; 12] = [
     Layer3SfbConversion::new(2, 0, 3, 1.000, 0.167),
     Layer3SfbConversion::new(2, 3, 5, 0.833, 0.833),
@@ -10181,6 +10398,7 @@ pub const LAYER3_SFB_CONVERSION_SHORT_C8E: [Layer3SfbConversion; 12] = [
 
 /// Table C.8.f — 32 kHz **short** blocks (12 bands, printed p.90 /
 /// PDF p.96).
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub const LAYER3_SFB_CONVERSION_SHORT_C8F: [Layer3SfbConversion; 12] = [
     Layer3SfbConversion::new(2, 0, 3, 1.000, 0.167),
     Layer3SfbConversion::new(2, 3, 5, 0.833, 0.833),
@@ -10200,6 +10418,7 @@ pub const LAYER3_SFB_CONVERSION_SHORT_C8F: [Layer3SfbConversion; 12] = [
 /// C.8.c = 32 kHz — same reversed suffix order as Table C.7).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_sfb_conversion_long(fs: AnnexDSamplingRate) -> &'static [Layer3SfbConversion] {
     match fs {
         AnnexDSamplingRate::Hz48000 => &LAYER3_SFB_CONVERSION_LONG_C8A,
@@ -10212,6 +10431,7 @@ pub fn layer3_sfb_conversion_long(fs: AnnexDSamplingRate) -> &'static [Layer3Sfb
 /// C.8.f = 32 kHz).
 #[inline]
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_sfb_conversion_short(fs: AnnexDSamplingRate) -> &'static [Layer3SfbConversion] {
     match fs {
         AnnexDSamplingRate::Hz48000 => &LAYER3_SFB_CONVERSION_SHORT_C8D,
@@ -10234,6 +10454,7 @@ pub fn layer3_sfb_conversion_short(fs: AnnexDSamplingRate) -> &'static [Layer3Sf
 /// `bo` falls outside `per_partition` or `bo <= bu` (never the case
 /// for the printed tables).
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_partitions_to_sfb(
     per_partition: &[f64],
     conv: &[Layer3SfbConversion],
@@ -10257,6 +10478,7 @@ pub fn layer3_partitions_to_sfb(
 /// convention as [`model2_step_f_cb`]). Returns `None` on length
 /// mismatch.
 #[must_use]
+#[doc(hidden)] // internal: psychoacoustic-model plumbing, public for tests only (not stable API)
 pub fn layer3_sfb_ratio(thm: &[f64], en: &[f64]) -> Option<Vec<f64>> {
     if thm.len() != en.len() {
         return None;

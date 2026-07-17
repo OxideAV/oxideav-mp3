@@ -391,44 +391,70 @@
 
 #![warn(missing_debug_implementations)]
 
+// Modules below marked #[doc(hidden)] are internal Layer III plumbing
+// (decode/encode pipeline stages), public only so integration tests and
+// benches can drive each stage directly; they are not stable API.
+#[doc(hidden)] // internal: alias-reduction stage
 pub mod alias;
+#[doc(hidden)] // internal: polyphase analysis filterbank stage
 pub mod analysis;
+#[doc(hidden)] // internal: encoder attack-detector stage
 pub mod attack_detect;
+#[doc(hidden)] // internal: block-type scheduler state machine
 pub mod block_type_sm;
 pub mod codec_decoder;
 pub mod codec_encoder;
+#[doc(hidden)] // internal: CRC-16 frame-protection primitives
 pub mod crc;
 pub mod demuxer;
 pub mod encoder;
 pub mod frame;
+#[doc(hidden)] // internal: Huffman decode/encode stage
 pub mod huffman;
+#[doc(hidden)] // internal: IMDCT/window/overlap stage
 pub mod imdct;
+#[doc(hidden)] // internal: inner-loop global_gain search stage
 pub mod inner_loop;
 pub mod lame_tag;
 pub mod main_data;
+#[doc(hidden)] // internal: forward MDCT stage
 pub mod mdct;
+#[doc(hidden)] // internal: mixed-vs-short classifier stage
 pub mod mixed_classifier;
+#[doc(hidden)] // internal: outer distortion-control loop stage
 pub mod outer_loop;
 pub mod psy;
 pub mod quality;
+#[doc(hidden)] // internal: quantization primitive
 pub mod quantize;
+#[doc(hidden)] // internal: short-block reorder stage
 pub mod reorder;
+#[doc(hidden)] // internal: requantization stage
 pub mod requantize;
+#[doc(hidden)] // internal: scalefactor decode stage
 pub mod scalefactors;
+#[doc(hidden)] // internal: short-block helpers
 pub mod short_block;
+#[doc(hidden)] // internal: side-information parse stage
 pub mod side_info;
+#[doc(hidden)] // internal: stereo processing stage
 pub mod stereo;
 pub mod stream_encoder;
+#[doc(hidden)] // internal: polyphase synthesis filterbank stage
 pub mod synth;
 pub mod xing_info;
 
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use analysis::{analyze_granule, analyze_row, m_coefficient, AnalysisState, C_TABLE, X_LEN};
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use attack_detect::{
     granule_subframe_energies, subframe_energy, AttackDetector, AttackDetectorParams,
     DEFAULT_AMBIENT_LEAK, DEFAULT_ATTACK_THRESHOLD, SAMPLES_PER_SUBFRAME,
     SILENCE_FLOOR as ATTACK_SILENCE_FLOOR, SUBFRAMES_PER_GRANULE,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use block_type_sm::BlockTypeStateMachine;
 pub use codec_decoder::{make_decoder, register_codecs, Mp3CoreDecoder};
 pub use codec_encoder::{
@@ -438,26 +464,31 @@ pub use codec_encoder::{
     make_encoder_with_threshold_in_quiet, make_encoder_with_threshold_in_quiet_offset,
     Mp3CoreEncoder,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use crc::{crc16_bits, crc16_layer3, crc16_layer3_lsf, INITIAL_STATE as CRC_INITIAL_STATE};
+#[doc(hidden)] // internal: re-export of hidden demuxer helpers
+pub use demuxer::{lame_magic_offset, side_info_len};
 pub use demuxer::{
-    lame_magic_offset, open_file_demuxer, parse_xing_info, probe, side_info_len, Mp3Demuxer,
-    Mp3Tags, XingTag, XingTagId, CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,
+    open_file_demuxer, parse_xing_info, probe, Mp3Demuxer, Mp3Tags, XingTag, XingTagId,
+    CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,
 };
-pub use encoder::{
-    encode_silent_frame, make_silent_header, silent_side_info, write_header, write_side_info,
-    EncodeError,
-};
+pub use encoder::{encode_silent_frame, make_silent_header, EncodeError};
+#[doc(hidden)] // internal: re-export of hidden encoder framing helpers
+pub use encoder::{silent_side_info, write_header, write_side_info};
 pub use frame::{
     parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
     Mp3FrameHeader, MpegVersion,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use huffman::{
     big_table_reach, choose_best_count1_table, choose_best_table_for_region, count1_bits,
     count_huffman_bits, decode_huffman, emit_huffman, encode_huffman, encoder_region_boundaries,
     partition_split, HuffmanEncodeError, HuffmanError, Mp3HuffmanData, PartitionSplit, NUM_LINES,
     SELECTABLE_BIG_TABLES,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use inner_loop::{
     coarse_bit_estimate, exact_bit_count, exact_bit_count_band_aligned, max_abs, search_bit_budget,
     search_bit_budget_band_aligned, search_magnitude_clamp, subdivide_bands, ExactBitCount,
@@ -467,17 +498,22 @@ pub use lame_tag::{
     parse_lame_tag, LameParseError, LameTag, DELAY_PADDING_OFFSET_FROM_LAME_MAGIC,
     LAME_MAGIC_OFFSET_ALL_FLAGS, LAME_TAG_FIELDS_LEN, LAME_TAG_FULL_LEN,
 };
+pub use main_data::ReservoirError;
+#[doc(hidden)] // internal: re-export of hidden reservoir/main-data plumbing
 pub use main_data::{
-    assemble_main_data, schedule_reservoir, AssembledMainData, GranuleChannelData, ReservoirError,
-    ReservoirFrame, ReservoirScheduler, ScheduledFrame, RESERVOIR_MAX_LSF, RESERVOIR_MAX_MPEG1,
+    assemble_main_data, schedule_reservoir, AssembledMainData, GranuleChannelData, ReservoirFrame,
+    ReservoirScheduler, ScheduledFrame, RESERVOIR_MAX_LSF, RESERVOIR_MAX_MPEG1,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use mdct::{
     analysis_long_window, analysis_short_window, forward_overlap, mdct,
     window_long_family_analysis, window_short_analysis, MdctState,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use mixed_classifier::{
     low_band_stability_ratio, low_pass_granule, MixedClassifier, DEFAULT_MIXED_LOW_BAND_STABILITY,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use outer_loop::{
     band_distortion_long, band_distortion_mixed_long, band_distortion_mixed_short,
     band_distortion_short, outer_loop_search_long, outer_loop_search_long_per_band,
@@ -488,31 +524,40 @@ pub use outer_loop::{
     OUTER_LOOP_SCALEFAC_COMPRESS_LSF, SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW, SCALEFAC_S_MAX_HIGH,
     SCALEFAC_S_MAX_LOW,
 };
+pub use psy::XminThresholds;
+#[doc(hidden)] // internal: re-export of hidden psychoacoustic plumbing
 pub use psy::{
     decimate_tonal_within_half_bark, masker_above_threshold_in_quiet, masker_at_band,
-    masker_in_step7_window_of_line, XminThresholds, DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE,
+    masker_in_step7_window_of_line, DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE,
     STEP5_TONAL_DECIMATION_WINDOW_BARK, STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE,
     STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE,
 };
 pub use quality::{QualityPreset, QualityPresetParams};
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use quantize::quantize;
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use reorder::reorder;
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use requantize::{requantize, scalefac_multiplier, PRETAB};
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use scalefactors::{
     decode_scalefactors, lsf_scale_params, FrameScaleFactors, LsfScaleParams, MainDataReader,
     MainDataWriter, Reservoir, ScaleFactorError, ScaleFactors, LONG_SFB, MPEG1_SLEN, SHORT_SFB,
     SHORT_WINDOWS,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use side_info::{
     parse_side_info, BlockType, GranuleChannel, SideInfo, SideInfoError, GRANULES, GRANULES_LSF,
     SIDE_INFO_BYTES_LSF_MONO, SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO,
     SIDE_INFO_BYTES_STEREO,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use stereo::process_stereo;
 pub use stream_encoder::{
     Mp3Encoder, StreamEncodeError, LSF_L3_BITRATE_LADDER_KBPS, MPEG1_L3_BITRATE_LADDER_KBPS,
     SAMPLES_PER_FRAME_MPEG1, SAMPLES_PER_GRANULE,
 };
+#[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use synth::{
     n_coefficient, pcm_f32_to_i16, synth_granule, synth_row, SynthState, D_TABLE, PCM_PER_GRANULE,
 };

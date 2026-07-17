@@ -97,8 +97,10 @@ use crate::side_info::SideInfo;
 /// The §2.4.2.7 bit-reservoir limit in bytes: `main_data_begin` is 9 bits
 /// in MPEG-1 (ISO/IEC 11172-3 §2.4.1.7) and 8 bits in MPEG-2 / MPEG-2.5
 /// LSF (ISO/IEC 13818-3 §2.4.1.7).
+#[doc(hidden)] // internal: main-data/reservoir plumbing, public for tests only (not stable API)
 pub const RESERVOIR_MAX_MPEG1: usize = 511;
 /// LSF reservoir limit — 8-bit `main_data_begin` ⇒ 255 bytes.
+#[doc(hidden)] // internal: main-data/reservoir plumbing, public for tests only (not stable API)
 pub const RESERVOIR_MAX_LSF: usize = 255;
 
 /// The Huffman-partition data of one granule/channel needed to emit its
@@ -114,6 +116,7 @@ pub const RESERVOIR_MAX_LSF: usize = 255;
 /// guarantees the emitted region/table assignment matches the decoder's
 /// derivation bit-for-bit, so the caller cannot desync the two.
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal: main-data/reservoir plumbing, public for tests only (not stable API)
 pub struct GranuleChannelData {
     /// The 576 quantized frequency lines (`is[]`), with signs.
     pub is: [i32; NUM_LINES],
@@ -126,6 +129,7 @@ pub struct GranuleChannelData {
 
 /// A fully assembled main-data block plus its bit-reservoir back-pointer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal: main-data/reservoir plumbing, public for tests only (not stable API)
 pub struct AssembledMainData {
     /// The contiguous main-data bytes (trailing partial byte zero-padded
     /// to a byte boundary). With `main_data_begin == 0` this block starts
@@ -168,6 +172,7 @@ pub struct AssembledMainData {
 ///
 /// Propagates [`HuffmanEncodeError`] from [`crate::huffman::emit_huffman`]
 /// if a granule/channel's `is[]` is not codable by its `table_select`.
+#[doc(hidden)] // internal: main-data/reservoir plumbing, public for tests only (not stable API)
 pub fn assemble_main_data(
     header: &Mp3FrameHeader,
     side_info: &mut SideInfo,
@@ -248,6 +253,7 @@ pub fn assemble_main_data(
 /// and only requires `slot_bytes` to be ≥ the side-info-implied minimum
 /// of zero. Free-format frames have no fixed slot and are out of scope.
 #[derive(Debug, Clone)]
+#[doc(hidden)] // internal: main-data/reservoir plumbing, public for tests only (not stable API)
 pub struct ReservoirFrame<'a> {
     /// This frame's assembled main-data bytes (typically the
     /// [`AssembledMainData::bytes`] of [`assemble_main_data`]).
@@ -266,6 +272,7 @@ pub struct ReservoirFrame<'a> {
 /// main-data slot plus the `main_data_begin` value to stamp into its
 /// side info.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // internal: main-data/reservoir plumbing, public for tests only (not stable API)
 pub struct ScheduledFrame {
     /// Exactly `slot_bytes` bytes — what goes into this frame's
     /// main-data area on the wire. The leading bytes (up to
@@ -389,6 +396,7 @@ impl std::error::Error for ReservoirError {}
 /// # Panics
 ///
 /// Panics if `frames.len() != side_infos.len()`.
+#[doc(hidden)] // internal: main-data/reservoir plumbing, public for tests only (not stable API)
 pub fn schedule_reservoir(
     frames: &[ReservoirFrame<'_>],
     side_infos: &mut [SideInfo],
@@ -483,6 +491,7 @@ pub fn schedule_reservoir(
 /// future-proofing handle; the one-shot [`schedule_reservoir`] is the
 /// expected entry point.
 #[derive(Debug, Default)]
+#[doc(hidden)] // internal: main-data/reservoir plumbing, public for tests only (not stable API)
 pub struct ReservoirScheduler {
     frames: Vec<OwnedReservoirFrame>,
 }
