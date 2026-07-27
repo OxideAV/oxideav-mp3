@@ -1,0 +1,28 @@
+name: Fuzz
+
+# Thin shim around the OxideAV org-level reusable fuzz workflow. See
+# https://github.com/OxideAV/.github for the job definition: it
+# auto-discovers the targets under fuzz/fuzz_targets/, splits the time
+# budget evenly across them, persists the libFuzzer corpus across runs
+# via the actions cache, and fails (uploading the offending input as an
+# artifact) on any crash.
+#
+# Because fuzz/ is its own workspace that resolves oxideav-core from
+# crates.io independently of the library build, this scheduled run is
+# also the canary for published-core API drift breaking the harness
+# while the library CI stays green.
+
+on:
+  schedule:
+    - cron: "23 3 * * *" # daily 03:23 UTC, jittered off the hour
+  workflow_dispatch: # manual trigger
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      # 30 min wall-clock split across the five targets (decode,
+      # granule, demux, encode, roundtrip) — 360 s each per night, on
+      # top of the cached cross-run corpus.
+      time_budget_seconds: 1800
+    secrets: inherit

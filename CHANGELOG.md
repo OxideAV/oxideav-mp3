@@ -32,6 +32,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   wall-clock total; ≈ 49 M executions) surfaced zero findings; the
   reference-PCM conformance suites (`corpus_reference_pcm`,
   `lsf_reference_pcm`, `mpeg25_reference_pcm`) pass unchanged.
+- **Scheduled Fuzz workflow** (`.github/workflows/fuzz.yml`): a thin
+  shim over the org-level reusable `crate-fuzz.yml` runs all five
+  targets nightly with a cached cross-run corpus, uploading any crash
+  input as an artifact. Since `fuzz/` resolves `oxideav-core` from
+  crates.io independently of the library build, the nightly run also
+  serves as the canary for a published-core API change breaking the
+  harness while library CI stays green.
 
 ### Changed
 
