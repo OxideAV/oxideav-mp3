@@ -45,8 +45,8 @@
 //!
 //! ```text
 //!   byte 0      — control:
-//!                   bits 0-1 → MPEG version (constrained to a
-//!                              decodable one: MPEG-1 / MPEG-2 LSF)
+//!                   bits 0-1 → MPEG version (MPEG-1 / MPEG-2 LSF /
+//!                              MPEG-2.5 — all three decode)
 //!                   bits 2-3 → sample-rate index (0..=2)
 //!                   bits 4-7 → channel mode + body stride seed
 //!   byte 1      — bitrate index seed (mapped to 1..=14)
@@ -71,14 +71,26 @@ use oxideav_mp3::scalefactors::{decode_scalefactors, MainDataReader};
 use oxideav_mp3::side_info::parse_side_info;
 use oxideav_mp3::synth::{synth_granule, SynthState};
 
-/// Build a structurally-valid 4-byte Layer III header. Version is
-/// constrained to a decodable one (MPEG-1 or MPEG-2 LSF); MPEG-2.5 is
-/// excluded because its scalefactor-band tables are docs-blocked and
-/// the trait decoder rejects it before the deep chain — the `decode`
-/// target already exercises that rejection.
+/// Build a structurally-valid 4-byte Layer III header. All three
+/// decodable versions are covered — MPEG-1, MPEG-2 LSF, and (since
+/// r432, the MPEG-2.5 tables having landed in the meantime) the
+/// MPEG-2.5 extension, whose 8 / 11.025 / 12 kHz scalefactor-band
+/// dispatch (`requantize::LONG_STARTS_MPEG25_8` and friends) is
+/// exactly the deep-chain surface this target exists to stress.
+///
+/// Note the MPEG-2.5 header narrows the syncword to 11 bits and
+/// repurposes bit 20 as the extension discriminator (see
+/// `frame::MpegVersion`): writing `0b00` into bits 20..19 below
+/// produces exactly that shape.
 fn build_header(ctl: u8, br: u8, modesel: u8) -> [u8; 4] {
     let mut raw: u32 = 0x7FF << 21;
-    let ver_bits = if ctl & 1 == 0 { 0b11u32 } else { 0b10 }; // MPEG-1 / MPEG-2
+    // MPEG-1 / MPEG-2 LSF / MPEG-2.5 (two seed values map to 2.5 so
+    // the low-rate tables get a fair share of the energy).
+    let ver_bits = match ctl & 0b11 {
+        0 => 0b11u32,
+        1 => 0b10,
+        _ => 0b00,
+    };
     raw |= ver_bits << 19;
     raw |= 0b01u32 << 17; // Layer III
     raw |= 1 << 16; // protection_bit '1' = no CRC (keep the slot layout simple)

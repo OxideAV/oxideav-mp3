@@ -6,6 +6,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Fuzz coverage extended to the full codec surface** (r432 depth
+  round). Two new libFuzzer targets: `encode` — panic-freedom over the
+  encode loop with hostile PCM geometries (zero / odd / single-sample /
+  multi-frame chunk schedules), off-ladder bitrates, off-table sample
+  rates, all channel modes, and the complete toggle surface (VBR
+  windows, CRC-16, Xing/Info emission with attacker flag words,
+  forced short / mixed blocks, energy- and Model-2-driven auto
+  block-typing with non-finite thresholds, intensity-stereo arming)
+  across both the `oxideav_core::Encoder` trait path (including
+  inconsistent `AudioFrame` plane/length geometry) and the direct
+  `Mp3Encoder` stream API — and `roundtrip` — a semantic
+  encode → decode invariant asserting that every stream emitted under
+  a valid configuration frame-walks back losslessly, decodes through
+  this crate's own `Decoder` without error, and covers the pushed PCM
+  sample count (§2.4.1.7 tail-flush zero-padding). The existing
+  `decode` target now also crafts free-format headers
+  (`bitrate_index == 0`, packet-length-delimited per the trait
+  contract), and `granule` drives the MPEG-2.5 versions through the
+  deep per-granule chain (the 8 / 11.025 / 12 kHz scalefactor-band
+  dispatch) — both were rejection paths when those targets were
+  written. A bounded campaign across all five targets (≈ 74 minutes
+  wall-clock total; ≈ 49 M executions) surfaced zero findings; the
+  reference-PCM conformance suites (`corpus_reference_pcm`,
+  `lsf_reference_pcm`, `mpeg25_reference_pcm`) pass unchanged.
+
 ### Changed
 
 - **Internal public surface marked `#[doc(hidden)]`** (fleet policy):

@@ -221,12 +221,21 @@ surface which path was taken.
 
 ## Robustness
 
-A `cargo-fuzz` harness drives attacker-controlled bytes through the
-attack surfaces for panic-freedom: `decode` (multi-packet decoder
-sessions with crafted valid-sync headers, reservoir / reset / flush
-state transitions), `granule` (the per-granule decode primitives), and
-`demux` (container open with ID3v2 / Xing / VBRI / LAME parsing,
-packet iteration, and the TOC / proportional seek paths).
+A `cargo-fuzz` harness covers both directions of the codec. Four
+panic-freedom targets: `decode` (multi-packet decoder sessions with
+crafted valid-sync headers across all three MPEG versions and
+free-format framing, reservoir / reset / flush state transitions),
+`granule` (the per-granule decode primitives, including the MPEG-2.5
+low-rate scalefactor-band dispatch), `demux` (container open with
+ID3v2 / Xing / VBRI / LAME parsing, packet iteration, and the TOC /
+proportional seek paths), and `encode` (hostile PCM geometries,
+off-ladder/off-table configurations, and the full toggle surface —
+VBR, CRC, Xing, forced/auto block types with non-finite thresholds,
+joint-stereo variants — over both the trait path and the direct
+stream API). A fifth target, `roundtrip`, asserts a semantic
+invariant: every stream the encoder emits under a valid configuration
+must frame-walk back losslessly, decode through this crate's own
+decoder without error, and cover the pushed PCM sample count.
 
 ## License
 

@@ -1,20 +1,24 @@
-# cargo-fuzz manifest for the oxideav-mp3 Layer III DECODE attacker
-# surface.
+# cargo-fuzz manifest for the oxideav-mp3 Layer III attacker surface —
+# decode, demux, AND encode.
 #
-# Round 289 depth-mode lane. The decoder is bit-exact at 100%; the
-# only remaining feature gap (MPEG-2.5 8 / 11.025 / 12 kHz
-# scalefactor-band tables) is docs-blocked. The remaining depth-mode
-# lane without coverage is libFuzzer on the Layer III decode path.
+# Started as the round-289 depth-mode decode lane (targets 1-2), the
+# r405 demuxer lane (target 3), and extended in r432 to the encode
+# loop and an encode→decode roundtrip invariant (targets 4-5), with
+# the decode-side targets widened to the MPEG-2.5 and free-format
+# paths that had landed in the library since r289.
 #
 # Spec basis for the targets: ISO/IEC 11172-3 §2.4.1.7 (side
 # information), §2.4.2.7 (Huffman code-bit decoding of big_values +
 # count1), §2.4.3.4 (requantisation, alias reduction, IMDCT, synthesis
-# polyphase filterbank). The harness drives the registered `Decoder`
-# trait object plus the per-granule decode primitives
+# polyphase filterbank), §C.1.5 (encode procedure); ISO/IEC 13818-3
+# §2.4.3.2 (LSF frames). The harness drives the registered `Decoder` /
+# `Encoder` trait objects, the per-granule decode primitives
 # (`parse_side_info`, `decode_scalefactors`, `decode_huffman`,
-# `requantize`, `alias_reduce`, `imdct_granule`, `synth_granule`) with
+# `requantize`, `alias_reduce`, `imdct_granule`, `synth_granule`), the
+# `Mp3Demuxer` container surface, and the `Mp3Encoder` stream API with
 # attacker-supplied bytes; the contract under test is panic-freedom on
-# every entry, irrespective of input shape.
+# every entry irrespective of input shape (plus the semantic roundtrip
+# invariant of target 5).
 
 [package]
 name = "oxideav-mp3-fuzz"
@@ -90,6 +94,36 @@ doc = false
 [[bin]]
 name = "demux"
 path = "fuzz_targets/demux.rs"
+test = false
+doc = false
+bench = false
+
+# Target 4 — `encode` (r432). Adversarial fuzzer for the encode loop:
+# hostile PCM geometries (zero / odd / single-sample / multi-frame
+# chunk schedules), extreme bitrate / sample-rate / channel-mode
+# configurations (off-ladder and off-table values included), and the
+# full toggle surface (VBR windows, CRC, Xing/Info emission, forced
+# short / mixed blocks, auto block-typing with non-finite thresholds,
+# intensity-stereo arming) across both the `oxideav_core::Encoder`
+# trait path (with inconsistent AudioFrame plane/length geometry) and
+# the direct `Mp3Encoder` stream API. Panic-freedom contract.
+[[bin]]
+name = "encode"
+path = "fuzz_targets/encode.rs"
+test = false
+doc = false
+bench = false
+
+# Target 5 — `roundtrip` (r432). Semantic encode → decode invariant:
+# every stream the encoder emits under a valid configuration (all nine
+# sample rates, ladder bitrates, mono/stereo/dual/MS-joint, CRC, VBR,
+# Xing, forced-short, auto block-typing where supported) must
+# frame-walk back losslessly, decode through this crate's own Decoder
+# without error, and cover the pushed PCM sample count (tail-flush
+# zero-padding). Violations panic and are reported as findings.
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
 test = false
 doc = false
 bench = false

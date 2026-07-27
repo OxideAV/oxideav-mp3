@@ -1,7 +1,10 @@
 #![no_main]
 
 //! Drive attacker-supplied bytes through `Decoder::send_packet` on a
-//! fresh MPEG-1 / MPEG-2 LSF Audio Layer III decoder.
+//! fresh MPEG-1 / MPEG-2 LSF / MPEG-2.5 Audio Layer III decoder,
+//! including free-format framing (r432: both were rejections when
+//! this target was written in r289; the decoder now takes them
+//! end-to-end, so the crafted headers cover them).
 //!
 //! Round 289 depth-mode lane: a panic-freedom fuzzer over the Layer
 //! III decoder's attacker surface. The contract under test is purely
@@ -76,11 +79,15 @@ const MAX_FRAME_BYTES: usize = 2048;
 /// a parsing header); within those ranges every field is
 /// attacker-controlled.
 ///
-/// `v` selects MPEG version, `sr` the sample-rate index, `br` the
-/// bitrate index (1..=14, never 0 free-format or 15 forbidden),
-/// `mode` the channel mode, and the remaining control bits drive the
-/// CRC, padding, mode-extension, and private/copyright/original
-/// flags. Layer is fixed to III (the decoder rejects I/II).
+/// `v` selects MPEG version (MPEG-1, MPEG-2 LSF, or MPEG-2.5 — all
+/// three decode end-to-end), `sr` the sample-rate index, `br` the
+/// bitrate index (usually 1..=14; a slice of the seed space maps to
+/// 0 = **free format**, whose frame length the decoder takes from
+/// the packet length per the trait contract — 15 forbidden stays
+/// excluded), `mode` the channel mode, and the remaining control
+/// bits drive the CRC, padding, mode-extension, and
+/// private/copyright/original flags. Layer is fixed to III (the
+/// decoder rejects I/II).
 fn build_header(v: u8, sr: u8, br: u8, mode: u8, ext: u8, flags: u8) -> [u8; 4] {
     // 11-bit sync (bits 31..21 all ones).
     let mut raw: u32 = 0x7FF << 21;
@@ -96,8 +103,11 @@ fn build_header(v: u8, sr: u8, br: u8, mode: u8, ext: u8, flags: u8) -> [u8; 4] 
     // protection_bit: '0' = CRC present.
     let crc = flags & 0b0000_0001;
     raw |= u32::from(crc ^ 1) << 16; // store '0' when CRC present
-                                     // bitrate index 1..=14 (avoid 0 free-format and 15 forbidden).
-    let br_idx = (br % 14) + 1;
+                                     // bitrate index: mostly 1..=14, with a 1/16 seed slice mapped
+                                     // to 0 = free format (§2.4.2.3 — no header-derivable length;
+                                     // the decoder takes the packet length as authoritative).
+                                     // 15 (forbidden) stays excluded.
+    let br_idx = if br >= 240 { 0 } else { (br % 14) + 1 };
     raw |= u32::from(br_idx) << 12;
     // sample-rate index 0..=2 (3 is reserved/rejected).
     let sr_idx = sr % 3;
@@ -194,12 +204,15 @@ fuzz_target!(|data: &[u8]| {
                 // Re-derive the frame length the decoder will compute so
                 // the body is the right size to satisfy its length check
                 // (otherwise the short-frame rejection fires first and
-                // the deep chain is never reached). Fall back to a fixed
-                // length on the rare parse miss.
+                // the deep chain is never reached). A free-format header
+                // has no derivable length — there the packet length IS
+                // the frame length per the trait contract, so pick an
+                // attacker-derived bounded one; same fallback covers the
+                // rare parse miss.
                 let frame_len = oxideav_mp3::frame::parse_header(&hdr)
                     .ok()
                     .and_then(|h| h.frame_len())
-                    .unwrap_or(417)
+                    .unwrap_or(8 + usize::from(v ^ br.rotate_left(3)) * 7)
                     .min(MAX_FRAME_BYTES);
                 let mut frame = vec![0u8; frame_len];
                 frame[..4].copy_from_slice(&hdr);
@@ -217,10 +230,10 @@ fuzz_target!(|data: &[u8]| {
         };
 
         let pkt = Packet::new(0, tb, body);
-        // send_packet may legitimately Err on a truncated tail,
-        // unsupported header (MPEG-2.5 / free-format), or short frame —
-        // that's the contract. Output frames are drained immediately to
-        // keep `pending_frames` bounded.
+        // send_packet may legitimately Err on a truncated tail, a
+        // reserved header field, or a short frame — that's the
+        // contract. Output frames are drained immediately to keep
+        // `pending_frames` bounded.
         if dec.send_packet(&pkt).is_ok() {
             let _ = dec.receive_frame();
         }
