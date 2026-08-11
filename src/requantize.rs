@@ -283,8 +283,10 @@ const MIXED_FIRST_SHORT_SFB: usize = 3;
 ///   pass through the reorder unchanged and are consumed by the
 ///   short IMDCT of subbands 2..3 in its native `[3·k + win]`
 ///   interleave (the fourth validator long-windows the whole 0..72
-///   region — the minority reading; the encoder keeps refusing to
-///   *emit* 8 kHz mixed because of that split);
+///   region — a minority reading contradicting the §2.4.2.7
+///   two-subband window-split text, which r440 grounded in the
+///   staged spec chain when it lifted the encoder's 8 kHz mixed
+///   emit refusal);
 /// * the mixed Huffman region-0 boundary stays at the fixed 36 lines
 ///   on all four (see `huffman::region_boundaries`).
 ///

@@ -272,28 +272,41 @@ fn lsf_auto_block_type_with_mixed_click_train_engages_short() {
 /// mixed flag**.
 #[test]
 fn lsf_auto_mixed_demotes_to_pure_short_on_the_wire() {
+    assert_auto_mixed_demotes(22_050, 64, 3300);
+}
+
+/// r440 — the 8 kHz toggle refusal is lifted
+/// (`enable_auto_block_type_with_mixed` now accepts 8 kHz); like every
+/// other LSF / MPEG-2.5 rate, the scheduler demotes mixed bursts to
+/// pure-short on the wire there.
+#[test]
+fn mpeg25_8k_auto_mixed_accepted_and_demotes_to_pure_short() {
+    assert_auto_mixed_demotes(8_000, 32, 1200);
+}
+
+fn assert_auto_mixed_demotes(sr: u32, bitrate_kbps: u32, click_period: usize) {
     // The r408 stimulus family that DOES promote to mixed at the
     // MPEG-1 rates: a low-band 50 Hz carrier (classifier-stable) with
     // Nyquist-alternation clicks on top (fires the attack detector).
-    const SR: u32 = 22_050;
-    let n = SR as usize;
+    let n = sr as usize;
     let mut pcm: Vec<i16> = (0..n)
         .map(|i| {
-            let t = i as f32 / SR as f32;
+            let t = i as f32 / sr as f32;
             ((2.0 * PI * 50.0 * t).sin() * 0.05 * i16::MAX as f32) as i16
         })
         .collect();
-    let mut pos = 3300usize;
+    let mut pos = click_period;
     while pos + 64 < n {
         for j in 0..64 {
             let hf = if j % 2 == 0 { 30_000i32 } else { -30_000i32 };
             pcm[pos + j] = (i32::from(pcm[pos + j]) + hf)
                 .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         }
-        pos += 3300;
+        pos += click_period;
     }
 
-    let mut enc = Mp3Encoder::new(64, SR, ChannelMode::SingleChannel).expect("encoder build");
+    let mut enc =
+        Mp3Encoder::new(bitrate_kbps, sr, ChannelMode::SingleChannel).expect("encoder build");
     // Relaxed stability threshold — at 44.1 kHz this same
     // configuration promotes granules to mixed (see
     // `tests/auto_block_type_mixed_roundtrip.rs`).

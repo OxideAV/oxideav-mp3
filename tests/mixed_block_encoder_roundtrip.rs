@@ -371,6 +371,75 @@ fn force_mixed_stream_passes_demuxer() {
     );
 }
 
+/// r440 — 8 kHz (MPEG-2.5) mixed emission. The r405/r408 emit refusal
+/// is lifted: the §2.4.2.7 window split (two lowest polyphase
+/// subbands, 36 lines) is fixed by the staged text chain at every
+/// rate — ISO/IEC 13818-3 §2.4.2.7 inherits the 11172-3 semantics
+/// verbatim and the staged low-rate-extension disclosure changes only
+/// the sync word and the 8 kHz scalefactor bandwidth table — while
+/// the coding split is the band-relative `3·short_starts[3]` = 72
+/// (r408, unanimous across deployed validators). This test pins the
+/// emitted wire shape and the own-decode round trip at 8 kHz.
+#[test]
+fn force_mixed_8k_emits_and_roundtrips() {
+    let sr = 8_000u32;
+    let n = sr as usize; // 1 s
+    let pcm = sine_pcm(n, 101.0, sr as f32, 0.5);
+    let mut enc = Mp3Encoder::new(32, sr, ChannelMode::SingleChannel).expect("encoder build");
+    enc.force_mixed_blocks_for_testing(true)
+        .expect("force_mixed accepted at 8 kHz (r440)");
+    enc.push_samples(&pcm).expect("push pcm");
+    let mut bytes: Vec<u8> = Vec::new();
+    enc.finish(&mut bytes).expect("encoder finish");
+
+    // Every granule must be a mixed granule with the r408 one-table
+    // big-values hardening (so every region-boundary interpretation
+    // consumes identical bits).
+    let mut granules = 0usize;
+    for frame in FrameWalker::new(&bytes) {
+        let hdr = parse_header(&frame.data[..4]).expect("header");
+        assert_eq!(hdr.sample_rate_hz, 8_000, "MPEG-2.5 8 kHz header");
+        let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
+        for gr in 0..si.granule_count as usize {
+            let gc = &si.granules[gr][0];
+            granules += 1;
+            assert!(gc.window_switching_flag, "window_switching_flag");
+            assert_eq!(gc.block_type, BlockType::Short, "block_type");
+            assert!(gc.mixed_block_flag, "mixed_block_flag");
+            assert_eq!(
+                gc.table_select[0], gc.table_select[1],
+                "one codebook for both big-values regions (r408 hardening)"
+            );
+        }
+    }
+    assert!(granules > 0, "no granules emitted");
+
+    // Own-decode round trip: finite, non-silent PCM.
+    let recon = decode_mp3_mono_short_aware(&bytes);
+    assert!(!recon.is_empty(), "decoded PCM was empty");
+    let energy: f64 = recon
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        / recon.len() as f64;
+    assert!(
+        energy.is_finite() && energy > 0.0,
+        "decoded PCM had zero or non-finite energy ({energy})"
+    );
+
+    // Demuxer accepts every frame.
+    let mut demux = Mp3Demuxer::open(Box::new(Cursor::new(bytes.clone()))).expect("demuxer open");
+    let mut frame_count = 0usize;
+    loop {
+        match demux.next_packet() {
+            Ok(_pkt) => frame_count += 1,
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("demuxer next_packet: {e}"),
+        }
+    }
+    assert!(frame_count > 0, "demuxer surfaced zero frames");
+}
+
 #[test]
 fn force_mixed_default_off() {
     let enc = Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("mono encoder");
@@ -611,8 +680,12 @@ fn mixed_granules_use_one_table_for_both_big_value_regions() {
             (v * 0.4 * f64::from(i16::MAX)) as i16
         })
         .collect();
-    for sr in [44_100u32, 22_050] {
-        let br = if sr == 44_100 { 128 } else { 48 };
+    for sr in [44_100u32, 22_050, 8_000] {
+        let br = match sr {
+            44_100 => 128,
+            22_050 => 48,
+            _ => 32,
+        };
         let mut enc = Mp3Encoder::new(br, sr, ChannelMode::SingleChannel).expect("encoder");
         enc.force_mixed_blocks_for_testing(true)
             .expect("force mixed");

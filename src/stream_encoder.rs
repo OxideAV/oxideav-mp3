@@ -160,13 +160,16 @@ pub enum StreamEncodeError {
     /// [`ChannelMode::DualChannel`] for independent two-channel
     /// content.
     StereoUnsupported,
-    /// An LSF (MPEG-2 16 / 22.05 / 24 kHz or MPEG-2.5 8 / 11.025 /
-    /// 12 kHz) encoder was asked for a feature whose LSF wire format
-    /// is not implemented yet: the §C.1.5.2 auto block-type scheduler
-    /// (whose frame walk is still two-granule shaped). Core LSF encode
-    /// — CBR / VBR, mono / stereo / dual-channel, MS joint stereo,
-    /// §2.4.3.2 intensity stereo (r286), forced block types, outer
-    /// loop, CRC, Xing — is supported.
+    /// **Historical (no longer returned since r287).** An LSF
+    /// (MPEG-2 16 / 22.05 / 24 kHz or MPEG-2.5 8 / 11.025 / 12 kHz)
+    /// encoder used to reject the §C.1.5.2 auto block-type scheduler
+    /// while its frame walk was still two-granule shaped; r287 made
+    /// the walk version-agnostic (`granules_per_frame()` steps per
+    /// frame), so every encode feature — CBR / VBR, mono / stereo /
+    /// dual-channel, MS joint stereo, §2.4.3.2 intensity stereo,
+    /// forced / auto / auto+mixed block types, outer loop, CRC,
+    /// Xing — is available at the LSF rates. The variant is kept so
+    /// existing matches keep compiling.
     LsfUnsupported,
     /// VBR configuration is malformed: `min_kbps` / `max_kbps` are not
     /// both on the §2.4.2.3 ladder, are reversed, or `max_kbps`
@@ -228,28 +231,34 @@ pub enum StreamEncodeError {
         /// `0` when the failure was a granule-length mismatch.
         sample_rate_hz: u32,
     },
-    /// Mixed blocks were requested on an 8 kHz (MPEG-2.5) encoder —
-    /// [`Mp3Encoder::force_mixed_blocks_for_testing`] or
-    /// [`Mp3Encoder::enable_auto_block_type_with_mixed`]. The mixed
-    /// carve-out fixes the long region at the two lowest polyphase
-    /// subbands (36 lines) and starts the short region at the short
-    /// band whose tripled start index is 36; the deployed 8 kHz
-    /// Fraunhofer short table (per-window starts 0, 8, 16, 24, …) has
-    /// **no** band boundary at per-window line 12. The r408
-    /// observer probes resolved the CODING layout — all four deployed
-    /// black-box validators requantize an 8 kHz mixed granule with a
-    /// 72-line long-coded region (`3·short_starts[3]`, matching the
-    /// six transmitted LSF long scalefactor bands; see
-    /// `requantize::mixed_long_lines`) — but the deployed world still
-    /// splits 3-1 on the WINDOW geometry (three validators keep the
-    /// §2.4.2.7 two-subband / 36-line window split; one long-windows
-    /// the whole 72-line region), so an emitted 8 kHz mixed stream
-    /// would render differently on a quarter of deployed decoders.
-    /// The encoder therefore refuses to emit mixed granules at 8 kHz;
-    /// pure short blocks (and the plain auto block-type path) are
-    /// fully supported there. The DECODER renders foreign 8 kHz mixed
-    /// granules per the majority reading (r408; previously lines
-    /// 36..72 were left silent).
+    /// **Historical (no longer returned since r440).** Mixed blocks
+    /// used to be refused on an 8 kHz (MPEG-2.5) encoder because the
+    /// r405/r408 observer probes found deployed decoders split 3-1 on
+    /// the WINDOW geometry of the 8 kHz mixed carve-out (three keep
+    /// the §2.4.2.7 two-subband / 36-line window split, one
+    /// long-windows the whole 72-line long-coded region). r440
+    /// re-derived the split strictly from the staged texts and lifted
+    /// the refusal: ISO/IEC 11172-3:1993 §2.4.2.7 defines
+    /// `mixed_block_flag` as "the frequency lines corresponding to
+    /// the **two lowest frequency polyphase subbands** are
+    /// transformed with normal window … while the remaining 30
+    /// subbands" — a fixed subband count, independent of any
+    /// scalefactor table; ISO/IEC 13818-3:1997 §2.4.2.7 inherits that
+    /// semantics verbatim ("with the exception of a different
+    /// definition of scalefac_compress") and its §2.4.3.2
+    /// LSF-differences list never touches window geometry; and the
+    /// staged low-rate-extension disclosure states that beyond the
+    /// sync word and the 8 kHz scalefactor bandwidth table the bit
+    /// stream structure "is unchanged with respect to ISO/IEC
+    /// 13818-3". The window split is therefore 36 lines at every
+    /// rate; the coding split stays band-relative
+    /// (`3·short_starts[3]` = 72 at 8 kHz — the reading all four
+    /// deployed validators share, see `requantize::mixed_long_lines`).
+    /// [`Mp3Encoder::force_mixed_blocks_for_testing`] and
+    /// [`Mp3Encoder::enable_auto_block_type_with_mixed`] now accept
+    /// 8 kHz (the auto scheduler demotes mixed bursts to pure-short
+    /// at every LSF / MPEG-2.5 rate as before). The variant is kept
+    /// so existing matches keep compiling.
     MixedBlocks8kUnsupported,
     /// [`Mp3Encoder::enable_auto_block_type_model2`] was called on an
     /// encoder that does not have the §C.1.5.3.2.1 automatic Model 2
@@ -272,8 +281,8 @@ impl core::fmt::Display for StreamEncodeError {
                 "ChannelMode::JointStereo not supported on this constructor (use Mp3Encoder::new_joint_stereo_ms, Stereo, or DualChannel)",
             ),
             StreamEncodeError::LsfUnsupported => f.write_str(
-                "feature not yet ported to the LSF (MPEG-2 / MPEG-2.5) wire format \
-                 (auto block-type remains MPEG-1 only)",
+                "LSF (MPEG-2 / MPEG-2.5) features are no longer refused \
+                 (historical variant; the auto block-type walk is version-agnostic since r287)",
             ),
             StreamEncodeError::InvalidVbrConfig => {
                 f.write_str("VBR config: min/max kbps off-ladder or out of range")
@@ -297,9 +306,8 @@ impl core::fmt::Display for StreamEncodeError {
                 "this block-type toggle is not supported with intensity-stereo coupling armed (mixed-promotion auto and Model-2-driven auto remain unavailable; force-short / force-mixed and signal-driven auto block-type — MS-joint or intensity-only — are supported)",
             ),
             StreamEncodeError::MixedBlocks8kUnsupported => f.write_str(
-                "mixed blocks are not supported at 8 kHz: deployed decoders disagree on \
-                 the window geometry of the MPEG-2.5 8 kHz mixed carve-out (use pure \
-                 short blocks)",
+                "mixed blocks at 8 kHz are no longer refused (historical variant; \
+                 the §2.4.2.7 two-subband window split applies at every rate)",
             ),
             StreamEncodeError::Model2AnalysisUnsupported { sample_rate_hz } => {
                 if *sample_rate_hz == 0 {
@@ -1130,14 +1138,16 @@ impl Mp3Encoder {
         &mut self,
         enabled: bool,
     ) -> Result<(), StreamEncodeError> {
-        if enabled && self.sample_rate_hz == 8000 {
-            // Deployed decoders split 3-1 on the WINDOW geometry of
-            // the 8 kHz mixed carve-out (r408 observer probes; the
-            // coding layout itself is resolved — see
-            // [`StreamEncodeError::MixedBlocks8kUnsupported`]) —
-            // refuse to emit.
-            return Err(StreamEncodeError::MixedBlocks8kUnsupported);
-        }
+        // 8 kHz mixed emission is accepted since r440: the §2.4.2.7
+        // window split (two lowest polyphase subbands, 36 lines) is
+        // fixed by the staged text chain at every rate, and the
+        // coding split is the band-relative `3·short_starts[3]` = 72
+        // all four deployed validators share (r408 probes). See
+        // [`StreamEncodeError::MixedBlocks8kUnsupported`] for the
+        // derivation; one deployed decoder long-windows the whole
+        // 72-line region (a minority reading contradicting the
+        // §2.4.2.7 subband-count text) and renders subbands 2..3 of
+        // an 8 kHz mixed granule differently.
         if enabled && self.intensity_start_sfb.is_some() && self.ms_joint_stereo_active() {
             // §2.4.3.4.10.3 mixed-block intensity coupling is wired for
             // the *intensity-only* (non-MS) path (r311): the carve-out's
@@ -1371,8 +1381,8 @@ impl Mp3Encoder {
     /// classifier still runs and the toggle is still accepted, but no
     /// mixed granule reaches the wire from the auto path at those
     /// rates. [`Self::force_mixed_blocks_for_testing`] (steady mixed
-    /// streams, no transition flanks) remains available at every rate
-    /// except 8 kHz.
+    /// streams, no transition flanks) remains available at every
+    /// rate, 8 kHz included since r440.
     ///
     /// # Errors
     ///
@@ -1384,14 +1394,12 @@ impl Mp3Encoder {
         attack_threshold: f64,
         mixed_low_band_stability: f64,
     ) -> Result<(), StreamEncodeError> {
-        // Deployed decoders disagree on the 8 kHz mixed window
-        // geometry (see [`StreamEncodeError::MixedBlocks8kUnsupported`]);
-        // the plain [`Self::enable_auto_block_type`] path
-        // (long/start/short/stop) is the supported auto configuration
-        // there.
-        if self.sample_rate_hz == 8000 {
-            return Err(StreamEncodeError::MixedBlocks8kUnsupported);
-        }
+        // 8 kHz is accepted since r440 (see
+        // [`StreamEncodeError::MixedBlocks8kUnsupported`] for the
+        // window-split derivation); like every other LSF / MPEG-2.5
+        // rate the scheduler demotes mixed bursts to pure-short on
+        // the wire, so the toggle arms the classifier without
+        // emitting mixed granules there.
         // Mixed-block intensity coupling is not wired (the §2.4.3.4.10.3
         // mixed carve-out's long-lowest-subbands + short-rest split needs
         // a two-region intensity bound that this round does not derive).
@@ -3317,7 +3325,7 @@ impl Mp3Encoder {
             // at the non-MPEG-1 rates (pure-short transitions decode
             // identically on every validator); `force_mixed_blocks`
             // — steady mixed streams without transition flanks —
-            // remains available at every rate except 8 kHz.
+            // remains available at every rate (8 kHz included, r440).
             let mixed_promotion_wire_safe = self.version == MpegVersion::Mpeg1;
             // Generalised over `ngr ∈ {1, 2}`: the §C.1.5.2 walk
             // builds, per channel, an attack flag for each of this
@@ -5069,8 +5077,7 @@ impl Mp3Encoder {
                             // Pure short AND mixed both end region 0
                             // at `3 · short_starts[3]` (36 lines at
                             // every ISO table; 72 at the 8 kHz
-                            // Fraunhofer tables — mixed is refused at
-                            // 8 kHz but the formulas stay unified;
+                            // Fraunhofer tables — emitted since r440;
                             // r408 observer probes confirmed the
                             // band-relative mixed boundary on all
                             // four deployed validators, see
@@ -6315,27 +6322,29 @@ fn inverse_alias_reduce_boundaries(xr: &[f32; NUM_LINES], sb_end: usize) -> [f32
 #[cfg(test)]
 mod tests {
     #[test]
-    fn mixed_blocks_rejected_at_8khz() {
-        // The 8 kHz Fraunhofer short table has no boundary at the
-        // 36-line long/short split, so mixed emission is refused
-        // (r405); pure short and plain auto stay available.
+    fn mixed_blocks_accepted_at_8khz() {
+        // r440: the 8 kHz mixed refusal is lifted. The §2.4.2.7
+        // window split (two lowest polyphase subbands) is fixed by
+        // the staged text chain at every rate; the coding split is
+        // the band-relative `3·short_starts[3]` = 72 (r408,
+        // unanimous across deployed validators). Both mixed toggles
+        // now accept 8 kHz; the auto scheduler demotes mixed bursts
+        // to pure-short there like every other LSF / MPEG-2.5 rate.
         let mut enc = super::Mp3Encoder::new(32, 8_000, crate::ChannelMode::SingleChannel).unwrap();
-        assert!(matches!(
-            enc.force_mixed_blocks_for_testing(true),
-            Err(super::StreamEncodeError::MixedBlocks8kUnsupported)
-        ));
-        assert!(matches!(
-            enc.enable_auto_block_type_with_mixed(2.0, 6.0),
-            Err(super::StreamEncodeError::MixedBlocks8kUnsupported)
-        ));
-        assert!(enc.force_short_blocks_for_testing(true).is_ok());
+        assert!(enc.force_mixed_blocks_for_testing(true).is_ok());
+        assert!(enc.force_mixed_blocks_enabled());
         let mut enc2 =
             super::Mp3Encoder::new(32, 8_000, crate::ChannelMode::SingleChannel).unwrap();
-        assert!(enc2.enable_auto_block_type(2.0).is_ok());
-        // Mixed stays available at the other MPEG-2.5 rates.
+        assert!(enc2.enable_auto_block_type_with_mixed(2.0, 6.0).is_ok());
+        // Pure short and plain auto stay available too.
         let mut enc3 =
+            super::Mp3Encoder::new(32, 8_000, crate::ChannelMode::SingleChannel).unwrap();
+        assert!(enc3.force_short_blocks_for_testing(true).is_ok());
+        assert!(enc3.enable_auto_block_type(2.0).is_ok());
+        // Mixed remains available at the other MPEG-2.5 rates.
+        let mut enc4 =
             super::Mp3Encoder::new(40, 12_000, crate::ChannelMode::SingleChannel).unwrap();
-        assert!(enc3.force_mixed_blocks_for_testing(true).is_ok());
+        assert!(enc4.force_mixed_blocks_for_testing(true).is_ok());
     }
 
     use super::*;

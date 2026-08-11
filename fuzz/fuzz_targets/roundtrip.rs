@@ -24,8 +24,8 @@
 //! constructors, CRC-16 protection, VBR with a valid `min ≤ max ≤
 //! ctor` ladder window, Xing/Info emission, forced short blocks, and
 //! the auto block-type scheduler (tolerated to refuse on LSF).
-//! Configuration calls that *reject* (e.g. mixed blocks at 8 kHz,
-//! auto block-typing on LSF) simply drop that toggle — the roundtrip
+//! Configuration calls that *reject* (e.g. incompatible intensity /
+//! block-type combinations) simply drop that toggle — the roundtrip
 //! then runs with whatever configuration stuck. `finish` may still
 //! legitimately fail on an unschedulable bit-reservoir budget
 //! (extreme low bitrates); that aborts the iteration without any

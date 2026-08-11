@@ -1,9 +1,12 @@
 //! **r408 — foreign MPEG-2.5 8 kHz mixed-block decode.**
 //!
-//! This crate's encoder refuses to *emit* mixed blocks at 8 kHz
-//! (deployed decoders split 3-1 on the window geometry of the 8 kHz
-//! mixed carve-out), but the decoder must still render a *foreign*
-//! 8 kHz mixed stream sensibly. Through r407 it did not: the mixed
+//! When these tests were written the encoder still refused to *emit*
+//! mixed blocks at 8 kHz (deployed decoders split 3-1 on the window
+//! geometry of the 8 kHz mixed carve-out; r440 later grounded the
+//! 36-line window split in the §2.4.2.7 subband-count text and
+//! lifted the refusal), but the decoder must render a *foreign*
+//! 8 kHz mixed stream sensibly either way. Through r407 it did not:
+//! the mixed
 //! decode used a fixed 36-line long-coded region and started the
 //! short walk at short scalefactor band 3 (per-window line 24 = wire
 //! line 72 at the 8 kHz Fraunhofer tables), silently zeroing wire

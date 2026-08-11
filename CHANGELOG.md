@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **8 kHz (MPEG-2.5) mixed-block encoding — the r405/r408 emit
+  refusal is lifted** (r440, conformance-closure round). The refusal
+  rested on deployed decoders splitting 3-1 on the mixed carve-out's
+  *window* geometry at 8 kHz; r440 re-derived that geometry strictly
+  from the staged texts and found it fully determined: ISO/IEC
+  11172-3:1993 §2.4.2.7 defines `mixed_block_flag` as "the frequency
+  lines corresponding to the **two lowest frequency polyphase
+  subbands** are transformed with normal window (block_type==0),
+  while the remaining 30 subbands" follow `block_type` — a fixed
+  subband count, independent of any scalefactor table; ISO/IEC
+  13818-3:1997 §2.4.2.7 inherits that semantics verbatim ("with the
+  exception of a different definition of scalefac_compress") and its
+  §2.4.3.2 list of LSF decoding differences never touches window
+  geometry; and the staged low-rate-extension disclosure modifies
+  only the sync word and the 8 kHz scalefactor bandwidth table ("In
+  all other respects the structure of the bit stream is unchanged
+  with respect to the Standard ISO/IEC 13818-3"). The window split is
+  therefore **36 lines at every rate**, while the coding split stays
+  the band-relative `3·short_starts[3]` = 72 the r408 observer probes
+  found unanimous across all four deployed validators — the exact
+  wire shape the (r408-fixed) decode side and the forward
+  MDCT/reorder path already produce, so no pipeline change was
+  needed: `force_mixed_blocks_for_testing` and
+  `enable_auto_block_type_with_mixed` simply accept 8 kHz now (the
+  auto scheduler demotes mixed bursts to pure-short at every
+  LSF / MPEG-2.5 rate as before;
+  `StreamEncodeError::MixedBlocks8kUnsupported` is kept as a
+  historical, no-longer-returned variant). Measured r440: three of
+  the four deployed black-box validators decode 8 kHz force-mixed
+  streams in the float-rounding regime (≤ 7e-6); the fourth
+  long-windows the whole 72-line long-coded region — a minority
+  reading contradicting the §2.4.2.7 subband-count text — and
+  renders subbands 2..3 (250–500 Hz) differently (nrmse ≈ 1.2e-3
+  with tone energy adjacent to the contested subbands, 4.1e-4 with
+  it ≥ 2 subbands away). New tests:
+  `force_mixed_8k_emits_and_roundtrips` (wire shape + one-table
+  hardening + own-decode round trip),
+  `mpeg25_8k_auto_mixed_accepted_and_demotes_to_pure_short`, the
+  8 kHz arm of
+  `mixed_granules_use_one_table_for_both_big_value_regions`, and
+  `mixed_blocks_accepted_at_8khz`.
 - **Fuzz coverage extended to the full codec surface** (r432 depth
   round). Two new libFuzzer targets: `encode` — panic-freedom over the
   encode loop with hostile PCM geometries (zero / odd / single-sample /
@@ -39,6 +80,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   crates.io independently of the library build, the nightly run also
   serves as the canary for a published-core API change breaking the
   harness while library CI stays green.
+
+### Changed
+
+- `StreamEncodeError::LsfUnsupported` / `MixedBlocks8kUnsupported`
+  docs and `Display` texts now say the variants are historical and
+  no longer returned (r287 made the auto block-type walk
+  version-agnostic; r440 lifted the 8 kHz mixed refusal). Doc/text
+  only — both variants remain in the enum so existing matches keep
+  compiling.
 
 ### Changed
 
