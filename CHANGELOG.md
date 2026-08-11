@@ -6,6 +6,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-mp3/compare/v0.1.3...v0.2.0) - 2026-08-11
+
+### Added
+
+- *(encoder)* lift the 8 kHz mixed-block emit refusal — window split grounded in the staged text chain
+- duration_micros reports the playable (gapless-trimmed) duration
+- demux fuzz target; fix free-format sub-header-length panic; README/CHANGELOG refresh
+
+### Fixed
+
+- render foreign 8 kHz mixed-block lines 36..72 (band-relative coding split); harden mixed region tables
+- mixed bursts flag flanking Start/End granules; LSF auto-mixed demotes to pure-short
+- mixed-block alias butterfly, Start/End region defaults, 8 kHz mixed refusal
+- MPEG-2.5 deployed band tables, band-relative short region 0, short band-12 coding
+
+### Other
+
+- state the black-box-decode posture without a denial clause
+- *(README)* 8 kHz mixed emit closure + r405 corrigendum refresh in the MPEG-2.5 decode section
+- *(sweep)* grow the validator matrix 35 -> 39 — steady MPEG-2.5 mixed graduates in
+- add the scheduled nightly Fuzz workflow shim
+- extend coverage to the full codec surface (r432 depth round)
+- *(api)* mark internal pipeline plumbing #[doc(hidden)]
+- *(README)* note the r409 output-invariant performance work
+- *(BENCHMARKS)* record the r409 optimization round -- per-stage and whole-stream before/after
+- *(requantize)* hoist the per-band term; precompute the mag^(4/3) power law
+- *(analysis,mdct)* precomputed kernel tables + interchanged vectorizable loops
+- *(imdct)* k-outer vectorizable long/short transforms via transposed tables
+- *(synth)* vectorizable matrixing/window sums + ring-buffer shift register
+- *(huffman)* single-pass multi-codebook region costing for the encoder chooser
+- *(inner_loop)* skip provably-uncodable gains in the budget scan via per-band probes
+- *(quantize)* hoist the per-band gain factor out of the per-line loop
+- drop redundant references in outer-loop assert message args
+- corpus-wide differential decode sweep vs black-box reference PCM
+
 ### Added
 
 - **8 kHz (MPEG-2.5) mixed-block encoding — the r405/r408 emit
