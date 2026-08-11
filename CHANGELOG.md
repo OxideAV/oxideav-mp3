@@ -104,6 +104,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   version-agnostic; r440 lifted the 8 kHz mixed refusal). Doc/text
   only — both variants remain in the enum so existing matches keep
   compiling.
+- README: the MPEG-2.5 decode section now carries the r405
+  corrigendum result (11.025 / 12 kHz both load the 13818-3 16 kHz
+  LSF table pair; the 8 kHz Fraunhofer table is observer-trace
+  confirmed verbatim per-line) instead of the refuted
+  half-rate-sibling wording, and drops the stale "a dedicated 8 kHz
+  observer-trace fixture would corroborate the boundaries" ask that
+  the r405 trace already satisfied.
 
 ### Changed
 

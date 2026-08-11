@@ -17,10 +17,10 @@ MPEG-1, MPEG-2 LSF, and all three MPEG-2.5 rates (8 / 11.025 /
 staged reference PCM for all 16 fixtures in the float-rounding regime
 (normalized RMS error ≤ 1.6e-5). The encoder produces valid CBR and
 VBR MP3 streams whose decode is verified against external black-box
-validator binaries across a 35-case matrix (every rate, mono/stereo,
-long / short / mixed / auto / auto+mixed block types, tone and
-wideband noise — all ≤ 8e-5 on four independent deployed decoders,
-`tests/validator_decode_sweep.rs`).
+validator binaries across a 39-case matrix (every rate, mono/stereo,
+long / short / mixed / auto / auto+mixed block types — mixed now at
+every rate including MPEG-2.5 8 / 11.025 / 12 kHz (r440) — tone and
+wideband noise, `tests/validator_decode_sweep.rs`).
 
 Both directions are benchmarked and optimized (r409, output-invariant
 — encoded bytes and decoded PCM bit-for-bit unchanged, every optimized
@@ -80,8 +80,8 @@ cross-frame bit-reservoir scheduling. Additional capabilities:
   four independent deployed black-box decoders at the MPEG-1 rates. At
   the LSF / MPEG-2.5 rates deployed decoders split 2-2 on that
   (conformant) wire combination, so the auto scheduler demotes mixed
-  bursts to pure-short there; steady force-mixed streams stay
-  available at every rate except 8 kHz.
+  bursts to pure-short there; steady force-mixed streams are
+  available at every rate (8 kHz included since r440).
 - True-VBR per-frame bitrate, opt-in Xing / Info VBR information-frame
   emission with auto-filled TOC, and opt-in CRC-16 protection.
 - MPEG-2.5 frame header writing and sample-rate dispatch, with the
@@ -97,23 +97,41 @@ cross-frame bit-reservoir scheduling. Additional capabilities:
   `mpeg2.5-scalefactor-bands.md` — and 8 kHz uses the distinct
   Fraunhofer tables from that doc (read back verbatim by the probe).
   The §2.4.2.7 short-block region-0 boundary is band-relative
-  (`3·short_starts[3]` — 72 lines at 8 kHz). Mixed blocks are still
-  refused at 8 kHz on the **encode** side: the r408 observer probes
-  resolved the coding layout (all four deployed validators requantize
-  wire lines 36..72 with the transmitted long scalefactor bands 3..5 —
-  the 8 kHz long table's six lowest bands span exactly
-  `0..3·short_starts[3] = 72`) but deployed decoders still split 3-1
-  on the window geometry, so emitted streams would render differently
-  on a quarter of them. The **decoder** renders foreign 8 kHz mixed
-  granules per the majority reading (long-coded to 72, two
-  long-windowed subbands; before r408 lines 36..72 were left silent).
-  The mixed Huffman region-0 boundary is a deployed grey zone
-  (validators split three ways at 8 kHz and 2-2 at the LSF rates), so
-  every mixed granule this encoder emits uses one codebook for both
-  big-values regions — every boundary interpretation consumes
-  identical bits. Encoder output at all three rates — long, short,
-  auto block-type, tone and wideband noise, mono and stereo — decodes
-  on the external validators in the float-rounding regime.
+  (`3·short_starts[3]` — 72 lines at 8 kHz). Mixed blocks **encode at
+  8 kHz too** (r440): the window split is grounded strictly in the
+  staged text chain — ISO/IEC 11172-3:1993 §2.4.2.7 fixes the mixed
+  carve-out at "the frequency lines corresponding to the two lowest
+  frequency polyphase subbands … while the remaining 30 subbands"
+  (a fixed subband count, independent of any scalefactor table);
+  ISO/IEC 13818-3:1997 §2.4.2.7 inherits that semantics verbatim
+  ("with the exception of a different definition of
+  scalefac_compress") and its §2.4.3.2 LSF-differences list never
+  touches window geometry; and the staged low-rate-extension
+  disclosure states the bit-stream structure is otherwise "unchanged
+  with respect to the Standard ISO/IEC 13818-3" (only the sync word
+  and the 8 kHz scalefactor bandwidth table differ). So the window
+  split is 36 lines at every rate, while the coding split is the
+  band-relative 72 the r408 observer probes found unanimous across
+  all four deployed validators (wire lines 36..72 requantize with
+  the transmitted long scalefactor bands 3..5 — the 8 kHz long
+  table's six lowest bands span exactly `0..3·short_starts[3] =
+  72`). Measured r440: three of the four deployed validators decode
+  8 kHz force-mixed streams in the float-rounding regime (≤ 7e-6);
+  the fourth long-windows the whole 72-line region — a minority
+  reading contradicting the §2.4.2.7 subband-count text — and
+  renders subbands 2..3 (250–500 Hz) of a mixed granule differently
+  (nrmse ≈ 1.2e-3 with tone energy adjacent to the contested
+  subbands, 4.1e-4 with it ≥ 2 subbands away). The **decoder** renders
+  foreign 8 kHz mixed granules per the same spec/majority reading
+  (long-coded to 72, two long-windowed subbands; before r408 lines
+  36..72 were left silent). The mixed Huffman region-0 boundary is a
+  deployed grey zone (validators split three ways at 8 kHz and 2-2
+  at the LSF rates), so every mixed granule this encoder emits uses
+  one codebook for both big-values regions — every boundary
+  interpretation consumes identical bits. Encoder output at all
+  three rates — long, short, mixed, auto block-type, tone and
+  wideband noise, mono and stereo — decodes on the external
+  validators in the float-rounding regime.
 
 The encoder is reachable through the `oxideav_core::Encoder` trait and
 several direct `make_encoder*` factory variants.
@@ -159,22 +177,25 @@ byte-exact with the same stream demuxed as CBR
 ## MPEG-2.5 decode
 
 The `Decoder` trait wrapper accepts MPEG-1, MPEG-2 LSF, and all three
-MPEG-2.5 extension rates. The 11.025 / 12 kHz rates reuse the in-repo
-ISO/IEC 13818-3 22.05 / 24 kHz LSF scalefactor-band tables verbatim
-(fully grounded per `mpeg2.5-scalefactor-bands.md`, #147/#151). The
+MPEG-2.5 extension rates. The 11.025 / 12 kHz rates both load the
+in-repo ISO/IEC 13818-3 **16 kHz** LSF scalefactor-band table pair
+(long + short) — the deployed de-facto mapping measured per spectral
+line by the r405 observer-trace
+(`mpeg2.5-scalefactor-bands-CORRIGENDUM-r405.md`, which refuted the
+half-rate-sibling hypothesis of `mpeg2.5-scalefactor-bands.md`). The
 **8 kHz** rate uses the distinct Fraunhofer 8 kHz table — its top long
 bands collapse to width 2 at the 4 kHz Nyquist — transcribed into
 `requantize::{LONG,SHORT}_STARTS_MPEG25_8` from the staged doc's "8 kHz,
-long/short blocks" tables (published-factual; satisfies the Table-B.2
-structural invariants: Σ = 576 long / 192 short, contiguous, 22/13
-bands). All three rates decode through the same chain as MPEG-2 LSF,
-byte-exact with the direct decode chain. The 11.025 kHz path is
-validated end-to-end against the staged `layer3-mpeg25-11025-32kbps`
-reference PCM (`tests/mpeg25_reference_pcm.rs`): the decode locks at the
-canonical 1105-sample codec delay with steady-state normalized RMS error
-≈ 1e-4, and the production trait decoder reproduces the direct chain
-byte-exact. A dedicated 8 kHz observer-trace fixture would further
-corroborate the published-factual 8 kHz boundaries (`MPEG-2.5-GAP.md`).
+long/short blocks" tables (confirmed verbatim per-line by the same
+r405 trace; satisfies the Table-B.2 structural invariants: Σ = 576
+long / 192 short, contiguous, 22/13 bands). All three rates decode
+through the same chain as MPEG-2 LSF, byte-exact with the direct
+decode chain. The 11.025 kHz path is validated end-to-end against the
+staged `layer3-mpeg25-11025-32kbps` reference PCM
+(`tests/mpeg25_reference_pcm.rs`): the decode locks at the canonical
+1105-sample codec delay with steady-state normalized RMS error ≈ 1e-4,
+and the production trait decoder reproduces the direct chain
+byte-exact.
 
 This validation surfaced and fixed a latent decoder bug shared by all
 versions: the per-granule decode loop handed the *full* `part2_3_length`
