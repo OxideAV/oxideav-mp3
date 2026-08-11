@@ -13,8 +13,8 @@
 //! 3. **Black-box external decode** — when `ffmpeg` is on `PATH` the
 //!    stream is decoded to raw PCM and asserted to be (a) the right
 //!    number of samples and (b) pure silence (every sample 0). `ffmpeg`
-//!    is used only as an opaque process: we feed it our bytes and check
-//!    its bytes; its source is never consulted. When `ffmpeg` is absent
+//!    is invoked as an opaque black-box process: we feed it our bytes
+//!    and check its output bytes as opaque reference data. When `ffmpeg` is absent
 //!    (CI without the binary) the external check logs a skip and the
 //!    test still passes on the in-crate round-trips.
 
