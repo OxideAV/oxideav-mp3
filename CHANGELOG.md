@@ -49,6 +49,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   8 kHz arm of
   `mixed_granules_use_one_table_for_both_big_value_regions`, and
   `mixed_blocks_accepted_at_8khz`.
+- **Validator sweep matrix grows 35 → 39 cases** (r440):
+  `mpeg25-11025-mixed`, `mpeg25-12000-mixed` (steady force-mixed at
+  the other MPEG-2.5 rates — float-perfect on all four deployed
+  validators since the r408 band-relative-split + one-codebook
+  hardening, so they graduate into the committed matrix),
+  `mpeg25-8000-mixed` (tones at 101 / 1103 Hz keep energy ≥ 2
+  polyphase subbands away from the contested subbands 2..3, so the
+  case pins the deployed-unanimous coding layout on every validator
+  — measured ≤ 6.1e-6 on three and 4.1e-4 on the minority-window
+  validator, inside the 1e-3 gate), and `mpeg25-8000-automixed`
+  (the demoted auto+mixed path decodes float-perfectly everywhere).
+  All 39 cases re-verified against all four deployed validator
+  binaries: ≤ 8.1e-6 on the three float-regime ones, ≤ 4.3e-5 on
+  the fourth apart from the documented 4.1e-4 above.
+
 - **Fuzz coverage extended to the full codec surface** (r432 depth
   round). Two new libFuzzer targets: `encode` — panic-freedom over the
   encode loop with hostile PCM geometries (zero / odd / single-sample /

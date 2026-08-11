@@ -55,17 +55,28 @@ struct Case {
     stereo: bool,
     force_short: bool,
     noise: bool,
-    /// Force every granule onto the §2.4.2.7 mixed-block path. Only
-    /// rates where both deployed validators agree on mixed geometry
-    /// are listed (8 kHz mixed is refused by the encoder; MPEG-2.5
-    /// 11.025 / 12 kHz mixed decodes bit-faithfully on the primary
-    /// deployed decoder but a second deployed decoder renders it
-    /// differently, so those stay out of the committed matrix).
+    /// Force every granule onto the §2.4.2.7 mixed-block path. The
+    /// mixed coding layout is deployed-unanimous at every rate since
+    /// the r408 hardening (band-relative coding split; one codebook
+    /// for both big-values regions so every region-boundary reading
+    /// consumes identical bits). At 8 kHz the *window* geometry
+    /// splits 3-1 across deployed decoders (three keep the §2.4.2.7
+    /// two-subband / 36-line split the staged texts fix; one
+    /// long-windows the whole 72-line long-coded region), so the
+    /// committed 8 kHz mixed case uses a stimulus whose energy avoids
+    /// the contested subbands 2..3 (250–500 Hz) — it pins the
+    /// unanimous coding layout on every validator while the
+    /// full-band window-split comparison lives in the README notes.
     force_mixed: bool,
     /// Arm the §C.1.5.2 signal-driven auto block-type scheduler and
     /// feed an attack-train signal, so the stream carries
     /// LONG / START / SHORT / STOP transitions.
     auto: bool,
+    /// Override the two channel-0 tone frequencies of the default
+    /// two-tone stimulus (`None` keeps 440 / 1330 Hz). Used by the
+    /// 8 kHz mixed case to keep energy out of the contested
+    /// subbands 2..3 (250–500 Hz; see `force_mixed`).
+    tones: Option<(f64, f64)>,
     /// Arm the mixed-promotion auto scheduler
     /// (`enable_auto_block_type_with_mixed`) and feed a low-band-DC +
     /// Nyquist-click stimulus, so the stream carries **mixed bursts**
@@ -87,6 +98,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -98,6 +110,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -109,6 +122,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -120,6 +134,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -132,6 +147,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -143,6 +159,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -154,6 +171,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -165,6 +183,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -176,6 +195,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -187,6 +207,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -198,6 +219,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -211,6 +233,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -222,6 +245,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -233,6 +257,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -244,6 +269,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -255,6 +281,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -266,6 +293,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -277,6 +305,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -288,6 +317,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -299,6 +329,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -313,6 +344,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: true,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -324,6 +356,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: true,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -335,6 +368,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: true,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -346,6 +380,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: true,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -357,6 +392,7 @@ const CASES: &[Case] = &[
         force_short: true,
         noise: true,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -370,6 +406,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: true,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -381,6 +418,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: true,
+        tones: None,
         auto: false,
         auto_mixed: false,
     },
@@ -392,6 +430,56 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: true,
+        tones: None,
+        auto: false,
+        auto_mixed: false,
+    },
+    // MPEG-2.5 steady mixed (r440): the r408 hardening made the mixed
+    // coding layout deployed-unanimous (band-relative split, one
+    // codebook for both big-values regions), so the 11.025 / 12 kHz
+    // cases ride the default stimulus. The 8 kHz case keeps its tone
+    // energy out of subbands 2..3 (250–500 Hz), the one region where
+    // deployed decoders split 3-1 on window geometry (the §2.4.2.7
+    // two-subband split the staged texts fix vs one decoder's
+    // whole-72-line long window) — so the case pins the unanimous
+    // coding layout on every validator.
+    Case {
+        label: "mpeg25-11025-mixed",
+        sample_rate: 11_025,
+        bitrate_kbps: 32,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: true,
+        tones: None,
+        auto: false,
+        auto_mixed: false,
+    },
+    Case {
+        label: "mpeg25-12000-mixed",
+        sample_rate: 12_000,
+        bitrate_kbps: 40,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: true,
+        tones: None,
+        auto: false,
+        auto_mixed: false,
+    },
+    Case {
+        label: "mpeg25-8000-mixed",
+        sample_rate: 8_000,
+        bitrate_kbps: 32,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: true,
+        // Subband 0 (≤ 125 Hz) and subband 8 — both ≥ 2 subbands away
+        // from the contested subbands 2..3, so polyphase leakage into
+        // the contested region is negligible; non-commensurate so the
+        // correlation alignment is unambiguous.
+        tones: Some((101.0, 1103.0)),
         auto: false,
         auto_mixed: false,
     },
@@ -407,6 +495,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: true,
         auto_mixed: false,
     },
@@ -418,6 +507,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: true,
         auto_mixed: false,
     },
@@ -429,6 +519,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: true,
         auto_mixed: false,
     },
@@ -440,6 +531,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: true,
         auto_mixed: false,
     },
@@ -449,10 +541,10 @@ const CASES: &[Case] = &[
     // rates the flanking Start / End granules carry the §2.4.2.7
     // mixed_block_flag (r408). At the LSF rates the scheduler demotes
     // mixed bursts to pure-short (deployed decoders split 2-2 on the
-    // flagged-flank wire combination, r408) — the 22.05 kHz case below
-    // pins that the demoted stream decodes float-perfectly everywhere.
-    // (MPEG-2.5 mixed stays out of the committed matrix — deployed-
-    // decoder grey zone; 8 kHz mixed is refused by the encoder.)
+    // flagged-flank wire combination, r408) — the 22.05 kHz and 8 kHz
+    // cases below pin that the demoted streams decode float-perfectly
+    // everywhere (steady MPEG-2.5 mixed is covered by the force-mixed
+    // cases above since r440).
     Case {
         label: "mpeg1-44100-automixed",
         sample_rate: 44_100,
@@ -461,6 +553,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: true,
     },
@@ -472,6 +565,7 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: true,
     },
@@ -483,6 +577,19 @@ const CASES: &[Case] = &[
         force_short: false,
         noise: false,
         force_mixed: false,
+        tones: None,
+        auto: false,
+        auto_mixed: true,
+    },
+    Case {
+        label: "mpeg25-8000-automixed",
+        sample_rate: 8_000,
+        bitrate_kbps: 32,
+        stereo: false,
+        force_short: false,
+        noise: false,
+        force_mixed: false,
+        tones: None,
         auto: false,
         auto_mixed: true,
     },
@@ -562,15 +669,18 @@ fn noise_pcm(n: usize, stereo: bool) -> Vec<i16> {
 
 /// Synthesise `n` samples of a two-tone test signal (per channel a
 /// different tone pair so a swapped-channel bug cannot cancel out).
-/// Tones sit well inside the 4 kHz Nyquist of the lowest rate.
-fn tone_pcm(n: usize, sample_rate: u32, stereo: bool) -> Vec<i16> {
+/// Tones sit well inside the 4 kHz Nyquist of the lowest rate. The
+/// channel-0 pair defaults to 440 / 1330 Hz; a case can override it
+/// (`Case::tones`) to steer energy away from specific bands.
+fn tone_pcm(n: usize, sample_rate: u32, stereo: bool, tones: Option<(f64, f64)>) -> Vec<i16> {
     let sr = sample_rate as f64;
     let two_pi = 2.0 * std::f64::consts::PI;
+    let (f0, f1) = tones.unwrap_or((440.0, 1330.0));
     let nch = if stereo { 2 } else { 1 };
     let mut out = Vec::with_capacity(n * nch);
     for i in 0..n {
         let t = i as f64 / sr;
-        let l = 0.35 * (two_pi * 440.0 * t).sin() + 0.15 * (two_pi * 1330.0 * t).sin();
+        let l = 0.35 * (two_pi * f0 * t).sin() + 0.15 * (two_pi * f1 * t).sin();
         out.push((l * f64::from(i16::MAX)) as i16);
         if stereo {
             let r = 0.35 * (two_pi * 554.0 * t).sin() + 0.15 * (two_pi * 990.0 * t).sin();
@@ -807,7 +917,7 @@ fn validator_decodes_encoder_output_at_every_rate() {
         } else if case.auto_mixed {
             lf_dc_with_hf_click_pcm(n, case.sample_rate)
         } else {
-            tone_pcm(n, case.sample_rate, case.stereo)
+            tone_pcm(n, case.sample_rate, case.stereo, case.tones)
         };
         let mp3 = encode(case, &pcm);
         assert!(!mp3.is_empty(), "{}: empty encode", case.label);
