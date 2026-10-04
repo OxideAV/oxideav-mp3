@@ -421,6 +421,7 @@ pub fn probe(p: &ProbeData) -> u8 {
 /// `ContainerRegistry`. Called by [`crate::register`].
 pub fn register_container(reg: &mut ContainerRegistry) {
     reg.register_demuxer(FORMAT_NAME, open_demuxer);
+    reg.register_muxer(FORMAT_NAME, crate::muxer::open_muxer);
     reg.register_extension("mp3", FORMAT_NAME);
     reg.register_extension("mp2", FORMAT_NAME);
     reg.register_extension("mp1", FORMAT_NAME);

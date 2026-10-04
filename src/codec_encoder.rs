@@ -347,6 +347,18 @@ fn boxed_joint_stereo_core(
     ))
 }
 
+/// Default bit rate when the caller sets none: 128 kbit/s for the
+/// MPEG-1 rates, 64 kbit/s for MPEG-2 LSF and 32 kbit/s for MPEG-2.5 —
+/// each on its version's §2.4.2.3 / ISO/IEC 13818-3 Layer III ladder
+/// and a transparent-leaning operating point for that bandwidth.
+pub fn default_bit_rate(sample_rate: u32) -> u64 {
+    match sample_rate {
+        32_000 | 44_100 | 48_000 => 128_000,
+        16_000 | 22_050 | 24_000 => 64_000,
+        _ => 32_000,
+    }
+}
+
 fn make_encoder_inner(
     params: &CodecParameters,
     outer_loop_threshold: Option<f64>,
@@ -376,7 +388,9 @@ fn make_encoder_inner(
     // Default the bitrate when absent. 128 kbit/s is the standard
     // mono / 44.1 kHz reference; it's a valid entry on the §2.4.2.3
     // ladder for every MPEG-1 sample rate the encoder supports.
-    let bitrate_bps = params.bit_rate.unwrap_or(128_000);
+    let bitrate_bps = params
+        .bit_rate
+        .unwrap_or_else(|| default_bit_rate(sample_rate));
     if bitrate_bps == 0 || bitrate_bps > 1_000_000 {
         return Err(Error::invalid(format!(
             "oxideav-mp3: bit_rate {bitrate_bps} out of range"
@@ -430,7 +444,9 @@ fn make_encoder_inner_threshold_in_quiet(
             )));
         }
     };
-    let bitrate_bps = params.bit_rate.unwrap_or(128_000);
+    let bitrate_bps = params
+        .bit_rate
+        .unwrap_or_else(|| default_bit_rate(sample_rate));
     if bitrate_bps == 0 || bitrate_bps > 1_000_000 {
         return Err(Error::invalid(format!(
             "oxideav-mp3: bit_rate {bitrate_bps} out of range"
@@ -508,7 +524,9 @@ pub fn make_encoder_quality_preset(
             )));
         }
     };
-    let bitrate_bps = params.bit_rate.unwrap_or(128_000);
+    let bitrate_bps = params
+        .bit_rate
+        .unwrap_or_else(|| default_bit_rate(sample_rate));
     if bitrate_bps == 0 || bitrate_bps > 1_000_000 {
         return Err(Error::invalid(format!(
             "oxideav-mp3: bit_rate {bitrate_bps} out of range"
@@ -736,7 +754,10 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         .capabilities(
             CodecCapabilities::audio("mp3")
                 .with_encode()
-                .with_lossy(true),
+                .with_lossy(true)
+                .with_max_channels(2)
+                .with_sample_rates(crate::codec_decoder::ENCODER_SAMPLE_RATES.to_vec())
+                .with_sample_formats(vec![SampleFormat::S16]),
         )
         .encoder(make_encoder)
         .tags([
@@ -908,6 +929,34 @@ mod tests {
         enc.send_frame(&Frame::Audio(frame.clone())).unwrap();
         enc.flush().unwrap();
         assert!(enc.send_frame(&Frame::Audio(frame)).is_err());
+    }
+
+    #[test]
+    fn default_bit_rate_follows_mpeg_version() {
+        assert_eq!(default_bit_rate(44_100), 128_000);
+        assert_eq!(default_bit_rate(22_050), 64_000);
+        assert_eq!(default_bit_rate(8_000), 32_000);
+        for &sr in crate::codec_decoder::ENCODER_SAMPLE_RATES {
+            let mut p = build_params(sr, 0);
+            p.bit_rate = None;
+            let enc = make_encoder(&p).unwrap_or_else(|e| panic!("{sr} Hz: {e}"));
+            assert_eq!(enc.output_params().bit_rate, Some(default_bit_rate(sr)));
+            assert_eq!(enc.output_params().sample_rate, Some(sr));
+        }
+    }
+
+    #[test]
+    fn registration_declares_encoder_input_shape() {
+        let mut reg = CodecRegistry::new();
+        register_codecs(&mut reg);
+        let imp = &reg.implementations(&CodecId::new("mp3"))[0];
+        assert_eq!(
+            imp.caps.accepted_sample_rates,
+            crate::codec_decoder::ENCODER_SAMPLE_RATES
+        );
+        assert_eq!(imp.caps.accepted_sample_formats, vec![SampleFormat::S16]);
+        assert_eq!(imp.caps.max_channels, Some(2));
+        assert_eq!(imp.caps.pick_sample_rate(96_000), 48_000);
     }
 
     #[test]

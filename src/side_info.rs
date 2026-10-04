@@ -550,14 +550,9 @@ fn read_granule_channel(r: &mut BitReader<'_>, lsf: bool) -> GranuleChannel {
 
     let mut table_select = [0u8; 3];
     let mut subblock_gain = [0u8; 3];
-    let block_type;
-    let mixed_block_flag;
-    let region0_count;
-    let region1_count;
-
-    if window_switching_flag {
-        block_type = block_type_from_bits(r.read(2));
-        mixed_block_flag = r.read_bool();
+    let (block_type, mixed_block_flag, region0_count, region1_count) = if window_switching_flag {
+        let block_type = block_type_from_bits(r.read(2));
+        let mixed_block_flag = r.read_bool();
         // Two table_select entries; the third region is absent.
         for ts in table_select.iter_mut().take(2) {
             *ts = r.read(5) as u8;
@@ -571,22 +566,21 @@ fn read_granule_channel(r: &mut BitReader<'_>, lsf: bool) -> GranuleChannel {
         // short blocks with mixed_block_flag; 8 for short blocks
         // without it. region1_count is 63 (all remaining big-values
         // in region 1).
-        region0_count = if block_type == BlockType::Short && !mixed_block_flag {
+        let region0_count = if block_type == BlockType::Short && !mixed_block_flag {
             8
         } else {
             7
         };
-        region1_count = 63;
+        (block_type, mixed_block_flag, region0_count, 63)
     } else {
         // Normal (long) window: block_type is defined to be zero.
-        block_type = BlockType::Long;
-        mixed_block_flag = false;
         for ts in table_select.iter_mut() {
             *ts = r.read(5) as u8;
         }
-        region0_count = r.read(4) as u8;
-        region1_count = r.read(3) as u8;
-    }
+        let region0_count = r.read(4) as u8;
+        let region1_count = r.read(3) as u8;
+        (BlockType::Long, false, region0_count, region1_count)
+    };
 
     // preflag is a transmitted bit in MPEG-1 only. In LSF it is not
     // carried in the side info (ISO/IEC 13818-3 §2.4.2.7 derives it

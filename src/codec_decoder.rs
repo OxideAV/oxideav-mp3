@@ -506,13 +506,27 @@ impl Decoder for Mp3CoreDecoder {
 /// Matroska codec id `A_MPEG/L3`. Both factories install on the same
 /// `CodecInfo` so a single `register_codecs` call covers both
 /// directions.
+/// Sampling frequencies the Layer III encoder accepts: MPEG-1
+/// (32 / 44.1 / 48 kHz), MPEG-2 LSF (16 / 22.05 / 24 kHz) and MPEG-2.5
+/// (8 / 11.025 / 12 kHz).
+pub const ENCODER_SAMPLE_RATES: &[u32] = &[
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
+];
+
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let info = CodecInfo::new(CodecId::new(CODEC_ID_STR))
         .capabilities(
             CodecCapabilities::audio("mp3")
                 .with_decode()
                 .with_encode()
-                .with_lossy(true),
+                .with_lossy(true)
+                .with_max_channels(2)
+                // Encoder input: the MPEG-1 (§2.4.2.3), MPEG-2 LSF
+                // (ISO/IEC 13818-3) and MPEG-2.5 sampling frequencies,
+                // interleaved S16. Pipelines resample / convert other
+                // shapes in front of the encoder.
+                .with_sample_rates(ENCODER_SAMPLE_RATES.to_vec())
+                .with_sample_formats(vec![oxideav_core::SampleFormat::S16]),
         )
         .decoder(make_decoder)
         .encoder(make_encoder)

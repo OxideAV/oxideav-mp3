@@ -421,6 +421,7 @@ pub mod main_data;
 pub mod mdct;
 #[doc(hidden)] // internal: mixed-vs-short classifier stage
 pub mod mixed_classifier;
+pub mod muxer;
 #[doc(hidden)] // internal: outer distortion-control loop stage
 pub mod outer_loop;
 pub mod psy;
