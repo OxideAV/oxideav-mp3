@@ -33,10 +33,10 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, RuntimeContext, SampleFormat, TimeBase,
 };
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, pcm_f32_to_i16, process_stereo, requantize, synth_granule, ChannelMode,
-    FrameWalker, ImdctState, MainDataReader, Mp3Encoder, Reservoir, SynthState, PCM_PER_GRANULE,
-    SAMPLES_PER_FRAME_MPEG1,
+    ChannelMode, FrameWalker, ImdctState, MainDataReader, Mp3Encoder, PCM_PER_GRANULE, Reservoir,
+    SAMPLES_PER_FRAME_MPEG1, SynthState, alias_reduce, decode_huffman, decode_scalefactors,
+    imdct_granule, parse_header, parse_side_info, pcm_f32_to_i16, process_stereo, requantize,
+    synth_granule,
 };
 
 const SR: u32 = 44_100;
@@ -188,10 +188,10 @@ fn trait_decode_stereo(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
                         2,
                         "stereo trait decoder must emit two planes per frame"
                     );
-                    for chunk in a.data[0].chunks_exact(2) {
+                    for chunk in a.data[0].as_chunks::<2>().0 {
                         out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
-                    for chunk in a.data[1].chunks_exact(2) {
+                    for chunk in a.data[1].as_chunks::<2>().0 {
                         out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                     // Per-frame sample count invariant.
@@ -216,10 +216,10 @@ fn trait_decode_stereo(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                for chunk in a.data[0].chunks_exact(2) {
+                for chunk in a.data[0].as_chunks::<2>().0 {
                     out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
-                for chunk in a.data[1].chunks_exact(2) {
+                for chunk in a.data[1].as_chunks::<2>().0 {
                     out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
             }
@@ -365,20 +365,20 @@ fn registry_built_decoder_handles_stereo_packets() {
         dec.send_packet(&pkt).expect("send_packet");
         while let Ok(Frame::Audio(a)) = dec.receive_frame() {
             assert_eq!(a.data.len(), 2);
-            for chunk in a.data[0].chunks_exact(2) {
+            for chunk in a.data[0].as_chunks::<2>().0 {
                 out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
-            for chunk in a.data[1].chunks_exact(2) {
+            for chunk in a.data[1].as_chunks::<2>().0 {
                 out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
         }
     }
     dec.flush().expect("flush");
     while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-        for chunk in a.data[0].chunks_exact(2) {
+        for chunk in a.data[0].as_chunks::<2>().0 {
             out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
-        for chunk in a.data[1].chunks_exact(2) {
+        for chunk in a.data[1].as_chunks::<2>().0 {
             out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
     }

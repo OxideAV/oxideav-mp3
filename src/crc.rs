@@ -234,7 +234,7 @@ mod tests {
         // [`crc16_layer3`] takes the first 135 bits of side_info for
         // mono. Compare against an explicit-bit recomputation.
         let header = [0xFF, 0xFB, 0x90, 0xC4]; // 128 kbps, 44.1 kHz, mono, no CRC bit set yet
-                                               // 17-byte mono side info, deterministic non-trivial content.
+        // 17-byte mono side info, deterministic non-trivial content.
         let mut side: Vec<u8> = (0..17u8).collect();
         side[16] = 0xA5;
 

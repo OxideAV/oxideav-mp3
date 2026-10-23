@@ -100,10 +100,10 @@
 //! Figure C.9.b.
 
 use crate::frame::MpegVersion;
-use crate::inner_loop::{search_bit_budget_band_aligned, search_magnitude_clamp, GAIN_MAX};
+use crate::inner_loop::{GAIN_MAX, search_bit_budget_band_aligned, search_magnitude_clamp};
 use crate::quantize::quantize;
-use crate::requantize::{long_band_starts, requantize, short_band_starts, NUM_LINES};
-use crate::scalefactors::{ScaleFactors, LONG_SFB, SHORT_SFB, SHORT_WINDOWS};
+use crate::requantize::{NUM_LINES, long_band_starts, requantize, short_band_starts};
+use crate::scalefactors::{LONG_SFB, SHORT_SFB, SHORT_WINDOWS, ScaleFactors};
 use crate::side_info::{BlockType, GranuleChannel};
 
 /// Upper bound on the per-band scalefactor stored in `scalefac_l[sfb]`
@@ -273,7 +273,7 @@ pub fn band_distortion_long(
     sample_rate_hz: u32,
     version: MpegVersion,
 ) -> [f64; LONG_SFB] {
-    use crate::requantize::{scalefac_multiplier, PRETAB};
+    use crate::requantize::{PRETAB, scalefac_multiplier};
     let starts = long_band_starts(sample_rate_hz, version);
     let mult = f64::from(scalefac_multiplier(scalefac_scale));
     let mut out = [0.0f64; LONG_SFB];

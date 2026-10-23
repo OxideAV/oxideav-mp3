@@ -27,9 +27,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_mp3::{
+    ChannelMode, FrameWalker, ImdctState, MainDataReader, PCM_PER_GRANULE, Reservoir, SynthState,
     alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, process_stereo, requantize, synth_granule, ChannelMode, FrameWalker,
-    ImdctState, MainDataReader, Reservoir, SynthState, PCM_PER_GRANULE,
+    parse_side_info, process_stereo, requantize, synth_granule,
 };
 
 fn fixture_dir() -> Option<PathBuf> {
@@ -164,7 +164,7 @@ fn read_wav_s16(path: &std::path::Path) -> (u16, u32, Vec<Vec<f32>>) {
             b"data" => {
                 assert!(channels > 0, "fmt chunk must precede data");
                 data = vec![Vec::new(); channels as usize];
-                for (i, chunk) in body.chunks_exact(2).enumerate() {
+                for (i, chunk) in body.as_chunks::<2>().0.iter().enumerate() {
                     let v = i16::from_le_bytes([chunk[0], chunk[1]]);
                     data[i % channels as usize].push(f32::from(v) / 32768.0);
                 }

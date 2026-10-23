@@ -92,7 +92,7 @@
 //! requantize / reorder stages via [`crate::requantize`].
 
 use crate::frame::{ModeExtension, MpegVersion};
-use crate::requantize::{long_band_starts, short_band_starts, NUM_LINES};
+use crate::requantize::{NUM_LINES, long_band_starts, short_band_starts};
 use crate::scalefactors::ScaleFactors;
 use crate::side_info::{BlockType, GranuleChannel};
 

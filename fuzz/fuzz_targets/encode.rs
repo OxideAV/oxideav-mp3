@@ -51,11 +51,11 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, CodecRegistry, Frame, SampleFormat};
+use oxideav_mp3::XingTagId;
 use oxideav_mp3::frame::ChannelMode;
 use oxideav_mp3::quality::QualityPreset;
 use oxideav_mp3::stream_encoder::Mp3Encoder;
-use oxideav_mp3::xing_info::{flag_bit, XingTagSpec};
-use oxideav_mp3::XingTagId;
+use oxideav_mp3::xing_info::{XingTagSpec, flag_bit};
 
 /// Every sample rate the encoder claims to support: MPEG-1, MPEG-2
 /// LSF, MPEG-2.5.

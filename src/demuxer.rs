@@ -60,8 +60,8 @@ use oxideav_core::{
     ProbeData, ReadSeek, Result, StreamInfo, TimeBase,
 };
 
-use crate::frame::{parse_header, Layer, MpegVersion};
-use crate::lame_tag::{parse_lame_tag, LameTag};
+use crate::frame::{Layer, MpegVersion, parse_header};
+use crate::lame_tag::{LameTag, parse_lame_tag};
 use crate::side_info::{
     SIDE_INFO_BYTES_LSF_MONO, SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO,
     SIDE_INFO_BYTES_STEREO,
@@ -385,31 +385,33 @@ pub fn probe(p: &ProbeData) -> u8 {
     // could otherwise be a different audio container that also
     // tolerates ID3v2 (FLAC, AAC). Validate that the bytes following
     // the tag start with an MPEG audio frame sync to break ties.
-    if p.buf.len() >= 10 && &p.buf[..3] == b"ID3" {
-        if let Some(total) = id3v2_total_len(&p.buf[..10]) {
-            let off = total as usize;
-            if off + 4 <= p.buf.len()
-                && p.buf[off] == 0xFF
-                && (p.buf[off + 1] & 0xE0) == 0xE0
-                && parse_header(&p.buf[off..off + 4])
-                    .map(|h| h.layer == Layer::LayerIII)
-                    .unwrap_or(false)
-            {
-                return 100;
-            }
+    if p.buf.len() >= 10
+        && &p.buf[..3] == b"ID3"
+        && let Some(total) = id3v2_total_len(&p.buf[..10])
+    {
+        let off = total as usize;
+        if off + 4 <= p.buf.len()
+            && p.buf[off] == 0xFF
+            && (p.buf[off + 1] & 0xE0) == 0xE0
+            && parse_header(&p.buf[off..off + 4])
+                .map(|h| h.layer == Layer::LayerIII)
+                .unwrap_or(false)
+        {
+            return 100;
         }
     }
     // Bare frame sync at offset 0 with a valid Layer III header.
-    if p.buf.len() >= 4 && p.buf[0] == 0xFF && (p.buf[1] & 0xE0) == 0xE0 {
-        if let Ok(h) = parse_header(&p.buf[..4]) {
-            if h.layer == Layer::LayerIII {
-                return if matches!(p.ext, Some("mp3") | Some("mp2") | Some("mp1")) {
-                    100
-                } else {
-                    75
-                };
-            }
-        }
+    if p.buf.len() >= 4
+        && p.buf[0] == 0xFF
+        && (p.buf[1] & 0xE0) == 0xE0
+        && let Ok(h) = parse_header(&p.buf[..4])
+        && h.layer == Layer::LayerIII
+    {
+        return if matches!(p.ext, Some("mp3") | Some("mp2") | Some("mp1")) {
+            100
+        } else {
+            75
+        };
     }
     // Extension-only fallback handled by the registry; we return 0
     // when no signature matched so the container registry can fall
@@ -845,15 +847,16 @@ fn locate_first_frame(
     let n = read_up_to(input.as_mut(), &mut buf)?;
     buf.truncate(n);
     for i in 0..buf.len().saturating_sub(3) {
-        if buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0 {
-            if let Ok(h) = parse_header(&buf[i..i + 4]) {
-                // A table-bitrate header is accepted on its derivable
-                // length; a free-format header (no table length) is
-                // accepted on a valid sync alone — its length is
-                // measured separately from the next sync.
-                if h.frame_len().is_some() || h.is_free_format() {
-                    return Ok(start_offset + i as u64);
-                }
+        if buf[i] == 0xFF
+            && (buf[i + 1] & 0xE0) == 0xE0
+            && let Ok(h) = parse_header(&buf[i..i + 4])
+        {
+            // A table-bitrate header is accepted on its derivable
+            // length; a free-format header (no table length) is
+            // accepted on a valid sync alone — its length is
+            // measured separately from the next sync.
+            if h.frame_len().is_some() || h.is_free_format() {
+                return Ok(start_offset + i as u64);
             }
         }
     }
@@ -905,43 +908,44 @@ fn measure_free_format_base_len(
     let n = read_up_to(input.as_mut(), &mut buf)?;
     buf.truncate(n);
     for i in 0..buf.len().saturating_sub(3) {
-        if buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0 {
-            if let Ok(h) = parse_header(&buf[i..i + 4]) {
-                let same_stream = h.version == first_header.version
-                    && h.layer == first_header.layer
-                    && h.sample_rate_hz == first_header.sample_rate_hz;
-                if same_stream && h.is_free_format() {
-                    // Padded length of the first frame = distance from
-                    // the first sync to this one.
-                    let padded_len = (search_start - first_frame_offset) + i as u64;
-                    let pad = (usize::from(first_header.padding)) * first_header.slot_bytes();
-                    let padded = padded_len as usize;
-                    if padded <= pad {
-                        return Err(Error::invalid(
-                            "free-format measured frame length is smaller than its padding slot",
-                        ));
-                    }
-                    let base = padded - pad;
-                    // Structural floor: a frame must at least hold its
-                    // 4-byte header, the optional 2-byte CRC, and the
-                    // fixed-size side information (§2.4.1.3). A hostile
-                    // stream can place a second sync pattern 1..3 bytes
-                    // after the first, which would otherwise "measure"
-                    // a frame shorter than its own header (r405 fuzz
-                    // finding: the header copy into the first-frame
-                    // buffer then sliced out of range and panicked).
-                    let crc_bytes = if first_header.crc_protected { 2 } else { 0 };
-                    let min_len = 4
-                        + crc_bytes
-                        + side_info_len(first_header.version, first_header.channel_count());
-                    if base < min_len {
-                        return Err(Error::invalid(format!(
-                            "free-format measured frame length {base} is smaller than the \
-                             header + side-info minimum {min_len}"
-                        )));
-                    }
-                    return Ok(base);
+        if buf[i] == 0xFF
+            && (buf[i + 1] & 0xE0) == 0xE0
+            && let Ok(h) = parse_header(&buf[i..i + 4])
+        {
+            let same_stream = h.version == first_header.version
+                && h.layer == first_header.layer
+                && h.sample_rate_hz == first_header.sample_rate_hz;
+            if same_stream && h.is_free_format() {
+                // Padded length of the first frame = distance from
+                // the first sync to this one.
+                let padded_len = (search_start - first_frame_offset) + i as u64;
+                let pad = (usize::from(first_header.padding)) * first_header.slot_bytes();
+                let padded = padded_len as usize;
+                if padded <= pad {
+                    return Err(Error::invalid(
+                        "free-format measured frame length is smaller than its padding slot",
+                    ));
                 }
+                let base = padded - pad;
+                // Structural floor: a frame must at least hold its
+                // 4-byte header, the optional 2-byte CRC, and the
+                // fixed-size side information (§2.4.1.3). A hostile
+                // stream can place a second sync pattern 1..3 bytes
+                // after the first, which would otherwise "measure"
+                // a frame shorter than its own header (r405 fuzz
+                // finding: the header copy into the first-frame
+                // buffer then sliced out of range and panicked).
+                let crc_bytes = if first_header.crc_protected { 2 } else { 0 };
+                let min_len = 4
+                    + crc_bytes
+                    + side_info_len(first_header.version, first_header.channel_count());
+                if base < min_len {
+                    return Err(Error::invalid(format!(
+                        "free-format measured frame length {base} is smaller than the \
+                             header + side-info minimum {min_len}"
+                    )));
+                }
+                return Ok(base);
             }
         }
     }
@@ -1090,31 +1094,30 @@ impl Demuxer for Mp3Demuxer {
         // audio_bytes / 256`. Then we slide the cursor to that
         // offset and resync on the next valid frame syncword via
         // `next_packet`.
-        if let (Some(xing), Some(total_dur)) = (self.xing.as_ref(), self.streams[0].duration) {
-            if let (Some(toc), Some(bytes_total)) = (xing.toc.as_ref(), xing.bytes) {
-                if total_dur > 0 {
-                    let p = (pts as f64) / (total_dur as f64);
-                    let mut idx = (p * 100.0) as usize;
-                    if idx > 99 {
-                        idx = 99;
-                    }
-                    let frac = toc[idx] as f64 / 256.0;
-                    let off = self.first_audio_frame_offset + (frac * bytes_total as f64) as u64;
-                    let off = off.min(self.audio_end_offset.saturating_sub(4));
-                    self.cursor = off;
-                    self.finished = false;
-                    self.resync_to_frame()?;
-                    // The cursor now sits on a real frame boundary that
-                    // generally differs from the percentile estimate.
-                    // Report the *actual* landed PTS (the frame's own
-                    // PTS) rather than the requested one, so the value
-                    // returned here and the PTS later stamped on the
-                    // first emitted packet agree and stay monotone with
-                    // the rest of the stream (§2.4.3 gapless/seek).
-                    self.next_pts = self.pts_at_cursor();
-                    return Ok(self.next_pts);
-                }
+        if let (Some(xing), Some(total_dur)) = (self.xing.as_ref(), self.streams[0].duration)
+            && let (Some(toc), Some(bytes_total)) = (xing.toc.as_ref(), xing.bytes)
+            && total_dur > 0
+        {
+            let p = (pts as f64) / (total_dur as f64);
+            let mut idx = (p * 100.0) as usize;
+            if idx > 99 {
+                idx = 99;
             }
+            let frac = toc[idx] as f64 / 256.0;
+            let off = self.first_audio_frame_offset + (frac * bytes_total as f64) as u64;
+            let off = off.min(self.audio_end_offset.saturating_sub(4));
+            self.cursor = off;
+            self.finished = false;
+            self.resync_to_frame()?;
+            // The cursor now sits on a real frame boundary that
+            // generally differs from the percentile estimate.
+            // Report the *actual* landed PTS (the frame's own
+            // PTS) rather than the requested one, so the value
+            // returned here and the PTS later stamped on the
+            // first emitted packet agree and stay monotone with
+            // the rest of the stream (§2.4.3 gapless/seek).
+            self.next_pts = self.pts_at_cursor();
+            return Ok(self.next_pts);
         }
 
         // CBR seek (or VBR fallback without a TOC): proportional
@@ -1173,17 +1176,18 @@ impl Mp3Demuxer {
         let got = read_up_to(self.input.as_mut(), &mut buf)?;
         buf.truncate(got);
         for i in 0..buf.len().saturating_sub(3) {
-            if buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0 {
-                if let Ok(h) = parse_header(&buf[i..i + 4]) {
-                    // Accept a table-bitrate sync on its derivable
-                    // length, or a free-format sync when this stream
-                    // was identified as free-format at open-time.
-                    let length_ok = h.frame_len().is_some()
-                        || (self.free_format_base_len.is_some() && h.is_free_format());
-                    if length_ok && h.sample_rate_hz == self.sample_rate {
-                        self.cursor += i as u64;
-                        return Ok(());
-                    }
+            if buf[i] == 0xFF
+                && (buf[i + 1] & 0xE0) == 0xE0
+                && let Ok(h) = parse_header(&buf[i..i + 4])
+            {
+                // Accept a table-bitrate sync on its derivable
+                // length, or a free-format sync when this stream
+                // was identified as free-format at open-time.
+                let length_ok = h.frame_len().is_some()
+                    || (self.free_format_base_len.is_some() && h.is_free_format());
+                if length_ok && h.sample_rate_hz == self.sample_rate {
+                    self.cursor += i as u64;
+                    return Ok(());
                 }
             }
         }
@@ -1460,8 +1464,8 @@ mod tests {
     #[test]
     fn free_format_mixed_padding_lengths() {
         let base = 521usize; // unpadded body
-                             // Frame 0: padded (+1 byte slot). Frame 1: unpadded.
-                             // Frame 2: padded. Frame 3: unpadded.
+        // Frame 0: padded (+1 byte slot). Frame 1: unpadded.
+        // Frame 2: padded. Frame 3: unpadded.
         let pads = [true, false, true, false];
         let mut buf = Vec::new();
         let mut offsets = Vec::new();
@@ -1904,7 +1908,7 @@ mod tests {
             carrier[52 + i] = ((i * 255) / 99) as u8;
         }
         carrier[152..156].copy_from_slice(&0u32.to_be_bytes()); // quality = 0
-                                                                // LAME extension @ +154 (overlaps last 2 zero bytes of quality).
+        // LAME extension @ +154 (overlaps last 2 zero bytes of quality).
         let lame_off = 4 + SIDE_INFO_BYTES_STEREO + 118;
         assert_eq!(lame_off, 154);
         carrier[lame_off..lame_off + 9].copy_from_slice(b"LAME3.100");

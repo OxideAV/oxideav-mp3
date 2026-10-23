@@ -169,11 +169,7 @@ impl AnalysisState {
     /// Read a single `X[i]` value (debug / test helper).
     #[must_use]
     pub fn x(&self, i: usize) -> f64 {
-        if i < X_LEN {
-            self.x[i]
-        } else {
-            0.0
-        }
+        if i < X_LEN { self.x[i] } else { 0.0 }
     }
 }
 
@@ -846,7 +842,7 @@ pub static C_TABLE: [f64; X_LEN] = [
 #[allow(clippy::needless_range_loop)]
 mod tests_inner {
     use super::*;
-    use crate::synth::{synth_row, SynthState};
+    use crate::synth::{SynthState, synth_row};
 
     const EPS_F64: f64 = 1e-12;
 
@@ -1273,7 +1269,7 @@ mod tests_inner {
             let mut pcm = [0.0f64; NUM_SUBBANDS];
             for v in pcm.iter_mut() {
                 let a = xorshift32_r409(&mut rng);
-                if a % 6 != 0 {
+                if !a.is_multiple_of(6) {
                     let mag = f64::from(a & 0xFFFFFF) / f64::from(0xFFFFFFu32);
                     let exp = f64::from((a >> 24) % 16) - 8.0;
                     *v = mag * exp.exp2() * if a & 0x8000 != 0 { -1.0 } else { 1.0 };

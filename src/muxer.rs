@@ -23,9 +23,9 @@ use std::io::{Seek, SeekFrom, Write};
 
 use oxideav_core::{Error, MediaType, Muxer, Packet, Result, StreamInfo, WriteSeek};
 
-use crate::demuxer::{XingTagId, FORMAT_NAME};
-use crate::frame::{parse_header, Layer, Mp3FrameHeader};
-use crate::xing_info::{build_info_frame, flag_bit, XingTagSpec};
+use crate::demuxer::{FORMAT_NAME, XingTagId};
+use crate::frame::{Layer, Mp3FrameHeader, parse_header};
+use crate::xing_info::{XingTagSpec, build_info_frame, flag_bit};
 
 /// Codec ids the raw MPEG-audio muxer carries.
 const ACCEPTED_CODECS: &[&str] = &["mp3", "mp2", "mp1"];

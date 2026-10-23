@@ -65,12 +65,12 @@
 
 use crate::frame::MpegVersion;
 use crate::huffman::{
-    big_table_reach, choose_best_count1_table, choose_best_table_for_region, count_huffman_bits,
-    partition_split, PartitionSplit, SELECTABLE_BIG_TABLES,
+    PartitionSplit, SELECTABLE_BIG_TABLES, big_table_reach, choose_best_count1_table,
+    choose_best_table_for_region, count_huffman_bits, partition_split,
 };
 use crate::quantize::quantize;
 use crate::requantize::{
-    long_band_starts, scalefac_multiplier, short_band_starts, NUM_LINES, PRETAB,
+    NUM_LINES, PRETAB, long_band_starts, scalefac_multiplier, short_band_starts,
 };
 use crate::scalefactors::ScaleFactors;
 use crate::side_info::{BlockType, GranuleChannel};

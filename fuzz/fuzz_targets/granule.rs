@@ -63,13 +63,13 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_mp3::alias::alias_reduce;
-use oxideav_mp3::frame::{parse_header, MpegVersion};
+use oxideav_mp3::frame::{MpegVersion, parse_header};
 use oxideav_mp3::huffman::decode_huffman;
-use oxideav_mp3::imdct::{imdct_granule, ImdctState};
+use oxideav_mp3::imdct::{ImdctState, imdct_granule};
 use oxideav_mp3::requantize::requantize;
-use oxideav_mp3::scalefactors::{decode_scalefactors, MainDataReader};
+use oxideav_mp3::scalefactors::{MainDataReader, decode_scalefactors};
 use oxideav_mp3::side_info::parse_side_info;
-use oxideav_mp3::synth::{synth_granule, SynthState};
+use oxideav_mp3::synth::{SynthState, synth_granule};
 
 /// Build a structurally-valid 4-byte Layer III header. All three
 /// decodable versions are covered — MPEG-1, MPEG-2 LSF, and (since

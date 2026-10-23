@@ -31,9 +31,9 @@ use std::path::PathBuf;
 
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase};
 use oxideav_mp3::{
+    FrameWalker, ImdctState, MainDataReader, MpegVersion, PCM_PER_GRANULE, Reservoir, SynthState,
     alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, reorder, requantize, synth_granule, FrameWalker, ImdctState, MainDataReader,
-    MpegVersion, Reservoir, SynthState, PCM_PER_GRANULE,
+    parse_side_info, reorder, requantize, synth_granule,
 };
 
 fn fixture_dir() -> Option<PathBuf> {
@@ -150,7 +150,7 @@ fn read_wav_s16_mono(path: &std::path::Path) -> (u16, u32, Vec<f32>) {
             }
             b"data" => {
                 assert!(channels > 0, "fmt chunk must precede data");
-                for chunk in body.chunks_exact(2) {
+                for chunk in body.as_chunks::<2>().0 {
                     let v = i16::from_le_bytes([chunk[0], chunk[1]]);
                     data.push(f32::from(v) / 32768.0);
                 }
@@ -297,7 +297,7 @@ fn trait_decode_mono(bytes: &[u8]) -> Vec<i16> {
     let mut dec = oxideav_mp3::make_decoder(&params).expect("make_decoder");
     let mut out: Vec<i16> = Vec::new();
     let drain = |a: &oxideav_core::AudioFrame, out: &mut Vec<i16>| {
-        for chunk in a.data[0].chunks_exact(2) {
+        for chunk in a.data[0].as_chunks::<2>().0 {
             out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
     };

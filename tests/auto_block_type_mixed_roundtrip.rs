@@ -34,8 +34,8 @@ use std::io::Cursor;
 
 use oxideav_core::Demuxer;
 use oxideav_mp3::{
-    parse_header, parse_side_info, BlockType, ChannelMode, FrameWalker, Mp3Demuxer, Mp3Encoder,
-    DEFAULT_ATTACK_THRESHOLD, DEFAULT_MIXED_LOW_BAND_STABILITY,
+    BlockType, ChannelMode, DEFAULT_ATTACK_THRESHOLD, DEFAULT_MIXED_LOW_BAND_STABILITY,
+    FrameWalker, Mp3Demuxer, Mp3Encoder, parse_header, parse_side_info,
 };
 
 const SR: u32 = 44_100;

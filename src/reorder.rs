@@ -53,7 +53,7 @@
 //! [`crate::requantize`].
 
 use crate::frame::MpegVersion;
-use crate::requantize::{short_band_starts, NUM_LINES};
+use crate::requantize::{NUM_LINES, short_band_starts};
 use crate::side_info::{BlockType, GranuleChannel};
 
 /// In a mixed block the short reorder begins at short scalefactor

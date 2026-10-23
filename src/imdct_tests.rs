@@ -879,7 +879,7 @@ fn interchanged_imdct_matches_reference() {
     for case in 0..256 {
         let mut xk_long = [0.0f64; LONG_N / 2];
         for v in xk_long.iter_mut() {
-            if xorshift32_r409(&mut rng) % 7 != 0 {
+            if !xorshift32_r409(&mut rng).is_multiple_of(7) {
                 *v = random_f64_r409(&mut rng);
             }
         }
@@ -895,7 +895,7 @@ fn interchanged_imdct_matches_reference() {
 
         let mut xk_short = [0.0f64; SHORT_N / 2];
         for v in xk_short.iter_mut() {
-            if xorshift32_r409(&mut rng) % 7 != 0 {
+            if !xorshift32_r409(&mut rng).is_multiple_of(7) {
                 *v = random_f64_r409(&mut rng);
             }
         }

@@ -1166,7 +1166,7 @@ mod tests_inner {
                 let mut xn = vec![0.0f64; n];
                 for v in xn.iter_mut() {
                     let a = xorshift32_r409(&mut rng);
-                    if a % 7 != 0 {
+                    if !a.is_multiple_of(7) {
                         let mag = f64::from(a & 0xFFFFFF) / f64::from(0xFFFFFFu32);
                         let exp = f64::from((a >> 24) % 24) - 12.0;
                         *v = mag * exp.exp2() * if a & 0x8000 != 0 { -1.0 } else { 1.0 };

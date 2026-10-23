@@ -14648,11 +14648,7 @@ mod tests {
         let v =
             coder_partition_d5_reduction_row_order(
                 |omega| {
-                    if omega == dip_line {
-                        dip
-                    } else {
-                        baseline
-                    }
+                    if omega == dip_line { dip } else { baseline }
                 },
             );
         for n in 1_u16..=32 {
@@ -14918,11 +14914,7 @@ mod tests {
         let baseline = 0.0;
         let dip = -100.0;
         let split = coder_partition_d5_reduction_row_order_by_width(|omega| {
-            if omega == dip_line {
-                dip
-            } else {
-                baseline
-            }
+            if omega == dip_line { dip } else { baseline }
         });
         // Narrow band: only index 4 (partition 5) drops.
         for (i, pair) in split.narrow_band.iter().enumerate() {
@@ -14963,11 +14955,7 @@ mod tests {
         let baseline = 0.0;
         let dip = -100.0;
         let split = coder_partition_d5_reduction_row_order_by_width(|omega| {
-            if omega == dip_line {
-                dip
-            } else {
-                baseline
-            }
+            if omega == dip_line { dip } else { baseline }
         });
         // Narrow band: every element at the baseline.
         for (i, pair) in split.narrow_band.iter().enumerate() {
@@ -15193,11 +15181,7 @@ mod tests {
         let interior = lo + (hi - lo) / 2;
         assert!(interior > lo && interior < hi);
         let split = coder_partition_d5_ltmin_db_row_order_by_width(|omega| {
-            if omega == interior {
-                dip
-            } else {
-                baseline
-            }
+            if omega == interior { dip } else { baseline }
         });
         let expected_index = (target_n as usize) - 1;
         for (i, v) in split.narrow_band.iter().enumerate() {
@@ -15227,11 +15211,7 @@ mod tests {
         let interior = lo + (hi - lo) / 2;
         assert!(interior > lo && interior < hi);
         let split = coder_partition_d5_ltmin_db_row_order_by_width(|omega| {
-            if omega == interior {
-                dip
-            } else {
-                baseline
-            }
+            if omega == interior { dip } else { baseline }
         });
         for (i, v) in split.narrow_band.iter().enumerate() {
             assert!(
@@ -15444,13 +15424,7 @@ mod tests {
         // index 2) lowers exactly one narrow-band cell relative to the
         // baseline; wide-band cells are unchanged.
         let baseline = coder_partition_d5_ltmin_linear_row_order_by_width(|_| 0.0);
-        let cb = |omega: u16| -> f64 {
-            if omega == 50 {
-                -20.0
-            } else {
-                0.0
-            }
-        };
+        let cb = |omega: u16| -> f64 { if omega == 50 { -20.0 } else { 0.0 } };
         let split = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
         for j in 0..20 {
             assert!(
@@ -15481,13 +15455,7 @@ mod tests {
         // index 5) lowers exactly one wide-band cell relative to the
         // baseline; narrow-band cells are unchanged.
         let baseline = coder_partition_d5_ltmin_linear_row_order_by_width(|_| 0.0);
-        let cb = |omega: u16| -> f64 {
-            if omega == 300 {
-                -20.0
-            } else {
-                0.0
-            }
-        };
+        let cb = |omega: u16| -> f64 { if omega == 300 { -20.0 } else { 0.0 } };
         let split = coder_partition_d5_ltmin_linear_row_order_by_width(cb);
         for i in 0..12 {
             assert!(
@@ -15713,13 +15681,7 @@ mod tests {
         // index 2) lowers exactly one narrow-band cell relative to the
         // baseline; wide-band cells are unchanged.
         let baseline = coder_partition_d5_ltmin_log2_row_order_by_width(|_| 0.0);
-        let cb = |omega: u16| -> f64 {
-            if omega == 50 {
-                -20.0
-            } else {
-                0.0
-            }
-        };
+        let cb = |omega: u16| -> f64 { if omega == 50 { -20.0 } else { 0.0 } };
         let split = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
         for j in 0..20 {
             assert!(
@@ -15750,13 +15712,7 @@ mod tests {
         // index 5) lowers exactly one wide-band cell relative to the
         // baseline; narrow-band cells are unchanged.
         let baseline = coder_partition_d5_ltmin_log2_row_order_by_width(|_| 0.0);
-        let cb = |omega: u16| -> f64 {
-            if omega == 300 {
-                -20.0
-            } else {
-                0.0
-            }
-        };
+        let cb = |omega: u16| -> f64 { if omega == 300 { -20.0 } else { 0.0 } };
         let split = coder_partition_d5_ltmin_log2_row_order_by_width(cb);
         for i in 0..12 {
             assert!(
@@ -15919,8 +15875,8 @@ mod tests {
     }
 
     #[test]
-    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_matches_weighted_full_sum_over_row_order(
-    ) {
+    fn coder_partition_d5_ltmin_log2_wide_band_bit_budget_total_matches_weighted_full_sum_over_row_order()
+     {
         // Width-gating algebraic identity: the reduction equals the
         // weighted sum `Σ_{n=1..=32} width_n · log2_n` taken over the
         // full row-order log2 vector — narrow rows weighted by 0,
@@ -15951,11 +15907,7 @@ mod tests {
         // total drops by that cell's magnitude.
         let baseline = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|_| 0.0);
         let dipped = coder_partition_d5_ltmin_log2_wide_band_bit_budget_total(|omega: u16| {
-            if omega == 300 {
-                -20.0
-            } else {
-                0.0
-            }
+            if omega == 300 { -20.0 } else { 0.0 }
         });
         assert!(
             dipped < baseline,
@@ -16104,8 +16056,8 @@ mod tests {
     }
 
     #[test]
-    fn coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total_matches_complementary_full_sum_over_row_order(
-    ) {
+    fn coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total_matches_complementary_full_sum_over_row_order()
+     {
         // Complementary width-gating algebraic identity: the reduction
         // equals the complementary weighted sum
         // `Σ_{n=1..=32} (1 − width_n) · log2_n` taken over the full
@@ -16141,11 +16093,7 @@ mod tests {
         // total drops by that cell's magnitude.
         let baseline = coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total(|_| 0.0);
         let dipped = coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total(|omega: u16| {
-            if omega == 50 {
-                -20.0
-            } else {
-                0.0
-            }
+            if omega == 50 { -20.0 } else { 0.0 }
         });
         assert!(
             dipped < baseline,
@@ -16162,8 +16110,8 @@ mod tests {
     }
 
     #[test]
-    fn coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total_proportional_to_step63_narrow_sum(
-    ) {
+    fn coder_partition_d5_ltmin_log2_narrow_band_bit_budget_total_proportional_to_step63_narrow_sum()
+     {
         // Equivalence to step 63's narrow-band dB sum scaled by the
         // dB → log2-linear constant `log2(10) / 10`. This pins the
         // reduction to the dB presentation without invoking step 65
@@ -16300,11 +16248,7 @@ mod tests {
         // `[497, 513]`). omega = 400 is interior to a wide partition.
         let wide_perturbed =
             coder_partition_d5_ltmin_log2_paired_bit_budget_totals(|omega: u16| {
-                if omega == 400 {
-                    -4.0
-                } else {
-                    0.0
-                }
+                if omega == 400 { -4.0 } else { 0.0 }
             });
         assert_eq!(
             wide_perturbed.0, baseline.0,
@@ -16320,11 +16264,7 @@ mod tests {
         // (`[97, 113]`, width 0).
         let narrow_perturbed =
             coder_partition_d5_ltmin_log2_paired_bit_budget_totals(|omega: u16| {
-                if omega == 100 {
-                    -4.0
-                } else {
-                    0.0
-                }
+                if omega == 100 { -4.0 } else { 0.0 }
             });
         assert!(
             narrow_perturbed.0 != baseline.0,
@@ -16918,9 +16858,11 @@ mod tests {
         let needs = coder_partition_d5_mnr_row_order(|_| 5.0, |_| 60.0, |_| 25.0);
         assert!(needs.iter().all(|r| r.smr_db == 35.0 && r.mnr_db == -30.0));
         let protected = coder_partition_d5_mnr_row_order(|_| 80.0, |_| 10.0, |_| 25.0);
-        assert!(protected
-            .iter()
-            .all(|r| r.smr_db == -15.0 && r.mnr_db == 95.0));
+        assert!(
+            protected
+                .iter()
+                .all(|r| r.smr_db == -15.0 && r.mnr_db == 95.0)
+        );
     }
 
     #[test]
@@ -17898,7 +17840,7 @@ mod tests {
         assert_eq!(model1_step4_is_local_maximum(&x, 1), Some(true)); // 2 > 0, 2 >= 2
         assert_eq!(model1_step4_is_local_maximum(&x, 2), Some(false)); // 2 > 2 fails
         assert_eq!(model1_step4_is_local_maximum(&x, 3), Some(false)); // 1 > 2 fails
-                                                                       // Edges have no neighbour — the spec formula is undefined.
+        // Edges have no neighbour — the spec formula is undefined.
         assert!(model1_step4_is_local_maximum(&x, 0).is_none());
         assert!(model1_step4_is_local_maximum(&x, 4).is_none());
     }
@@ -18430,7 +18372,7 @@ mod tests {
         assert_eq!(model1_d1_index_for_line(l2, fs, 99), Some(73)); // 100 at 1 vs 96 at 3
         assert_eq!(model1_d1_index_for_line(l2, fs, 203), Some(97)); // 200 at 3 vs 208 at 5
         assert_eq!(model1_d1_index_for_line(l2, fs, 205), Some(98)); // 208 at 3 vs 200 at 5
-                                                                     // Bounds: DC and above the last tabulated line refuse.
+        // Bounds: DC and above the last tabulated line refuse.
         assert_eq!(model1_d1_index_for_line(l2, fs, 0), None);
         assert_eq!(model1_d1_index_for_line(l2, fs, 464), Some(130));
         assert_eq!(model1_d1_index_for_line(l2, fs, 465), None);
@@ -19850,9 +19792,9 @@ mod tests {
         assert_eq!(model2_layer3_step_m_thr(0.1, 7.0, 1.0, 0.1), 7.0); // nbb
         assert_eq!(model2_layer3_step_m_thr(0.1, 1.0, 4.0, 0.1), 8.0); // 2·nbb_l
         assert_eq!(model2_layer3_step_m_thr(0.1, 1.0, 1.0, 1.0), 16.0); // 16·nbb_ll
-                                                                        // Stateful walk: zeroed history → first block is
-                                                                        // max(qthr, nbb); a loud block elevates the next two blocks'
-                                                                        // floors by rpelev / rpelev2.
+        // Stateful walk: zeroed history → first block is
+        // max(qthr, nbb); a loud block elevates the next two blocks'
+        // floors by rpelev / rpelev2.
         let mut pe = Model2Layer3PreEcho::new(2);
         assert_eq!(pe.partitions(), 2);
         let qthr = [0.5, 0.5];

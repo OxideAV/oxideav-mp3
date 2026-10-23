@@ -409,7 +409,7 @@ mod tests {
         let f = LAME_MAGIC_OFFSET_ALL_FLAGS;
         buf[f + OFF_REV_METHOD] = 0x10; // revision 1, VBR method 0
         buf[f + OFF_LOWPASS] = 196; // lowpass = 196 * 100 = 19_600 Hz
-                                    // peak amplitude as f32 BE = 1.0 → 0x3F80_0000.
+        // peak amplitude as f32 BE = 1.0 → 0x3F80_0000.
         buf[f + OFF_PEAK..f + OFF_PEAK + 4].copy_from_slice(&0x3F80_0000u32.to_be_bytes());
         buf[f + OFF_RADIO_RG..f + OFF_RADIO_RG + 2].copy_from_slice(&0x1234u16.to_be_bytes());
         buf[f + OFF_AUDIOPHILE_RG..f + OFF_AUDIOPHILE_RG + 2]

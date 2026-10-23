@@ -26,9 +26,10 @@ use std::io::Cursor;
 
 use oxideav_core::Demuxer;
 use oxideav_mp3::{
-    demuxer::{parse_xing_info, side_info_len, Mp3Demuxer, XingTagId},
-    frame::{parse_header, ChannelMode, FrameWalker, Layer},
-    xing_flag_bit, Mp3Encoder, StreamEncodeError, XingTagSpec,
+    Mp3Encoder, StreamEncodeError, XingTagSpec,
+    demuxer::{Mp3Demuxer, XingTagId, parse_xing_info, side_info_len},
+    frame::{ChannelMode, FrameWalker, Layer, parse_header},
+    xing_flag_bit,
 };
 
 const SR: u32 = 44_100;

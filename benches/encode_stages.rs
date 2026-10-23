@@ -40,12 +40,12 @@
 //! Run with:
 //!     cargo bench -p oxideav-mp3 --bench encode_stages
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use oxideav_mp3::analysis::{analyze_granule, AnalysisState};
+use oxideav_mp3::analysis::{AnalysisState, analyze_granule};
 use oxideav_mp3::frame::MpegVersion;
 use oxideav_mp3::inner_loop::search_bit_budget;
-use oxideav_mp3::mdct::{forward_overlap, mdct, window_long_family_analysis, MdctState};
+use oxideav_mp3::mdct::{MdctState, forward_overlap, mdct, window_long_family_analysis};
 use oxideav_mp3::scalefactors::ScaleFactors;
 use oxideav_mp3::side_info::{BlockType, GranuleChannel};
 

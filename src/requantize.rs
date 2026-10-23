@@ -79,11 +79,7 @@ pub const PRETAB: [u8; 21] = [
 /// `0.5` for `scalefac_scale == 0`, `1.0` for `scalefac_scale == 1`.
 #[must_use]
 pub fn scalefac_multiplier(scalefac_scale: bool) -> f32 {
-    if scalefac_scale {
-        1.0
-    } else {
-        0.5
-    }
+    if scalefac_scale { 1.0 } else { 0.5 }
 }
 
 /// Long-block scalefactor-band *start* indices for the active sampling
@@ -341,11 +337,7 @@ fn signed_pow43(is: i32) -> f32 {
     } else {
         (is.unsigned_abs() as f32).powf(4.0 / 3.0)
     };
-    if is < 0 {
-        -mag
-    } else {
-        mag
-    }
+    if is < 0 { -mag } else { mag }
 }
 
 /// Requantize one granule-channel's 576 quantized frequency lines into

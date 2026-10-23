@@ -446,92 +446,91 @@ pub mod synth;
 pub mod xing_info;
 
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
-pub use alias::{alias_ca, alias_cs, alias_reduce, ALIAS_C};
+pub use alias::{ALIAS_C, alias_ca, alias_cs, alias_reduce};
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
-pub use analysis::{analyze_granule, analyze_row, m_coefficient, AnalysisState, C_TABLE, X_LEN};
+pub use analysis::{AnalysisState, C_TABLE, X_LEN, analyze_granule, analyze_row, m_coefficient};
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use attack_detect::{
-    granule_subframe_energies, subframe_energy, AttackDetector, AttackDetectorParams,
-    DEFAULT_AMBIENT_LEAK, DEFAULT_ATTACK_THRESHOLD, SAMPLES_PER_SUBFRAME,
-    SILENCE_FLOOR as ATTACK_SILENCE_FLOOR, SUBFRAMES_PER_GRANULE,
+    AttackDetector, AttackDetectorParams, DEFAULT_AMBIENT_LEAK, DEFAULT_ATTACK_THRESHOLD,
+    SAMPLES_PER_SUBFRAME, SILENCE_FLOOR as ATTACK_SILENCE_FLOOR, SUBFRAMES_PER_GRANULE,
+    granule_subframe_energies, subframe_energy,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use block_type_sm::BlockTypeStateMachine;
-pub use codec_decoder::{make_decoder, register_codecs, Mp3CoreDecoder};
+pub use codec_decoder::{Mp3CoreDecoder, make_decoder, register_codecs};
 pub use codec_encoder::{
-    make_encoder, make_encoder_joint_stereo_auto, make_encoder_joint_stereo_auto_with_threshold,
-    make_encoder_joint_stereo_is, make_encoder_joint_stereo_ms, make_encoder_joint_stereo_ms_is,
-    make_encoder_quality_preset, make_encoder_with_outer_loop,
-    make_encoder_with_threshold_in_quiet, make_encoder_with_threshold_in_quiet_offset,
-    Mp3CoreEncoder,
+    Mp3CoreEncoder, make_encoder, make_encoder_joint_stereo_auto,
+    make_encoder_joint_stereo_auto_with_threshold, make_encoder_joint_stereo_is,
+    make_encoder_joint_stereo_ms, make_encoder_joint_stereo_ms_is, make_encoder_quality_preset,
+    make_encoder_with_outer_loop, make_encoder_with_threshold_in_quiet,
+    make_encoder_with_threshold_in_quiet_offset,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
-pub use crc::{crc16_bits, crc16_layer3, crc16_layer3_lsf, INITIAL_STATE as CRC_INITIAL_STATE};
+pub use crc::{INITIAL_STATE as CRC_INITIAL_STATE, crc16_bits, crc16_layer3, crc16_layer3_lsf};
+pub use demuxer::{
+    CODEC_ID_STR, FORMAT_NAME, Mp3Demuxer, Mp3Tags, WAVE_FORMAT_MP3, XingTag, XingTagId,
+    open_file_demuxer, parse_xing_info, probe,
+};
 #[doc(hidden)] // internal: re-export of hidden demuxer helpers
 pub use demuxer::{lame_magic_offset, side_info_len};
-pub use demuxer::{
-    open_file_demuxer, parse_xing_info, probe, Mp3Demuxer, Mp3Tags, XingTag, XingTagId,
-    CODEC_ID_STR, FORMAT_NAME, WAVE_FORMAT_MP3,
-};
-pub use encoder::{encode_silent_frame, make_silent_header, EncodeError};
+pub use encoder::{EncodeError, encode_silent_frame, make_silent_header};
 #[doc(hidden)] // internal: re-export of hidden encoder framing helpers
 pub use encoder::{silent_side_info, write_header, write_side_info};
 pub use frame::{
-    parse_header, ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension,
-    Mp3FrameHeader, MpegVersion,
+    ChannelMode, Emphasis, Frame, FrameWalker, HeaderError, Layer, ModeExtension, Mp3FrameHeader,
+    MpegVersion, parse_header,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use huffman::{
-    big_table_reach, choose_best_count1_table, choose_best_table_for_region, count1_bits,
-    count_huffman_bits, decode_huffman, emit_huffman, encode_huffman, encoder_region_boundaries,
-    partition_split, HuffmanEncodeError, HuffmanError, Mp3HuffmanData, PartitionSplit, NUM_LINES,
-    SELECTABLE_BIG_TABLES,
+    HuffmanEncodeError, HuffmanError, Mp3HuffmanData, NUM_LINES, PartitionSplit,
+    SELECTABLE_BIG_TABLES, big_table_reach, choose_best_count1_table, choose_best_table_for_region,
+    count_huffman_bits, count1_bits, decode_huffman, emit_huffman, encode_huffman,
+    encoder_region_boundaries, partition_split,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
-pub use imdct::{imdct_granule, ImdctState, SAMPLES_PER_SUBBAND};
+pub use imdct::{ImdctState, SAMPLES_PER_SUBBAND, imdct_granule};
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use inner_loop::{
+    BIG_VALUES_LIMIT, ExactBitCount, GAIN_MAX, GAIN_MIN, InnerLoopResult, SubdivideBands,
     coarse_bit_estimate, exact_bit_count, exact_bit_count_band_aligned, max_abs, search_bit_budget,
-    search_bit_budget_band_aligned, search_magnitude_clamp, subdivide_bands, ExactBitCount,
-    InnerLoopResult, SubdivideBands, BIG_VALUES_LIMIT, GAIN_MAX, GAIN_MIN,
+    search_bit_budget_band_aligned, search_magnitude_clamp, subdivide_bands,
 };
 pub use lame_tag::{
-    parse_lame_tag, LameParseError, LameTag, DELAY_PADDING_OFFSET_FROM_LAME_MAGIC,
-    LAME_MAGIC_OFFSET_ALL_FLAGS, LAME_TAG_FIELDS_LEN, LAME_TAG_FULL_LEN,
+    DELAY_PADDING_OFFSET_FROM_LAME_MAGIC, LAME_MAGIC_OFFSET_ALL_FLAGS, LAME_TAG_FIELDS_LEN,
+    LAME_TAG_FULL_LEN, LameParseError, LameTag, parse_lame_tag,
 };
 pub use main_data::ReservoirError;
 #[doc(hidden)] // internal: re-export of hidden reservoir/main-data plumbing
 pub use main_data::{
-    assemble_main_data, schedule_reservoir, AssembledMainData, GranuleChannelData, ReservoirFrame,
-    ReservoirScheduler, ScheduledFrame, RESERVOIR_MAX_LSF, RESERVOIR_MAX_MPEG1,
+    AssembledMainData, GranuleChannelData, RESERVOIR_MAX_LSF, RESERVOIR_MAX_MPEG1, ReservoirFrame,
+    ReservoirScheduler, ScheduledFrame, assemble_main_data, schedule_reservoir,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use mdct::{
-    analysis_long_window, analysis_short_window, forward_overlap, mdct,
-    window_long_family_analysis, window_short_analysis, MdctState,
+    MdctState, analysis_long_window, analysis_short_window, forward_overlap, mdct,
+    window_long_family_analysis, window_short_analysis,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use mixed_classifier::{
-    low_band_stability_ratio, low_pass_granule, MixedClassifier, DEFAULT_MIXED_LOW_BAND_STABILITY,
+    DEFAULT_MIXED_LOW_BAND_STABILITY, MixedClassifier, low_band_stability_ratio, low_pass_granule,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use outer_loop::{
+    MIXED_FIRST_SHORT_SFB, MIXED_LAST_LONG_SFB, MIXED_SCALEFAC_L_MAX, OUTER_LOOP_SCALEFAC_COMPRESS,
+    OUTER_LOOP_SCALEFAC_COMPRESS_LSF, OuterLoopMixedResult, OuterLoopResult, OuterLoopShortResult,
+    OuterLoopStats, SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW, SCALEFAC_S_MAX_HIGH, SCALEFAC_S_MAX_LOW,
     band_distortion_long, band_distortion_mixed_long, band_distortion_mixed_short,
     band_distortion_short, outer_loop_search_long, outer_loop_search_long_per_band,
     outer_loop_search_mixed, outer_loop_search_mixed_per_band, outer_loop_search_short,
     outer_loop_search_short_per_band, scalefac_long_upper_limit, scalefac_short_upper_limit,
-    OuterLoopMixedResult, OuterLoopResult, OuterLoopShortResult, OuterLoopStats,
-    MIXED_FIRST_SHORT_SFB, MIXED_LAST_LONG_SFB, MIXED_SCALEFAC_L_MAX, OUTER_LOOP_SCALEFAC_COMPRESS,
-    OUTER_LOOP_SCALEFAC_COMPRESS_LSF, SCALEFAC_MAX_HIGH, SCALEFAC_MAX_LOW, SCALEFAC_S_MAX_HIGH,
-    SCALEFAC_S_MAX_LOW,
 };
 pub use psy::XminThresholds;
 #[doc(hidden)] // internal: re-export of hidden psychoacoustic plumbing
 pub use psy::{
+    DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE, STEP5_TONAL_DECIMATION_WINDOW_BARK,
+    STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE, STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE,
     decimate_tonal_within_half_bark, masker_above_threshold_in_quiet, masker_at_band,
-    masker_in_step7_window_of_line, DEFAULT_XMIN_DB_TO_OUTER_LOOP_SCALE,
-    STEP5_TONAL_DECIMATION_WINDOW_BARK, STEP7_NEARBY_MASKER_DZ_HI_FROM_LINE,
-    STEP7_NEARBY_MASKER_DZ_LO_FROM_LINE,
+    masker_in_step7_window_of_line,
 };
 pub use quality::{QualityPreset, QualityPresetParams};
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
@@ -539,32 +538,32 @@ pub use quantize::quantize;
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use reorder::reorder;
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
-pub use requantize::{requantize, scalefac_multiplier, PRETAB};
+pub use requantize::{PRETAB, requantize, scalefac_multiplier};
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use scalefactors::{
-    decode_scalefactors, lsf_scale_params, FrameScaleFactors, LsfScaleParams, MainDataReader,
-    MainDataWriter, Reservoir, ScaleFactorError, ScaleFactors, LONG_SFB, MPEG1_SLEN, SHORT_SFB,
-    SHORT_WINDOWS,
+    FrameScaleFactors, LONG_SFB, LsfScaleParams, MPEG1_SLEN, MainDataReader, MainDataWriter,
+    Reservoir, SHORT_SFB, SHORT_WINDOWS, ScaleFactorError, ScaleFactors, decode_scalefactors,
+    lsf_scale_params,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use side_info::{
-    parse_side_info, BlockType, GranuleChannel, SideInfo, SideInfoError, GRANULES, GRANULES_LSF,
-    SIDE_INFO_BYTES_LSF_MONO, SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO,
-    SIDE_INFO_BYTES_STEREO,
+    BlockType, GRANULES, GRANULES_LSF, GranuleChannel, SIDE_INFO_BYTES_LSF_MONO,
+    SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO, SIDE_INFO_BYTES_STEREO, SideInfo,
+    SideInfoError, parse_side_info,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use stereo::process_stereo;
 pub use stream_encoder::{
-    Mp3Encoder, StreamEncodeError, LSF_L3_BITRATE_LADDER_KBPS, MPEG1_L3_BITRATE_LADDER_KBPS,
-    SAMPLES_PER_FRAME_MPEG1, SAMPLES_PER_GRANULE,
+    LSF_L3_BITRATE_LADDER_KBPS, MPEG1_L3_BITRATE_LADDER_KBPS, Mp3Encoder, SAMPLES_PER_FRAME_MPEG1,
+    SAMPLES_PER_GRANULE, StreamEncodeError,
 };
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use synth::{
-    n_coefficient, pcm_f32_to_i16, synth_granule, synth_row, SynthState, D_TABLE, PCM_PER_GRANULE,
+    D_TABLE, PCM_PER_GRANULE, SynthState, n_coefficient, pcm_f32_to_i16, synth_granule, synth_row,
 };
 pub use xing_info::{
-    build_info_frame, build_xing_info_payload, flag_bit as xing_flag_bit, XingEmitError,
-    XingTagSpec, MAX_PAYLOAD_BYTES as XING_MAX_PAYLOAD_BYTES,
+    MAX_PAYLOAD_BYTES as XING_MAX_PAYLOAD_BYTES, XingEmitError, XingTagSpec, build_info_frame,
+    build_xing_info_payload, flag_bit as xing_flag_bit,
 };
 
 use oxideav_core::RuntimeContext;

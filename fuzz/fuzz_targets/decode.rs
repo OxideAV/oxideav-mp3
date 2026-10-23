@@ -103,10 +103,10 @@ fn build_header(v: u8, sr: u8, br: u8, mode: u8, ext: u8, flags: u8) -> [u8; 4] 
     // protection_bit: '0' = CRC present.
     let crc = flags & 0b0000_0001;
     raw |= u32::from(crc ^ 1) << 16; // store '0' when CRC present
-                                     // bitrate index: mostly 1..=14, with a 1/16 seed slice mapped
-                                     // to 0 = free format (§2.4.2.3 — no header-derivable length;
-                                     // the decoder takes the packet length as authoritative).
-                                     // 15 (forbidden) stays excluded.
+    // bitrate index: mostly 1..=14, with a 1/16 seed slice mapped
+    // to 0 = free format (§2.4.2.3 — no header-derivable length;
+    // the decoder takes the packet length as authoritative).
+    // 15 (forbidden) stays excluded.
     let br_idx = if br >= 240 { 0 } else { (br % 14) + 1 };
     raw |= u32::from(br_idx) << 12;
     // sample-rate index 0..=2 (3 is reserved/rejected).

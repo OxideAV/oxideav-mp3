@@ -74,11 +74,7 @@ const NRMSE_BOUND: f64 = 2e-4;
 
 fn corpus_root() -> Option<PathBuf> {
     let p = PathBuf::from("../../docs/audio/mp3/fixtures");
-    if p.is_dir() {
-        Some(p)
-    } else {
-        None
-    }
+    if p.is_dir() { Some(p) } else { None }
 }
 
 /// Decode `input.mp3` through the production path: `Mp3Demuxer` (ID3v2
@@ -118,7 +114,7 @@ fn production_decode(path: &std::path::Path, channels: u16, sample_rate: u32) ->
                         "decoder plane count != channel count"
                     );
                     for (ch, plane) in a.data.iter().enumerate() {
-                        for chunk in plane.chunks_exact(2) {
+                        for chunk in plane.as_chunks::<2>().0 {
                             let v = i16::from_le_bytes([chunk[0], chunk[1]]);
                             out[ch].push(f32::from(v) / 32768.0);
                         }
@@ -158,7 +154,7 @@ fn read_wav_s16(path: &std::path::Path) -> (u16, u32, Vec<f32>) {
             }
             b"data" => {
                 assert!(channels > 0, "fmt chunk must precede data");
-                for chunk in body.chunks_exact(2) {
+                for chunk in body.as_chunks::<2>().0 {
                     let v = i16::from_le_bytes([chunk[0], chunk[1]]);
                     data.push(f32::from(v) / 32768.0);
                 }

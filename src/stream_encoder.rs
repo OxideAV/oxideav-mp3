@@ -68,27 +68,27 @@
 
 use std::io::{self, Write};
 
-use crate::analysis::{analyze_granule, AnalysisState};
+use crate::analysis::{AnalysisState, analyze_granule};
 use crate::frame::{ChannelMode, ModeExtension, Mp3FrameHeader, MpegVersion};
 use crate::huffman::{
-    choose_best_count1_table, choose_best_table_for_region, partition_split, NUM_LINES,
+    NUM_LINES, choose_best_count1_table, choose_best_table_for_region, partition_split,
 };
 use crate::inner_loop::{
-    search_bit_budget_band_aligned, search_magnitude_clamp, GAIN_MAX, GAIN_MIN,
+    GAIN_MAX, GAIN_MIN, search_bit_budget_band_aligned, search_magnitude_clamp,
 };
 use crate::main_data::{
-    assemble_main_data, schedule_reservoir, GranuleChannelData, ReservoirError, ReservoirFrame,
+    GranuleChannelData, ReservoirError, ReservoirFrame, assemble_main_data, schedule_reservoir,
 };
-use crate::mdct::{forward_overlap, mdct, window_long_family_analysis, MdctState, LONG_N};
+use crate::mdct::{LONG_N, MdctState, forward_overlap, mdct, window_long_family_analysis};
 use crate::outer_loop::{
-    outer_loop_search_long, outer_loop_search_mixed, outer_loop_search_short,
     INTENSITY_SCALEFAC_COMPRESS_LSF, MIXED_FIRST_SHORT_SFB, MIXED_LAST_LONG_SFB,
-    OUTER_LOOP_SCALEFAC_COMPRESS, OUTER_LOOP_SCALEFAC_COMPRESS_LSF,
+    OUTER_LOOP_SCALEFAC_COMPRESS, OUTER_LOOP_SCALEFAC_COMPRESS_LSF, outer_loop_search_long,
+    outer_loop_search_mixed, outer_loop_search_short,
 };
 use crate::quantize::quantize;
-use crate::scalefactors::{FrameScaleFactors, ScaleFactors, LONG_SFB};
-use crate::side_info::{BlockType, GranuleChannel, SideInfo, GRANULES, GRANULES_LSF};
-use crate::{make_silent_header, write_header, write_side_info, EncodeError};
+use crate::scalefactors::{FrameScaleFactors, LONG_SFB, ScaleFactors};
+use crate::side_info::{BlockType, GRANULES, GRANULES_LSF, GranuleChannel, SideInfo};
+use crate::{EncodeError, make_silent_header, write_header, write_side_info};
 
 /// MPEG-1 Layer III bitrate ladder (ISO/IEC 11172-3 §2.4.2.3, Table
 /// 2-B.1 row "Layer III, version 1"). Used by the encoder's VBR path
@@ -4024,189 +4024,46 @@ impl Mp3Encoder {
                 && (self.force_short_blocks
                     || (block_type_per_gc[gr][0] == BlockType::Short && !mixed_per_gc[gr][0]));
         }
-        if let Some(start_sfb) = self.intensity_start_sfb {
-            if self.nch == 2 {
-                let short_starts = short_band_starts_for(self.sample_rate_hz);
-                let long_starts = long_band_starts_for(self.sample_rate_hz);
-                let starts = long_starts;
-                for gr in 0..ngr {
-                    if mixed_intensity_gr[gr] {
-                        // §2.4.3.4.10.3 mixed-block intensity coupling.
-                        // The granule's lowest 2 polyphase subbands
-                        // (long bands 0..=7, lines 0..36) are long-windowed
-                        // and the upper 30 subbands (short bands 3..12) are
-                        // short-windowed. Couple the long region on the
-                        // long-band walk and the short region per window —
-                        // the exact two regions the decoder's
-                        // `process_short` rebuilds for a `mixed_block_flag`
-                        // granule (`for sfb in 0..8` long, then per-window
-                        // short bands `MIXED_FIRST_SHORT_SFB..12`).
-                        let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
-                        let left = &mut left_slice[0];
-                        let right = &mut right_slice[0];
-                        let is_pos_bands = &mut is_pos_per_gr[gr];
-
-                        // --- Long region: long bands `start_sfb..8` ---
-                        // The user `intensity_start_sfb` (1..=20) addresses
-                        // the long-band grid directly. A granule couples at
-                        // all whenever it has a long-region band at/above
-                        // the bound (`start_sfb < 8`) or any short region
-                        // above its mapped bound (handled below).
-                        let long_eff_end = MIXED_LAST_LONG_SFB + 1; // = 8
-                        for sfb in start_sfb..long_eff_end {
-                            let lo = long_starts[sfb];
-                            let hi = long_starts[sfb + 1];
-                            let mut l_energy = 0.0f64;
-                            let mut r_energy = 0.0f64;
-                            for i in lo..hi {
-                                l_energy += f64::from(left[i]) * f64::from(left[i]);
-                                r_energy += f64::from(right[i]) * f64::from(right[i]);
-                            }
-                            is_pos_bands[sfb] = if self.version.is_lsf() {
-                                derive_intensity_position_lsf(l_energy, r_energy)
-                            } else {
-                                derive_intensity_position(l_energy, r_energy)
-                            };
-                            for i in lo..hi {
-                                left[i] += right[i];
-                                right[i] = 0.0;
-                            }
-                        }
-
-                        // --- Short region: per-window short bands ---
-                        // Map the long start line onto a short band, then
-                        // clamp to `MIXED_FIRST_SHORT_SFB` (= 3): the lowest
-                        // three short bands fall inside the long-windowed
-                        // carve-out and carry no short-region intensity.
-                        let start_line = long_starts[start_sfb];
-                        let mapped = (0..12)
-                            .find(|&sfb| short_starts[sfb] >= start_line)
-                            .unwrap_or(12);
-                        let short_start = mapped.max(MIXED_FIRST_SHORT_SFB);
-                        short_intensity_start_per_gr[gr] = short_start;
-                        // A mixed granule couples whenever either region has
-                        // a band at/above the bound.
-                        intensity_coupled_per_gr[gr] = start_sfb < long_eff_end || short_start < 12;
-                        for sfb in short_start..12 {
-                            let s = short_starts[sfb];
-                            let w = short_starts[sfb + 1] - short_starts[sfb];
-                            let base = 3 * s;
-                            for win in 0..3 {
-                                let mut l_energy = 0.0f64;
-                                let mut r_energy = 0.0f64;
-                                let win_base = base + win * w;
-                                for k in 0..w {
-                                    let i = win_base + k;
-                                    if i < NUM_LINES {
-                                        l_energy += f64::from(left[i]) * f64::from(left[i]);
-                                        r_energy += f64::from(right[i]) * f64::from(right[i]);
-                                    }
-                                }
-                                is_pos_short_per_gr[gr][sfb][win] = if self.version.is_lsf() {
-                                    derive_intensity_position_lsf(l_energy, r_energy)
-                                } else {
-                                    derive_intensity_position(l_energy, r_energy)
-                                };
-                                for k in 0..w {
-                                    let i = win_base + k;
-                                    if i < NUM_LINES {
-                                        left[i] += right[i];
-                                        right[i] = 0.0;
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    if short_intensity_gr[gr] {
-                        let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
-                        let left = &mut left_slice[0];
-                        let right = &mut right_slice[0];
-                        // Map the long-block `intensity_start_sfb` (1..=20,
-                        // the public API's only knob) onto a short-block
-                        // start band by frequency: the short band whose first
-                        // line is at or beyond the long start line. This
-                        // keeps the one user-facing bound consistent across
-                        // block types without a second API surface.
-                        let start_line = long_starts[start_sfb];
-                        let short_start = (0..12)
-                            .find(|&sfb| short_starts[sfb] >= start_line)
-                            .unwrap_or(12);
-                        // A short granule always couples (it shares the short
-                        // geometry); the per-window zero-part below the bound
-                        // is what makes the decoder's per-window bound
-                        // derivation land where intended.
-                        intensity_coupled_per_gr[gr] = short_start < 12;
-                        short_intensity_start_per_gr[gr] = short_start;
-                        for sfb in short_start..12 {
-                            let s = short_starts[sfb];
-                            let w = short_starts[sfb + 1] - short_starts[sfb];
-                            let base = 3 * s;
-                            for win in 0..3 {
-                                let mut l_energy = 0.0f64;
-                                let mut r_energy = 0.0f64;
-                                // Native bitstream layout (post-reorder):
-                                // band `sfb` window `win` occupies the
-                                // contiguous run `base + win·w .. base +
-                                // (win+1)·w`. Coupling is a per-line
-                                // operation, so deriving the position and
-                                // folding the magnitude over this run yields
-                                // exactly the spectrum the decoder rebuilds
-                                // from `scalefac_s[sfb][win]` after its
-                                // §2.4.3.4.8 reorder.
-                                let win_base = base + win * w;
-                                for k in 0..w {
-                                    let i = win_base + k;
-                                    if i < NUM_LINES {
-                                        l_energy += f64::from(left[i]) * f64::from(left[i]);
-                                        r_energy += f64::from(right[i]) * f64::from(right[i]);
-                                    }
-                                }
-                                is_pos_short_per_gr[gr][sfb][win] = if self.version.is_lsf() {
-                                    derive_intensity_position_lsf(l_energy, r_energy)
-                                } else {
-                                    derive_intensity_position(l_energy, r_energy)
-                                };
-                                for k in 0..w {
-                                    let i = win_base + k;
-                                    if i < NUM_LINES {
-                                        left[i] += right[i];
-                                        right[i] = 0.0;
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    let is_pos_bands = &mut is_pos_per_gr[gr];
+        if let Some(start_sfb) = self.intensity_start_sfb
+            && self.nch == 2
+        {
+            let short_starts = short_band_starts_for(self.sample_rate_hz);
+            let long_starts = long_band_starts_for(self.sample_rate_hz);
+            let starts = long_starts;
+            for gr in 0..ngr {
+                if mixed_intensity_gr[gr] {
+                    // §2.4.3.4.10.3 mixed-block intensity coupling.
+                    // The granule's lowest 2 polyphase subbands
+                    // (long bands 0..=7, lines 0..36) are long-windowed
+                    // and the upper 30 subbands (short bands 3..12) are
+                    // short-windowed. Couple the long region on the
+                    // long-band walk and the short region per window —
+                    // the exact two regions the decoder's
+                    // `process_short` rebuilds for a `mixed_block_flag`
+                    // granule (`for sfb in 0..8` long, then per-window
+                    // short bands `MIXED_FIRST_SHORT_SFB..12`).
                     let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
                     let left = &mut left_slice[0];
                     let right = &mut right_slice[0];
-                    // Per-granule effective start band. Fixed-bound modes
-                    // couple `start_sfb..21` verbatim; the adaptive mode
-                    // (`intensity_auto_threshold`) raises the bound to the
-                    // lowest band whose contiguous high tail all carries
-                    // little right-channel stereo information. `eff_start
-                    // == 21` ⇒ this granule couples nothing (it keeps a
-                    // full right channel and decodes as ordinary stereo).
-                    let eff_start = match self.intensity_auto_threshold {
-                        Some(t) => choose_intensity_bound(left, right, starts, start_sfb, t),
-                        None => start_sfb,
-                    };
-                    // A granule whose adaptive bound reaches 21 couples
-                    // nothing: its right channel keeps full spectral data
-                    // and pass 2 must write it as an ordinary channel.
-                    intensity_coupled_per_gr[gr] = eff_start < 21;
-                    for (sfb, slot) in is_pos_bands.iter_mut().enumerate().skip(eff_start) {
-                        let lo = starts[sfb];
-                        let hi = starts[sfb + 1];
+                    let is_pos_bands = &mut is_pos_per_gr[gr];
+
+                    // --- Long region: long bands `start_sfb..8` ---
+                    // The user `intensity_start_sfb` (1..=20) addresses
+                    // the long-band grid directly. A granule couples at
+                    // all whenever it has a long-region band at/above
+                    // the bound (`start_sfb < 8`) or any short region
+                    // above its mapped bound (handled below).
+                    let long_eff_end = MIXED_LAST_LONG_SFB + 1; // = 8
+                    for sfb in start_sfb..long_eff_end {
+                        let lo = long_starts[sfb];
+                        let hi = long_starts[sfb + 1];
                         let mut l_energy = 0.0f64;
                         let mut r_energy = 0.0f64;
                         for i in lo..hi {
                             l_energy += f64::from(left[i]) * f64::from(left[i]);
                             r_energy += f64::from(right[i]) * f64::from(right[i]);
                         }
-                        *slot = if self.version.is_lsf() {
+                        is_pos_bands[sfb] = if self.version.is_lsf() {
                             derive_intensity_position_lsf(l_energy, r_energy)
                         } else {
                             derive_intensity_position(l_energy, r_energy)
@@ -4216,26 +4073,169 @@ impl Mp3Encoder {
                             right[i] = 0.0;
                         }
                     }
-                    // Partial top region above the last band boundary:
-                    // no scalefactor slot exists for these lines
-                    // (Table B.8 `scalefac_l` stops at `starts[21]`),
-                    // so there is no position to transmit — couple the
-                    // magnitude into the left channel anyway so the
-                    // right channel's zero-part reaches the Nyquist
-                    // rate (§2.4.3.4.9.1); the lines decode left-only.
-                    //
-                    // Skip the top region when the adaptive chooser
-                    // coupled nothing (`eff_start == 21`): zeroing only
-                    // the top lines while the rest of the right channel
-                    // stays full would create a spurious left-only tail.
-                    // A coupled-nothing granule must keep a complete
-                    // right channel so the decoder's derived bound lands
-                    // at band 21 and reconstructs plain stereo.
-                    if eff_start < 21 {
-                        for i in starts[21]..NUM_LINES {
-                            left[i] += right[i];
-                            right[i] = 0.0;
+
+                    // --- Short region: per-window short bands ---
+                    // Map the long start line onto a short band, then
+                    // clamp to `MIXED_FIRST_SHORT_SFB` (= 3): the lowest
+                    // three short bands fall inside the long-windowed
+                    // carve-out and carry no short-region intensity.
+                    let start_line = long_starts[start_sfb];
+                    let mapped = (0..12)
+                        .find(|&sfb| short_starts[sfb] >= start_line)
+                        .unwrap_or(12);
+                    let short_start = mapped.max(MIXED_FIRST_SHORT_SFB);
+                    short_intensity_start_per_gr[gr] = short_start;
+                    // A mixed granule couples whenever either region has
+                    // a band at/above the bound.
+                    intensity_coupled_per_gr[gr] = start_sfb < long_eff_end || short_start < 12;
+                    for sfb in short_start..12 {
+                        let s = short_starts[sfb];
+                        let w = short_starts[sfb + 1] - short_starts[sfb];
+                        let base = 3 * s;
+                        for win in 0..3 {
+                            let mut l_energy = 0.0f64;
+                            let mut r_energy = 0.0f64;
+                            let win_base = base + win * w;
+                            for k in 0..w {
+                                let i = win_base + k;
+                                if i < NUM_LINES {
+                                    l_energy += f64::from(left[i]) * f64::from(left[i]);
+                                    r_energy += f64::from(right[i]) * f64::from(right[i]);
+                                }
+                            }
+                            is_pos_short_per_gr[gr][sfb][win] = if self.version.is_lsf() {
+                                derive_intensity_position_lsf(l_energy, r_energy)
+                            } else {
+                                derive_intensity_position(l_energy, r_energy)
+                            };
+                            for k in 0..w {
+                                let i = win_base + k;
+                                if i < NUM_LINES {
+                                    left[i] += right[i];
+                                    right[i] = 0.0;
+                                }
+                            }
                         }
+                    }
+                    continue;
+                }
+                if short_intensity_gr[gr] {
+                    let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
+                    let left = &mut left_slice[0];
+                    let right = &mut right_slice[0];
+                    // Map the long-block `intensity_start_sfb` (1..=20,
+                    // the public API's only knob) onto a short-block
+                    // start band by frequency: the short band whose first
+                    // line is at or beyond the long start line. This
+                    // keeps the one user-facing bound consistent across
+                    // block types without a second API surface.
+                    let start_line = long_starts[start_sfb];
+                    let short_start = (0..12)
+                        .find(|&sfb| short_starts[sfb] >= start_line)
+                        .unwrap_or(12);
+                    // A short granule always couples (it shares the short
+                    // geometry); the per-window zero-part below the bound
+                    // is what makes the decoder's per-window bound
+                    // derivation land where intended.
+                    intensity_coupled_per_gr[gr] = short_start < 12;
+                    short_intensity_start_per_gr[gr] = short_start;
+                    for sfb in short_start..12 {
+                        let s = short_starts[sfb];
+                        let w = short_starts[sfb + 1] - short_starts[sfb];
+                        let base = 3 * s;
+                        for win in 0..3 {
+                            let mut l_energy = 0.0f64;
+                            let mut r_energy = 0.0f64;
+                            // Native bitstream layout (post-reorder):
+                            // band `sfb` window `win` occupies the
+                            // contiguous run `base + win·w .. base +
+                            // (win+1)·w`. Coupling is a per-line
+                            // operation, so deriving the position and
+                            // folding the magnitude over this run yields
+                            // exactly the spectrum the decoder rebuilds
+                            // from `scalefac_s[sfb][win]` after its
+                            // §2.4.3.4.8 reorder.
+                            let win_base = base + win * w;
+                            for k in 0..w {
+                                let i = win_base + k;
+                                if i < NUM_LINES {
+                                    l_energy += f64::from(left[i]) * f64::from(left[i]);
+                                    r_energy += f64::from(right[i]) * f64::from(right[i]);
+                                }
+                            }
+                            is_pos_short_per_gr[gr][sfb][win] = if self.version.is_lsf() {
+                                derive_intensity_position_lsf(l_energy, r_energy)
+                            } else {
+                                derive_intensity_position(l_energy, r_energy)
+                            };
+                            for k in 0..w {
+                                let i = win_base + k;
+                                if i < NUM_LINES {
+                                    left[i] += right[i];
+                                    right[i] = 0.0;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let is_pos_bands = &mut is_pos_per_gr[gr];
+                let (left_slice, right_slice) = xr_pre_per_gc[gr].split_at_mut(1);
+                let left = &mut left_slice[0];
+                let right = &mut right_slice[0];
+                // Per-granule effective start band. Fixed-bound modes
+                // couple `start_sfb..21` verbatim; the adaptive mode
+                // (`intensity_auto_threshold`) raises the bound to the
+                // lowest band whose contiguous high tail all carries
+                // little right-channel stereo information. `eff_start
+                // == 21` ⇒ this granule couples nothing (it keeps a
+                // full right channel and decodes as ordinary stereo).
+                let eff_start = match self.intensity_auto_threshold {
+                    Some(t) => choose_intensity_bound(left, right, starts, start_sfb, t),
+                    None => start_sfb,
+                };
+                // A granule whose adaptive bound reaches 21 couples
+                // nothing: its right channel keeps full spectral data
+                // and pass 2 must write it as an ordinary channel.
+                intensity_coupled_per_gr[gr] = eff_start < 21;
+                for (sfb, slot) in is_pos_bands.iter_mut().enumerate().skip(eff_start) {
+                    let lo = starts[sfb];
+                    let hi = starts[sfb + 1];
+                    let mut l_energy = 0.0f64;
+                    let mut r_energy = 0.0f64;
+                    for i in lo..hi {
+                        l_energy += f64::from(left[i]) * f64::from(left[i]);
+                        r_energy += f64::from(right[i]) * f64::from(right[i]);
+                    }
+                    *slot = if self.version.is_lsf() {
+                        derive_intensity_position_lsf(l_energy, r_energy)
+                    } else {
+                        derive_intensity_position(l_energy, r_energy)
+                    };
+                    for i in lo..hi {
+                        left[i] += right[i];
+                        right[i] = 0.0;
+                    }
+                }
+                // Partial top region above the last band boundary:
+                // no scalefactor slot exists for these lines
+                // (Table B.8 `scalefac_l` stops at `starts[21]`),
+                // so there is no position to transmit — couple the
+                // magnitude into the left channel anyway so the
+                // right channel's zero-part reaches the Nyquist
+                // rate (§2.4.3.4.9.1); the lines decode left-only.
+                //
+                // Skip the top region when the adaptive chooser
+                // coupled nothing (`eff_start == 21`): zeroing only
+                // the top lines while the rest of the right channel
+                // stays full would create a spurious left-only tail.
+                // A coupled-nothing granule must keep a complete
+                // right channel so the decoder's derived bound lands
+                // at band 21 and reconstructs plain stereo.
+                if eff_start < 21 {
+                    for i in starts[21]..NUM_LINES {
+                        left[i] += right[i];
+                        right[i] = 0.0;
                     }
                 }
             }
@@ -5358,9 +5358,9 @@ impl Mp3Encoder {
         // ---- Main-data assembly ----
         let mut header = self.header_template;
         header.padding = false; // initial; reservoir step decides
-                                // Per-frame mode_extension from the joint-stereo picker (no-op
-                                // for the unconditional `new_joint_stereo_ms` path — the
-                                // template already carries '10' there).
+        // Per-frame mode_extension from the joint-stereo picker (no-op
+        // for the unconditional `new_joint_stereo_ms` path — the
+        // template already carries '10' there).
         header.mode_extension = frame_mode_extension;
         let asm = assemble_main_data(&header, &mut side_info, &scalefactors, &gc_data)
             .map_err(|e| StreamEncodeError::Huffman(e.to_string()))?;
@@ -5565,7 +5565,7 @@ impl Mp3Encoder {
         // first-frame skip path).
         let mut written = 0usize;
         if let Some(template) = xing_template {
-            use crate::xing_info::{build_info_frame, flag_bit, XingTagSpec};
+            use crate::xing_info::{XingTagSpec, build_info_frame, flag_bit};
             // Fill in unresolved frames / bytes / toc fields per the
             // flag bits. Pre-set fields take precedence.
             let mut spec = XingTagSpec {
@@ -5804,12 +5804,12 @@ fn derive_intensity_position_lsf(l_energy: f64, r_energy: f64) -> u8 {
     //   p: 0    1    2    3    4    5    6
     //   ln(L'/R')/a: 0   -1   +1   -2   +2   -3   +3
     const A: f64 = std::f64::consts::LN_2 * 0.25; // ln(i0^-1)
-                                                  // Original target in the same log units. Guard the degenerate
-                                                  // energies: a silent right channel pans fully left (largest grid
-                                                  // ratio, p = 6); a silent left channel pans fully right (p = 5,
-                                                  // the smallest grid ratio i0³). A fully-silent band decodes to
-                                                  // zero under any position, so its value is immaterial — fall into
-                                                  // the r_energy <= 0 branch (p = 6) by convention.
+    // Original target in the same log units. Guard the degenerate
+    // energies: a silent right channel pans fully left (largest grid
+    // ratio, p = 6); a silent left channel pans fully right (p = 5,
+    // the smallest grid ratio i0³). A fully-silent band decodes to
+    // zero under any position, so its value is immaterial — fall into
+    // the r_energy <= 0 branch (p = 6) by convention.
     if r_energy <= 0.0 {
         return 6;
     }
@@ -6386,7 +6386,7 @@ mod tests {
     fn lossless_chain_finds_unit_gain_scale_factor() {
         use crate::alias::alias_reduce;
         use crate::imdct::imdct_granule;
-        use crate::synth::{synth_granule, PCM_PER_GRANULE};
+        use crate::synth::{PCM_PER_GRANULE, synth_granule};
 
         // Feed 5 granules of a known-amplitude signal so the
         // filterbank states warm up.
@@ -6469,7 +6469,7 @@ mod tests {
         use crate::alias::alias_reduce;
         use crate::imdct::imdct_granule;
         use crate::requantize::requantize;
-        use crate::synth::{synth_granule, PCM_PER_GRANULE};
+        use crate::synth::{PCM_PER_GRANULE, synth_granule};
 
         const G: usize = 12; // 12 granules total, warm-up ~5
         const SR: u32 = 44_100;
@@ -6667,7 +6667,7 @@ mod tests {
 
         // Wire protection bit is set on every CRC-enabled audio frame.
         // Walk the stream and verify.
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
         let frames_crc: Vec<_> = FrameWalker::new(&out_crc).collect();
         for f in &frames_crc {
             let hdr = parse_header(&f.data[..4]).unwrap();
@@ -6702,7 +6702,7 @@ mod tests {
         let mut out = Vec::new();
         enc.finish(&mut out).unwrap();
 
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
         let frames: Vec<_> = FrameWalker::new(&out).collect();
         // 4 frames of 1152 samples each — and the stream encoder may
         // round up by one to absorb tail PCM, so 4..=5 is the safe
@@ -6791,7 +6791,7 @@ mod tests {
     /// audio frame's header carries `mode_extension = '10'`.
     #[test]
     fn auto_ms_picker_correlated_input_chooses_ms() {
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
         use std::f32::consts::PI;
 
         const SR: u32 = 44_100;
@@ -6837,7 +6837,7 @@ mod tests {
     /// frame's header carries `mode_extension = '00'`.
     #[test]
     fn auto_ms_picker_anticorrelated_input_chooses_lr() {
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
         use std::f32::consts::PI;
 
         const SR: u32 = 44_100;
@@ -6889,7 +6889,7 @@ mod tests {
     /// produces `E_S = 0` and slips below.
     #[test]
     fn auto_ms_picker_zero_threshold_forces_lr_on_any_side_energy() {
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
         use std::f32::consts::PI;
 
         const SR: u32 = 44_100;
@@ -7645,7 +7645,7 @@ mod tests {
         // stream: every frame parses, and the per-granule analysis
         // leaves a signal-dependent per-band threshold installed
         // (the last granule's `xmin`) after the run.
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
         let mut enc =
             Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
                 .unwrap();
@@ -7914,8 +7914,8 @@ mod tests {
         // decision is `attack == false` and every emitted granule is a
         // Long block — the §C.1.5.2 scheduler never leaves Long without
         // an attack ahead.
-        use crate::frame::{parse_header, FrameWalker};
-        use crate::side_info::{parse_side_info, BlockType};
+        use crate::frame::{FrameWalker, parse_header};
+        use crate::side_info::{BlockType, parse_side_info};
         let mut enc =
             Mp3Encoder::new_with_outer_loop(128, 44_100, ChannelMode::SingleChannel, 1.0e6)
                 .unwrap();
@@ -7962,8 +7962,8 @@ mod tests {
         // any signal regardless of whether `pe > 1800` ever fires, and
         // confirms the Model-2-driven scheduler produces self-consistent
         // window geometry rather than arbitrary per-granule types.
-        use crate::frame::{parse_header, FrameWalker};
-        use crate::side_info::{parse_side_info, BlockType};
+        use crate::frame::{FrameWalker, parse_header};
+        use crate::side_info::{BlockType, parse_side_info};
         let rate = 44_100;
         let total = SAMPLES_PER_FRAME_MPEG1 * 6;
         let pcm: Vec<i16> = (0..total)
@@ -8018,7 +8018,7 @@ mod tests {
         // detector — governs the emitted window geometry, across frame
         // boundaries (the scheduler state carries between frames).
         use crate::block_type_sm::BlockTypeStateMachine;
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
         use crate::side_info::parse_side_info;
         let rate = 44_100;
         let nframes = 5;
@@ -8028,7 +8028,11 @@ mod tests {
                 .map(|j| {
                     let i = fi * SAMPLES_PER_FRAME_MPEG1 + j;
                     let t = i as f64 / f64::from(rate);
-                    let gate = if (i / 350) % 2 == 0 { 1.0 } else { 0.03 };
+                    let gate = if (i / 350).is_multiple_of(2) {
+                        1.0
+                    } else {
+                        0.03
+                    };
                     let s = (2.0 * core::f64::consts::PI * 9000.0 * t).sin();
                     (9000.0 * gate * s) as i16
                 })
@@ -8193,7 +8197,7 @@ mod tests {
         // of each granule on the same window geometry (the §2.4.3.4.9
         // channel agreement the OR-fold enforces). Encoding the same PCM
         // twice yields byte-identical output (determinism).
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
         use crate::side_info::parse_side_info;
         let rate = 44_100;
         let total = SAMPLES_PER_FRAME_MPEG1 * 6;
@@ -8276,7 +8280,7 @@ mod tests {
         // a clone and never captured, so we assert only gr 0, whose
         // §C.1.5.2 companion is the captured gr 1 attack flag.
         use crate::block_type_sm::BlockTypeStateMachine;
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
         use crate::side_info::parse_side_info;
         let rate = 44_100;
         // One frame of audio plus one lookahead granule so exactly one

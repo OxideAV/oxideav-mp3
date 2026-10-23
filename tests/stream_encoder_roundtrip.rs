@@ -21,10 +21,9 @@ use std::io::Cursor;
 
 use oxideav_core::Demuxer;
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, pcm_f32_to_i16, requantize, synth_granule, ChannelMode, FrameWalker,
-    ImdctState, MainDataReader, Mp3Demuxer, Mp3Encoder, MpegVersion, Reservoir, SynthState,
-    PCM_PER_GRANULE,
+    ChannelMode, FrameWalker, ImdctState, MainDataReader, Mp3Demuxer, Mp3Encoder, MpegVersion,
+    PCM_PER_GRANULE, Reservoir, SynthState, alias_reduce, decode_huffman, decode_scalefactors,
+    imdct_granule, parse_header, parse_side_info, pcm_f32_to_i16, requantize, synth_granule,
 };
 
 /// Synthesise an `n`-sample mono `i16` sine tone of `freq_hz` at
@@ -136,7 +135,7 @@ fn decode_scalefactors_until(
 ) -> Option<usize> {
     // Replicates the loop inside `decode_scalefactors` but stops at the
     // requested gc and reports its part2 bit length.
-    use oxideav_mp3::{lsf_scale_params, BlockType, MPEG1_SLEN};
+    use oxideav_mp3::{BlockType, MPEG1_SLEN, lsf_scale_params};
     let mut r = MainDataReader::new(run);
     let _ = lsf_scale_params; // re-export keep-alive
     let prev_g0_sf: [Option<oxideav_mp3::ScaleFactors>; 2] = [None, None];

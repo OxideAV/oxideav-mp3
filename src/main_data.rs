@@ -87,10 +87,10 @@
 //! at offset 0 and extending through the byte at offset `L_i - 1`.
 
 use crate::frame::{Mp3FrameHeader, MpegVersion};
-use crate::huffman::{emit_huffman, encoder_region_boundaries, HuffmanEncodeError, NUM_LINES};
+use crate::huffman::{HuffmanEncodeError, NUM_LINES, emit_huffman, encoder_region_boundaries};
 use crate::scalefactors::{
-    is_intensity_stereo, write_lsf_channel, write_mpeg1_granule_channel, FrameScaleFactors,
-    MainDataWriter, ScaleFactors,
+    FrameScaleFactors, MainDataWriter, ScaleFactors, is_intensity_stereo, write_lsf_channel,
+    write_mpeg1_granule_channel,
 };
 use crate::side_info::SideInfo;
 

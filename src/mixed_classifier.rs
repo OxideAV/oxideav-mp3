@@ -93,7 +93,7 @@
 
 #[cfg(test)]
 use crate::attack_detect::SAMPLES_PER_SUBFRAME;
-use crate::attack_detect::{granule_subframe_energies, SILENCE_FLOOR};
+use crate::attack_detect::{SILENCE_FLOOR, granule_subframe_energies};
 use crate::stream_encoder::SAMPLES_PER_GRANULE;
 
 /// Default low-band stability threshold: the maximum allowed ratio

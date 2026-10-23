@@ -16,8 +16,8 @@
 //!   [`oxideav_mp3::Mp3FrameHeader::crc_protected`]).
 
 use oxideav_mp3::{
-    crc::crc16_layer3, parse_header, parse_side_info, ChannelMode, FrameWalker, Mp3Encoder,
-    SAMPLES_PER_FRAME_MPEG1,
+    ChannelMode, FrameWalker, Mp3Encoder, SAMPLES_PER_FRAME_MPEG1, crc::crc16_layer3, parse_header,
+    parse_side_info,
 };
 
 /// Synthesise an `n`-sample mono `i16` silence buffer (every sample
@@ -143,7 +143,7 @@ fn crc_enabled_stream_decodes_via_existing_decoder() {
                     // but for true silence input the energy is bounded
                     // tight). Confirm finite values and a low cap.
                     for plane in &a.data {
-                        for chunk in plane.chunks_exact(2) {
+                        for chunk in plane.as_chunks::<2>().0 {
                             let s = i16::from_le_bytes([chunk[0], chunk[1]]);
                             assert!(
                                 s.unsigned_abs() < 8000,

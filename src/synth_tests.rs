@@ -576,7 +576,7 @@ fn synth_row_interchanged_matrixing_matches_reference() {
     for row in 0..200 {
         let mut s = [0.0f64; NUM_SUBBANDS];
         for v in s.iter_mut() {
-            if xorshift32_r409(&mut rng) % 6 != 0 {
+            if !xorshift32_r409(&mut rng).is_multiple_of(6) {
                 *v = random_f64_r409(&mut rng);
             }
         }

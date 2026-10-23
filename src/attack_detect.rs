@@ -499,11 +499,7 @@ mod tests {
         let mut g1 = [0.0f32; SAMPLES_PER_GRANULE];
         for (i, slot) in g1.iter_mut().enumerate() {
             *slot = if i < SAMPLES_PER_SUBFRAME {
-                if i % 7 == 0 {
-                    1.0e-4
-                } else {
-                    -1.0e-4
-                }
+                if i % 7 == 0 { 1.0e-4 } else { -1.0e-4 }
             } else if i % 2 == 0 {
                 0.5
             } else {
@@ -1134,7 +1130,13 @@ mod tests {
         });
         let mut fires = 0usize;
         let mut g = [0.0f32; SAMPLES_PER_GRANULE];
-        for (idx, chunk) in row.pcm.chunks_exact(SAMPLES_PER_GRANULE).enumerate() {
+        for (idx, chunk) in row
+            .pcm
+            .as_chunks::<SAMPLES_PER_GRANULE>()
+            .0
+            .iter()
+            .enumerate()
+        {
             g.copy_from_slice(chunk);
             let flagged = det.classify(&g);
             if idx >= 1 && flagged {
@@ -1376,7 +1378,13 @@ mod tests {
         });
         let mut fires = 0usize;
         let mut g = [0.0f32; SAMPLES_PER_GRANULE];
-        for (idx, chunk) in row.pcm.chunks_exact(SAMPLES_PER_GRANULE).enumerate() {
+        for (idx, chunk) in row
+            .pcm
+            .as_chunks::<SAMPLES_PER_GRANULE>()
+            .0
+            .iter()
+            .enumerate()
+        {
             g.copy_from_slice(chunk);
             let flagged = det.classify(&g);
             if idx >= 1 && flagged {

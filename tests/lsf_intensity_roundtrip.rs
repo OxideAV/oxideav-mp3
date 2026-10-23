@@ -20,10 +20,10 @@
 use std::f32::consts::PI;
 
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, lsf_scale_params,
-    parse_header, parse_side_info, pcm_f32_to_i16, process_stereo, reorder, requantize,
-    synth_granule, BlockType, ChannelMode, FrameWalker, GranuleChannel, ImdctState, MainDataReader,
-    Mp3Encoder, MpegVersion, Reservoir, StreamEncodeError, SynthState, PCM_PER_GRANULE,
+    BlockType, ChannelMode, FrameWalker, GranuleChannel, ImdctState, MainDataReader, Mp3Encoder,
+    MpegVersion, PCM_PER_GRANULE, Reservoir, StreamEncodeError, SynthState, alias_reduce,
+    decode_huffman, decode_scalefactors, imdct_granule, lsf_scale_params, parse_header,
+    parse_side_info, pcm_f32_to_i16, process_stereo, reorder, requantize, synth_granule,
 };
 
 /// Synthesise an `n`-sample mono `i16` sine tone.

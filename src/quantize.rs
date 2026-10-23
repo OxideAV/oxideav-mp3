@@ -60,7 +60,7 @@
 
 use crate::frame::MpegVersion;
 use crate::requantize::{
-    long_band_starts, scalefac_multiplier, short_band_starts, NUM_LINES, PRETAB,
+    NUM_LINES, PRETAB, long_band_starts, scalefac_multiplier, short_band_starts,
 };
 use crate::scalefactors::ScaleFactors;
 use crate::side_info::{BlockType, GranuleChannel};
@@ -115,11 +115,7 @@ pub(crate) fn quantize_line(xr: f32, factor: f32) -> i32 {
     }
     let abs_quot = (xr.abs() / factor).max(0.0);
     let mag = quantize_magnitude(abs_quot);
-    if xr < 0.0 {
-        -mag
-    } else {
-        mag
-    }
+    if xr < 0.0 { -mag } else { mag }
 }
 
 /// Quantize one granule-channel's 576 target float frequency lines `xr[]`

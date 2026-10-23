@@ -751,7 +751,7 @@ fn own_decode(bytes: &[u8], channels: u16, sample_rate: u32) -> Vec<Vec<f32>> {
                 Ok(Frame::Audio(a)) => {
                     assert_eq!(a.data.len(), channels as usize, "plane count");
                     for (ch, plane) in a.data.iter().enumerate() {
-                        for chunk in plane.chunks_exact(2) {
+                        for chunk in plane.as_chunks::<2>().0 {
                             let v = i16::from_le_bytes([chunk[0], chunk[1]]);
                             out[ch].push(f32::from(v) / 32768.0);
                         }
@@ -810,7 +810,7 @@ fn read_wav_s16(path: &Path) -> (u16, u32, Vec<f32>) {
             }
             b"data" => {
                 assert!(channels > 0, "fmt chunk must precede data");
-                for chunk in body.chunks_exact(2) {
+                for chunk in body.as_chunks::<2>().0 {
                     let v = i16::from_le_bytes([chunk[0], chunk[1]]);
                     data.push(f32::from(v) / 32768.0);
                 }

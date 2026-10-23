@@ -31,7 +31,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, Decoder, Demuxer, Error, Frame, Packet, RuntimeContext, SampleFormat,
 };
-use oxideav_mp3::{parse_header, ChannelMode, Mp3Demuxer, Mp3Encoder};
+use oxideav_mp3::{ChannelMode, Mp3Demuxer, Mp3Encoder, parse_header};
 
 use std::f32::consts::PI;
 use std::io::Cursor;
@@ -113,7 +113,7 @@ fn decode_packets(packets: &[Packet], sample_rate: u32, channels: u16) -> Vec<i1
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     for plane in &a.data {
-                        for chunk in plane.chunks_exact(2) {
+                        for chunk in plane.as_chunks::<2>().0 {
                             out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                         }
                     }

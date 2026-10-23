@@ -33,8 +33,8 @@
 
 use crate::frame::{ChannelMode, Emphasis, Layer, ModeExtension, Mp3FrameHeader, MpegVersion};
 use crate::side_info::{
-    BlockType, GranuleChannel, SideInfo, GRANULES, GRANULES_LSF, SIDE_INFO_BYTES_LSF_MONO,
-    SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO, SIDE_INFO_BYTES_STEREO,
+    BlockType, GRANULES, GRANULES_LSF, GranuleChannel, SIDE_INFO_BYTES_LSF_MONO,
+    SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO, SIDE_INFO_BYTES_STEREO, SideInfo,
 };
 
 /// A most-significant-bit-first bit writer over a growing byte buffer.

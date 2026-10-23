@@ -34,12 +34,12 @@
 //! Run with:
 //!     cargo bench -p oxideav-mp3 --bench decode_stages
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_mp3::frame::{ChannelMode, FrameWalker, Mp3FrameHeader, MpegVersion};
 use oxideav_mp3::imdct::{ImdctState, SAMPLES_PER_SUBBAND};
-use oxideav_mp3::scalefactors::{decode_scalefactors, MainDataReader, Reservoir, ScaleFactors};
-use oxideav_mp3::side_info::{parse_side_info, GranuleChannel};
+use oxideav_mp3::scalefactors::{MainDataReader, Reservoir, ScaleFactors, decode_scalefactors};
+use oxideav_mp3::side_info::{GranuleChannel, parse_side_info};
 use oxideav_mp3::stream_encoder::Mp3Encoder;
 use oxideav_mp3::synth::SynthState;
 use oxideav_mp3::{

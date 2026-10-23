@@ -468,11 +468,7 @@ pub fn lsf_scale_params(
     //   1 => block_type==2 (short), mixed_block_flag==0  ('10', mbf 0)
     //   2 => block_type==2 (short), mixed_block_flag==1  ('10', mbf 1)
     let row = if block_type == BlockType::Short {
-        if mixed_block_flag {
-            2
-        } else {
-            1
-        }
+        if mixed_block_flag { 2 } else { 1 }
     } else {
         0
     };
@@ -568,11 +564,7 @@ pub fn lsf_scale_params(
 /// (ISO/IEC 11172-3 §2.4.2.7).
 #[must_use]
 pub fn mpeg1_long_band_slen(sfb: usize, slen1: u8, slen2: u8) -> u8 {
-    if sfb <= 10 {
-        slen1
-    } else {
-        slen2
-    }
+    if sfb <= 10 { slen1 } else { slen2 }
 }
 
 /// Read the MPEG-1 scalefactors for one granule/channel from `r`,
@@ -1080,7 +1072,7 @@ mod tests {
             self.bits.push(u8::from(b));
         }
         fn finish(mut self) -> Vec<u8> {
-            while self.bits.len() % 8 != 0 {
+            while !self.bits.len().is_multiple_of(8) {
                 self.bits.push(0);
             }
             self.bits

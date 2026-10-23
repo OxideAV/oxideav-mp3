@@ -94,15 +94,15 @@ use oxideav_core::{
 use crate::alias::alias_reduce;
 use crate::codec_encoder::make_encoder;
 use crate::demuxer::{CODEC_ID_STR, WAVE_FORMAT_MP3};
-use crate::frame::{parse_header, Layer, Mp3FrameHeader, MpegVersion};
+use crate::frame::{Layer, Mp3FrameHeader, MpegVersion, parse_header};
 use crate::huffman::decode_huffman;
-use crate::imdct::{imdct_granule, ImdctState};
+use crate::imdct::{ImdctState, imdct_granule};
 use crate::reorder::reorder;
 use crate::requantize::requantize;
-use crate::scalefactors::{decode_scalefactors, MainDataReader, Reservoir};
+use crate::scalefactors::{MainDataReader, Reservoir, decode_scalefactors};
 use crate::side_info::parse_side_info;
 use crate::stream_encoder::SAMPLES_PER_FRAME_MPEG1;
-use crate::synth::{pcm_f32_to_i16, synth_granule, SynthState, PCM_PER_GRANULE};
+use crate::synth::{PCM_PER_GRANULE, SynthState, pcm_f32_to_i16, synth_granule};
 
 /// Build a boxed MPEG-1 / MPEG-2 LSF Audio Layer III [`Decoder`] from
 /// `params`.
@@ -733,7 +733,7 @@ mod tests {
                     Ok(Frame::Audio(a)) => {
                         // Mono frame: data[0] is the interleaved S16
                         // byte run (interleaved == planar for mono).
-                        for chunk in a.data[0].chunks_exact(2) {
+                        for chunk in a.data[0].as_chunks::<2>().0 {
                             trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                         }
                     }
@@ -750,7 +750,7 @@ mod tests {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
+                    for chunk in a.data[0].as_chunks::<2>().0 {
                         trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }
@@ -835,7 +835,7 @@ mod tests {
             loop {
                 match dec.receive_frame() {
                     Ok(Frame::Audio(a)) => {
-                        for chunk in a.data[0].chunks_exact(2) {
+                        for chunk in a.data[0].as_chunks::<2>().0 {
                             trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                         }
                     }
@@ -931,12 +931,12 @@ mod tests {
             dec.send_packet(pkt).expect("send_packet (reset)");
             dec2.send_packet(pkt).expect("send_packet (fresh)");
             while let Ok(Frame::Audio(af)) = dec.receive_frame() {
-                for chunk in af.data[0].chunks_exact(2) {
+                for chunk in af.data[0].as_chunks::<2>().0 {
                     a.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
             }
             while let Ok(Frame::Audio(af)) = dec2.receive_frame() {
-                for chunk in af.data[0].chunks_exact(2) {
+                for chunk in af.data[0].as_chunks::<2>().0 {
                     b.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
             }
@@ -1018,7 +1018,7 @@ mod tests {
             loop {
                 match dec.receive_frame() {
                     Ok(Frame::Audio(a)) => {
-                        for chunk in a.data[0].chunks_exact(2) {
+                        for chunk in a.data[0].as_chunks::<2>().0 {
                             trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                         }
                     }
@@ -1032,7 +1032,7 @@ mod tests {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
+                    for chunk in a.data[0].as_chunks::<2>().0 {
                         trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }
@@ -1101,7 +1101,7 @@ mod tests {
             loop {
                 match dec.receive_frame() {
                     Ok(Frame::Audio(a)) => {
-                        for chunk in a.data[0].chunks_exact(2) {
+                        for chunk in a.data[0].as_chunks::<2>().0 {
                             trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                         }
                     }
@@ -1115,7 +1115,7 @@ mod tests {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
+                    for chunk in a.data[0].as_chunks::<2>().0 {
                         trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }

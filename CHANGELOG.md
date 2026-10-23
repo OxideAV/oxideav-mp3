@@ -98,6 +98,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - `StreamEncodeError::LsfUnsupported` / `MixedBlocks8kUnsupported`
   docs and `Display` texts now say the variants are historical and
   no longer returned (r287 made the auto block-type walk

@@ -28,10 +28,9 @@ use oxideav_core::{
     CodecId, CodecParameters, Decoder, Error, Frame, Packet, RuntimeContext, SampleFormat, TimeBase,
 };
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, pcm_f32_to_i16, requantize, synth_granule, ChannelMode, FrameWalker,
-    ImdctState, MainDataReader, Mp3Encoder, Reservoir, SynthState, PCM_PER_GRANULE,
-    SAMPLES_PER_FRAME_MPEG1,
+    ChannelMode, FrameWalker, ImdctState, MainDataReader, Mp3Encoder, PCM_PER_GRANULE, Reservoir,
+    SAMPLES_PER_FRAME_MPEG1, SynthState, alias_reduce, decode_huffman, decode_scalefactors,
+    imdct_granule, parse_header, parse_side_info, pcm_f32_to_i16, requantize, synth_granule,
 };
 
 fn sine_pcm(n: usize, freq_hz: f32, sr: f32, amp: f32) -> Vec<i16> {
@@ -207,7 +206,7 @@ fn registry_decoder_byte_exact_against_direct_chain() {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
+                    for chunk in a.data[0].as_chunks::<2>().0 {
                         trait_out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }

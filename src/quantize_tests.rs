@@ -405,7 +405,7 @@ fn quantize_hoisted_band_factor_matches_per_line() {
             let mut xr = [0.0f32; NUM_LINES];
             for v in xr.iter_mut() {
                 let r = xorshift32_test(&mut rng);
-                if r % 5 == 0 {
+                if r.is_multiple_of(5) {
                     *v = 0.0;
                 } else {
                     // Magnitudes spanning ~2^-20 .. 2^+20, both signs.

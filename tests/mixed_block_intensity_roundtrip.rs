@@ -36,10 +36,10 @@
 use std::f32::consts::PI;
 
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, pcm_f32_to_i16, process_stereo, reorder, requantize, synth_granule, BlockType,
-    ChannelMode, FrameWalker, ImdctState, MainDataReader, Mp3Encoder, Reservoir, SynthState,
-    NUM_LINES, PCM_PER_GRANULE,
+    BlockType, ChannelMode, FrameWalker, ImdctState, MainDataReader, Mp3Encoder, NUM_LINES,
+    PCM_PER_GRANULE, Reservoir, SynthState, alias_reduce, decode_huffman, decode_scalefactors,
+    imdct_granule, parse_header, parse_side_info, pcm_f32_to_i16, process_stereo, reorder,
+    requantize, synth_granule,
 };
 
 const SR: u32 = 44_100;

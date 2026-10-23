@@ -1139,7 +1139,7 @@ mod tests {
         // frames with the §2.4.2.3 sync word. Confirms the per-band
         // outer-loop dispatch wires through the trait wrapper without
         // changing the wire shape.
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
 
         let p = build_params(44_100, 128_000);
         let mut enc = make_encoder_with_threshold_in_quiet(&p).expect("ltq factory");
@@ -1204,7 +1204,7 @@ mod tests {
         // End-to-end sanity for the custom-offset variant: encoded
         // stream parses cleanly as MPEG-1 Layer III frames at the
         // requested sample rate.
-        use crate::frame::{parse_header, FrameWalker};
+        use crate::frame::{FrameWalker, parse_header};
 
         let p = build_params(44_100, 128_000);
         let mut enc =

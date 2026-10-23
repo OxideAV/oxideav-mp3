@@ -47,8 +47,8 @@ use oxideav_core::{
     CodecId, CodecParameters, Decoder, Demuxer, Error, Frame, RuntimeContext, SampleFormat,
 };
 use oxideav_mp3::{
-    assemble_main_data, make_silent_header, silent_side_info, write_header, write_side_info,
     BlockType, ChannelMode, FrameScaleFactors, GranuleChannelData, Mp3Demuxer, ScaleFactors,
+    assemble_main_data, make_silent_header, silent_side_info, write_header, write_side_info,
 };
 
 /// Decode a stream through the production demuxer + trait decoder.
@@ -72,7 +72,7 @@ fn own_decode(bytes: &[u8], sample_rate: u32) -> Vec<f32> {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    for chunk in a.data[0].chunks_exact(2) {
+                    for chunk in a.data[0].as_chunks::<2>().0 {
                         let v = i16::from_le_bytes([chunk[0], chunk[1]]);
                         out.push(f32::from(v) / 32768.0);
                     }

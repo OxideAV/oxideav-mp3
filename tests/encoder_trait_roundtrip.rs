@@ -31,9 +31,9 @@ use oxideav_core::{
     SampleFormat,
 };
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, pcm_f32_to_i16, requantize, synth_granule, FrameWalker, ImdctState,
-    MainDataReader, Mp3Demuxer, Reservoir, SynthState, PCM_PER_GRANULE, SAMPLES_PER_FRAME_MPEG1,
+    FrameWalker, ImdctState, MainDataReader, Mp3Demuxer, PCM_PER_GRANULE, Reservoir,
+    SAMPLES_PER_FRAME_MPEG1, SynthState, alias_reduce, decode_huffman, decode_scalefactors,
+    imdct_granule, parse_header, parse_side_info, pcm_f32_to_i16, requantize, synth_granule,
 };
 
 /// Synthesise `n` mono `i16` samples of a sine tone.

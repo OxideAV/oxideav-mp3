@@ -53,7 +53,7 @@
 
 use crate::frame::MpegVersion;
 use crate::huffman::NUM_LINES;
-use crate::mdct::{mdct, window_short_analysis, MdctState, LONG_N, SHORT_N};
+use crate::mdct::{LONG_N, MdctState, SHORT_N, mdct, window_short_analysis};
 use crate::requantize::short_band_starts;
 use crate::side_info::{BlockType, GranuleChannel};
 
@@ -236,7 +236,7 @@ pub const fn short_block_region_defaults() -> (u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::imdct::{imdct_granule, ImdctState};
+    use crate::imdct::{ImdctState, imdct_granule};
     use crate::mdct::MdctState;
     use crate::reorder::reorder;
     use crate::side_info::GranuleChannel;

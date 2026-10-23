@@ -23,8 +23,8 @@ use std::process::Command;
 
 use oxideav_core::Demuxer;
 use oxideav_mp3::{
-    encode_silent_frame, make_silent_header, parse_header, parse_side_info, ChannelMode,
-    FrameWalker, Mp3Demuxer, MpegVersion,
+    ChannelMode, FrameWalker, Mp3Demuxer, MpegVersion, encode_silent_frame, make_silent_header,
+    parse_header, parse_side_info,
 };
 
 /// Build a CBR silent stream of `n` frames at the given parameters.
@@ -173,7 +173,9 @@ fn ffmpeg_accepts_and_decodes_to_silence() {
     assert_eq!(pcm.len() % 2, 0, "PCM byte length not 16-bit aligned");
 
     let max_abs = pcm
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs())
         .max()
         .unwrap_or(0);

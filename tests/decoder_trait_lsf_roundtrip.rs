@@ -43,21 +43,16 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, RuntimeContext, SampleFormat, TimeBase,
 };
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
+    ChannelMode, FrameWalker, ImdctState, MainDataReader, MpegVersion, PCM_PER_GRANULE, Reservoir,
+    SynthState, alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
     parse_side_info, pcm_f32_to_i16, process_stereo, reorder, requantize, synth_granule,
-    ChannelMode, FrameWalker, ImdctState, MainDataReader, MpegVersion, Reservoir, SynthState,
-    PCM_PER_GRANULE,
 };
 
 /// Locate the LSF fixture relative to the crate root. Returns `None`
 /// when the workspace `docs/` tree is absent (standalone-crate CI).
 fn lsf_fixture_path() -> Option<PathBuf> {
     let p = PathBuf::from("../../docs/audio/mp3/fixtures/layer3-mpeg2-22050-64kbps/input.mp3");
-    if p.exists() {
-        Some(p)
-    } else {
-        None
-    }
+    if p.exists() { Some(p) } else { None }
 }
 
 /// Reference per-channel direct decode. Mirrors `decode_stereo_direct`
@@ -204,10 +199,10 @@ fn trait_decode_lsf_stereo(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
                         2 * (a.samples as usize),
                         "plane bytes = 2 × sample count (S16 LE)"
                     );
-                    for chunk in a.data[0].chunks_exact(2) {
+                    for chunk in a.data[0].as_chunks::<2>().0 {
                         out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
-                    for chunk in a.data[1].chunks_exact(2) {
+                    for chunk in a.data[1].as_chunks::<2>().0 {
                         out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }
@@ -221,10 +216,10 @@ fn trait_decode_lsf_stereo(bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                for chunk in a.data[0].chunks_exact(2) {
+                for chunk in a.data[0].as_chunks::<2>().0 {
                     out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
-                for chunk in a.data[1].chunks_exact(2) {
+                for chunk in a.data[1].as_chunks::<2>().0 {
                     out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
             }
@@ -352,20 +347,20 @@ fn registry_built_decoder_handles_lsf_stereo_packets() {
         while let Ok(Frame::Audio(a)) = dec.receive_frame() {
             assert_eq!(a.data.len(), 2);
             assert_eq!(a.samples as usize, PCM_PER_GRANULE);
-            for chunk in a.data[0].chunks_exact(2) {
+            for chunk in a.data[0].as_chunks::<2>().0 {
                 out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
-            for chunk in a.data[1].chunks_exact(2) {
+            for chunk in a.data[1].as_chunks::<2>().0 {
                 out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
         }
     }
     dec.flush().expect("flush");
     while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-        for chunk in a.data[0].chunks_exact(2) {
+        for chunk in a.data[0].as_chunks::<2>().0 {
             out_l.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
-        for chunk in a.data[1].chunks_exact(2) {
+        for chunk in a.data[1].as_chunks::<2>().0 {
             out_r.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
     }

@@ -673,7 +673,7 @@ mod tests {
         }
         /// Pad to a byte boundary with zeros and pack to bytes.
         fn finish(mut self) -> Vec<u8> {
-            while self.bits.len() % 8 != 0 {
+            while !self.bits.len().is_multiple_of(8) {
                 self.bits.push(0);
             }
             self.bits
@@ -822,7 +822,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.put(123, 9); // main_data_begin
         w.put(0b10101, 5); // private_bits (5 bits in mono)
-                           // scfsi[0][0..4]
+        // scfsi[0][0..4]
         w.put_bool(true);
         w.put_bool(false);
         w.put_bool(true);
@@ -903,7 +903,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.put(0x1FF, 9); // main_data_begin = 511 (max 9-bit)
         w.put(0b101, 3); // private_bits (3 bits in stereo)
-                         // scfsi[ch][band] for two channels
+        // scfsi[ch][band] for two channels
         for band in 0..4 {
             w.put_bool(band % 2 == 0); // ch0: T,F,T,F
         }
@@ -923,9 +923,9 @@ mod tests {
                     [tag % 32, (tag + 1) % 32, (tag + 2) % 32],
                     tag % 16,
                     tag % 8,
-                    tag % 2 == 0,
-                    tag % 3 == 0,
-                    tag % 5 == 0,
+                    tag.is_multiple_of(2),
+                    tag.is_multiple_of(3),
+                    tag.is_multiple_of(5),
                 );
                 tag += 1;
             }
@@ -959,9 +959,9 @@ mod tests {
                 );
                 assert_eq!(g.region0_count, (tag % 16) as u8);
                 assert_eq!(g.region1_count, (tag % 8) as u8);
-                assert_eq!(g.preflag, tag % 2 == 0);
-                assert_eq!(g.scalefac_scale, tag % 3 == 0);
-                assert_eq!(g.count1table_select, tag % 5 == 0);
+                assert_eq!(g.preflag, tag.is_multiple_of(2));
+                assert_eq!(g.scalefac_scale, tag.is_multiple_of(3));
+                assert_eq!(g.count1table_select, tag.is_multiple_of(5));
                 assert!(!g.window_switching_flag);
                 tag += 1;
             }
@@ -1255,8 +1255,8 @@ mod tests {
         let mut w = BitWriter::new();
         w.put(200, 8); // main_data_begin (8 bits in LSF)
         w.put_bool(true); // private_bits (1 bit in mono LSF)
-                          // no scfsi field in LSF
-                          // single granule, channel 0
+        // no scfsi field in LSF
+        // single granule, channel 0
         put_lsf_long_channel(
             &mut w,
             511,         // part2_3_length
@@ -1309,7 +1309,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.put(0xFF, 8); // main_data_begin = 255 (max 8-bit)
         w.put(0b10, 2); // private_bits (2 bits in stereo LSF)
-                        // single granule, two channels, distinct values
+        // single granule, two channels, distinct values
         put_lsf_long_channel(&mut w, 100, 20, 60, 300, [1, 2, 3], 5, 2, false, true);
         put_lsf_long_channel(&mut w, 250, 40, 90, 130, [4, 5, 6], 9, 6, true, false);
         let bytes = w.finish();

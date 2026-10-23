@@ -52,10 +52,10 @@
 use std::f32::consts::PI;
 
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, pcm_f32_to_i16, process_stereo, reorder, requantize, synth_granule, BlockType,
-    ChannelMode, FrameWalker, ImdctState, MainDataReader, Mp3Encoder, Reservoir, StreamEncodeError,
-    SynthState, DEFAULT_ATTACK_THRESHOLD, NUM_LINES, PCM_PER_GRANULE,
+    BlockType, ChannelMode, DEFAULT_ATTACK_THRESHOLD, FrameWalker, ImdctState, MainDataReader,
+    Mp3Encoder, NUM_LINES, PCM_PER_GRANULE, Reservoir, StreamEncodeError, SynthState, alias_reduce,
+    decode_huffman, decode_scalefactors, imdct_granule, parse_header, parse_side_info,
+    pcm_f32_to_i16, process_stereo, reorder, requantize, synth_granule,
 };
 
 const SR: u32 = 44_100;
@@ -269,9 +269,10 @@ fn auto_ms_intensity_api_acceptance() {
 
     // Accepted on the auto-MS (picker) + intensity encoder too.
     let mut auto = Mp3Encoder::new_joint_stereo_auto_is(BR, SR, START_SFB).expect("auto+is");
-    assert!(auto
-        .enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
-        .is_ok());
+    assert!(
+        auto.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+            .is_ok()
+    );
 
     // Accepted on the intensity-only path too (r308): arming intensity
     // coupling forces the §2.4.3.4.9 channel-agreement OR-fold in the
@@ -279,9 +280,11 @@ fn auto_ms_intensity_api_acceptance() {
     // channels), so L/R block types stay consistent and the per-window /
     // long intensity coupling is well-defined.
     let mut is_only = Mp3Encoder::new_joint_stereo_is(BR, SR, START_SFB).expect("is-only");
-    assert!(is_only
-        .enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
-        .is_ok());
+    assert!(
+        is_only
+            .enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
+            .is_ok()
+    );
     assert!(is_only.auto_block_type_enabled() && is_only.intensity_stereo_enabled());
 
     // Mixed promotion stays rejected on the intensity-only path too (the

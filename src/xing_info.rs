@@ -54,7 +54,7 @@
 //! out to [`crate::Mp3FrameHeader::frame_len`]).
 
 use crate::demuxer::{XingTag, XingTagId};
-use crate::encoder::{encode_silent_frame, EncodeError};
+use crate::encoder::{EncodeError, encode_silent_frame};
 use crate::frame::Mp3FrameHeader;
 
 /// Author-side specification of a Xing / Info VBR information-frame
@@ -278,7 +278,7 @@ pub fn build_info_frame(
 mod tests {
     use super::*;
     use crate::demuxer::{parse_xing_info, side_info_len};
-    use crate::frame::{parse_header, ChannelMode};
+    use crate::frame::{ChannelMode, parse_header};
     use crate::make_silent_header;
 
     fn spec_all_fields() -> XingTagSpec {

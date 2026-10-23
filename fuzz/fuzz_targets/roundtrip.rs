@@ -46,13 +46,13 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_core::{
     CodecId, CodecParameters, CodecRegistry, Decoder, Frame, Packet, Rational, TimeBase,
 };
+use oxideav_mp3::XingTagId;
 use oxideav_mp3::frame::{ChannelMode, FrameWalker};
 use oxideav_mp3::quality::QualityPreset;
 use oxideav_mp3::stream_encoder::{
-    Mp3Encoder, LSF_L3_BITRATE_LADDER_KBPS, MPEG1_L3_BITRATE_LADDER_KBPS,
+    LSF_L3_BITRATE_LADDER_KBPS, MPEG1_L3_BITRATE_LADDER_KBPS, Mp3Encoder,
 };
-use oxideav_mp3::xing_info::{flag_bit, XingTagSpec};
-use oxideav_mp3::XingTagId;
+use oxideav_mp3::xing_info::{XingTagSpec, flag_bit};
 
 const RATES: [u32; 9] = [
     44_100, 48_000, 32_000, 22_050, 24_000, 16_000, 11_025, 12_000, 8_000,

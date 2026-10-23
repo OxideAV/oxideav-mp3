@@ -35,10 +35,10 @@ use std::f32::consts::PI;
 use std::process::Command;
 
 use oxideav_mp3::{
-    alias_reduce, decode_huffman, decode_scalefactors, imdct_granule, parse_header,
-    parse_side_info, pcm_f32_to_i16, process_stereo, requantize, synth_granule, ChannelMode,
-    FrameWalker, ImdctState, MainDataReader, Mp3Encoder, Reservoir, SynthState, MPEG1_SLEN,
-    NUM_LINES, PCM_PER_GRANULE,
+    ChannelMode, FrameWalker, ImdctState, MPEG1_SLEN, MainDataReader, Mp3Encoder, NUM_LINES,
+    PCM_PER_GRANULE, Reservoir, SynthState, alias_reduce, decode_huffman, decode_scalefactors,
+    imdct_granule, parse_header, parse_side_info, pcm_f32_to_i16, process_stereo, requantize,
+    synth_granule,
 };
 
 /// Part2 (scalefactor) bit count of one MPEG-1 **long-block** granule
@@ -230,7 +230,7 @@ fn deinterleave(interleaved: &[i16]) -> (Vec<i16>, Vec<i16>) {
     let n = interleaved.len() / 2;
     let mut l = Vec::with_capacity(n);
     let mut r = Vec::with_capacity(n);
-    for pair in interleaved.chunks_exact(2) {
+    for pair in interleaved.as_chunks::<2>().0 {
         l.push(pair[0]);
         r.push(pair[1]);
     }
@@ -756,7 +756,9 @@ fn assert_external_pcm_preserves_image(pcm_bytes: &[u8], label: &str) {
         pcm_bytes.len()
     );
     let samples: Vec<i16> = pcm_bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| i16::from_le_bytes([b[0], b[1]]))
         .collect();
     let (l, r) = deinterleave(&samples);

@@ -41,8 +41,8 @@ use std::io::Cursor;
 
 use oxideav_core::Demuxer;
 use oxideav_mp3::{
-    parse_header, parse_side_info, BlockType, ChannelMode, FrameWalker, Mp3Demuxer, Mp3Encoder,
-    DEFAULT_ATTACK_THRESHOLD,
+    BlockType, ChannelMode, DEFAULT_ATTACK_THRESHOLD, FrameWalker, Mp3Demuxer, Mp3Encoder,
+    parse_header, parse_side_info,
 };
 
 const SR: u32 = 44_100;
@@ -329,7 +329,7 @@ fn auto_block_type_on_transient_burst_engages_start_short_sequence() {
     // granules of silence (so the ambient resets between clicks and
     // each click reliably trips the threshold).
     let n = SR as usize; // 1 s of audio
-                         // Click every ~150 ms (~6600 samples, well over one granule).
+    // Click every ~150 ms (~6600 samples, well over one granule).
     let pcm = click_train_pcm(n, /*click_period=*/ 6600);
     let mut enc = Mp3Encoder::new(BR, SR, ChannelMode::SingleChannel).expect("mono encoder build");
     enc.enable_auto_block_type(DEFAULT_ATTACK_THRESHOLD)
@@ -474,7 +474,11 @@ fn auto_block_type_on_independent_stereo_runs_per_channel_scheduler() {
         // alternating burst at click_period intervals.
         let l_burst = if i >= next_click_pos && i < next_click_pos + 64 {
             let s = i - next_click_pos;
-            let v = if s % 2 == 0 { 30_000i16 } else { -30_000i16 };
+            let v = if s.is_multiple_of(2) {
+                30_000i16
+            } else {
+                -30_000i16
+            };
             if s + 1 == 64 {
                 next_click_pos += click_period;
             }
@@ -566,7 +570,11 @@ fn auto_block_type_on_ms_stereo_agrees_per_granule_and_responds_to_either_channe
     for i in 0..n {
         let l_burst = if i >= next_click_pos && i < next_click_pos + 64 {
             let s = i - next_click_pos;
-            let v = if s % 2 == 0 { 30_000i16 } else { -30_000i16 };
+            let v = if s.is_multiple_of(2) {
+                30_000i16
+            } else {
+                -30_000i16
+            };
             if s + 1 == 64 {
                 next_click_pos += click_period;
             }

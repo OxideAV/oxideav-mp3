@@ -983,7 +983,7 @@ fn random_xr_r409(rng: &mut u32, amp_exp: i32) -> [f32; NUM_LINES] {
     let mut xr = [0.0f32; NUM_LINES];
     for (i, v) in xr.iter_mut().enumerate() {
         let r = xorshift32_r409(rng);
-        if r % 4 == 0 || (i > 400 && r % 2 == 0) {
+        if r.is_multiple_of(4) || (i > 400 && r.is_multiple_of(2)) {
             continue;
         }
         let mag = ((r >> 8) & 0xFFFF) as f32 / 65536.0;

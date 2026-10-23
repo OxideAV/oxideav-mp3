@@ -41,7 +41,7 @@
 use oxideav_core::{
     CodecId, CodecParameters, Decoder, Error, Frame, Packet, RuntimeContext, SampleFormat, TimeBase,
 };
-use oxideav_mp3::{parse_header, ChannelMode, FrameWalker, Mp3Encoder, SAMPLES_PER_FRAME_MPEG1};
+use oxideav_mp3::{ChannelMode, FrameWalker, Mp3Encoder, SAMPLES_PER_FRAME_MPEG1, parse_header};
 
 use std::f32::consts::PI;
 
@@ -114,7 +114,7 @@ fn decode_via_trait(packets: &[Packet], sample_rate: u32, channels: u16) -> Vec<
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     for plane in &a.data {
-                        for chunk in plane.chunks_exact(2) {
+                        for chunk in plane.as_chunks::<2>().0 {
                             out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                         }
                     }
