@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The registry decoder reports its output stream parameters**
+  (oxideav-core 0.1.42 `Decoder::output_params` /
+  `output_params_generation`): `sample_rate` and `channels` /
+  `channel_layout` from the frame headers (§2.4.2.3 `sampling_frequency`
+  under MPEG-1 / MPEG-2 LSF / MPEG-2.5, `mode`: mono, stereo / joint
+  stereo = `Stereo`, dual channel = `DiscreteN(2)`) and `sample_format`
+  `S16P` — what `receive_frame` emits, one little-endian `i16` plane per
+  channel (the construction-time `output` template said `S16`; it now
+  says `S16P` too). `None` until a header is parsed (container hints are
+  not facts), then the first header's shape before any frame returns —
+  a frame held back by the bit reservoir still announces it — and the
+  shape of the frame last returned afterwards. Each queued frame keeps
+  its own header's shape; the generation bumps when the first frame of a
+  new shape is returned (a chained stream switching version, rate or
+  mode), and a `reset` keeps the answer until the next frame.
+  `tests/output_params.rs` pins libmp3lame fixtures at MPEG-1 44.1 kHz
+  stereo / 32 kHz mono, MPEG-2 22.05 kHz stereo / 16 kHz mono, MPEG-2.5
+  11.025 kHz mono / 8 kHz stereo (`tests/fixtures/output_params/gen.sh`)
+  against `ffprobe -show_streams` and the emitted planes, plus a chained
+  stream across all of them.
 - **8 kHz (MPEG-2.5) mixed-block encoding — the r405/r408 emit
   refusal is lifted** (r440, conformance-closure round). The refusal
   rested on deployed decoders splitting 3-1 on the mixed carve-out's

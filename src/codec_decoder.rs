@@ -87,8 +87,8 @@
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    AudioFrame, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag,
-    Decoder, Error, Frame, Packet, Result, SampleFormat,
+    AudioFrame, ChannelLayout, CodecCapabilities, CodecId, CodecInfo, CodecParameters,
+    CodecRegistry, CodecTag, Decoder, Error, Frame, Packet, Result, SampleFormat,
 };
 
 use crate::alias::alias_reduce;
@@ -134,7 +134,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     out_params.sample_rate = Some(sample_rate);
     out_params.channels = Some(channels);
-    out_params.sample_format = Some(SampleFormat::S16);
+    out_params.sample_format = Some(SampleFormat::S16P);
     out_params.tag = Some(CodecTag::wave_format(WAVE_FORMAT_MP3));
 
     Ok(Box::new(Mp3CoreDecoder::new(
@@ -173,10 +173,54 @@ pub struct Mp3CoreDecoder {
     /// Per-channel polyphase synthesis shift register. Same indexing
     /// convention as `imdct_state`.
     synth_state: [SynthState; 2],
-    pending_frames: VecDeque<AudioFrame>,
+    /// Decoded frames awaiting `receive_frame`, each with the shape
+    /// its own frame header states.
+    pending_frames: VecDeque<(AudioFrame, AudioShape)>,
     /// Set once [`Decoder::flush`] has been called; `receive_frame`
     /// returns [`Error::Eof`] after `pending_frames` is empty.
     eof: bool,
+    /// The shape of the frame `receive_frame` returned last (`None`
+    /// before the first one).
+    shown: Option<AudioShape>,
+    /// Before the first frame: the shape the first parsed frame
+    /// header states (a frame held back by the bit reservoir still
+    /// announces it).
+    announced: Option<AudioShape>,
+    /// `Decoder::output_params_generation` — bumped (wrapping) when a
+    /// returned frame's shape differs from the previous one's.
+    generation: u64,
+}
+
+/// What one frame header fixes about the PCM it decodes to: the
+/// sampling frequency (§2.4.2.3 `sampling_frequency` under the
+/// version `ID` — MPEG-1, MPEG-2 LSF or MPEG-2.5) and the channel
+/// layout (§2.4.2.3 `mode`). Every frame carries its own header, so
+/// any frame of a chained / concatenated stream may change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AudioShape {
+    sample_rate: u32,
+    mode: crate::frame::ChannelMode,
+}
+
+impl AudioShape {
+    fn of(hdr: &Mp3FrameHeader) -> Self {
+        Self {
+            sample_rate: hdr.sample_rate_hz,
+            mode: hdr.mode,
+        }
+    }
+
+    /// `single_channel` = mono; `stereo` / `joint_stereo` = L, R;
+    /// `dual_channel` = two independent programmes, not a left/right
+    /// pair (`DiscreteN(2)`).
+    fn layout(self) -> ChannelLayout {
+        use crate::frame::ChannelMode;
+        match self.mode {
+            ChannelMode::SingleChannel => ChannelLayout::Mono,
+            ChannelMode::Stereo | ChannelMode::JointStereo => ChannelLayout::Stereo,
+            ChannelMode::DualChannel => ChannelLayout::DiscreteN(2),
+        }
+    }
 }
 
 impl std::fmt::Debug for Mp3CoreDecoder {
@@ -199,6 +243,9 @@ impl Mp3CoreDecoder {
             synth_state: [SynthState::new(), SynthState::new()],
             pending_frames: VecDeque::new(),
             eof: false,
+            shown: None,
+            announced: None,
+            generation: 0,
         }
     }
 
@@ -463,18 +510,33 @@ impl Decoder for Mp3CoreDecoder {
         if self.eof {
             return Err(Error::other("oxideav-mp3: cannot send_packet after flush"));
         }
-        if let Some(frame) = self.decode_packet(packet)? {
-            // Update the cached output params from this frame's header.
-            if let Ok(hdr) = parse_header(&packet.data[..4]) {
-                self.refresh_output_params(&hdr);
-            }
-            self.pending_frames.push_back(frame);
+        let decoded = self.decode_packet(packet)?;
+        // `decode_packet` parsed the header successfully.
+        let Ok(hdr) = parse_header(&packet.data[..4]) else {
+            return Ok(());
+        };
+        let shape = AudioShape::of(&hdr);
+        // Update the cached output params from this frame's header.
+        self.refresh_output_params(&hdr);
+        if self.shown.is_none() && self.announced.is_none() {
+            self.announced = Some(shape);
+        }
+        if let Some(frame) = decoded {
+            self.pending_frames.push_back((frame, shape));
         }
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(audio) = self.pending_frames.pop_front() {
+        if let Some((audio, shape)) = self.pending_frames.pop_front() {
+            // The first frame resolves the description (no bump); a
+            // later frame of a different shape bumps the generation as
+            // it is returned.
+            if self.shown.is_some_and(|prev| prev != shape) {
+                self.generation = self.generation.wrapping_add(1);
+            }
+            self.shown = Some(shape);
+            self.announced = None;
             return Ok(Frame::Audio(audio));
         }
         if self.eof {
@@ -495,6 +557,27 @@ impl Decoder for Mp3CoreDecoder {
         self.pending_frames.clear();
         self.eof = false;
         Ok(())
+    }
+
+    /// The decoded PCM's shape: sample rate and channel count / layout
+    /// from the frame headers, planar `S16P` (one
+    /// plane per channel). After a frame was returned, that frame's;
+    /// before, the first parsed frame header's (no configuration
+    /// record precedes an MPEG audio stream). `None` until a header
+    /// was parsed — the construction-time hints are not facts.
+    fn output_params(&self) -> Option<CodecParameters> {
+        let shape = self.shown.or(self.announced)?;
+        let layout = shape.layout();
+        let mut p = CodecParameters::audio(self.codec_id.clone());
+        p.sample_rate = Some(shape.sample_rate);
+        p.channels = Some(layout.channel_count());
+        p.channel_layout = Some(layout);
+        p.sample_format = Some(SampleFormat::S16P);
+        Some(p)
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -693,6 +776,29 @@ mod tests {
         let p = build_decoder_params(44_100);
         let dec = make_decoder(&p).expect("make_decoder");
         assert_eq!(dec.codec_id().as_str(), "mp3");
+    }
+
+    /// §2.4.2.3 `mode` → the layout the decoded planes carry.
+    #[test]
+    fn channel_mode_layouts() {
+        use crate::frame::ChannelMode;
+        let shape = |mode| AudioShape {
+            sample_rate: 44_100,
+            mode,
+        };
+        assert_eq!(
+            shape(ChannelMode::SingleChannel).layout(),
+            ChannelLayout::Mono
+        );
+        assert_eq!(shape(ChannelMode::Stereo).layout(), ChannelLayout::Stereo);
+        assert_eq!(
+            shape(ChannelMode::JointStereo).layout(),
+            ChannelLayout::Stereo
+        );
+        assert_eq!(
+            shape(ChannelMode::DualChannel).layout(),
+            ChannelLayout::DiscreteN(2)
+        );
     }
 
     #[test]
