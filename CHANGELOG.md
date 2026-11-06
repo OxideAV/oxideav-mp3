@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`Frame::StreamParams` on mid-stream shape changes** (oxideav-core
+  0.1.43). When a frame header changes the output shape (sample rate or
+  channel layout: concatenated files, MPEG-1 ↔ MPEG-2 LSF / MPEG-2.5,
+  mono ↔ stereo, stereo ↔ dual channel), `receive_frame` returns one
+  event after every frame of the old shape and right before the first
+  frame of the new one. Its payload equals `output_params()`, and the
+  generation has already moved. There is no event for the first shape
+  or for constant streams. The same rule holds after `reset()` and when
+  draining after `flush()`. A new shape starts a fresh decode segment
+  (bit reservoir, IMDCT overlap and synthesis memory cleared), so each
+  segment's PCM equals its standalone decode. A VBR bit-rate change,
+  free format, and `stereo` ↔ `joint_stereo` are not shape changes.
+  `tests/stream_params.rs` covers byte-concatenated libmp3lame fixtures
+  (`tests/fixtures/stream_params/gen.sh`). The encoder rejects the event
+  with `Error::Unsupported`.
+
 - **The registry decoder reports its output stream parameters**
   (oxideav-core 0.1.42 `Decoder::output_params` /
   `output_params_generation`): `sample_rate` and `channels` /
@@ -21,8 +37,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   a frame held back by the bit reservoir still announces it — and the
   shape of the frame last returned afterwards. Each queued frame keeps
   its own header's shape; the generation bumps when the first frame of a
-  new shape is returned (a chained stream switching version, rate or
-  mode), and a `reset` keeps the answer until the next frame.
+  new shape is returned (a chained stream switching rate or channel
+  layout; a `stereo` ↔ `joint_stereo` switch is not a change), and a `reset` keeps the answer until the next frame.
   `tests/output_params.rs` pins libmp3lame fixtures at MPEG-1 44.1 kHz
   stereo / 32 kHz mono, MPEG-2 22.05 kHz stereo / 16 kHz mono, MPEG-2.5
   11.025 kHz mono / 8 kHz stereo (`tests/fixtures/output_params/gen.sh`)

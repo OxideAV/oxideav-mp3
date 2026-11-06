@@ -29,6 +29,22 @@
 //!   overlap memory so the next `send_packet` decodes as if it were the
 //!   first").
 //!
+//! ## Output shape and `Frame::StreamParams`
+//!
+//! [`output_params`](Decoder::output_params) describes the sample rate
+//! and channel layout the frame headers state, plus `S16P`. Each MP3
+//! frame has its own header, so a chained stream can change that shape
+//! at any frame: concatenated files, an MPEG-1 ↔ MPEG-2 LSF / MPEG-2.5
+//! switch, mono ↔ stereo, stereo ↔ dual channel. `receive_frame` then
+//! returns one [`Frame::StreamParams`] event carrying the new
+//! `output_params()`, after every queued frame of the old shape and
+//! immediately before the first frame of the new one. The generation
+//! moves with the event. The decoder delays no samples across frames:
+//! the old shape's IMDCT overlap tail is dropped with the rest of its
+//! carry-over state when the new segment starts, as it is at the end
+//! of any stream. Bit-rate changes (VBR), free-format frames and the
+//! `stereo` ↔ `joint_stereo` distinction do not change the shape.
+//!
 //! The wrapper parses the packet's MP3 frame, walks the existing
 //! [`decode_huffman`] → [`requantize`] → [`alias_reduce`] →
 //! [`imdct_granule`] → [`synth_granule`] chain (per granule per
@@ -186,40 +202,57 @@ pub struct Mp3CoreDecoder {
     /// header states (a frame held back by the bit reservoir still
     /// announces it).
     announced: Option<AudioShape>,
-    /// `Decoder::output_params_generation` — bumped (wrapping) when a
-    /// returned frame's shape differs from the previous one's.
+    /// The shape of the frame header `send_packet` parsed last (`None`
+    /// before the first one and after `reset`). A packet whose shape
+    /// differs starts a new decode segment: the carry-over state of
+    /// the old shape is dropped before it decodes (see
+    /// [`Self::start_segment_if_shape_changed`]).
+    decoded: Option<AudioShape>,
+    /// `Decoder::output_params_generation` — bumped (wrapping) when
+    /// the next queued frame's shape differs from the one last
+    /// returned, at the moment `receive_frame` returns the
+    /// [`Frame::StreamParams`] event announcing it.
     generation: u64,
 }
 
-/// What one frame header fixes about the PCM it decodes to: the
+/// What one frame header fixes about the PCM it decodes to — exactly
+/// what [`Decoder::output_params`] describes, nothing more: the
 /// sampling frequency (§2.4.2.3 `sampling_frequency` under the
 /// version `ID` — MPEG-1, MPEG-2 LSF or MPEG-2.5) and the channel
-/// layout (§2.4.2.3 `mode`). Every frame carries its own header, so
-/// any frame of a chained / concatenated stream may change it.
+/// layout the §2.4.2.3 `mode` implies. Every frame carries its own
+/// header, so any frame of a chained / concatenated stream may change
+/// it.
+///
+/// Header fields that do **not** change the PCM's shape are not part
+/// of it: `bitrate_index` (a VBR stream changes it frame to frame; a
+/// free-format frame has index `0`), `padding_bit`, `mode_extension`,
+/// `protection_bit`, `emphasis`, and the `stereo` ↔ `joint_stereo`
+/// distinction (both decode to the same L, R pair).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AudioShape {
     sample_rate: u32,
-    mode: crate::frame::ChannelMode,
+    layout: ChannelLayout,
 }
 
 impl AudioShape {
     fn of(hdr: &Mp3FrameHeader) -> Self {
         Self {
             sample_rate: hdr.sample_rate_hz,
-            mode: hdr.mode,
+            layout: layout_of_mode(hdr.mode),
         }
     }
+}
 
-    /// `single_channel` = mono; `stereo` / `joint_stereo` = L, R;
-    /// `dual_channel` = two independent programmes, not a left/right
-    /// pair (`DiscreteN(2)`).
-    fn layout(self) -> ChannelLayout {
-        use crate::frame::ChannelMode;
-        match self.mode {
-            ChannelMode::SingleChannel => ChannelLayout::Mono,
-            ChannelMode::Stereo | ChannelMode::JointStereo => ChannelLayout::Stereo,
-            ChannelMode::DualChannel => ChannelLayout::DiscreteN(2),
-        }
+/// §2.4.2.3 `mode` → the layout of the decoded planes:
+/// `single_channel` = mono; `stereo` / `joint_stereo` = L, R;
+/// `dual_channel` = two independent programmes, not a left/right
+/// pair (`DiscreteN(2)`).
+fn layout_of_mode(mode: crate::frame::ChannelMode) -> ChannelLayout {
+    use crate::frame::ChannelMode;
+    match mode {
+        ChannelMode::SingleChannel => ChannelLayout::Mono,
+        ChannelMode::Stereo | ChannelMode::JointStereo => ChannelLayout::Stereo,
+        ChannelMode::DualChannel => ChannelLayout::DiscreteN(2),
     }
 }
 
@@ -245,8 +278,31 @@ impl Mp3CoreDecoder {
             eof: false,
             shown: None,
             announced: None,
+            decoded: None,
             generation: 0,
         }
+    }
+
+    /// Called with the shape of each packet's header before it
+    /// decodes. When the shape differs from the previous packet's, the
+    /// stream has been chained (concatenated files, an MPEG-1 ↔ MPEG-2
+    /// LSF switch, mono ↔ stereo): the bit reservoir (§2.4.2.7), the
+    /// IMDCT overlap memory (§2.4.3.4.10.4) and the synthesis shift
+    /// register (§2.4.3.2) all belong to the old shape — a different
+    /// sampling frequency or channel set makes them meaningless for
+    /// the new one — so they are cleared and the new segment decodes
+    /// exactly as it would standalone. The old shape's overlap tail is
+    /// dropped, as it is at the end of any stream (`flush` does not
+    /// synthesise a trailing granule either): every old-shape sample
+    /// the decoder produces is in an old-shape frame, so all of them
+    /// come out before the [`Frame::StreamParams`] event.
+    fn start_segment_if_shape_changed(&mut self, shape: AudioShape) {
+        if self.decoded.is_some_and(|prev| prev != shape) {
+            self.reservoir = Reservoir::new();
+            self.imdct_state = [ImdctState::new(), ImdctState::new()];
+            self.synth_state = [SynthState::new(), SynthState::new()];
+        }
+        self.decoded = Some(shape);
     }
 
     /// Decode one MP3 frame from `packet` (header + optional CRC +
@@ -510,9 +566,17 @@ impl Decoder for Mp3CoreDecoder {
         if self.eof {
             return Err(Error::other("oxideav-mp3: cannot send_packet after flush"));
         }
+        // A header that does not parse (or a short packet) is
+        // reported by `decode_packet` below.
+        let hdr = packet.data.get(..4).and_then(|h| parse_header(h).ok());
+        if let Some(hdr) = &hdr
+            && hdr.layer == Layer::LayerIII
+        {
+            self.start_segment_if_shape_changed(AudioShape::of(hdr));
+        }
         let decoded = self.decode_packet(packet)?;
         // `decode_packet` parsed the header successfully.
-        let Ok(hdr) = parse_header(&packet.data[..4]) else {
+        let Some(hdr) = hdr else {
             return Ok(());
         };
         let shape = AudioShape::of(&hdr);
@@ -528,13 +592,25 @@ impl Decoder for Mp3CoreDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
+        if let Some(&(_, shape)) = self.pending_frames.front()
+            && self.shown.is_some_and(|prev| prev != shape)
+        {
+            // The first frame of a new shape: announce it first. The
+            // description and the generation move now, the frame
+            // itself comes with the next call (when `shown` already
+            // equals its shape, so there is exactly one event). Every
+            // frame queued ahead of it — the old shape's — has been
+            // returned already. The first frame ever only resolves the
+            // description: no event, no bump.
+            self.generation = self.generation.wrapping_add(1);
+            self.shown = Some(shape);
+            self.announced = None;
+            let params = self
+                .output_params()
+                .expect("described once a frame was returned");
+            return Ok(Frame::StreamParams(Box::new(params)));
+        }
         if let Some((audio, shape)) = self.pending_frames.pop_front() {
-            // The first frame resolves the description (no bump); a
-            // later frame of a different shape bumps the generation as
-            // it is returned.
-            if self.shown.is_some_and(|prev| prev != shape) {
-                self.generation = self.generation.wrapping_add(1);
-            }
             self.shown = Some(shape);
             self.announced = None;
             return Ok(Frame::Audio(audio));
@@ -556,6 +632,11 @@ impl Decoder for Mp3CoreDecoder {
         self.synth_state = [SynthState::new(), SynthState::new()];
         self.pending_frames.clear();
         self.eof = false;
+        // The next packet starts a fresh segment. `shown` stays: the
+        // description keeps answering for the frame last returned
+        // until the first frame after the seek, which is announced by
+        // a `StreamParams` event if its shape differs.
+        self.decoded = None;
         Ok(())
     }
 
@@ -567,7 +648,7 @@ impl Decoder for Mp3CoreDecoder {
     /// was parsed — the construction-time hints are not facts.
     fn output_params(&self) -> Option<CodecParameters> {
         let shape = self.shown.or(self.announced)?;
-        let layout = shape.layout();
+        let layout = shape.layout;
         let mut p = CodecParameters::audio(self.codec_id.clone());
         p.sample_rate = Some(shape.sample_rate);
         p.channels = Some(layout.channel_count());
@@ -782,23 +863,11 @@ mod tests {
     #[test]
     fn channel_mode_layouts() {
         use crate::frame::ChannelMode;
-        let shape = |mode| AudioShape {
-            sample_rate: 44_100,
-            mode,
-        };
-        assert_eq!(
-            shape(ChannelMode::SingleChannel).layout(),
-            ChannelLayout::Mono
-        );
-        assert_eq!(shape(ChannelMode::Stereo).layout(), ChannelLayout::Stereo);
-        assert_eq!(
-            shape(ChannelMode::JointStereo).layout(),
-            ChannelLayout::Stereo
-        );
-        assert_eq!(
-            shape(ChannelMode::DualChannel).layout(),
-            ChannelLayout::DiscreteN(2)
-        );
+        let shape = layout_of_mode;
+        assert_eq!(shape(ChannelMode::SingleChannel), ChannelLayout::Mono);
+        assert_eq!(shape(ChannelMode::Stereo), ChannelLayout::Stereo);
+        assert_eq!(shape(ChannelMode::JointStereo), ChannelLayout::Stereo);
+        assert_eq!(shape(ChannelMode::DualChannel), ChannelLayout::DiscreteN(2));
     }
 
     #[test]

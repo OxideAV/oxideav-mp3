@@ -50,13 +50,35 @@ The full Layer III decode pipeline is implemented:
   across frames.
 - **CRC-16** frame protection (§2.4.3.1).
 
-Output is interleaved PCM through the `oxideav_core::Decoder` trait. The
+Output is planar `S16P` PCM (one little-endian `i16` plane per channel)
+through the `oxideav_core::Decoder` trait. The
 final float-to-`i16` conversion follows §2.4.3.4.7 exactly: the decoder
 output range is `[-1.0, +1.0]`, so samples scale by the MSB weight
 `2^15 = 32768` and round to the nearest integer with half-integer values
 rounded away from zero (§2.3 "Nearest integer operator"). The decode
 path is validated by PSNR self-round-trip tests and against staged
 reference fixtures.
+
+### Stream shape and mid-stream changes
+
+`output_params()` reports the sample rate, channel count / layout and
+`S16P` from the frame headers. Every MPEG audio frame carries its own
+header, so a chained stream (`cat a.mp3 b.mp3`, an MPEG-1 ↔ MPEG-2 LSF
+switch, mono ↔ stereo) can change that shape at any frame. The decoder
+then returns one `Frame::StreamParams` event from `receive_frame` after
+every frame of the old shape and immediately before the first frame of
+the new one; its payload is the new `output_params()` and
+`output_params_generation()` has already moved. A new shape starts a
+fresh decode segment (bit reservoir, IMDCT overlap and synthesis memory
+cleared), so each segment decodes exactly as the file would on its own.
+The same holds after `reset()` and while draining after `flush()`.
+
+A change is a different sampling frequency or channel layout: mono,
+stereo / joint stereo (`Stereo`), or dual channel (`DiscreteN(2)`).
+A bit-rate change (VBR), a free-format frame, or a `stereo` ↔
+`joint_stereo` switch is not a change, because `output_params()` does
+not describe it. The encoder rejects the event with `Unsupported`: its
+rate and mode are fixed at construction.
 
 ## Encoder
 

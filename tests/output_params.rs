@@ -88,6 +88,10 @@ fn decode_into(dec: &mut dyn Decoder, pkts: &[Vec<u8>], out: &mut Vec<(u64, Code
                     }
                     out.push((dec.output_params_generation(), p));
                 }
+                Ok(Frame::StreamParams(_)) => {
+                    // The change announcement (tests/stream_params.rs);
+                    // the generation is checked on the frame after it.
+                }
                 Ok(_) => panic!("audio only"),
                 Err(Error::NeedMore) => break,
                 Err(e) => panic!("decode: {e}"),

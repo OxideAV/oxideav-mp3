@@ -678,6 +678,16 @@ impl Encoder for Mp3CoreEncoder {
         if self.eof {
             return Err(Error::other("oxideav-mp3: cannot send_frame after flush"));
         }
+        if frame.is_stream_params() {
+            // The bitstream's sampling frequency and mode are fixed when
+            // the encoder is built (they select the MPEG version, the
+            // scalefactor-band tables and the side-info layout); a
+            // mid-stream input-shape change is not re-configured.
+            return Err(Error::unsupported(
+                "oxideav-mp3: encoder cannot re-configure for a mid-stream \
+                 StreamParams change",
+            ));
+        }
         let Frame::Audio(a) = frame else {
             return Err(Error::invalid("oxideav-mp3: encoder requires audio frame"));
         };
@@ -914,6 +924,28 @@ mod tests {
         enc.send_frame(&Frame::Audio(frame)).unwrap();
         enc.flush().unwrap();
         enc.flush().expect("second flush no-op");
+    }
+
+    #[test]
+    fn stream_params_event_is_unsupported_and_leaves_the_encoder_usable() {
+        let p = build_params(44_100, 128_000);
+        let mut enc = make_encoder(&p).expect("make_encoder");
+        let mut change = CodecParameters::audio(CodecId::new("pcm_s16le"));
+        change.sample_rate = Some(22_050);
+        change.channels = Some(1);
+        let err = enc
+            .send_frame(&Frame::StreamParams(Box::new(change)))
+            .expect_err("no mid-stream re-configuration");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        let pcm = sine_s16(SAMPLES_PER_FRAME_MPEG1, 440.0, 44_100.0, 0.5);
+        let frame = AudioFrame {
+            samples: SAMPLES_PER_FRAME_MPEG1 as u32,
+            pts: None,
+            data: vec![pcm],
+        };
+        enc.send_frame(&Frame::Audio(frame)).expect("still encodes");
+        enc.flush().unwrap();
+        assert!(enc.receive_packet().is_ok());
     }
 
     #[test]
