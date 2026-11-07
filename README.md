@@ -176,7 +176,11 @@ the previous frame ended that keeps the version / layer / sampling
 frequency is trusted; one that switches them must be followed by a
 header with its own key; a candidate found by scanning (junk, a damaged
 splice) must chain three more correctly-spaced headers, so a resync
-does not lock onto a false sync inside main data. A free-format segment
+does not lock onto a false sync inside main data. A cut splice (the
+first file's last frame truncated, the next file starting inside it) is
+detected when nothing plausible sits where the frame should end but a
+fully chained frame starts inside it: the cut frame is dropped. A
+free-format segment
 re-measures its slot count at a switch, bounded by the §2.4.2.3
 free-format bitrate ceilings.
 
@@ -197,9 +201,9 @@ shape with `Frame::StreamParams`.
 frame) and steps to the frame containing the requested time — at or
 before it — returning the PTS that frame is then emitted with.
 `tests/demuxer_splice.rs` checks all 72 ordered pairs of sampling
-frequencies, channel-mode / bitrate / VBR / free-format switches, fully
-tagged files back to back, junk between switching segments, and seeks to
-every packet, against ffprobe frame counts, an independent header walk
+frequencies, Layer III ↔ Layer II (CRC-protected), channel-mode /
+bitrate / VBR / free-format switches, fully tagged files back to back,
+junk between switching segments, cut splices, and seeks to every packet, against ffprobe frame counts, an independent header walk
 and per-segment standalone decodes.
 Each emitted packet's **keyframe flag** reflects the §2.4.2.7 bit
 reservoir: a Layer III frame is a random-access point only when its

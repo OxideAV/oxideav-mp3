@@ -200,14 +200,13 @@ fn standalone(bytes: &[u8]) -> Vec<Vec<Vec<i16>>> {
     audio(&out).into_iter().map(|(_, p)| p).collect()
 }
 
-/// Concatenate segment files and check the whole spliced stream:
-/// frame counts, bytes, timeline, events, and per-segment PCM.
-/// `exact_pcm[i]` says whether segment `i`'s PCM must equal its
-/// standalone decode from its first frame (true after an output-shape
-/// change, where the decoder starts a fresh segment) or only from its
-/// second frame on (a boundary the decoder does not see as a change, so
-/// its filterbank memory carries across).
-fn check_splice(names: &[&str]) {
+/// `(frames, samples_per_frame, sampling frequency)` of one segment.
+type Walk = (usize, u32, u32);
+
+/// Concatenate segment files and check the framing of the spliced
+/// stream: frame counts, bytes, timeline, duration, switch count.
+/// Returns the packets and the segments' bytes and header walks.
+fn check_framing(names: &[&str]) -> (Vec<Packet>, Vec<Vec<u8>>, Vec<Walk>) {
     let man = manifest();
     let segs: Vec<Vec<u8>> = names.iter().map(|n| file(n)).collect();
     let walks: Vec<(usize, u32, u32)> = segs.iter().map(|b| header_walk(b)).collect();
@@ -240,8 +239,30 @@ fn check_splice(names: &[&str]) {
         Some(exact_duration(&walks, base)),
         "{what}: exact duration"
     );
-    let switches = walks.windows(2).filter(|w| w[0].2 != w[1].2).count();
+    // A framing switch: version / layer / sampling frequency change.
+    let keys: Vec<_> = segs
+        .iter()
+        .map(|b| {
+            let h = parse_header(b).unwrap();
+            (h.version, h.layer, h.sample_rate_hz)
+        })
+        .collect();
+    let switches = keys.windows(2).filter(|w| w[0] != w[1]).count();
     assert_eq!(d.framing_switch_count(), switches as u64, "{what}");
+    (pkts, segs, walks)
+}
+
+/// [`check_framing`], then decode: one `StreamParams` event per
+/// output-shape change, and each segment's PCM equal to its standalone
+/// decode — from its first frame after a shape change (the decoder
+/// starts a fresh segment there), from its second frame on at a
+/// boundary the decoder does not see as a change (its filterbank
+/// memory carries across).
+fn check_splice(names: &[&str]) {
+    let man = manifest();
+    let what = names.join("+");
+    let (pkts, segs, walks) = check_framing(names);
+    let total = pkts.len();
 
     // Decode: one event per output-shape change, PCM per segment.
     let shapes: Vec<(u32, u16)> = names.iter().map(|n| (man[*n].1, man[*n].2)).collect();
@@ -321,6 +342,25 @@ fn channel_mode_and_bitrate_switches() {
     ]);
     check_splice(&["raw_22050.mp3", "raw_22050_mono.mp3", "raw_8000_mono.mp3"]);
     check_splice(&["raw_44100_vbr.mp3", "raw_32000.mp3", "raw_44100_vbr.mp3"]);
+}
+
+/// Layer III ↔ Layer II switches (MPEG-1 and MPEG-2 LSF Layer II,
+/// CRC-protected), including one at an unchanged sampling frequency:
+/// framed completely (Layer II is not decoded by this crate).
+#[test]
+fn layer_switches() {
+    check_framing(&[
+        "raw_48000.mp3",
+        "raw_l2_48000.mp2",
+        "raw_8000.mp3",
+        "raw_l2_22050.mp2",
+        "raw_22050.mp3",
+        "raw_l2_48000.mp2",
+    ]);
+    for a in RATES {
+        check_framing(&[a, "raw_l2_48000.mp2", a]);
+        check_framing(&["raw_l2_22050.mp2", a, "raw_l2_22050.mp2"]);
+    }
 }
 
 /// The round-482 failure: 44.1 kHz followed by 32 kHz or 22.05 kHz.
@@ -540,4 +580,55 @@ fn seek_across_switches() {
     // Back to the start.
     assert_eq!(d.seek_to(0, 0).unwrap(), 0);
     assert!(d.next_packet().unwrap().data == all[0].data);
+}
+
+/// A cut splice: the first file's last frame is truncated and the next
+/// file starts inside its span. The cut frame is dropped; every whole
+/// frame of both files comes out — unless the cut frame's nominal end
+/// happens to land exactly on a frame start of the next file, which no
+/// header lookahead can tell from an intact frame: then the cut frame
+/// (with the next file's first frames inside it) is emitted as one
+/// packet and framing continues from that frame start.
+#[test]
+fn truncated_frame_before_switch() {
+    let mut coincident = 0;
+    for (a, b) in [
+        ("raw_44100.mp3", "raw_8000.mp3"),
+        ("raw_8000.mp3", "raw_48000.mp3"),
+        ("raw_44100_vbr.mp3", "raw_44100_mono.mp3"),
+        ("raw_22050.mp3", "raw_22050.mp3"),
+        ("raw_l2_48000.mp2", "raw_24000.mp3"),
+    ] {
+        let (fa, fb) = (file(a), file(b));
+        let frames_a: Vec<&[u8]> = FrameWalker::new(&fa).map(|f| f.data).collect();
+        let starts_b: Vec<usize> = FrameWalker::new(&fb).map(|f| f.offset).collect();
+        let last = frames_a.last().unwrap().len();
+        for cut in [1usize, 17, last / 2, last - 5] {
+            let kept = fa.len() - cut;
+            let mut joined = fa[..kept].to_vec();
+            joined.extend_from_slice(&fb);
+            let mut d = open(joined.clone());
+            let pkts = packets(&mut d);
+            let got: Vec<Vec<u8>> = pkts.iter().map(|p| p.data.clone()).collect();
+            let cut_frame_at = kept - (last - cut);
+            let nominal_end_in_b = cut_frame_at + last - kept;
+            let mut want: Vec<Vec<u8>> = frames_a[..frames_a.len() - 1]
+                .iter()
+                .map(|f| f.to_vec())
+                .collect();
+            let from = if let Some(k) = starts_b.iter().position(|&o| o == nominal_end_in_b) {
+                coincident += 1;
+                want.push(joined[cut_frame_at..cut_frame_at + last].to_vec());
+                k
+            } else {
+                0
+            };
+            want.extend(FrameWalker::new(&fb).skip(from).map(|f| f.data.to_vec()));
+            assert!(got == want, "{a} cut by {cut} + {b}: whole frames only");
+            check_timeline(&d, &pkts, "cut");
+        }
+    }
+    // The fixtures hit the coincidence twice (e.g. a 44.1 kHz VBR frame
+    // cut in half before 64 kbit/s mono frames about half its length).
+    assert_eq!(coincident, 2, "coincident cuts");
 }

@@ -325,6 +325,41 @@ fn chain_ok(
     Ok(true)
 }
 
+/// First offset in `start..stop` holding a table-bitrate frame header
+/// confirmed by a [`SCAN_CHAIN`]-frame chain.
+fn chained_sync_within(
+    input: &mut dyn ReadSeek,
+    start: u64,
+    stop: u64,
+    end: u64,
+) -> Result<Option<u64>> {
+    if stop <= start {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; (stop - start + 3) as usize];
+    let n = read_at(input, start, &mut buf)?;
+    buf.truncate(n);
+    for i in 0..buf.len().saturating_sub(3) {
+        if buf[i] != 0xFF || buf[i + 1] & 0xE0 != 0xE0 {
+            continue;
+        }
+        let Ok(h) = parse_header(&buf[i..i + 4]) else {
+            continue;
+        };
+        if h.emphasis == Emphasis::Reserved {
+            continue;
+        }
+        let Some(len) = h.frame_len().filter(|&l| l >= structural_min_len(&h)) else {
+            continue;
+        };
+        let q = start + i as u64;
+        if q + len as u64 <= end && chain_ok(input, q + len as u64, end, &h, None, SCAN_CHAIN)? {
+            return Ok(Some(q));
+        }
+    }
+    Ok(None)
+}
+
 /// `true` when the Layer III frame at `pos` carries the "Xing" /
 /// "Info" magic right after its side information.
 fn is_info_frame(
@@ -466,6 +501,18 @@ pub(crate) fn next_frame(
         // boundary needs the next frame to agree with the new key; a
         // candidate found by scanning needs a longer chain.
         let confirmed = if on_boundary && same_key {
+            // A cut splice: this frame was truncated and the next
+            // stream starts inside its span. Seen as nothing plausible
+            // where the frame should end, plus a fully chained frame
+            // start inside it; the cut frame is dropped and framing
+            // resumes there.
+            if matches!(plausible_follower(input, next, end)?, Follower::Nothing)
+                && let Some(q) = chained_sync_within(input, pos + 1, next, end)?
+            {
+                pos = q;
+                on_boundary = false;
+                continue;
+            }
             true
         } else {
             let depth = if on_boundary { 1 } else { SCAN_CHAIN };

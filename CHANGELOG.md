@@ -17,7 +17,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   mid-stream are stepped over. A header that switches on a frame
   boundary must be followed by one with its own key; a candidate found
   by scanning must chain three more, so a resync cannot lock onto a
-  false sync in main data. The free-format length measurement is bounded
+  false sync in main data. A cut splice (a truncated last frame with the
+  next file starting inside it) drops the cut frame instead of
+  swallowing the next file's first frame. Layer II segments frame the
+  same way. The free-format length measurement is bounded
   by the §2.4.2.3 free-format bitrate ceilings and re-runs at a switch.
 
 ### Changed

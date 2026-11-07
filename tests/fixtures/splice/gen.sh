@@ -10,15 +10,17 @@
 # Run from this directory.
 set -e
 : > manifest.txt
-enc() {
-    out=$1; rate=$2; ch=$3; freq=$4; shift 4
+# encw <codec> <muxer> <out> <rate> <channels> <tone Hz> [ffmpeg options]
+encw() {
+    codec=$1; fmt=$2; out=$3; rate=$4; ch=$5; freq=$6; shift 6
     ffmpeg -hide_banner -loglevel error -y -f lavfi \
         -i "sine=frequency=$freq:sample_rate=$rate:duration=0.15" \
-        -ac "$ch" -c:a libmp3lame "$@" -f mp3 "$out"
+        -ac "$ch" -c:a "$codec" "$@" -f "$fmt" "$out"
     printf '%s %s\n' "$out" "$(ffprobe -v error -count_packets \
         -show_entries stream=nb_read_packets,sample_rate,channels \
         -of csv=p=0 "$out" | tr ',' ' ')" >> manifest.txt
 }
+enc() { encw libmp3lame mp3 "$@"; }
 raw() { enc "$@" -id3v2_version 0 -write_xing 0; }
 tagged() { enc "$@" -id3v2_version 3 -write_id3v1 1 -metadata title=splice; }
 # Every sampling frequency: MPEG-1, MPEG-2 LSF, MPEG-2.5; stereo
@@ -39,6 +41,9 @@ raw raw_44100_128k.mp3 44100 2 415 -b:a 128k
 raw raw_44100_vbr.mp3 44100 2 466 -q:a 2
 raw raw_22050_mono.mp3 22050 1 554 -b:a 32k
 raw raw_8000_mono.mp3 8000 1 622 -b:a 16k
+# Layer II (MPEG-1 and MPEG-2 LSF) segments, for layer switches.
+encw mp2 mp2 raw_l2_48000.mp2 48000 2 740 -b:a 192k
+encw mp2 mp2 raw_l2_22050.mp2 22050 1 830 -b:a 64k
 # Full files: ID3v2 + Info / Xing frame + ID3v1 trailer.
 tagged tagged_44100.mp3 44100 2 523 -b:a 64k
 tagged tagged_32000_vbr.mp3 32000 2 587 -q:a 4
