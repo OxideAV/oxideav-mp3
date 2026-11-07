@@ -25,6 +25,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **API hygiene: public error enums, growable enums and parsed /
+  author-side records are `#[non_exhaustive]`.** Future variants and
+  fields stop being semver-breaking. Error enums: `StreamEncodeError`,
+  `EncodeError`, `HeaderError`, `LameParseError`, `ReservoirError`,
+  `XingEmitError` (plus the hidden stage errors). Enums: `XingTagId`,
+  `QualityPreset`. Records: `Mp3FrameHeader`, `ModeExtension`, `Frame`,
+  `Mp3Tags`, `XingTag`, `LameTag`, `QualityPresetParams`,
+  `Model2WindowSwitch`, `Model2Layer3Granule`, `XminThresholds`,
+  `XingTagSpec`. Downstream `match`es on these need a wildcard arm and
+  struct literals must use the constructors. The spec-closed header
+  field enums (`MpegVersion`, `Layer`, `ChannelMode`, `Emphasis`,
+  `AnnexDSamplingRate`) stay exhaustive. The unused scaffold
+  `oxideav_mp3::Error` is now `#[doc(hidden)]`.
+
 - **Demuxer timestamps, duration and seeking are exact.** Packets keep
   the `1 / f` time base of the first audio frame; across a switch the
   running time is kept in 1 / 14 112 000 s units (the LCM of all MPEG
@@ -38,6 +52,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `XingTagSpec::new(id)` plus `with_flags` / `with_frames` /
+  `with_bytes` / `with_toc` / `with_quality` builders (each field
+  setter also sets its flag bit) replace struct-literal construction.
 - `Mp3Demuxer::audio_frame_count()` and `framing_switch_count()`.
 - `tests/demuxer_splice.rs` + `tests/fixtures/splice/gen.sh` (segments
   encoded with the black-box `ffmpeg` CLI, `ffprobe` frame-count

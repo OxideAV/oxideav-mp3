@@ -156,6 +156,7 @@ pub struct FrameScaleFactors {
 
 /// Errors returned by the scalefactor decode stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScaleFactorError {
     /// The main-data bit reservoir did not hold enough bytes to satisfy
     /// a `main_data_begin` back-pointer, i.e. the referenced bytes were

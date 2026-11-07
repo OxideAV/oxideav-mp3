@@ -135,6 +135,7 @@ pub const SAMPLES_PER_GRANULE: usize = 576;
 
 /// Errors returned by the stream encoder.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StreamEncodeError {
     /// Wraps a header-construction failure from
     /// [`crate::make_silent_header`] — bad bitrate / sample-rate /
@@ -848,6 +849,7 @@ pub struct Mp3Encoder {
 /// automatic Model 2 path surfaces it here so callers can inspect the
 /// decision the analysis reached for the granules of the last frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct Model2WindowSwitch {
     /// §C.1.5.3.2.1 psychoacoustic entropy of the long path for this
     /// granule/channel.

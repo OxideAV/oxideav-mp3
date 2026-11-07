@@ -111,6 +111,7 @@
 /// downstream consumer can inspect or surface them without re-parsing
 /// the wire bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LameTag {
     /// 9-byte encoder version string — typically ASCII like `"LAME3.100"`.
     /// The first four bytes are the unmovable `"LAME"` magic.
@@ -181,6 +182,7 @@ pub const DELAY_PADDING_OFFSET_FROM_LAME_MAGIC: usize = OFF_DELAY_PADDING;
 
 /// Errors returned by [`parse_lame_tag`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LameParseError {
     /// The byte range described by `lame_magic_offset` and the
     /// trailing 38 bytes of LAME-extension fields does not fit inside

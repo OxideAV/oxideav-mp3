@@ -291,6 +291,7 @@ pub struct ScheduledFrame {
 
 /// Errors produced by the reservoir scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReservoirError {
     /// A frame's main-data length plus the running reservoir would
     /// overflow the §2.4.2.7 9-bit (MPEG-1, 511 bytes) or 8-bit

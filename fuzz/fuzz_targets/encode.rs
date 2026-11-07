@@ -238,28 +238,21 @@ fn lane_direct(bytes: &[u8]) {
         enc.with_protection_bit(true);
     }
     if toggles & 0x04 != 0 {
-        enc.enable_xing_info(XingTagSpec {
-            id: if seed_a & 1 == 0 {
-                XingTagId::Xing
-            } else {
-                XingTagId::Info
-            },
-            // Attacker flag word; FRAMES | BYTES auto-fill at flush,
-            // higher bits written verbatim.
-            flags: u32::from(seed_b) | flag_bit::FRAMES,
-            frames: None,
-            bytes: None,
-            toc: if seed_b & 0x04 != 0 {
-                Some([seed_a; 100])
-            } else {
-                None
-            },
-            quality: if seed_b & 0x08 != 0 {
-                Some(u32::from(seed_a))
-            } else {
-                None
-            },
-        });
+        let id = if seed_a & 1 == 0 {
+            XingTagId::Xing
+        } else {
+            XingTagId::Info
+        };
+        // Attacker flag word; FRAMES | BYTES auto-fill at flush,
+        // higher bits written verbatim.
+        let mut spec = XingTagSpec::new(id).with_flags(u32::from(seed_b) | flag_bit::FRAMES);
+        if seed_b & 0x04 != 0 {
+            spec = spec.with_toc([seed_a; 100]);
+        }
+        if seed_b & 0x08 != 0 {
+            spec = spec.with_quality(u32::from(seed_a));
+        }
+        enc.enable_xing_info(spec);
     }
     if toggles & 0x08 != 0 {
         let _ = enc.force_short_blocks_for_testing(seed_a & 1 == 0);

@@ -49,14 +49,9 @@ fn carrier_frame_is_first_in_stream_and_carries_xing_magic() {
     // template that flags only frames + bytes (encoder fills them in).
     let n = SAMPLES_PER_FRAME * 5;
     let pcm = sine_pcm(n, 440.0, SR as f32, 0.5);
-    let mut enc = fresh_encoder_with_xing(XingTagSpec {
-        id: XingTagId::Xing,
-        flags: xing_flag_bit::FRAMES | xing_flag_bit::BYTES,
-        frames: None,
-        bytes: None,
-        toc: None,
-        quality: None,
-    });
+    let mut enc = fresh_encoder_with_xing(
+        XingTagSpec::new(XingTagId::Xing).with_flags(xing_flag_bit::FRAMES | xing_flag_bit::BYTES),
+    );
     enc.push_samples(&pcm).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     enc.finish(&mut bytes).unwrap();
@@ -79,14 +74,9 @@ fn carrier_frame_is_first_in_stream_and_carries_xing_magic() {
 fn carrier_frame_parse_xing_info_recovers_writer_intent() {
     let n = SAMPLES_PER_FRAME * 7;
     let pcm = sine_pcm(n, 440.0, SR as f32, 0.5);
-    let mut enc = fresh_encoder_with_xing(XingTagSpec {
-        id: XingTagId::Info,
-        flags: xing_flag_bit::FRAMES | xing_flag_bit::BYTES,
-        frames: None,
-        bytes: None,
-        toc: None,
-        quality: None,
-    });
+    let mut enc = fresh_encoder_with_xing(
+        XingTagSpec::new(XingTagId::Info).with_flags(xing_flag_bit::FRAMES | xing_flag_bit::BYTES),
+    );
     enc.push_samples(&pcm).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     enc.finish(&mut bytes).unwrap();
@@ -125,14 +115,9 @@ fn xing_audio_total_bytes_matches_actual_audio_region_length() {
     // with byte-counting via FrameWalker.
     let n = SAMPLES_PER_FRAME * 20; // ~520 ms — pad cycle long enough to land padded frames.
     let pcm = sine_pcm(n, 440.0, SR as f32, 0.5);
-    let mut enc = fresh_encoder_with_xing(XingTagSpec {
-        id: XingTagId::Info,
-        flags: xing_flag_bit::FRAMES | xing_flag_bit::BYTES,
-        frames: None,
-        bytes: None,
-        toc: None,
-        quality: None,
-    });
+    let mut enc = fresh_encoder_with_xing(
+        XingTagSpec::new(XingTagId::Info).with_flags(xing_flag_bit::FRAMES | xing_flag_bit::BYTES),
+    );
     enc.push_samples(&pcm).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     enc.finish(&mut bytes).unwrap();
@@ -173,14 +158,13 @@ fn pre_filled_xing_template_fields_are_written_verbatim() {
     // overwrite them with post-encode totals.
     let pcm = sine_pcm(SAMPLES_PER_FRAME * 3, 440.0, SR as f32, 0.5);
     let toc_in: [u8; 100] = std::array::from_fn(|i| i as u8);
-    let mut enc = fresh_encoder_with_xing(XingTagSpec {
-        id: XingTagId::Xing,
-        flags: xing_flag_bit::ALL_FOUR,
-        frames: Some(0xDEAD),
-        bytes: Some(0xBEEF),
-        toc: Some(toc_in),
-        quality: Some(50),
-    });
+    let mut enc = fresh_encoder_with_xing(
+        XingTagSpec::new(XingTagId::Xing)
+            .with_frames(0xDEAD)
+            .with_bytes(0xBEEF)
+            .with_toc(toc_in)
+            .with_quality(50),
+    );
     enc.push_samples(&pcm).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     enc.finish(&mut bytes).unwrap();
@@ -225,14 +209,9 @@ fn mp3_demuxer_consumes_carrier_frame_at_open() {
     // encoder wrote.
     let n = SAMPLES_PER_FRAME * 6;
     let pcm = sine_pcm(n, 440.0, SR as f32, 0.5);
-    let mut enc = fresh_encoder_with_xing(XingTagSpec {
-        id: XingTagId::Info,
-        flags: xing_flag_bit::FRAMES | xing_flag_bit::BYTES,
-        frames: None,
-        bytes: None,
-        toc: None,
-        quality: None,
-    });
+    let mut enc = fresh_encoder_with_xing(
+        XingTagSpec::new(XingTagId::Info).with_flags(xing_flag_bit::FRAMES | xing_flag_bit::BYTES),
+    );
     enc.push_samples(&pcm).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     enc.finish(&mut bytes).unwrap();
@@ -260,14 +239,9 @@ fn carrier_decode_to_silence_does_not_leak_into_audio() {
     // every granule's `part2_3_length` reads as 0, so no spectral data
     // is consumed and the output is silence.
     let pcm = sine_pcm(SAMPLES_PER_FRAME * 3, 440.0, SR as f32, 0.5);
-    let mut enc = fresh_encoder_with_xing(XingTagSpec {
-        id: XingTagId::Xing,
-        flags: xing_flag_bit::FRAMES,
-        frames: None,
-        bytes: None,
-        toc: None,
-        quality: None,
-    });
+    let mut enc = fresh_encoder_with_xing(
+        XingTagSpec::new(XingTagId::Xing).with_flags(xing_flag_bit::FRAMES),
+    );
     enc.push_samples(&pcm).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     enc.finish(&mut bytes).unwrap();

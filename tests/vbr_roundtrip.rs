@@ -244,14 +244,10 @@ fn vbr_with_xing_toc_auto_fills_seek_table() {
     let pcm = mixed_content_pcm(10, 10);
     let mut enc = Mp3Encoder::new(320, SR, ChannelMode::SingleChannel).unwrap();
     enc.enable_vbr(64, 192).expect("vbr enable");
-    enc.enable_xing_info(XingTagSpec {
-        id: XingTagId::Xing,
-        flags: xing_flag_bit::FRAMES | xing_flag_bit::BYTES | xing_flag_bit::TOC,
-        frames: None,
-        bytes: None,
-        toc: None,
-        quality: None,
-    });
+    enc.enable_xing_info(
+        XingTagSpec::new(XingTagId::Xing)
+            .with_flags(xing_flag_bit::FRAMES | xing_flag_bit::BYTES | xing_flag_bit::TOC),
+    );
     enc.push_samples(&pcm).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     enc.finish(&mut bytes).unwrap();
@@ -292,14 +288,10 @@ fn vbr_xing_toc_bytes_field_matches_audio_region() {
     let pcm = mixed_content_pcm(8, 8);
     let mut enc = Mp3Encoder::new(256, SR, ChannelMode::SingleChannel).unwrap();
     enc.enable_vbr(64, 192).expect("vbr enable");
-    enc.enable_xing_info(XingTagSpec {
-        id: XingTagId::Xing,
-        flags: xing_flag_bit::FRAMES | xing_flag_bit::BYTES | xing_flag_bit::TOC,
-        frames: None,
-        bytes: None,
-        toc: None,
-        quality: None,
-    });
+    enc.enable_xing_info(
+        XingTagSpec::new(XingTagId::Xing)
+            .with_flags(xing_flag_bit::FRAMES | xing_flag_bit::BYTES | xing_flag_bit::TOC),
+    );
     enc.push_samples(&pcm).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     enc.finish(&mut bytes).unwrap();
@@ -330,14 +322,10 @@ fn vbr_xing_toc_seeks_via_demuxer() {
     let pcm = mixed_content_pcm(10, 10); // ~520 ms of audio.
     let mut enc = Mp3Encoder::new(320, SR, ChannelMode::SingleChannel).unwrap();
     enc.enable_vbr(64, 192).expect("vbr enable");
-    enc.enable_xing_info(XingTagSpec {
-        id: XingTagId::Xing,
-        flags: xing_flag_bit::FRAMES | xing_flag_bit::BYTES | xing_flag_bit::TOC,
-        frames: None,
-        bytes: None,
-        toc: None,
-        quality: None,
-    });
+    enc.enable_xing_info(
+        XingTagSpec::new(XingTagId::Xing)
+            .with_flags(xing_flag_bit::FRAMES | xing_flag_bit::BYTES | xing_flag_bit::TOC),
+    );
     enc.push_samples(&pcm).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     enc.finish(&mut bytes).unwrap();

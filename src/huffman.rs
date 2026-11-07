@@ -76,6 +76,7 @@ struct BigTable {
 
 /// Error from the Huffman decode stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HuffmanError {
     /// The Huffman bitstream did not match any codeword in the selected
     /// table before the symbol's maximum length was reached, indicating
@@ -1060,6 +1061,7 @@ fn write_sign(w: &mut MainDataWriter, v: i32) {
 
 /// Error from the Huffman **encode** stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HuffmanEncodeError {
     /// A big-values `(x, y)` pair could not be coded by the `table_select`
     /// chosen for its region: the magnitude is out of the codebook's index

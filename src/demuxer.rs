@@ -93,6 +93,7 @@ pub const WAVE_FORMAT_MP3: u16 = 0x0055;
 /// was found so callers (and tests) can confirm the demuxer noticed
 /// them.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Mp3Tags {
     /// `true` when an ID3v2 tag was detected at offset 0.
     pub id3v2_present: bool,
@@ -112,6 +113,7 @@ pub struct Mp3Tags {
 /// payload layouts are identical — the magic alone selects the tag —
 /// so we collapse them to one type with an [`XingTagId`] discriminant.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct XingTag {
     /// Whether the magic was "Xing" or "Info".
     pub id: XingTagId,
@@ -138,6 +140,7 @@ pub struct XingTag {
 
 /// Xing-versus-Info discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum XingTagId {
     /// Encoder believes the stream is variable-bitrate.
     Xing,

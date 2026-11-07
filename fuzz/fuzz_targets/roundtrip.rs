@@ -162,18 +162,11 @@ fuzz_target!(|data: &[u8]| {
         let _ = enc.enable_vbr(ladder[min_idx], ladder[max_idx]);
     }
     if toggles & 0x04 != 0 {
-        enc.enable_xing_info(XingTagSpec {
-            id: if seed_a & 1 == 0 {
+        enc.enable_xing_info(XingTagSpec::new(if seed_a & 1 == 0 {
                 XingTagId::Xing
             } else {
                 XingTagId::Info
-            },
-            flags: flag_bit::FRAMES | flag_bit::BYTES,
-            frames: None,
-            bytes: None,
-            toc: None,
-            quality: None,
-        });
+            }).with_flags(flag_bit::FRAMES | flag_bit::BYTES));
     }
     if toggles & 0x08 != 0 {
         let _ = enc.force_short_blocks_for_testing(true);

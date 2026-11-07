@@ -300,6 +300,7 @@ impl SideInfo {
 
 /// Errors returned by [`parse_side_info`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SideInfoError {
     /// The supplied slice was shorter than the side-info block this
     /// header implies (MPEG-1: 17 mono / 32 stereo; MPEG-2 / MPEG-2.5

@@ -134,6 +134,7 @@ use crate::stream_encoder::DEFAULT_OUTER_LOOP_THRESHOLD;
 /// instead of a scalar argument — produces identical results to the
 /// scalar variants when fed a uniform fill.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct XminThresholds {
     /// Long-block per-band threshold, `xmin[sfb]` for `sfb ∈ 0..21`.
     /// Consumed by [`crate::outer_loop::outer_loop_search_long_per_band`].
@@ -10497,6 +10498,7 @@ pub fn layer3_sfb_ratio(thm: &[f64], en: &[f64]) -> Option<Vec<f64>> {
 /// the §C.1.5.3.2.1 psychoacoustic entropy and the window switching
 /// decision it implies.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Model2Layer3Granule {
     /// §C.1.5.3.2.1 psychoacoustic entropy of the long path.
     pub pe: f64,

@@ -332,6 +332,7 @@ const SILENT_GRANULE_CHANNEL: GranuleChannel = GranuleChannel {
 
 /// Errors returned by the Phase 1 encode path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// The requested layer is not Layer III. The Phase 1 encoder writes
     /// Layer III frames only.

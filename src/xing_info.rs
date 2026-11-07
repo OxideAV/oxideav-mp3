@@ -65,6 +65,7 @@ use crate::frame::Mp3FrameHeader;
 /// flag bit is set, else [`build_xing_info_payload`] returns
 /// [`XingEmitError::FlagFieldMismatch`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct XingTagSpec {
     /// Tag id: `Xing` for true-VBR streams, `Info` for CBR streams
     /// carrying the same structure for VBR-aware seekers.
@@ -105,6 +106,7 @@ pub mod flag_bit {
 /// Errors returned by [`build_xing_info_payload`] and
 /// [`build_info_frame`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum XingEmitError {
     /// A flag bit is set in `flags` but the corresponding
     /// [`XingTagSpec`] field is `None`, or vice versa. The wire layout
@@ -143,6 +145,62 @@ impl From<EncodeError> for XingEmitError {
 }
 
 impl XingTagSpec {
+    /// An empty spec for tag `id`: flag word `0`, every optional field
+    /// absent. Add fields with the `with_*` builders.
+    #[must_use]
+    pub const fn new(id: XingTagId) -> Self {
+        Self {
+            id,
+            flags: 0,
+            frames: None,
+            bytes: None,
+            toc: None,
+            quality: None,
+        }
+    }
+
+    /// Replace the whole flag word verbatim. A flag bit set here with
+    /// its field left `None` asks the streaming encoder to fill the
+    /// field in at flush time (`FRAMES` / `BYTES` / `TOC`); higher,
+    /// non-enumerated bits are written verbatim.
+    #[must_use]
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Set the `frames` field and its [`flag_bit::FRAMES`] bit.
+    #[must_use]
+    pub const fn with_frames(mut self, frames: u32) -> Self {
+        self.frames = Some(frames);
+        self.flags |= flag_bit::FRAMES;
+        self
+    }
+
+    /// Set the `bytes` field and its [`flag_bit::BYTES`] bit.
+    #[must_use]
+    pub const fn with_bytes(mut self, bytes: u32) -> Self {
+        self.bytes = Some(bytes);
+        self.flags |= flag_bit::BYTES;
+        self
+    }
+
+    /// Set the 100-entry seek table and its [`flag_bit::TOC`] bit.
+    #[must_use]
+    pub const fn with_toc(mut self, toc: [u8; 100]) -> Self {
+        self.toc = Some(toc);
+        self.flags |= flag_bit::TOC;
+        self
+    }
+
+    /// Set the quality indicator and its [`flag_bit::QUALITY`] bit.
+    #[must_use]
+    pub const fn with_quality(mut self, quality: u32) -> Self {
+        self.quality = Some(quality);
+        self.flags |= flag_bit::QUALITY;
+        self
+    }
+
     /// Convert into the [`XingTag`] struct returned by
     /// [`crate::demuxer::parse_xing_info`]. Used by the round-trip
     /// tests to compare the decoded-side struct against the
@@ -290,6 +348,24 @@ mod tests {
             toc: Some([7u8; 100]),
             quality: Some(0),
         }
+    }
+
+    #[test]
+    fn builders_match_struct_literal() {
+        let built = XingTagSpec::new(XingTagId::Xing)
+            .with_frames(32)
+            .with_bytes(6114)
+            .with_toc([7u8; 100])
+            .with_quality(0);
+        let lit = spec_all_fields();
+        assert_eq!(built.flags, lit.flags);
+        assert_eq!(built.as_xing_tag().frames, lit.frames);
+        assert_eq!(built.bytes, lit.bytes);
+        assert_eq!(built.toc, lit.toc);
+        assert_eq!(built.quality, lit.quality);
+        let auto = XingTagSpec::new(XingTagId::Info).with_flags(flag_bit::FRAMES);
+        assert_eq!(auto.flags, flag_bit::FRAMES);
+        assert!(auto.frames.is_none());
     }
 
     #[test]

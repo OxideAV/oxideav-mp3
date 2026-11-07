@@ -572,6 +572,8 @@ use oxideav_core::RuntimeContext;
 /// Crate-local error type. Until the clean-room rebuild lands every
 /// public API path returns [`Error::NotImplemented`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[doc(hidden)] // internal: unused scaffold placeholder, not stable API
 pub enum Error {
     /// The crate has been reset to a scaffold pending clean-room
     /// rebuild; no decoder or encoder functionality is wired up yet.

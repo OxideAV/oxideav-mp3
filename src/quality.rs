@@ -52,6 +52,7 @@
 /// Apply a preset with
 /// [`crate::stream_encoder::Mp3Encoder::with_quality_preset`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum QualityPreset {
     /// Transparency-leaning: the tightest staged threshold (§D.1 Step 3
     /// `offset_db = -24 dB`, two §D.1 steps below the spec's own
@@ -88,6 +89,7 @@ pub enum QualityPreset {
 /// a preset will arm before applying it (and so the integration tests can
 /// assert the mapping without re-deriving it).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct QualityPresetParams {
     /// §D.1 Step 3 threshold offset in dB applied to the per-band
     /// threshold-in-quiet bowl. More negative ⇒ tighter ⇒ more bits.

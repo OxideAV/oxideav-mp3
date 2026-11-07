@@ -141,6 +141,7 @@ impl ChannelMode {
 /// are applied (ISO/IEC 11172-3 §2.4.2.3): bit pattern `i` `s`,
 /// where `i` enables intensity_stereo and `s` enables ms_stereo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct ModeExtension {
     /// Layer III: intensity_stereo on (`'01'` or `'11'`).
     /// Layer I/II: indicates the intensity-stereo subband bound
@@ -176,6 +177,7 @@ pub enum Emphasis {
 /// via the standard's tables (bitrate in kbit/s, sample rate in Hz,
 /// frame length in bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Mp3FrameHeader {
     /// MPEG version, from the `ID` bit.
     pub version: MpegVersion,
@@ -351,6 +353,7 @@ impl Mp3FrameHeader {
 /// Error returned when four candidate bytes do not form a valid
 /// MPEG audio frame header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HeaderError {
     /// Fewer than four bytes were available.
     TooShort,
@@ -566,6 +569,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<Mp3FrameHeader, HeaderError> {
 
 /// One frame located by [`FrameWalker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Frame<'a> {
     /// The parsed header for this frame.
     pub header: Mp3FrameHeader,
