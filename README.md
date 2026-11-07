@@ -166,13 +166,41 @@ and the trailing gapless-playback extension (encoder delay / padding),
 so `trimmed_duration_samples()` reports the gapless sample count.
 Registered as a container alongside the codec.
 
-**Seeking** is frame-accurate. The Xing-TOC path (VBR) and the
-proportional bitrate path (CBR / free-format) position the cursor on a
-byte estimate, snap it forward to the next real frame syncword, then
-re-derive the **exact** PTS of the frame they landed on by counting
-whole frames from the first audio frame — so `seek_to` returns a
-whole-frame-aligned timestamp that matches the PTS later stamped on the
-next packet and keeps the stream strictly monotone (no leaked estimate).
+**Mid-stream header changes.** A stream may switch sampling frequency,
+MPEG version (MPEG-1 / MPEG-2 LSF / MPEG-2.5), channel mode, bitrate or
+free-format slot count at any frame boundary — `cat a.mp3 b.mp3` does
+exactly that, and also leaves the later files' ID3v2 tags, ID3v1
+trailers and Xing / Info frames in the middle. Every audio frame comes
+out once; tags and info frames are stepped over. A header exactly where
+the previous frame ended that keeps the version / layer / sampling
+frequency is trusted; one that switches them must be followed by a
+header with its own key; a candidate found by scanning (junk, a damaged
+splice) must chain three more correctly-spaced headers, so a resync
+does not lock onto a false sync inside main data. A free-format segment
+re-measures its slot count at a switch, bounded by the §2.4.2.3
+free-format bitrate ceilings.
+
+**Time base and duration.** The stream declares `1 / f`, `f` the first
+audio frame's sampling frequency, so a stream that never switches gets
+plain sample-count timestamps. Across a switch the running time is kept
+exactly in units of 1 / 14 112 000 s (the least common multiple of the
+nine MPEG audio sampling frequencies) and each packet's `pts` is that
+time floored to the declared base: `pts + duration` is always the next
+`pts`, timestamps strictly increase, and nothing drifts. `open()` walks
+every frame header once, so `streams()[0].duration` is the exact sum of
+the packet durations (`audio_frame_count()` and `framing_switch_count()`
+report what the walk found). The decoder announces each new output
+shape with `Frame::StreamParams`.
+
+**Seeking** is frame-accurate, VBR or CBR, before or after any switch:
+`seek_to` uses a sparse index from the open-time walk (every 32nd audio
+frame) and steps to the frame containing the requested time — at or
+before it — returning the PTS that frame is then emitted with.
+`tests/demuxer_splice.rs` checks all 72 ordered pairs of sampling
+frequencies, channel-mode / bitrate / VBR / free-format switches, fully
+tagged files back to back, junk between switching segments, and seeks to
+every packet, against ffprobe frame counts, an independent header walk
+and per-segment standalone decodes.
 Each emitted packet's **keyframe flag** reflects the §2.4.2.7 bit
 reservoir: a Layer III frame is a random-access point only when its
 `main_data_begin` back-pointer is zero (it borrows no main data from
@@ -189,9 +217,8 @@ first two frame syncs that agree on `(version, layer, sample_rate)`,
 minus the first frame's own padding slot — and stores it; every
 subsequent frame's length is that base plus its own padding bit
 (`Mp3FrameHeader::frame_len_free_format`). An effective constant
-bitrate (`base · 8 · sample_rate / samples_per_frame`) is derived so
-the duration estimate and the CBR/proportional seek path work on
-free-format input too. A single free-format frame (no second sync to
+bitrate (`base · 8 · sample_rate / samples_per_frame`) is reported as
+the stream's `bit_rate`. A single free-format frame (no second sync to
 measure against) is rejected. End-to-end mono + stereo demux→decode is
 byte-exact with the same stream demuxed as CBR
 (`tests/demuxer_free_format_roundtrip.rs`).
@@ -270,8 +297,8 @@ crafted valid-sync headers across all three MPEG versions and
 free-format framing, reservoir / reset / flush state transitions),
 `granule` (the per-granule decode primitives, including the MPEG-2.5
 low-rate scalefactor-band dispatch), `demux` (container open with
-ID3v2 / Xing / VBRI / LAME parsing, packet iteration, and the TOC /
-proportional seek paths), and `encode` (hostile PCM geometries,
+ID3v2 / Xing / LAME parsing, the open-time header walk, packet
+iteration with resync, and the indexed seek path), and `encode` (hostile PCM geometries,
 off-ladder/off-table configurations, and the full toggle surface —
 VBR, CRC, Xing, forced/auto block types with non-finite thresholds,
 joint-stereo variants — over both the trait path and the direct

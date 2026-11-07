@@ -2,11 +2,11 @@
 
 //! Drive attacker-supplied bytes through the [`oxideav_mp3::Mp3Demuxer`]
 //! container surface: `open` (ID3v2 skip, first-frame probe, Xing /
-//! Info / VBRI and LAME-tag parsing, free-format frame-length
-//! measurement), `next_packet` iteration (frame walk, resync,
-//! reservoir-aware keyframe flag), duration estimation, and
-//! `seek_to` (Xing-TOC percentile path, CBR proportional path,
-//! `pts_at_cursor` frame recount).
+//! Info and LAME-tag parsing, free-format frame-length measurement,
+//! the whole-stream header walk), `next_packet` iteration (frame
+//! boundaries across header switches, mid-stream tags, resync,
+//! reservoir-aware keyframe flag), duration, and `seek_to` (indexed
+//! frame-accurate landing).
 //!
 //! r405 depth lane. The contract under test is panic-freedom: every
 //! entry point returns a `Result` (never panics, never
@@ -32,9 +32,8 @@
 //! After draining up to a bounded number of packets, the harness
 //! issues `seek_to` calls derived from input bytes (front, interior
 //! percentiles, far-past-EOF) and drains a few more packets after each
-//! — covering the TOC snap, the proportional estimate, the resync
-//! walk, and the post-seek PTS re-derivation, plus the
-//! monotonicity-relevant interior state they rebuild.
+//! — covering the index lookup, the forward frame walk to the target,
+//! and the framer state they rebuild.
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{Demuxer, Error};

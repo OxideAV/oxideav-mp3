@@ -1,10 +1,12 @@
 //! MP3 container demuxer.
 //!
-//! Wraps the [`frame::FrameWalker`] in an `oxideav_core::Demuxer` so a
-//! pipeline can open `*.mp3` files, skip the ID3v2/ID3v1 frontmatter
-//! and trailer, detect a Xing/Info VBR-info frame and use it for
-//! duration / TOC seeking, and stream packets one MPEG audio frame at
-//! a time.
+//! An `oxideav_core::Demuxer` over an MPEG audio elementary stream: it
+//! skips the ID3v2/ID3v1 frontmatter and trailer, parses the Xing/Info
+//! VBR-info frame and its gapless extension, walks every frame header
+//! once at open time (exact duration, seek index), and streams packets
+//! one MPEG audio frame at a time — across mid-stream changes of
+//! sampling frequency, MPEG version, channel mode, bitrate and free
+//! format (frame-boundary discovery lives in `crate::framing`).
 //!
 //! # What is in `docs/audio/mp3/` and what is not
 //!
@@ -55,12 +57,14 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
+use crate::framing::{self, CachedInput, FramerState, FramingKey, Located};
+
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, CodecTag, ContainerRegistry, Demuxer, Error, Packet,
     ProbeData, ReadSeek, Result, StreamInfo, TimeBase,
 };
 
-use crate::frame::{Layer, MpegVersion, parse_header};
+use crate::frame::{Layer, Mp3FrameHeader, MpegVersion, parse_header};
 use crate::lame_tag::{LameTag, parse_lame_tag};
 use crate::side_info::{
     SIDE_INFO_BYTES_LSF_MONO, SIDE_INFO_BYTES_LSF_STEREO, SIDE_INFO_BYTES_MONO,
@@ -438,17 +442,48 @@ fn open_demuxer(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
 
 /// The MP3 demuxer.
 ///
-/// Sequential mode: keep a sliding read window that holds at least
-/// the next frame. After parsing each frame's four-byte header we
-/// know its length (`Mp3FrameHeader::frame_len`) and refill the
-/// window before issuing a `Packet`.
+/// # Mid-stream header changes
+///
+/// The stream may switch sampling frequency, MPEG version (MPEG-1 /
+/// MPEG-2 LSF / MPEG-2.5), layer, channel mode, bitrate or free-format
+/// slot count at any frame boundary — a byte-concatenation of files
+/// does exactly that, and may also carry the later files' ID3v2 tags,
+/// ID3v1 trailers and Xing / Info frames in between. Every audio frame
+/// is emitted once; tags and info frames are stepped over. A header
+/// exactly where the previous frame ended that keeps the version /
+/// layer / sampling frequency is trusted; one that switches them must
+/// be followed by a header with its own key; a candidate found by
+/// scanning must chain three more correctly-spaced headers, so a
+/// resync cannot lock onto a false sync inside main data.
+///
+/// **Time base.** The stream declares `1 / f` where `f` is the
+/// sampling frequency of the first audio frame, the same as for a
+/// stream that never switches, so packet timestamps of such a stream
+/// are plain sample counts. Across a switch the running time is kept
+/// exactly in units of 1 / 14 112 000 s (the least common multiple of
+/// every MPEG audio sampling frequency, in which every frame duration
+/// is whole) and each packet's `pts` is that time floored to the
+/// declared base; its `duration` is the distance to the next packet's
+/// `pts`. Timestamps are therefore continuous (`pts + duration` is the
+/// next `pts`) and strictly increasing, and never drift: after a
+/// 44.1 kHz → 32 kHz switch a 1152-sample frame lasts 1587 or 1588
+/// ticks of the 1/44 100 base, alternating so the sum stays exact. The
+/// decoder announces the new output shape with `Frame::StreamParams`;
+/// the stream's declared time base never changes.
+///
+/// **Duration and seeking.** `open()` walks every frame header once,
+/// so `streams()[0].duration` is the exact sum of the emitted packets'
+/// durations whatever the stream switches to (a Xing / Info frame
+/// describes only the file it was written for), and keeps a sparse
+/// index of frame positions so `seek_to` lands on the frame that
+/// contains the requested time — at or before it, as the `Demuxer`
+/// contract asks — with the PTS that frame is then emitted with.
 pub struct Mp3Demuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     tags: Mp3Tags,
     /// Optional Xing/Info frame parsed from the first audio frame
-    /// (or `None` for plain CBR streams). Drives VBR duration +
-    /// TOC-based seeking.
+    /// (or `None` for plain CBR streams).
     xing: Option<XingTag>,
     /// Optional LAME-extension tag parsed from the carrier frame's
     /// LAME magic (when present and all four Xing flag bits are set).
@@ -461,50 +496,62 @@ pub struct Mp3Demuxer {
     /// before the first frame's syncword).
     first_frame_offset: u64,
     /// Byte offset of the first **playable** frame — equal to
-    /// `first_frame_offset` for CBR streams without a Xing/Info
-    /// info frame, or to `first_frame_offset + info_frame_len`
-    /// otherwise.
+    /// `first_frame_offset` for streams without a Xing/Info info
+    /// frame, or to `first_frame_offset + info_frame_len` otherwise.
     first_audio_frame_offset: u64,
-    /// Total file length (used for ID3v1 detection + CBR duration).
+    /// Total file length.
     total_len: u64,
     /// End-of-audio offset = `total_len - 128` when an ID3v1 trailer
     /// was detected, else `total_len`.
     audio_end_offset: u64,
-    /// Current read cursor inside the audio region (>=
-    /// `first_audio_frame_offset` and <= `audio_end_offset`).
+    /// Current read cursor inside the audio region.
     cursor: u64,
-    /// Sample rate inherited from the first MPEG audio frame.
-    /// Cached so timestamps don't have to re-parse the header.
+    /// Whether `cursor` sits exactly where the previous frame ended.
+    on_boundary: bool,
+    /// Framer state in force at `cursor`.
+    state: FramerState,
+    /// Sampling frequency of the first audio frame: the declared time
+    /// base is `1 / sample_rate`.
     sample_rate: u32,
-    /// Samples-per-frame inherited from the first audio frame. Used
-    /// for CBR duration estimation and for stamping packet
-    /// durations.
-    samples_per_frame: u32,
-    /// Bitrate (in bits/s) inherited from the first audio frame.
-    /// `None` when the stream is free-format.
-    bitrate_bps: Option<u32>,
-    /// Constant **unpadded** frame body length (bytes) for a
-    /// free-format stream, measured once at open-time as the byte
-    /// distance between the first two frame syncs (§2.4.1.3 fixes
-    /// the free-format bitrate, so every frame is this length plus
-    /// the per-frame padding slot). `None` for table-bitrate
-    /// streams, whose per-frame length comes from
-    /// [`crate::frame::Mp3FrameHeader::frame_len`].
+    /// Running time of the next packet, in `framing::TICKS_PER_SECOND`
+    /// units.
+    next_ticks: u64,
+    /// Exact total running time of the audio frames, in ticks.
+    total_ticks: u64,
+    /// Unpadded free-format frame length measured on the first frame
+    /// (§2.4.1.3), `None` for a table-bitrate first frame.
     free_format_base_len: Option<usize>,
-    /// Sequential PTS counter, ticked once per emitted packet by
-    /// [`Self::next_packet`]. Expressed in `time_base = 1 /
-    /// sample_rate` units, so each tick adds `samples_per_frame`.
-    next_pts: i64,
-    /// Whether `streams[0].duration` was filled in.
-    /// Tracks whether we ever entered the EOF path of
-    /// [`Self::next_packet`], so duplicate calls all return `Eof`
-    /// rather than re-probing the underlying reader.
+    /// Number of audio frames (info frames excluded).
+    audio_frames: u64,
+    /// Number of framing-key changes (sampling frequency / MPEG
+    /// version / layer / free-format switches) between audio frames.
+    framing_switches: u64,
+    /// Sparse seek index: every [`SEEK_INDEX_STRIDE`]-th audio frame.
+    seek_index: Vec<SeekPoint>,
+    /// Whether the EOF path of [`Self::next_packet`] was entered, so
+    /// repeated calls keep returning `Eof`.
     finished: bool,
     /// Trimmed PCM sample count after applying the LAME encoder-delay
     /// and zero-padding fields. Equal to `streams[0].duration` for
     /// streams without a LAME tag; smaller when gapless trim applies.
     trimmed_duration_samples: Option<i64>,
 }
+
+/// One entry of the demuxer's seek index: where an audio frame starts,
+/// the running time at its start, and the framer state to resume with.
+#[derive(Debug, Clone, Copy)]
+struct SeekPoint {
+    offset: u64,
+    ticks: u64,
+    state: FramerState,
+}
+
+/// Audio frames between two seek-index entries.
+const SEEK_INDEX_STRIDE: u64 = 32;
+
+/// How many junk bytes may precede the first frame after the ID3v2
+/// tag (a tag whose size is off by its padding, say).
+const MAX_LEADING_JUNK: u64 = 4096;
 
 impl std::fmt::Debug for Mp3Demuxer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -519,10 +566,11 @@ impl std::fmt::Debug for Mp3Demuxer {
             .field("audio_end_offset", &self.audio_end_offset)
             .field("cursor", &self.cursor)
             .field("sample_rate", &self.sample_rate)
-            .field("samples_per_frame", &self.samples_per_frame)
-            .field("bitrate_bps", &self.bitrate_bps)
+            .field("next_ticks", &self.next_ticks)
+            .field("total_ticks", &self.total_ticks)
+            .field("audio_frames", &self.audio_frames)
+            .field("framing_switches", &self.framing_switches)
             .field("free_format_base_len", &self.free_format_base_len)
-            .field("next_pts", &self.next_pts)
             .field("finished", &self.finished)
             .field("trimmed_duration_samples", &self.trimmed_duration_samples)
             .finish()
@@ -531,7 +579,8 @@ impl std::fmt::Debug for Mp3Demuxer {
 
 impl Mp3Demuxer {
     /// Open an MP3 stream from a generic [`ReadSeek`] source.
-    pub fn open(mut input: Box<dyn ReadSeek>) -> Result<Self> {
+    pub fn open(input: Box<dyn ReadSeek>) -> Result<Self> {
+        let mut input: Box<dyn ReadSeek> = Box::new(CachedInput::new(input));
         // 1. Bound the input length so we can spot ID3v1 trailers.
         let total_len = input.seek(SeekFrom::End(0))?;
         input.seek(SeekFrom::Start(0))?;
@@ -539,7 +588,7 @@ impl Mp3Demuxer {
         // 2. ID3v2 frontmatter — skip past the tag if present.
         let mut head10 = [0u8; 10];
         let n = read_up_to(input.as_mut(), &mut head10)?;
-        let (id3v2_present, id3v2_size, mut cursor) = if n == 10 {
+        let (id3v2_present, id3v2_size, cursor) = if n == 10 {
             if let Some(total) = id3v2_total_len(&head10) {
                 if total > total_len {
                     return Err(Error::invalid("ID3v2 size overruns the file"));
@@ -572,54 +621,30 @@ impl Mp3Demuxer {
             ));
         }
 
-        // 4. Find the first valid MPEG audio frame sync. The walker
-        //    tolerates a few stray garbage bytes between an ID3v2
-        //    tag (whose size is sometimes off-by-padding in the
-        //    wild) and the first frame.
-        let first_frame_offset = locate_first_frame(&mut input, cursor, audio_end_offset)?;
-        cursor = first_frame_offset;
-
-        // 5. Parse that frame's header (and enough payload to test
-        //    the Xing/Info magic).
-        input.seek(SeekFrom::Start(cursor))?;
-        let mut hdr = [0u8; 4];
-        if read_up_to(input.as_mut(), &mut hdr)? < 4 {
-            return Err(Error::invalid("truncated MPEG audio frame at start"));
-        }
-        let first_header =
-            parse_header(&hdr).map_err(|e| Error::invalid(format!("first frame header: {e}")))?;
-
-        // Free-format streams carry no table bitrate, so the first
-        // frame's length is measured from the distance to the next
-        // sync (§2.4.1.3). The measured constant is the *unpadded*
-        // body; the first frame's actual length adds back its own
-        // padding slot.
-        let (first_len, free_format_base_len) = match first_header.frame_len() {
-            Some(len) => (len, None),
-            None => {
-                let base = measure_free_format_base_len(
-                    &mut input,
-                    first_frame_offset,
-                    &first_header,
-                    audio_end_offset,
-                )?;
-                let len = first_header
-                    .frame_len_free_format(base)
-                    .ok_or_else(|| Error::unsupported("free-format MPEG audio frame at start"))?;
-                (len, Some(base))
-            }
-        };
-
-        // Re-seek to the start of the first frame; the free-format
-        // measurement above advanced the reader past the header.
-        input.seek(SeekFrom::Start(cursor))?;
-        if read_up_to(input.as_mut(), &mut hdr)? < 4 {
-            return Err(Error::invalid("truncated MPEG audio frame at start"));
-        }
+        // 4. First frame. A few stray bytes between an ID3v2 tag
+        //    (whose size is sometimes off by its padding in the wild)
+        //    and the first frame are tolerated; a free-format first
+        //    frame has its length measured from the next sync
+        //    (§2.4.1.3).
+        let mut state = FramerState::default();
+        let first = framing::next_frame(
+            input.as_mut(),
+            cursor,
+            audio_end_offset,
+            &mut state,
+            true,
+            Some(MAX_LEADING_JUNK),
+        )?
+        .ok_or_else(|| {
+            Error::invalid("no MPEG audio frame sync within the scan window after ID3v2")
+        })?;
+        let first_header = first.header;
+        let first_frame_offset = first.offset;
+        let first_len = first.len;
+        let free_format_base_len = state.free_base;
 
         let mut first_frame_buf = vec![0u8; first_len];
-        first_frame_buf[..4].copy_from_slice(&hdr);
-        if read_up_to(input.as_mut(), &mut first_frame_buf[4..])? + 4 < first_len {
+        if framing::read_at(input.as_mut(), first_frame_offset, &mut first_frame_buf)? < first_len {
             return Err(Error::invalid("truncated first MPEG audio frame"));
         }
 
@@ -641,79 +666,100 @@ impl Mp3Demuxer {
             parse_lame_tag(&first_frame_buf, off).ok()
         });
 
-        // 6. Decide where playable audio starts. A Xing/Info frame
-        //    carries no PCM — its slot is reserved as a metadata
-        //    carrier — so we skip past it for `next_packet`.
-        let first_audio_frame_offset = if xing.is_some() {
-            first_frame_offset + first_len as u64
-        } else {
-            first_frame_offset
+        // 6. Walk every frame header once: exact frame count and
+        //    running time across any switch, and the seek index.
+        //    A Xing/Info frame carries no PCM — its slot is a metadata
+        //    carrier — so it is skipped wherever it sits.
+        // `before` is the framer state to resume *at* the frame being
+        // processed; `after` the state once it is accepted.
+        let mut before = FramerState::default();
+        let mut after = state;
+        let mut first_audio: Option<(u64, FramerState, Mp3FrameHeader)> = None;
+        let mut seek_index = Vec::new();
+        let mut ticks: u64 = 0;
+        let mut audio_frames: u64 = 0;
+        let mut framing_switches: u64 = 0;
+        let mut last_key: Option<FramingKey> = None;
+        let mut cur = Some(first);
+        while let Some(f) = cur {
+            if !f.info_frame {
+                if first_audio.is_none() {
+                    first_audio = Some((f.offset, before, f.header));
+                }
+                if audio_frames.is_multiple_of(SEEK_INDEX_STRIDE) {
+                    seek_index.push(SeekPoint {
+                        offset: f.offset,
+                        ticks,
+                        state: before,
+                    });
+                }
+                let key = FramingKey::of(&f.header);
+                if last_key.is_some_and(|k| k != key) {
+                    framing_switches += 1;
+                }
+                last_key = Some(key);
+                ticks += framing::frame_ticks(&f.header);
+                audio_frames += 1;
+            }
+            let mut next_state = after;
+            cur = framing::next_frame(
+                input.as_mut(),
+                f.end(),
+                audio_end_offset,
+                &mut next_state,
+                true,
+                None,
+            )?;
+            before = after;
+            after = next_state;
+        }
+
+        let (first_audio_frame_offset, cursor_state, audio_header) = match first_audio {
+            Some(v) => v,
+            None => (first.end(), state, first_header),
         };
 
-        // 7. Build the StreamInfo from the first frame. The codec
-        //    parameters carry the same MP3 WAVEFORMATEX tag muxers
-        //    consume to round-trip into AVI/WAV containers.
-        let sample_rate = first_header.sample_rate_hz;
+        // 7. Build the StreamInfo from the first audio frame. The
+        //    codec parameters carry the same MP3 WAVEFORMATEX tag
+        //    muxers consume to round-trip into AVI/WAV containers.
+        let sample_rate = audio_header.sample_rate_hz;
         let samples_per_frame = first_header.samples_per_frame();
-        let bitrate_kbps = first_header.bitrate_kbps;
         // Free-format streams have no table bitrate, but a fixed one:
         // the unpadded body carries `samples_per_frame` samples, so
         // the effective constant bitrate is
         // `base_len * 8 * sample_rate / samples_per_frame` bit/s.
         // Table-bitrate streams take their declared rate directly.
-        let bitrate_bps = match bitrate_kbps {
+        let bitrate_bps = match first_header.bitrate_kbps {
             Some(k) => Some(k * 1000),
             None => free_format_base_len.map(|base| {
-                ((base as u128) * 8 * sample_rate as u128 / samples_per_frame as u128) as u32
+                ((base as u128) * 8 * first_header.sample_rate_hz as u128
+                    / samples_per_frame as u128) as u32
             }),
         };
         let time_base = TimeBase::new(1, sample_rate as i64);
+        let duration_samples = framing::ticks_to_units(ticks, sample_rate);
 
-        // Duration estimation.
-        //
-        // * VBR (Xing.frames present): duration_samples = frames *
-        //   samples_per_frame. This is the prompt's prescribed
-        //   estimator and the trace file's `frames=N` matches the
-        //   real frame count.
-        // * CBR: duration_seconds = (audio_end - first_audio_frame)
-        //   / (bitrate_bps / 8). Convert to samples via
-        //   sample_rate.
-        let duration_samples: Option<i64> = if let Some(xing) = xing.as_ref() {
-            xing.frames
-                .map(|f| (f as i64).saturating_mul(samples_per_frame as i64))
-        } else {
-            bitrate_bps.map(|br| {
-                let audio_bytes = audio_end_offset - first_audio_frame_offset;
-                // samples = audio_bytes * 8 / bitrate_bps * sample_rate
-                ((audio_bytes as u128) * 8u128 * sample_rate as u128 / br as u128) as i64
-            })
-        };
-
-        // Gapless trim: when a LAME tag with non-zero
-        // encoder_delay or zero_padding is present, the playable PCM
-        // sample count is the gross duration minus the two trim
-        // values. Computed against the per-stream sample-rate-relative
-        // duration (which equals (frame_count × samples_per_frame)
-        // for the VBR case, and the bitrate-derived sample count for
-        // the CBR case).
-        let trimmed_duration_samples: Option<i64> = match (lame.as_ref(), duration_samples) {
-            (Some(tag), Some(gross)) if tag.has_gapless_trim() => {
+        // Gapless trim: when a LAME tag with non-zero encoder_delay or
+        // zero_padding is present, the playable PCM sample count is
+        // the gross duration minus the two trim values.
+        let trimmed_duration_samples = match lame.as_ref() {
+            Some(tag) if tag.has_gapless_trim() => {
                 let trim = (tag.encoder_delay as i64) + (tag.zero_padding as i64);
-                Some((gross - trim).max(0))
+                Some((duration_samples - trim).max(0))
             }
-            (_, dur) => dur,
+            _ => Some(duration_samples),
         };
 
         let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
         params.sample_rate = Some(sample_rate);
-        params.channels = Some(channels as u16);
+        params.channels = Some(audio_header.channel_count() as u16);
         params.bit_rate = bitrate_bps.map(|b| b as u64);
         params.tag = Some(CodecTag::wave_format(WAVE_FORMAT_MP3));
 
         let stream = StreamInfo {
             index: 0,
             time_base,
-            duration: duration_samples,
+            duration: Some(duration_samples),
             start_time: Some(0),
             params,
         };
@@ -729,11 +775,15 @@ impl Mp3Demuxer {
             total_len,
             audio_end_offset,
             cursor: first_audio_frame_offset,
+            on_boundary: true,
+            state: cursor_state,
             sample_rate,
-            samples_per_frame,
-            bitrate_bps,
+            next_ticks: 0,
+            total_ticks: ticks,
             free_format_base_len,
-            next_pts: 0,
+            audio_frames,
+            framing_switches,
+            seek_index,
             finished: false,
             trimmed_duration_samples,
         })
@@ -827,131 +877,23 @@ impl Mp3Demuxer {
     pub fn is_vbr(&self) -> bool {
         matches!(self.xing.as_ref().map(|x| x.id), Some(XingTagId::Xing))
     }
-}
 
-/// Walk the input from `start_offset` looking for the first byte
-/// that begins a valid MPEG audio frame. Tolerates `max_skip` stray
-/// bytes between the cursor and the syncword.
-fn locate_first_frame(
-    input: &mut Box<dyn ReadSeek>,
-    start_offset: u64,
-    end_offset: u64,
-) -> Result<u64> {
-    // Cap how far we'll scan looking for a sync; an MPEG audio file
-    // with several kilobytes of junk between the ID3 tag and the
-    // first frame is malformed.
-    const MAX_SKIP: u64 = 4096;
-    let limit = end_offset.min(start_offset + MAX_SKIP);
-    let mut buf = vec![0u8; (limit - start_offset) as usize];
-    input.seek(SeekFrom::Start(start_offset))?;
-    let n = read_up_to(input.as_mut(), &mut buf)?;
-    buf.truncate(n);
-    for i in 0..buf.len().saturating_sub(3) {
-        if buf[i] == 0xFF
-            && (buf[i + 1] & 0xE0) == 0xE0
-            && let Ok(h) = parse_header(&buf[i..i + 4])
-        {
-            // A table-bitrate header is accepted on its derivable
-            // length; a free-format header (no table length) is
-            // accepted on a valid sync alone — its length is
-            // measured separately from the next sync.
-            if h.frame_len().is_some() || h.is_free_format() {
-                return Ok(start_offset + i as u64);
-            }
-        }
+    /// Number of audio frames (packets) the stream holds, counted by
+    /// the open-time header walk. Xing / Info carrier frames are not
+    /// counted.
+    #[must_use]
+    pub fn audio_frame_count(&self) -> u64 {
+        self.audio_frames
     }
-    Err(Error::invalid(
-        "no MPEG audio frame sync within the scan window after ID3v2",
-    ))
-}
 
-/// Measure the constant **unpadded** body length of a free-format
-/// stream.
-///
-/// In free format (§2.4.1.3, `bitrate_index == '0000'`) the bitrate
-/// is fixed but absent from the header table, so a frame's length is
-/// not derivable from its header. Every frame, however, is the same
-/// size up to the padding slot. We measure it once: starting just
-/// after the first frame's 4-byte header at `first_frame_offset`,
-/// scan forward to the next valid frame sync that agrees with the
-/// first frame's `(version, layer, sample_rate)` and is itself
-/// free-format. The byte distance from `first_frame_offset` to that
-/// next sync is the first frame's *padded* length; subtracting the
-/// first frame's own padding slot yields the constant unpadded base.
-///
-/// Returns the unpadded base length, or an error if no second sync
-/// is found within the scan window (a single-frame free-format
-/// stream cannot be length-measured this way).
-fn measure_free_format_base_len(
-    input: &mut Box<dyn ReadSeek>,
-    first_frame_offset: u64,
-    first_header: &crate::frame::Mp3FrameHeader,
-    end_offset: u64,
-) -> Result<usize> {
-    // A free-format frame is bounded above by the spec's maximum
-    // free-format bitrates (448/384/320 kbit/s for Layers I/II/III)
-    // at the lowest sample rate; ~3 KiB is a comfortable ceiling for
-    // a single Layer III frame, so a 8 KiB scan window always spans
-    // at least one full frame plus the next sync.
-    const SCAN: u64 = 8192;
-    // Start one byte past the first sync so we don't immediately
-    // re-match it.
-    let search_start = first_frame_offset + 1;
-    if search_start + 4 > end_offset {
-        return Err(Error::unsupported(
-            "free-format stream has no second frame to measure frame length",
-        ));
+    /// Number of points where consecutive audio frames change their
+    /// framing — sampling frequency, MPEG version, layer, or free
+    /// format versus table bitrate. Zero for a stream that never
+    /// switches. Channel-mode and bitrate changes do not count.
+    #[must_use]
+    pub fn framing_switch_count(&self) -> u64 {
+        self.framing_switches
     }
-    let limit = end_offset.min(search_start + SCAN);
-    let mut buf = vec![0u8; (limit - search_start) as usize];
-    input.seek(SeekFrom::Start(search_start))?;
-    let n = read_up_to(input.as_mut(), &mut buf)?;
-    buf.truncate(n);
-    for i in 0..buf.len().saturating_sub(3) {
-        if buf[i] == 0xFF
-            && (buf[i + 1] & 0xE0) == 0xE0
-            && let Ok(h) = parse_header(&buf[i..i + 4])
-        {
-            let same_stream = h.version == first_header.version
-                && h.layer == first_header.layer
-                && h.sample_rate_hz == first_header.sample_rate_hz;
-            if same_stream && h.is_free_format() {
-                // Padded length of the first frame = distance from
-                // the first sync to this one.
-                let padded_len = (search_start - first_frame_offset) + i as u64;
-                let pad = (usize::from(first_header.padding)) * first_header.slot_bytes();
-                let padded = padded_len as usize;
-                if padded <= pad {
-                    return Err(Error::invalid(
-                        "free-format measured frame length is smaller than its padding slot",
-                    ));
-                }
-                let base = padded - pad;
-                // Structural floor: a frame must at least hold its
-                // 4-byte header, the optional 2-byte CRC, and the
-                // fixed-size side information (§2.4.1.3). A hostile
-                // stream can place a second sync pattern 1..3 bytes
-                // after the first, which would otherwise "measure"
-                // a frame shorter than its own header (r405 fuzz
-                // finding: the header copy into the first-frame
-                // buffer then sliced out of range and panicked).
-                let crc_bytes = if first_header.crc_protected { 2 } else { 0 };
-                let min_len = 4
-                    + crc_bytes
-                    + side_info_len(first_header.version, first_header.channel_count());
-                if base < min_len {
-                    return Err(Error::invalid(format!(
-                        "free-format measured frame length {base} is smaller than the \
-                             header + side-info minimum {min_len}"
-                    )));
-                }
-                return Ok(base);
-            }
-        }
-    }
-    Err(Error::unsupported(
-        "no second free-format frame sync within the scan window",
-    ))
 }
 
 /// Extract a Layer III frame's `main_data_begin` reservoir back-pointer
@@ -967,7 +909,7 @@ fn measure_free_format_base_len(
 /// Returns `None` for non-Layer-III frames (Layers I/II have no
 /// reservoir — every frame is self-contained) or when the buffer is too
 /// short to hold the field.
-fn frame_main_data_begin(header: &crate::frame::Mp3FrameHeader, frame: &[u8]) -> Option<u16> {
+fn frame_main_data_begin(header: &Mp3FrameHeader, frame: &[u8]) -> Option<u16> {
     if header.layer != Layer::LayerIII {
         return None;
     }
@@ -998,65 +940,21 @@ impl Demuxer for Mp3Demuxer {
             return Err(Error::Eof);
         }
         loop {
-            if self.cursor + 4 > self.audio_end_offset {
+            let Some(f) = self.advance()? else {
                 self.finished = true;
                 return Err(Error::Eof);
-            }
-            // Read header.
-            self.input.seek(SeekFrom::Start(self.cursor))?;
-            let mut hdr = [0u8; 4];
-            let n = read_up_to(self.input.as_mut(), &mut hdr)?;
-            if n < 4 {
-                self.finished = true;
-                return Err(Error::Eof);
-            }
-            // Resync if the header is not valid.
-            let header = match parse_header(&hdr) {
-                Ok(h) => h,
-                Err(_) => {
-                    self.cursor += 1;
-                    continue;
-                }
             };
-            // Frame length: table bitrate derives it directly; a
-            // free-format stream uses the constant unpadded base
-            // measured at open-time plus the current frame's padding.
-            let frame_len = match header.frame_len() {
-                Some(l) => Some(l),
-                None => self
-                    .free_format_base_len
-                    .and_then(|base| header.frame_len_free_format(base)),
-            };
-            let len = match frame_len {
-                Some(l) if l >= 4 => l,
-                _ => {
-                    self.cursor += 1;
-                    continue;
-                }
-            };
-            if self.cursor + len as u64 > self.audio_end_offset {
-                self.finished = true;
-                return Err(Error::Eof);
-            }
-            // Refuse to emit a packet whose header looks valid in
-            // isolation but doesn't agree with the stream
-            // parameters we settled on at open-time. Mid-stream
-            // sample-rate / channel switches are not supported.
-            if header.sample_rate_hz != self.sample_rate {
-                self.cursor += 1;
+            if f.info_frame {
                 continue;
             }
-            // Read the rest of the frame.
-            let mut data = vec![0u8; len];
-            data[..4].copy_from_slice(&hdr);
-            let read = read_up_to(self.input.as_mut(), &mut data[4..])?;
-            if read + 4 < len {
+            let mut data = vec![0u8; f.len];
+            if framing::read_at(self.input.as_mut(), f.offset, &mut data)? < f.len {
                 self.finished = true;
                 return Err(Error::Eof);
             }
-            let pts = self.next_pts;
-            self.next_pts = self.next_pts.saturating_add(self.samples_per_frame as i64);
-            self.cursor += len as u64;
+            let pts = framing::ticks_to_units(self.next_ticks, self.sample_rate);
+            self.next_ticks += framing::frame_ticks(&f.header);
+            let duration = framing::ticks_to_units(self.next_ticks, self.sample_rate) - pts;
             // A Layer III frame is a true random-access point (keyframe)
             // only when its `main_data_begin` back-pointer is zero — i.e.
             // its main data is wholly contained in its own slot and does
@@ -1065,13 +963,13 @@ impl Demuxer for Mp3Demuxer {
             // decoded in isolation, so a seeker must not treat it as a
             // safe landing point. Layers I/II carry no reservoir, so
             // every frame is self-contained.
-            let keyframe = frame_main_data_begin(&header, &data)
+            let keyframe = frame_main_data_begin(&f.header, &data)
                 .map(|m| m == 0)
                 .unwrap_or(true);
             let pkt = Packet::new(0, self.streams[0].time_base, data)
                 .with_pts(pts)
                 .with_dts(pts)
-                .with_duration(self.samples_per_frame as i64)
+                .with_duration(duration)
                 .with_keyframe(keyframe);
             return Ok(pkt);
         }
@@ -1081,68 +979,47 @@ impl Demuxer for Mp3Demuxer {
         if pts < 0 {
             return Err(Error::invalid("negative seek PTS"));
         }
-        let total_pts = self.streams[0].duration.unwrap_or(i64::MAX);
-        let pts = pts.min(total_pts);
-
-        // VBR with TOC: use the percentile table.
-        //
-        // Per the prompt + the trace+hexdump derivation, each TOC[i]
-        // ∈ 0..=255 holds `floor(256 * audio_byte_at_percentile_i /
-        // total_audio_bytes)`. So given a fractional position `p`
-        // (0.0 ..= 1.0) we look up `toc[floor(100 * p)]` and the byte
-        // offset is `first_audio_frame_offset + toc[idx] *
-        // audio_bytes / 256`. Then we slide the cursor to that
-        // offset and resync on the next valid frame syncword via
-        // `next_packet`.
-        if let (Some(xing), Some(total_dur)) = (self.xing.as_ref(), self.streams[0].duration)
-            && let (Some(toc), Some(bytes_total)) = (xing.toc.as_ref(), xing.bytes)
-            && total_dur > 0
-        {
-            let p = (pts as f64) / (total_dur as f64);
-            let mut idx = (p * 100.0) as usize;
-            if idx > 99 {
-                idx = 99;
+        let rate = self.sample_rate;
+        // Compare in the declared time base: a frame is "at or before"
+        // the request when the PTS it is emitted with is.
+        let total = framing::ticks_to_units(self.total_ticks, rate);
+        let target = pts.min(total);
+        // Last index entry at or before the target (entry 0 is the
+        // first audio frame at time 0).
+        let idx = self
+            .seek_index
+            .partition_point(|p| framing::ticks_to_units(p.ticks, rate) <= target);
+        let Some(point) = idx.checked_sub(1).map(|i| self.seek_index[i]) else {
+            // No audio frame at all.
+            self.finished = true;
+            return Ok(0);
+        };
+        self.cursor = point.offset;
+        self.state = point.state;
+        self.on_boundary = true;
+        self.next_ticks = point.ticks;
+        self.finished = false;
+        // Walk forward to the frame containing the target: the last
+        // frame that starts at or before it.
+        loop {
+            let (cursor, state, on_boundary) = (self.cursor, self.state, self.on_boundary);
+            let Some(f) = self.advance()? else {
+                break;
+            };
+            if f.info_frame {
+                continue;
             }
-            let frac = toc[idx] as f64 / 256.0;
-            let off = self.first_audio_frame_offset + (frac * bytes_total as f64) as u64;
-            let off = off.min(self.audio_end_offset.saturating_sub(4));
-            self.cursor = off;
-            self.finished = false;
-            self.resync_to_frame()?;
-            // The cursor now sits on a real frame boundary that
-            // generally differs from the percentile estimate.
-            // Report the *actual* landed PTS (the frame's own
-            // PTS) rather than the requested one, so the value
-            // returned here and the PTS later stamped on the
-            // first emitted packet agree and stay monotone with
-            // the rest of the stream (§2.4.3 gapless/seek).
-            self.next_pts = self.pts_at_cursor();
-            return Ok(self.next_pts);
+            let ft = framing::frame_ticks(&f.header);
+            if framing::ticks_to_units(self.next_ticks + ft, rate) > target {
+                // Land on this frame: rewind to just before it.
+                self.cursor = cursor;
+                self.state = state;
+                self.on_boundary = on_boundary;
+                break;
+            }
+            self.next_ticks += ft;
         }
-
-        // CBR seek (or VBR fallback without a TOC): proportional
-        // bytes-per-PTS based on the bitrate of the first frame.
-        if let Some(br) = self.bitrate_bps {
-            // seconds = pts / sample_rate
-            // bytes  = seconds * br / 8
-            //        = pts * br / (8 * sample_rate)
-            let bytes_into_audio =
-                ((pts as u128) * (br as u128) / (8u128 * self.sample_rate as u128)) as u64;
-            let target = self.first_audio_frame_offset + bytes_into_audio;
-            self.cursor = target.min(self.audio_end_offset.saturating_sub(4));
-            self.finished = false;
-            self.resync_to_frame()?;
-            // Snap the reported PTS to the frame the cursor actually
-            // landed on (counted from the first audio frame), so the
-            // returned value matches the PTS stamped on the next packet
-            // instead of the proportional estimate.
-            self.next_pts = self.pts_at_cursor();
-            return Ok(self.next_pts);
-        }
-
-        Err(Error::unsupported(
-            "seek requires a bitrate or Xing TOC; this stream has neither",
-        ))
+        Ok(framing::ticks_to_units(self.next_ticks, self.sample_rate))
     }
 
     fn duration_micros(&self) -> Option<i64> {
@@ -1161,112 +1038,21 @@ impl Demuxer for Mp3Demuxer {
 }
 
 impl Mp3Demuxer {
-    /// After a raw byte-offset seek, walk forward to the next valid
-    /// frame syncword and snap `self.cursor` to it. Resynchronisation
-    /// follows the same one-byte-step pattern as the frame walker.
-    fn resync_to_frame(&mut self) -> Result<()> {
-        const SCAN: u64 = 8192;
-        let limit = self.audio_end_offset.min(self.cursor.saturating_add(SCAN));
-        if self.cursor + 4 > limit {
-            return Ok(());
+    /// Locate the next frame from the cursor and step past it.
+    fn advance(&mut self) -> Result<Option<Located>> {
+        let f = framing::next_frame(
+            self.input.as_mut(),
+            self.cursor,
+            self.audio_end_offset,
+            &mut self.state,
+            self.on_boundary,
+            None,
+        )?;
+        if let Some(f) = &f {
+            self.cursor = f.end();
+            self.on_boundary = true;
         }
-        let n = (limit - self.cursor) as usize;
-        let mut buf = vec![0u8; n];
-        self.input.seek(SeekFrom::Start(self.cursor))?;
-        let got = read_up_to(self.input.as_mut(), &mut buf)?;
-        buf.truncate(got);
-        for i in 0..buf.len().saturating_sub(3) {
-            if buf[i] == 0xFF
-                && (buf[i + 1] & 0xE0) == 0xE0
-                && let Ok(h) = parse_header(&buf[i..i + 4])
-            {
-                // Accept a table-bitrate sync on its derivable
-                // length, or a free-format sync when this stream
-                // was identified as free-format at open-time.
-                let length_ok = h.frame_len().is_some()
-                    || (self.free_format_base_len.is_some() && h.is_free_format());
-                if length_ok && h.sample_rate_hz == self.sample_rate {
-                    self.cursor += i as u64;
-                    return Ok(());
-                }
-            }
-        }
-        // No sync in the window — leave the cursor alone; the next
-        // `next_packet` call will return `Eof` if nothing remains.
-        Ok(())
-    }
-
-    /// Exact PTS of the frame the cursor currently sits on, in
-    /// `time_base = 1 / sample_rate` units.
-    ///
-    /// After a byte-offset seek and [`Self::resync_to_frame`], the
-    /// cursor is on a real frame boundary, but the requested PTS was a
-    /// proportional / percentile *estimate* that generally lands a few
-    /// frames off. The true PTS is `frame_index · samples_per_frame`,
-    /// where `frame_index` is the number of whole frames between
-    /// `first_audio_frame_offset` and the cursor. We recover it by
-    /// walking the frames from the first audio frame, summing each
-    /// frame's exact length (table-bitrate or free-format), and
-    /// counting how many fully precede the cursor. This is robust for
-    /// CBR, VBR, and free-format alike: it reads only frame *headers*
-    /// (4 bytes each), and the count is bounded by the seek distance.
-    ///
-    /// On any read/parse hiccup it falls back to `0` (start of audio),
-    /// which is always a valid, monotone PTS.
-    fn pts_at_cursor(&mut self) -> i64 {
-        let target = self.cursor;
-        if target <= self.first_audio_frame_offset {
-            return 0;
-        }
-        let mut off = self.first_audio_frame_offset;
-        let mut frame_index: i64 = 0;
-        // Bound the walk so a corrupt stream can't spin forever: at
-        // most one iteration per frame between the first audio frame
-        // and the cursor (every frame is >= 4 bytes -> length-bounded).
-        let max_frames = (target - self.first_audio_frame_offset) / 4 + 1;
-        for _ in 0..=max_frames {
-            if off >= target {
-                break;
-            }
-            if off + 4 > self.audio_end_offset {
-                break;
-            }
-            if self.input.seek(SeekFrom::Start(off)).is_err() {
-                return frame_index.saturating_mul(self.samples_per_frame as i64);
-            }
-            let mut hdr = [0u8; 4];
-            match read_up_to(self.input.as_mut(), &mut hdr) {
-                Ok(4) => {}
-                _ => break,
-            }
-            let header = match parse_header(&hdr) {
-                Ok(h) => h,
-                Err(_) => break,
-            };
-            let len = match header.frame_len() {
-                Some(l) => l,
-                None => match self
-                    .free_format_base_len
-                    .and_then(|base| header.frame_len_free_format(base))
-                {
-                    Some(l) => l,
-                    None => break,
-                },
-            };
-            if len < 4 {
-                break;
-            }
-            let next = off + len as u64;
-            // A frame counts as preceding the cursor only if it ends at
-            // or before it; the frame the cursor sits *on* is the one
-            // we land on (its PTS is `frame_index`).
-            if next > target {
-                break;
-            }
-            off = next;
-            frame_index += 1;
-        }
-        frame_index.saturating_mul(self.samples_per_frame as i64)
+        Ok(f)
     }
 }
 
@@ -1711,11 +1497,14 @@ mod tests {
             buf.extend(std::iter::repeat_n(0u8, frame_len - 4));
         }
         let d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).unwrap();
-        // total_audio_bytes = 8 * 417 = 3336
-        // seconds = 3336 * 8 / 128_000 = 0.20850
-        // micros = 208_500
+        // The open-time header walk counts the frames exactly:
+        // 8 * 1152 samples at 44.1 kHz = 9216 / 44100 s = 208_979 µs
+        // (a bytes / bitrate estimate would say 208_500, off by the
+        // 417-vs-417.96 byte rounding of the unpadded frame).
+        assert_eq!(d.streams()[0].duration, Some(8 * 1152));
+        assert_eq!(d.audio_frame_count(), 8);
         let micros = d.duration_micros().unwrap();
-        assert!((micros - 208_500).abs() <= 50);
+        assert_eq!(micros, 208_979);
     }
 
     #[test]
@@ -1819,14 +1608,12 @@ mod tests {
             buf.extend(std::iter::repeat_n(0u8, frame_len - 4));
         }
         let mut d = Mp3Demuxer::open(Box::new(Cursor::new(buf))).unwrap();
-        // Request a PTS that does NOT fall on a frame boundary. The
-        // proportional byte offset (3107) lands inside frame 7's body;
-        // resync snaps the cursor forward to the next sync, frame 8 at
-        // byte 3336.
+        // Request a PTS that does NOT fall on a frame boundary: 8564
+        // lies inside frame 7 (8064 ..= 9215). The seek lands on the
+        // frame containing it — at or before the request, as the
+        // `Demuxer::seek_to` contract asks.
         let actual = d.seek_to(0, 8_564).unwrap();
-        // Landed PTS is the exact PTS of the frame the cursor snapped
-        // to (frame 8), not the requested 8564.
-        assert_eq!(actual, 8 * 1152);
+        assert_eq!(actual, 7 * 1152);
         // The next four packets carry strictly increasing, frame-exact
         // PTS values starting at the landed one.
         let mut expect = actual;

@@ -409,6 +409,7 @@ pub mod crc;
 pub mod demuxer;
 pub mod encoder;
 pub mod frame;
+mod framing;
 #[doc(hidden)] // internal: Huffman decode/encode stage
 pub mod huffman;
 #[doc(hidden)] // internal: IMDCT/window/overlap stage
