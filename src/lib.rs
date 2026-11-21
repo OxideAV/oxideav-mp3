@@ -469,8 +469,9 @@ pub use codec_encoder::{
 #[doc(hidden)] // internal: re-export of hidden pipeline-stage items
 pub use crc::{INITIAL_STATE as CRC_INITIAL_STATE, crc16_bits, crc16_layer3, crc16_layer3_lsf};
 pub use demuxer::{
-    CODEC_ID_STR, FORMAT_NAME, Mp3Demuxer, Mp3Tags, WAVE_FORMAT_MP3, XingTag, XingTagId,
-    open_file_demuxer, parse_xing_info, probe,
+    CODEC_ID_LAYER1_STR, CODEC_ID_LAYER2_STR, CODEC_ID_STR, FORMAT_NAME, Mp3Demuxer, Mp3Tags,
+    WAVE_FORMAT_MP3, WAVE_FORMAT_MPEG, XingTag, XingTagId, codec_id_for_layer, open_file_demuxer,
+    parse_xing_info, probe, wave_format_for_layer,
 };
 #[doc(hidden)] // internal: re-export of hidden demuxer helpers
 pub use demuxer::{lame_magic_offset, side_info_len};
@@ -591,9 +592,10 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Install the MP3 container demuxer (and its `.mp3`/`.mp2`/`.mp1`
-/// extension + probe entries) into the runtime context's
-/// container registry, **and** the Layer III [`Encoder`] + [`Decoder`]
+/// Install the MPEG audio elementary-stream demuxer (and its
+/// `.mp3`/`.mp2`/`.mp1` extension + probe entries; it announces a
+/// Layer I / II / III stream as codec `mp1` / `mp2` / `mp3`) into the
+/// runtime context's container registry, **and** the Layer III [`Encoder`] + [`Decoder`]
 /// factories (`oxideav-mp3` mono CBR MPEG-1) into the codec registry.
 ///
 /// Both factories install on a single `CodecInfo` so the codec

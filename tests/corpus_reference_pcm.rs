@@ -24,8 +24,9 @@
 //!   shows up as nrmse orders of magnitude above the bound.
 //!
 //! The Layer II fixture is excluded by design: this crate decodes
-//! Layer III only (the demuxer walks Layer II framing, but there is no
-//! Layer II decoder to differ against).
+//! Layer III only (the demuxer frames Layer II and announces it as
+//! codec `mp2`, but there is no Layer II decoder here to differ
+//! against).
 //!
 //! Skips (with a log line) when the workspace `docs/` tree is absent
 //! (standalone-crate CI checkout), matching `tests/docs_corpus.rs`.

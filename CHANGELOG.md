@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Layer I / Layer II files are announced as `mp1` / `mp2`.** The
+  elementary-stream demuxer claims `.mp3` / `.mp2` / `.mp1` but
+  labelled every stream codec `mp3` with the 0x0055 tag, so a Layer II
+  file went to the Layer III decoder and produced no audio. The codec
+  id and tag now follow the layer of the stream's audio frames
+  (`mp1` / `mp2` with tag 0x0050, `mp3` with 0x0055), for MPEG-1,
+  MPEG-2 LSF and MPEG-2.5 headers. The probe recognises Layer I / II
+  headers (it scored them 0); a Layer I / II header must be followed
+  by a matching one when the probe buffer reaches the next frame.
+- **A layer change mid-file ends the stream** instead of emitting the
+  other layer's frames under the first layer's codec id: packets,
+  frame count, duration and seeking stop at the first frame of another
+  layer, and `Mp3Demuxer::layer_change_offset()` reports its position.
+  `audio_end_offset()` is that position when there is one, and
+  `framing_switch_count()` no longer counts layer changes.
+
 - **Information frame in a CRC-protected stream.** A protected stream
   keeps the "Xing" / "Info" magic at the offset tabulated from the
   frame start (36 / 21 / 13 by version and channel mode); the demuxer
@@ -91,6 +107,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   by the §2.4.2.3 free-format bitrate ceilings and re-runs at a switch.
 
 ### Added
+
+- `Mp3Demuxer::layer()`, `Mp3Demuxer::layer_change_offset()`,
+  `codec_id_for_layer()`, `wave_format_for_layer()`,
+  `CODEC_ID_LAYER1_STR`, `CODEC_ID_LAYER2_STR`, `WAVE_FORMAT_MPEG`.
+- `tests/layer_labels.rs`: 36 Layer II + 6 Layer III files from
+  black-box encoders, codec / frame count / duration against a
+  black-box reader (runtime-skipped without the tools).
 
 - **Gapless information frame from the encoder**:
   `Mp3Encoder::enable_info_frame` leads the stream with an Info /

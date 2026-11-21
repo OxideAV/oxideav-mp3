@@ -4,8 +4,10 @@
 
 A pure-Rust **MPEG-1 / MPEG-2 / MPEG-2.5 Audio Layer III** (MP3) codec
 for the [oxideav](https://github.com/OxideAV/oxideav-workspace)
-framework — decoder, CBR / VBR encoder, stream demuxer and `.mp3`
-muxer.
+framework — decoder, CBR / VBR encoder, and the MPEG audio
+elementary-stream demuxer / muxer for `.mp3`, `.mp2` and `.mp1` files
+(the demuxer labels a Layer I / II stream `mp1` / `mp2` for the
+decoders of those layers; this crate decodes Layer III).
 
 Clean-room implementation: every numeric constant is transcribed from
 ISO/IEC 11172-3:1993 and ISO/IEC 13818-3:1997, the staged clean-room
@@ -284,7 +286,34 @@ stream), and the registry encoder therefore returns its packets at
 
 ## Demuxer
 
-The `demuxer` module provides a streaming MP3 container reader: ID3v2
+The `demuxer` module reads MPEG audio elementary streams of all three
+layers (`.mp3`, `.mp2`, `.mp1`; MPEG-1, MPEG-2 LSF and MPEG-2.5
+headers). The stream is announced under the codec of the layer its
+frames carry:
+
+| Frames | Codec id | Codec tag (`wFormatTag`) | Samples per frame |
+|--------|----------|--------------------------|-------------------|
+| Layer I | `mp1` | 0x0050 | 384 |
+| Layer II | `mp2` | 0x0050 | 1152 |
+| Layer III | `mp3` | 0x0055 | 1152 (MPEG-1), 576 (MPEG-2 LSF / MPEG-2.5) |
+
+Only Layer III is decoded by this crate; the registry resolves `mp1` /
+`mp2` to the decoders registered under those ids. Probe score, frame
+count, duration, timestamps and seeking follow the layer; every
+Layer I / II packet is a keyframe. `tests/layer_labels.rs` writes 36
+Layer II files with a black-box encoder (six sampling frequencies ×
+mono / stereo × three bit rates) plus six Layer III files, and checks
+codec, frame count and duration of each against a black-box reader:
+42 of 42 agree. No available tool writes Layer I, which is checked on
+hand-built streams only.
+
+**A change of layer mid-file is a change of codec and ends the
+stream**: the packets, frame count, duration and seek range stop at
+the first frame of another layer — its frames are never emitted under
+the first layer's codec id — and `Mp3Demuxer::layer_change_offset()`
+reports where it sits.
+
+For Layer III it provides ID3v2
 skip, frame iteration, and parsing of the `Xing` / `Info` VBR header
 and the gapless-playback extension behind it (encoder delay / padding),
 so `trimmed_duration_samples()` reports the gapless sample count —
@@ -295,7 +324,7 @@ start). Registered as a container alongside the codec. The decoder
 does not trim: it returns every frame, and the demuxer reports the
 figures.
 
-**Mid-stream header changes.** A stream may switch sampling frequency,
+**Mid-stream header changes.** Within one layer a stream may switch sampling frequency,
 MPEG version (MPEG-1 / MPEG-2 LSF / MPEG-2.5), channel mode, bitrate or
 free-format slot count at any frame boundary — `cat a.mp3 b.mp3` does
 exactly that, and also leaves the later files' ID3v2 tags, ID3v1
@@ -330,7 +359,8 @@ shape with `Frame::StreamParams`.
 frame) and steps to the frame containing the requested time — at or
 before it — returning the PTS that frame is then emitted with.
 `tests/demuxer_splice.rs` checks all 72 ordered pairs of sampling
-frequencies, Layer III ↔ Layer II (CRC-protected), channel-mode /
+frequencies, Layer III ↔ Layer II splices (the stream ends at the
+layer change), Layer II rate switches, channel-mode /
 bitrate / VBR / free-format switches, fully tagged files back to back,
 junk between switching segments, cut splices, and seeks to every packet, against ffprobe frame counts, an independent header walk
 and per-segment standalone decodes.
@@ -425,8 +455,8 @@ surface which path was taken.
 - **Intensity stereo at the lower sampling frequencies** decodes
   identically on only one of the two black-box decoders in 19 of the
   matrix cells (those decoders differ from each other there).
-- Layers I and II are framed by the demuxer but not decoded here
-  (`oxideav-mp2` does), and the ISO/IEC 13818-3 multichannel extension
+- Layers I and II are framed by the demuxer and announced as `mp1` /
+  `mp2`, but not decoded here, and the ISO/IEC 13818-3 multichannel extension
   is not decoded.
 
 ## Robustness

@@ -354,11 +354,9 @@ fn every_fixture_walks_without_panic() {
     // through to the version dispatch (`raw >> 19 & 0b11 == 0b00 =>
     // Mpeg25`). The earlier exclusion comment cited a 12-bit-sync parser
     // that no longer exists.
-    // Layer II fixtures are still excluded — the demuxer accepts any
-    // layer the framing layer accepts, but the side-info length used
-    // for Xing-magic offset arithmetic is Layer III specific; a
-    // Layer II info-frame would slot in at a different offset that
-    // the round-121 brief explicitly scopes out.
+    // Layer III fixtures only: this walk checks Layer III facts. The
+    // demuxer frames Layer I / II too and announces them as `mp1` /
+    // `mp2` (`tests/layer_labels.rs`).
     let names = [
         "layer3-cbr-320kbps-stereo-44100",
         "layer3-vbr-q5-stereo-44100",

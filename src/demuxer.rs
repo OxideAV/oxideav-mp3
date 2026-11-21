@@ -1,4 +1,10 @@
-//! MP3 container demuxer.
+//! MPEG audio elementary-stream demuxer (`.mp3` / `.mp2` / `.mp1`).
+//!
+//! The stream is announced under the codec id of the **layer** its
+//! audio frames carry (ISO/IEC 11172-3 §2.4.2.3 `layer` field): `"mp1"`
+//! for Layer I, `"mp2"` for Layer II, `"mp3"` for Layer III — see
+//! [`codec_id_for_layer`]. This crate decodes Layer III only; the
+//! registry resolves the other two ids to their own decoders.
 //!
 //! An `oxideav_core::Demuxer` over an MPEG audio elementary stream: it
 //! skips the ID3v2/ID3v1 frontmatter and trailer, parses the Xing/Info
@@ -74,16 +80,49 @@ use crate::side_info::{
 /// Format-registry name used by the container registry.
 pub const FORMAT_NAME: &str = "mp3";
 
-/// CodecId stream parameters carry for the audio inside an MP3
-/// container. The codec crate itself doesn't yet expose a decoder,
-/// but pipelines that go through `CodecResolver` use this identifier.
+/// Codec id announced for a Layer III stream (and registered by this
+/// crate's decoder / encoder).
 pub const CODEC_ID_STR: &str = "mp3";
+
+/// Codec id announced for a Layer II stream.
+pub const CODEC_ID_LAYER2_STR: &str = "mp2";
+
+/// Codec id announced for a Layer I stream.
+pub const CODEC_ID_LAYER1_STR: &str = "mp1";
+
+/// The codec id a stream of `layer` frames is announced under:
+/// `"mp1"` / `"mp2"` / `"mp3"` for Layer I / II / III, whatever the
+/// MPEG version (MPEG-1, MPEG-2 LSF, MPEG-2.5).
+#[must_use]
+pub fn codec_id_for_layer(layer: Layer) -> &'static str {
+    match layer {
+        Layer::LayerI => CODEC_ID_LAYER1_STR,
+        Layer::LayerII => CODEC_ID_LAYER2_STR,
+        Layer::LayerIII => CODEC_ID_STR,
+    }
+}
+
+/// The `WAVEFORMATEX::wFormatTag` a stream of `layer` frames is
+/// announced with: [`WAVE_FORMAT_MP3`] for Layer III,
+/// [`WAVE_FORMAT_MPEG`] for Layers I and II.
+#[must_use]
+pub fn wave_format_for_layer(layer: Layer) -> u16 {
+    match layer {
+        Layer::LayerI | Layer::LayerII => WAVE_FORMAT_MPEG,
+        Layer::LayerIII => WAVE_FORMAT_MP3,
+    }
+}
 
 /// `WAVEFORMATEX::wFormatTag` value historically assigned to MP3 by
 /// Microsoft for the Windows AVI / WAV container ecosystem (0x0055,
 /// "MPEGLAYER3"). Surfaced on `CodecParameters::tag` so re-muxers can
 /// preserve the original on-wire tag.
 pub const WAVE_FORMAT_MP3: u16 = 0x0055;
+
+/// `WAVEFORMATEX::wFormatTag` value for MPEG audio Layers I and II
+/// (0x0050, "MPEG"). Surfaced on `CodecParameters::tag` of a Layer I /
+/// Layer II stream.
+pub const WAVE_FORMAT_MPEG: u16 = 0x0050;
 
 /// MP3 metadata extracted from the on-disk container frontmatter.
 ///
@@ -392,13 +431,44 @@ fn detect_id3v1(input: &mut Box<dyn ReadSeek>, total_len: u64) -> Result<bool> {
     Ok(n == 3 && &tag == b"TAG")
 }
 
-/// Container-level probe — `register_probe` invokes this with the
-/// first ~256 KB of an unknown input to score it as MP3.
+/// `true` when `buf[off..]` starts with an MPEG audio frame header
+/// the probe trusts.
 ///
-/// Returns a high score on the canonical ID3v2 / "Xing" / "Info" /
-/// frame-sync prefixes, a lower score on a bare frame sync, and zero
-/// otherwise. The extension hint `.mp3` (or `.mp2`/`.mp1`) bumps the
-/// confidence for streams that only carry a frame-sync prefix.
+/// A Layer III header is taken on its own. Layers I and II share the
+/// syncword but are rarer, so when the buffer reaches the next frame
+/// (table bitrate), that position must hold a header of the same MPEG
+/// version, layer and sampling frequency.
+fn probe_frame_at(buf: &[u8], off: usize) -> bool {
+    let Some(head) = buf.get(off..off + 4) else {
+        return false;
+    };
+    let Ok(h) = parse_header(head) else {
+        return false;
+    };
+    if h.layer == Layer::LayerIII {
+        return true;
+    }
+    let Some(len) = h.frame_len() else {
+        // Free format: the length is not in the header.
+        return true;
+    };
+    match buf.get(off + len..off + len + 4) {
+        Some(next) => parse_header(next).is_ok_and(|n| {
+            n.version == h.version && n.layer == h.layer && n.sample_rate_hz == h.sample_rate_hz
+        }),
+        None => true,
+    }
+}
+
+/// Container-level probe — `register_probe` invokes this with the
+/// first ~256 KB of an unknown input to score it as an MPEG audio
+/// elementary stream (any layer).
+///
+/// Returns 100 for an ID3v2 tag followed by a frame header, or a frame
+/// header at offset 0 with the `.mp3` / `.mp2` / `.mp1` extension
+/// hint; 75 for a frame header at offset 0 without the hint; zero
+/// otherwise. A Layer I / II header must be followed by a second one
+/// when the buffer reaches that far (see [`probe_frame_at`]).
 pub fn probe(p: &ProbeData) -> u8 {
     // ID3v2 prefix at the start — strongest signal, since the tag
     // could otherwise be a different audio container that also
@@ -407,25 +477,13 @@ pub fn probe(p: &ProbeData) -> u8 {
     if p.buf.len() >= 10
         && &p.buf[..3] == b"ID3"
         && let Some(total) = id3v2_total_len(&p.buf[..10])
+        && let Ok(off) = usize::try_from(total)
+        && probe_frame_at(p.buf, off)
     {
-        let off = total as usize;
-        if off + 4 <= p.buf.len()
-            && p.buf[off] == 0xFF
-            && (p.buf[off + 1] & 0xE0) == 0xE0
-            && parse_header(&p.buf[off..off + 4])
-                .map(|h| h.layer == Layer::LayerIII)
-                .unwrap_or(false)
-        {
-            return 100;
-        }
+        return 100;
     }
-    // Bare frame sync at offset 0 with a valid Layer III header.
-    if p.buf.len() >= 4
-        && p.buf[0] == 0xFF
-        && (p.buf[1] & 0xE0) == 0xE0
-        && let Ok(h) = parse_header(&p.buf[..4])
-        && h.layer == Layer::LayerIII
-    {
+    // Bare frame header at offset 0.
+    if probe_frame_at(p.buf, 0) {
         return if matches!(p.ext, Some("mp3") | Some("mp2") | Some("mp1")) {
             100
         } else {
@@ -438,7 +496,7 @@ pub fn probe(p: &ProbeData) -> u8 {
     0
 }
 
-/// Install the MP3 demuxer + extension + probe into a
+/// Install the MPEG audio demuxer + extensions + probe into a
 /// `ContainerRegistry`. Called by [`crate::register`].
 pub fn register_container(reg: &mut ContainerRegistry) {
     reg.register_demuxer(FORMAT_NAME, open_demuxer);
@@ -455,18 +513,35 @@ fn open_demuxer(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     Ok(Box::new(demuxer))
 }
 
-/// The MP3 demuxer.
+/// The MPEG audio elementary-stream demuxer.
+///
+/// # Layer and codec id
+///
+/// The one stream it exposes carries the codec id and codec tag of the
+/// layer of its first audio frame ([`codec_id_for_layer`],
+/// [`wave_format_for_layer`]); [`Self::layer`] reports it. Frame
+/// durations follow the layer: 384 samples for Layer I, 1152 for
+/// Layer II, 1152 (MPEG-1) or 576 (MPEG-2 LSF / MPEG-2.5) for
+/// Layer III. Xing / Info frames exist in Layer III streams only.
+///
+/// **A change of layer is a change of codec, and ends the stream.** A
+/// stream has one codec id, and a decoder for one layer cannot decode
+/// another, so the frames of a different layer are never emitted under
+/// the first layer's label: the stream's packets, frame count,
+/// duration and seek range all stop at the first frame whose layer
+/// differs. [`Self::layer_change_offset`] reports where that frame
+/// sits, so a caller can open the remainder as a stream of its own.
 ///
 /// # Mid-stream header changes
 ///
-/// The stream may switch sampling frequency, MPEG version (MPEG-1 /
-/// MPEG-2 LSF / MPEG-2.5), layer, channel mode, bitrate or free-format
-/// slot count at any frame boundary — a byte-concatenation of files
+/// Within one layer the stream may switch sampling frequency, MPEG
+/// version (MPEG-1 / MPEG-2 LSF / MPEG-2.5), channel mode, bitrate or
+/// free-format slot count at any frame boundary — a byte-concatenation of files
 /// does exactly that, and may also carry the later files' ID3v2 tags,
 /// ID3v1 trailers and Xing / Info frames in between. Every audio frame
 /// is emitted once; tags and info frames are stepped over. A header
 /// exactly where the previous frame ended that keeps the version /
-/// layer / sampling frequency is trusted; one that switches them must
+/// sampling frequency is trusted; one that switches them must
 /// be followed by a header with its own key; a candidate found by
 /// scanning must chain three more correctly-spaced headers, so a
 /// resync cannot lock onto a false sync inside main data.
@@ -516,9 +591,14 @@ pub struct Mp3Demuxer {
     first_audio_frame_offset: u64,
     /// Total file length.
     total_len: u64,
-    /// End-of-audio offset = `total_len - 128` when an ID3v1 trailer
-    /// was detected, else `total_len`.
+    /// End-of-audio offset: where the first frame of a different
+    /// layer starts, else `total_len - 128` when an ID3v1 trailer was
+    /// detected, else `total_len`.
     audio_end_offset: u64,
+    /// Layer of the stream's audio frames.
+    layer: Layer,
+    /// Offset of the first frame of a different layer, if any.
+    layer_change_offset: Option<u64>,
     /// Current read cursor inside the audio region.
     cursor: u64,
     /// Whether `cursor` sits exactly where the previous frame ended.
@@ -539,7 +619,7 @@ pub struct Mp3Demuxer {
     /// Number of audio frames (info frames excluded).
     audio_frames: u64,
     /// Number of framing-key changes (sampling frequency / MPEG
-    /// version / layer / free-format switches) between audio frames.
+    /// version / free-format switches) between audio frames.
     framing_switches: u64,
     /// Sparse seek index: every [`SEEK_INDEX_STRIDE`]-th audio frame.
     seek_index: Vec<SeekPoint>,
@@ -579,6 +659,8 @@ impl std::fmt::Debug for Mp3Demuxer {
             .field("first_audio_frame_offset", &self.first_audio_frame_offset)
             .field("total_len", &self.total_len)
             .field("audio_end_offset", &self.audio_end_offset)
+            .field("layer", &self.layer)
+            .field("layer_change_offset", &self.layer_change_offset)
             .field("cursor", &self.cursor)
             .field("sample_rate", &self.sample_rate)
             .field("next_ticks", &self.next_ticks)
@@ -593,7 +675,8 @@ impl std::fmt::Debug for Mp3Demuxer {
 }
 
 impl Mp3Demuxer {
-    /// Open an MP3 stream from a generic [`ReadSeek`] source.
+    /// Open an MPEG audio elementary stream (any layer) from a generic
+    /// [`ReadSeek`] source.
     pub fn open(input: Box<dyn ReadSeek>) -> Result<Self> {
         let mut input: Box<dyn ReadSeek> = Box::new(CachedInput::new(input));
         // 1. Bound the input length so we can spot ID3v1 trailers.
@@ -691,8 +774,17 @@ impl Mp3Demuxer {
         let mut audio_frames: u64 = 0;
         let mut framing_switches: u64 = 0;
         let mut last_key: Option<FramingKey> = None;
+        let mut layer_change_offset: Option<u64> = None;
         let mut cur = Some(first);
         while let Some(f) = cur {
+            // A frame of another layer than the stream's audio frames
+            // is another codec: the stream ends in front of it.
+            if let Some((_, _, audio)) = &first_audio
+                && f.header.layer != audio.layer
+            {
+                layer_change_offset = Some(f.offset);
+                break;
+            }
             if !f.info_frame {
                 if first_audio.is_none() {
                     first_audio = Some((f.offset, before, f.header));
@@ -729,10 +821,12 @@ impl Mp3Demuxer {
             Some(v) => v,
             None => (first.end(), state, first_header),
         };
+        let layer = audio_header.layer;
+        // Packets, seeks and the duration stop where the layer changes.
+        let audio_end_offset = layer_change_offset.unwrap_or(audio_end_offset);
 
         // 7. Build the StreamInfo from the first audio frame. The
-        //    codec parameters carry the same MP3 WAVEFORMATEX tag
-        //    muxers consume to round-trip into AVI/WAV containers.
+        //    codec id and the WAVEFORMATEX tag are those of its layer.
         let sample_rate = audio_header.sample_rate_hz;
         let samples_per_frame = first_header.samples_per_frame();
         // Free-format streams have no table bitrate, but a fixed one:
@@ -761,11 +855,11 @@ impl Mp3Demuxer {
             _ => Some(duration_samples),
         };
 
-        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        let mut params = CodecParameters::audio(CodecId::new(codec_id_for_layer(layer)));
         params.sample_rate = Some(sample_rate);
         params.channels = Some(audio_header.channel_count() as u16);
         params.bit_rate = bitrate_bps.map(|b| b as u64);
-        params.tag = Some(CodecTag::wave_format(WAVE_FORMAT_MP3));
+        params.tag = Some(CodecTag::wave_format(wave_format_for_layer(layer)));
 
         let stream = StreamInfo {
             index: 0,
@@ -785,6 +879,8 @@ impl Mp3Demuxer {
             first_audio_frame_offset,
             total_len,
             audio_end_offset,
+            layer,
+            layer_change_offset,
             cursor: first_audio_frame_offset,
             on_boundary: true,
             state: cursor_state,
@@ -875,11 +971,27 @@ impl Mp3Demuxer {
         self.first_audio_frame_offset
     }
 
-    /// One-past-the-end byte offset of the audio region (file end
-    /// minus the ID3v1 trailer, if any).
+    /// One-past-the-end byte offset of the stream's audio region: the
+    /// start of the first frame of a different layer when there is
+    /// one, else the file end minus the ID3v1 trailer, if any.
     #[must_use]
     pub fn audio_end_offset(&self) -> u64 {
         self.audio_end_offset
+    }
+
+    /// Layer of the stream's audio frames; fixes the announced codec
+    /// id ([`codec_id_for_layer`]).
+    #[must_use]
+    pub fn layer(&self) -> Layer {
+        self.layer
+    }
+
+    /// Byte offset of the first frame whose layer differs from
+    /// [`Self::layer`], where this stream ends; `None` when every
+    /// frame of the file has the same layer.
+    #[must_use]
+    pub fn layer_change_offset(&self) -> Option<u64> {
+        self.layer_change_offset
     }
 
     /// True when the open() probe identified the stream as VBR via
@@ -898,8 +1010,8 @@ impl Mp3Demuxer {
     }
 
     /// Number of points where consecutive audio frames change their
-    /// framing — sampling frequency, MPEG version, layer, or free
-    /// format versus table bitrate. Zero for a stream that never
+    /// framing — sampling frequency, MPEG version, or free format
+    /// versus table bitrate (a layer change ends the stream instead). Zero for a stream that never
     /// switches. Channel-mode and bitrate changes do not count.
     #[must_use]
     pub fn framing_switch_count(&self) -> u64 {
@@ -1067,7 +1179,7 @@ impl Mp3Demuxer {
     }
 }
 
-/// Open an MP3 demuxer over a file path. Convenience helper that
+/// Open the MPEG audio demuxer over a file path. Convenience helper that
 /// mirrors the direct-API convention used elsewhere in the workspace.
 pub fn open_file_demuxer<P: AsRef<std::path::Path>>(path: P) -> Result<Mp3Demuxer> {
     let f = File::open(path)?;
@@ -1456,6 +1568,200 @@ mod tests {
             side_info_len(MpegVersion::Mpeg2, 2),
             SIDE_INFO_BYTES_LSF_STEREO
         );
+    }
+
+    /// `n` identical frames with header fields `(version_bits,
+    /// layer_bits, bitrate_index, sampling_index, mode)` and a zero
+    /// body, plus the parsed header.
+    fn layer_stream(
+        version_bits: u32,
+        layer_bits: u32,
+        bitrate_index: u32,
+        sampling_index: u32,
+        mode: u32,
+        n: usize,
+    ) -> (Vec<u8>, Mp3FrameHeader) {
+        let raw: u32 = (0x7FF << 21)
+            | (version_bits << 19)
+            | (layer_bits << 17)
+            | (1 << 16)
+            | (bitrate_index << 12)
+            | (sampling_index << 10)
+            | (mode << 6);
+        let hdr = raw.to_be_bytes();
+        let h = parse_header(&hdr).expect("header parses");
+        let len = h.frame_len().expect("table bitrate");
+        let mut stream = Vec::new();
+        for _ in 0..n {
+            stream.extend_from_slice(&hdr);
+            stream.resize(stream.len() + len - 4, 0);
+        }
+        (stream, h)
+    }
+
+    /// The stream is announced under the codec id and tag of its
+    /// layer, with that layer's frame duration and frame lengths, for
+    /// MPEG-1, MPEG-2 LSF and MPEG-2.5 headers, mono and stereo.
+    #[test]
+    fn codec_id_tag_and_timing_follow_the_layer() {
+        // (version bits, layer bits, bitrate index, sampling index,
+        //  mode, codec id, tag, samples per frame, rate, frame bytes)
+        type Case = (u32, u32, u32, u32, u32, &'static str, u16, i64, u32, usize);
+        #[rustfmt::skip]
+        let cases: [Case; 12] = [
+            // MPEG-1 Layer I, 192 kbit/s, 44.1 kHz: floor(12*192000/44100) = 52 slots of 4 bytes.
+            (0b11, 0b11, 6, 0, 0, "mp1", 0x0050, 384, 44_100, 208),
+            // MPEG-1 Layer I, 448 kbit/s, 48 kHz, mono: 112 slots.
+            (0b11, 0b11, 14, 1, 3, "mp1", 0x0050, 384, 48_000, 448),
+            // MPEG-2 LSF Layer I, 128 kbit/s, 24 kHz: 64 slots.
+            (0b10, 0b11, 8, 1, 0, "mp1", 0x0050, 384, 24_000, 256),
+            // MPEG-2.5 Layer I, 64 kbit/s, 8 kHz, mono: 96 slots.
+            (0b00, 0b11, 4, 2, 3, "mp1", 0x0050, 384, 8_000, 384),
+            // MPEG-1 Layer II, 192 kbit/s, 48 kHz: 144*192000/48000.
+            (0b11, 0b10, 10, 1, 0, "mp2", 0x0050, 1152, 48_000, 576),
+            // MPEG-1 Layer II, 64 kbit/s, 32 kHz, mono.
+            (0b11, 0b10, 4, 2, 3, "mp2", 0x0050, 1152, 32_000, 288),
+            // MPEG-2 LSF Layer II, 64 kbit/s, 22.05 kHz: floor(144*64000/22050).
+            (0b10, 0b10, 8, 0, 0, "mp2", 0x0050, 1152, 22_050, 417),
+            // MPEG-2 LSF Layer II, 32 kbit/s, 16 kHz, mono.
+            (0b10, 0b10, 4, 2, 3, "mp2", 0x0050, 1152, 16_000, 288),
+            // MPEG-2.5 Layer II, 32 kbit/s, 12 kHz, mono.
+            (0b00, 0b10, 4, 1, 3, "mp2", 0x0050, 1152, 12_000, 384),
+            // MPEG-1 Layer III, 128 kbit/s, 44.1 kHz.
+            (0b11, 0b01, 9, 0, 0, "mp3", 0x0055, 1152, 44_100, 417),
+            // MPEG-2 LSF Layer III, 64 kbit/s, 24 kHz: 72*64000/24000.
+            (0b10, 0b01, 8, 1, 0, "mp3", 0x0055, 576, 24_000, 192),
+            // MPEG-2.5 Layer III, 32 kbit/s, 8 kHz, mono.
+            (0b00, 0b01, 4, 2, 3, "mp3", 0x0055, 576, 8_000, 288),
+        ];
+        const N: usize = 40; // crosses the seek-index stride
+        for (vb, lb, bi, si, mode, id, tag, spf, rate, bytes) in cases {
+            let what = format!("version {vb:02b} layer {lb:02b} rate {rate}");
+            let (stream, h) = layer_stream(vb, lb, bi, si, mode, N);
+            assert_eq!(stream.len(), N * bytes, "{what}: frame length");
+            let p = ProbeData {
+                buf: &stream,
+                ext: None,
+            };
+            assert_eq!(probe(&p), 75, "{what}: probe");
+            let mut d = Mp3Demuxer::open(Box::new(Cursor::new(stream))).expect("open");
+            assert_eq!(d.layer(), h.layer, "{what}");
+            assert_eq!(d.layer_change_offset(), None, "{what}");
+            assert!(d.xing().is_none(), "{what}");
+            let st = d.streams()[0].clone();
+            assert_eq!(st.params.codec_id.as_str(), id, "{what}: codec id");
+            assert_eq!(
+                st.params.tag,
+                Some(CodecTag::wave_format(tag)),
+                "{what}: codec tag"
+            );
+            assert_eq!(st.params.sample_rate, Some(rate), "{what}");
+            let channels = if mode == 3 { 1 } else { 2 };
+            assert_eq!(st.params.channels, Some(channels), "{what}");
+            assert_eq!(
+                st.params.bit_rate,
+                h.bitrate_kbps.map(|k| u64::from(k) * 1000),
+                "{what}"
+            );
+            assert_eq!(st.time_base, TimeBase::new(1, i64::from(rate)), "{what}");
+            assert_eq!(st.duration, Some(N as i64 * spf), "{what}: duration");
+            assert_eq!(d.audio_frame_count(), N as u64, "{what}");
+            assert_eq!(
+                d.duration_micros(),
+                Some(N as i64 * spf * 1_000_000 / i64::from(rate)),
+                "{what}"
+            );
+            for i in 0..N as i64 {
+                let pkt = d.next_packet().expect("packet");
+                assert_eq!(pkt.data.len(), bytes, "{what}: packet {i} size");
+                assert_eq!(pkt.pts, Some(i * spf), "{what}: packet {i} pts");
+                assert_eq!(pkt.duration, Some(spf), "{what}: packet {i} duration");
+                // Zero body: Layers I / II have no reservoir, and the
+                // Layer III back-pointer is zero.
+                assert!(pkt.flags.keyframe, "{what}: packet {i} keyframe");
+            }
+            assert!(matches!(d.next_packet(), Err(Error::Eof)), "{what}");
+            // Seek into frame 35 (past the second index entry).
+            assert_eq!(d.seek_to(0, 35 * spf + 7).unwrap(), 35 * spf, "{what}");
+            assert_eq!(d.next_packet().unwrap().pts, Some(35 * spf), "{what}");
+        }
+    }
+
+    /// A layer change is a codec change: the stream keeps the first
+    /// layer's label and ends in front of the first frame of another
+    /// layer, in both directions and at an unchanged sampling
+    /// frequency.
+    #[test]
+    fn layer_change_ends_the_stream() {
+        let (l1, _) = layer_stream(0b11, 0b11, 6, 1, 0, 5);
+        let (l2, _) = layer_stream(0b11, 0b10, 10, 1, 0, 6);
+        let (l3, _) = layer_stream(0b11, 0b01, 9, 1, 0, 7);
+        for (a, b, id, frames, spf) in [
+            (&l2, &l3, "mp2", 6i64, 1152i64),
+            (&l3, &l2, "mp3", 7, 1152),
+            (&l1, &l2, "mp1", 5, 384),
+            (&l3, &l1, "mp3", 7, 1152),
+        ] {
+            let mut joined = a.clone();
+            joined.extend_from_slice(b);
+            // The first layer comes back after the foreign run: still
+            // not part of the stream.
+            joined.extend_from_slice(a);
+            let mut d = Mp3Demuxer::open(Box::new(Cursor::new(joined))).expect("open");
+            let st = &d.streams()[0];
+            assert_eq!(st.params.codec_id.as_str(), id);
+            assert_eq!(st.duration, Some(frames * spf));
+            assert_eq!(d.audio_frame_count(), frames as u64);
+            assert_eq!(d.framing_switch_count(), 0);
+            assert_eq!(d.layer_change_offset(), Some(a.len() as u64));
+            assert_eq!(d.audio_end_offset(), a.len() as u64);
+            let mut bytes = Vec::new();
+            while let Ok(p) = d.next_packet() {
+                assert_eq!(parse_header(&p.data).unwrap().layer, d.layer());
+                bytes.extend_from_slice(&p.data);
+            }
+            assert!(&bytes == a, "exactly the first layer's frames come out");
+            assert!(matches!(d.next_packet(), Err(Error::Eof)));
+            // A seek to the last sample lands on the last frame of
+            // the stream.
+            assert_eq!(d.seek_to(0, frames * spf - 1).unwrap(), (frames - 1) * spf);
+            assert_eq!(d.next_packet().unwrap().pts, Some((frames - 1) * spf));
+            assert!(matches!(d.next_packet(), Err(Error::Eof)));
+        }
+    }
+
+    /// Layer I / II probe: a lone header at the end of the buffer is
+    /// taken; one followed by bytes that are not a matching header is
+    /// not.
+    #[test]
+    fn probe_layer_one_and_two() {
+        for lb in [0b11u32, 0b10] {
+            let (stream, h) = layer_stream(0b11, lb, 6, 1, 0, 2);
+            let len = h.frame_len().unwrap();
+            for (ext, score) in [(None, 75), (Some("mp2"), 100), (Some("mp1"), 100)] {
+                let p = ProbeData { buf: &stream, ext };
+                assert_eq!(probe(&p), score);
+                let p = ProbeData {
+                    buf: &stream[..4],
+                    ext,
+                };
+                assert_eq!(probe(&p), score);
+            }
+            let mut broken = stream.clone();
+            broken[len] = 0x00;
+            let p = ProbeData {
+                buf: &broken,
+                ext: Some("mp2"),
+            };
+            assert_eq!(probe(&p), 0);
+            let mut id3 = vec![b'I', b'D', b'3', 3, 0, 0x00, 0, 0, 0, 0x00];
+            id3.extend_from_slice(&stream);
+            let p = ProbeData {
+                buf: &id3,
+                ext: None,
+            };
+            assert_eq!(probe(&p), 100);
+        }
     }
 
     /// Probe scores: ID3v2 + frame sync = 100; bare frame sync with

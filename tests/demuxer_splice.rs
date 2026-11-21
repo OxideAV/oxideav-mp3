@@ -206,9 +206,37 @@ type Walk = (usize, u32, u32);
 /// Concatenate segment files and check the framing of the spliced
 /// stream: frame counts, bytes, timeline, duration, switch count.
 /// Returns the packets and the segments' bytes and header walks.
+///
+/// A change of layer is a change of codec and ends the stream: the
+/// stream is the run of leading segments that share the first
+/// segment's layer, announced under that layer's codec id, and the
+/// demuxer reports where the next layer starts.
 fn check_framing(names: &[&str]) -> (Vec<Packet>, Vec<Vec<u8>>, Vec<Walk>) {
     let man = manifest();
-    let segs: Vec<Vec<u8>> = names.iter().map(|n| file(n)).collect();
+    let all: Vec<Vec<u8>> = names.iter().map(|n| file(n)).collect();
+    let layer = parse_header(&all[0]).unwrap().layer;
+    let same_layer = all
+        .iter()
+        .take_while(|b| parse_header(b).unwrap().layer == layer)
+        .count();
+    {
+        let d = open(all.concat());
+        let stream_bytes: usize = all[..same_layer].iter().map(Vec::len).sum();
+        assert_eq!(d.layer(), layer);
+        assert_eq!(
+            d.layer_change_offset(),
+            (same_layer < all.len()).then_some(stream_bytes as u64),
+            "{}: where the layer changes",
+            names.join("+")
+        );
+        assert_eq!(
+            d.streams()[0].params.codec_id.as_str(),
+            oxideav_mp3::codec_id_for_layer(layer)
+        );
+    }
+    let full = all.concat();
+    let names = &names[..same_layer];
+    let segs: Vec<Vec<u8>> = all[..same_layer].to_vec();
     let walks: Vec<(usize, u32, u32)> = segs.iter().map(|b| header_walk(b)).collect();
     for (i, n) in names.iter().enumerate() {
         let (count, rate, _) = man[*n];
@@ -217,7 +245,7 @@ fn check_framing(names: &[&str]) -> (Vec<Packet>, Vec<Vec<u8>>, Vec<Walk>) {
     }
     let what = names.join("+");
     let joined: Vec<u8> = segs.concat();
-    let mut d = open(joined.clone());
+    let mut d = open(full);
     let pkts = packets(&mut d);
 
     // Every frame exactly once, nothing else.
@@ -239,12 +267,12 @@ fn check_framing(names: &[&str]) -> (Vec<Packet>, Vec<Vec<u8>>, Vec<Walk>) {
         Some(exact_duration(&walks, base)),
         "{what}: exact duration"
     );
-    // A framing switch: version / layer / sampling frequency change.
+    // A framing switch: version / sampling frequency change.
     let keys: Vec<_> = segs
         .iter()
         .map(|b| {
             let h = parse_header(b).unwrap();
-            (h.version, h.layer, h.sample_rate_hz)
+            (h.version, h.sample_rate_hz)
         })
         .collect();
     let switches = keys.windows(2).filter(|w| w[0] != w[1]).count();
@@ -346,7 +374,10 @@ fn channel_mode_and_bitrate_switches() {
 
 /// Layer III ↔ Layer II switches (MPEG-1 and MPEG-2 LSF Layer II,
 /// CRC-protected), including one at an unchanged sampling frequency:
-/// framed completely (Layer II is not decoded by this crate).
+/// the stream is the first layer's frames, under its codec id, and
+/// ends where the layer changes (see [`check_framing`]). Layer II
+/// segments spliced to each other across a sampling-frequency /
+/// version switch are framed completely.
 #[test]
 fn layer_switches() {
     check_framing(&[
@@ -361,6 +392,13 @@ fn layer_switches() {
         check_framing(&[a, "raw_l2_48000.mp2", a]);
         check_framing(&["raw_l2_22050.mp2", a, "raw_l2_22050.mp2"]);
     }
+    let (pkts, _, _) = check_framing(&[
+        "raw_l2_48000.mp2",
+        "raw_l2_22050.mp2",
+        "raw_l2_48000.mp2",
+        "raw_44100.mp3",
+    ]);
+    assert!(pkts.iter().all(|p| p.flags.keyframe));
 }
 
 /// The round-482 failure: 44.1 kHz followed by 32 kHz or 22.05 kHz.
@@ -624,6 +662,13 @@ fn truncated_frame_before_switch() {
                 0
             };
             want.extend(FrameWalker::new(&fb).skip(from).map(|f| f.data.to_vec()));
+            // The stream ends where the layer changes.
+            let layer = parse_header(&fa).unwrap().layer;
+            let keep = want
+                .iter()
+                .take_while(|f| parse_header(f).unwrap().layer == layer)
+                .count();
+            want.truncate(keep);
             assert!(got == want, "{a} cut by {cut} + {b}: whole frames only");
             check_timeline(&d, &pkts, "cut");
         }
