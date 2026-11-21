@@ -421,15 +421,26 @@ impl Mp3CoreDecoder {
         let main_slot = &bytes[main_slot_start..frame_len];
 
         // Assemble main_data through the bit reservoir. If the look-
-        // back is larger than the reservoir's current contents we
-        // can't decode this frame yet — buffer its main-data and tell
-        // the caller to send more packets.
+        // back is larger than the reservoir's current contents (the
+        // first frames after a cut, a seek or a splice) the frame's
+        // main data is incomplete and nothing in it can be decoded.
+        // Its main-data bytes are still buffered for the frames that
+        // follow, and the frame is rendered as silence: it occupies
+        // its `samples_per_frame` on the timeline (the container
+        // counted it), so every later sample keeps its position.
         let run = match self
             .reservoir
             .assemble(usize::from(si.main_data_begin), main_slot)
         {
             Ok(run) => run,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                let samples = (si.granule_count as usize) * PCM_PER_GRANULE;
+                return Ok(Some(AudioFrame {
+                    samples: samples as u32,
+                    pts: packet.pts,
+                    data: vec![vec![0u8; samples * 2]; si.channels as usize],
+                }));
+            }
         };
         let fsf = decode_scalefactors(&hdr, &si, &run)
             .map_err(|e| Error::other(format!("oxideav-mp3: scalefactors: {e:?}")))?;

@@ -68,20 +68,30 @@ use crate::frame::{Emphasis, Layer, Mp3FrameHeader, MpegVersion, parse_header};
 /// §2.4.2.3, the MPEG-2.5 table in `datavoyage-mpgscript-mpeghdr.html`).
 pub(crate) const TICKS_PER_SECOND: u64 = 14_112_000;
 
-/// Longest frame (padded) a free-format stream may use: ISO/IEC
-/// 11172-3 §2.4.2.3 does not require a decoder to support free-format
-/// bitrates above 448 / 384 / 320 kbit/s for Layers I / II / III, and
-/// ISO/IEC 13818-3 §2.4.2.3 above 256 / 160 / 160 kbit/s for the lower
-/// sampling frequencies (MPEG-2.5 inherits the latter). The measurement
-/// never looks further than one such frame, so it cannot span other
-/// frames to a far-away sync of the same key.
+/// Longest frame (padded) a free-format stream is searched for.
+///
+/// ISO/IEC 11172-3 §2.4.2.3 does not require a decoder to support
+/// free-format bitrates above 448 / 384 / 320 kbit/s for Layers I / II
+/// / III, and ISO/IEC 13818-3 §2.4.2.3 above 256 / 160 / 160 kbit/s
+/// for the lower sampling frequencies (MPEG-2.5 inherits the latter).
+/// Layers I / II are measured up to those figures. Layer III streams
+/// above them exist in the wild (a deployed black-box encoder writes
+/// free format up to 640 kbit/s and a deployed decoder plays it), and
+/// the syntax carries them unchanged — a frame is still delimited by
+/// its header and `part2_3_length` fields — so Layer III is measured
+/// up to twice the non-mandatory ceiling: 640 kbit/s (MPEG-1) and
+/// 320 kbit/s (lower sampling frequencies), which is past what the
+/// 12-bit `part2_3_length` fields can fill at 32 kHz and above.
+/// The measurement never looks further than one such frame, so it
+/// cannot span other frames to a far-away sync of the same key.
 fn max_free_format_len(h: &Mp3FrameHeader) -> usize {
     let kbps: u64 = match (h.version.is_lsf(), h.layer) {
         (false, Layer::LayerI) => 448,
         (false, Layer::LayerII) => 384,
-        (false, Layer::LayerIII) => 320,
+        (false, Layer::LayerIII) => 640,
         (true, Layer::LayerI) => 256,
-        (true, Layer::LayerII | Layer::LayerIII) => 160,
+        (true, Layer::LayerII) => 160,
+        (true, Layer::LayerIII) => 320,
     };
     let body = kbps * 1000 * u64::from(h.samples_per_frame()) / (8 * u64::from(h.sample_rate_hz));
     // Whole slots, plus the padding slot.
@@ -371,15 +381,26 @@ fn is_info_frame(
     if h.layer != Layer::LayerIII {
         return Ok(false);
     }
-    let off = structural_min_len(h);
-    if off + 4 > len {
-        return Ok(false);
+    // The magic offset is tabulated from the frame start by MPEG
+    // version and channel mode only (lame-xing-info-tag.md §1): a
+    // protected carrier frame keeps the tag at the same offset, where
+    // it overlaps the last two side-information bytes. A writer that
+    // instead places it after the CRC word and the full side
+    // information is accepted too.
+    let after_crc = structural_min_len(h);
+    let tabulated = after_crc - if h.crc_protected { 2 } else { 0 };
+    for off in [tabulated, after_crc] {
+        if off + 4 > len {
+            continue;
+        }
+        let mut magic = [0u8; 4];
+        if read_at(input, pos + off as u64, &mut magic)? == 4
+            && (&magic == b"Xing" || &magic == b"Info")
+        {
+            return Ok(true);
+        }
     }
-    let mut magic = [0u8; 4];
-    if read_at(input, pos + off as u64, &mut magic)? < 4 {
-        return Ok(false);
-    }
-    Ok(&magic == b"Xing" || &magic == b"Info")
+    Ok(false)
 }
 
 /// Find the next frame at or after `pos` (before `end`), updating

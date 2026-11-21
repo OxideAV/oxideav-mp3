@@ -179,12 +179,22 @@ pub enum XingTagId {
 /// optional field (if any) starts at offset +8. This module assembles
 /// them in increasing-offset order based on the four guard bits.
 pub fn parse_xing_info(frame_payload: &[u8], side_info_bytes: usize) -> Option<XingTag> {
-    // Header is 4 bytes; CRC (when present) is another 2 — but the
-    // caller's `side_info_bytes` is the value we got from the header,
-    // and the prompt locates the magic "after the side-info bytes of
-    // the first frame", which (per ISO/IEC 11172-3 §2.4.1.7) starts
-    // immediately after the optional CRC. We need the header byte to
-    // know whether CRC is present, so re-parse it here.
+    locate_xing_info(frame_payload, side_info_bytes).map(|(_, tag)| tag)
+}
+
+/// [`parse_xing_info`] plus the frame-relative offset of the magic.
+///
+/// `lame-xing-info-tag.md` §1 tabulates the magic offset from the
+/// frame start by MPEG version and channel mode alone — `4 +
+/// side_info_bytes` — and a CRC-protected carrier frame written by the
+/// tag's originating encoder keeps it there (the tag then overlaps the
+/// last two side-information bytes of the protected layout). That
+/// offset is tried first; the position after the CRC word and the
+/// whole side information is accepted as well.
+pub(crate) fn locate_xing_info(
+    frame_payload: &[u8],
+    side_info_bytes: usize,
+) -> Option<(usize, XingTag)> {
     if frame_payload.len() < 4 {
         return None;
     }
@@ -193,8 +203,16 @@ pub fn parse_xing_info(frame_payload: &[u8], side_info_bytes: usize) -> Option<X
     if header.layer != Layer::LayerIII {
         return None;
     }
-    let crc_bytes = if header.crc_protected { 2 } else { 0 };
-    let magic_offset = 4 + crc_bytes + side_info_bytes;
+    let tabulated = 4 + side_info_bytes;
+    let found = xing_info_at(frame_payload, tabulated).map(|t| (tabulated, t));
+    if found.is_none() && header.crc_protected {
+        return xing_info_at(frame_payload, tabulated + 2).map(|t| (tabulated + 2, t));
+    }
+    found
+}
+
+/// Parse the Xing / Info fields whose magic starts at `magic_offset`.
+fn xing_info_at(frame_payload: &[u8], magic_offset: usize) -> Option<XingTag> {
     let magic_end = magic_offset + 4;
     if magic_end > frame_payload.len() {
         return None;
@@ -653,21 +671,19 @@ impl Mp3Demuxer {
 
         let channels = first_header.channel_count();
         let side_bytes = side_info_len(first_header.version, channels);
-        let xing = parse_xing_info(&first_frame_buf, side_bytes);
+        let located = locate_xing_info(&first_frame_buf, side_bytes);
 
         // 5b. LAME-extension tag (gapless playback). Only attempted
         //     when all four Xing flag bits are set, since that is the
         //     only layout `docs/audio/mp3/lame-xing-info-tag.md`
         //     documents. The encoder version, encoder-delay /
         //     zero-padding pair, and the rest of the LAME-defined
-        //     fields are unpacked from the canonical
-        //     `header_bytes + side_info_bytes + 118` byte offset.
-        let lame = xing.as_ref().and_then(|xt| {
-            let crc_bytes = if first_header.crc_protected { 2 } else { 0 };
-            let header_bytes = 4 + crc_bytes;
-            let off = lame_magic_offset(header_bytes, side_bytes, xt)?;
+        //     fields sit 118 bytes after the Xing / Info magic.
+        let lame = located.as_ref().and_then(|(magic_offset, xt)| {
+            let off = lame_magic_offset(magic_offset - side_bytes, side_bytes, xt)?;
             parse_lame_tag(&first_frame_buf, off).ok()
         });
+        let xing = located.map(|(_, xt)| xt);
 
         // 6. Walk every frame header once: exact frame count and
         //    running time across any switch, and the seek index.

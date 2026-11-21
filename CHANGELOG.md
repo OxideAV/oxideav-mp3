@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Information frame in a CRC-protected stream.** A protected stream
+  keeps the "Xing" / "Info" magic at the offset tabulated from the
+  frame start (36 / 21 / 13 by version and channel mode); the demuxer
+  looked two bytes later, took the information frame for audio and
+  decoded one frame too many (every later sample 1152 / 576 samples
+  late, no gapless figures). Both positions are recognised now.
+- **Free-format Layer III above 320 kbit/s (160 kbit/s at the lower
+  sampling frequencies) opens.** The frame-length measurement stopped
+  at the bitrate a decoder is required to support, so such files
+  failed with "no MPEG audio frame sync". Layer III is measured up to
+  640 / 320 kbit/s.
+- **A frame whose bit-reservoir data is missing is rendered as
+  silence instead of being dropped** (first frames after a cut head, a
+  seek or a damaged splice). The frame keeps its place on the
+  timeline, so later samples stay aligned with the container
+  timestamps.
+
+### Added
+
+- `tests/blackbox_matrix.rs` — live black-box matrix, foreign streams
+  into this decoder: 970 cells from a black-box encoder (every
+  sampling frequency x full bitrate ladder x joint / stereo / forced
+  MS / dual channel / mono, free format, VBR and ABR, CRC, reservoir
+  off, header-bit and tag variants, tiny inputs, a long stream,
+  truncated / junk-prefixed / concatenated files), each decoded here
+  and by two black-box decoders and compared against their float
+  output (every sample within 2 LSB, RMS <= 0.41 LSB). Skips when the
+  tools are not installed.
+- `examples/mp3_to_pcm.rs` — file decode to raw PCM with a speed
+  readout.
+
+### Fixed (earlier in this cycle)
+
 - **The demuxer keeps every frame across a mid-stream header change.**
   A sampling-frequency switch (e.g. a 44.1 kHz file concatenated with a
   32 kHz or 22.05 kHz one) used to drop every frame after it. Switches
