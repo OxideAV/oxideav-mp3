@@ -75,6 +75,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   it. A black-box reader reported "invalid concatenated file" on the
   shorter figure.
 
+- **The demuxer keeps every frame across a mid-stream header change.**
+  A sampling-frequency switch (e.g. a 44.1 kHz file concatenated with a
+  32 kHz or 22.05 kHz one) used to drop every frame after it. Switches
+  of sampling frequency, MPEG version (MPEG-1 / MPEG-2 LSF / MPEG-2.5),
+  channel mode, bitrate and free-format slot count now frame completely;
+  ID3v2 tags, ID3v1 / TAG+ trailers and Xing / Info frames met
+  mid-stream are stepped over. A header that switches on a frame
+  boundary must be followed by one with its own key; a candidate found
+  by scanning must chain three more, so a resync cannot lock onto a
+  false sync in main data. A cut splice (a truncated last frame with the
+  next file starting inside it) drops the cut frame instead of
+  swallowing the next file's first frame. Layer II segments frame the
+  same way. The free-format length measurement is bounded
+  by the §2.4.2.3 free-format bitrate ceilings and re-runs at a switch.
+
 ### Added
 
 - **Gapless information frame from the encoder**:
@@ -106,22 +121,6 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - `examples/mp3_to_pcm.rs` — file decode to raw PCM with a speed
   readout.
 
-### Fixed (earlier in this cycle)
-
-- **The demuxer keeps every frame across a mid-stream header change.**
-  A sampling-frequency switch (e.g. a 44.1 kHz file concatenated with a
-  32 kHz or 22.05 kHz one) used to drop every frame after it. Switches
-  of sampling frequency, MPEG version (MPEG-1 / MPEG-2 LSF / MPEG-2.5),
-  channel mode, bitrate and free-format slot count now frame completely;
-  ID3v2 tags, ID3v1 / TAG+ trailers and Xing / Info frames met
-  mid-stream are stepped over. A header that switches on a frame
-  boundary must be followed by one with its own key; a candidate found
-  by scanning must chain three more, so a resync cannot lock onto a
-  false sync in main data. A cut splice (a truncated last frame with the
-  next file starting inside it) drops the cut frame instead of
-  swallowing the next file's first frame. Layer II segments frame the
-  same way. The free-format length measurement is bounded
-  by the §2.4.2.3 free-format bitrate ceilings and re-runs at a switch.
 
 ### Performance
 

@@ -2,33 +2,132 @@
 
 [![CI](https://github.com/OxideAV/oxideav-mp3/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mp3/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mp3.svg)](https://crates.io/crates/oxideav-mp3) [![docs.rs](https://docs.rs/oxideav-mp3/badge.svg)](https://docs.rs/oxideav-mp3) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A pure-Rust **MPEG-1 / MPEG-2 Audio Layer III** (MP3) codec for the
-[oxideav](https://github.com/OxideAV/oxideav-workspace) framework —
-decoder, CBR/VBR encoder, and a stream demuxer.
+A pure-Rust **MPEG-1 / MPEG-2 / MPEG-2.5 Audio Layer III** (MP3) codec
+for the [oxideav](https://github.com/OxideAV/oxideav-workspace)
+framework — decoder, CBR / VBR encoder, stream demuxer and `.mp3`
+muxer.
 
-## Status
-
-Clean-room implementation. Every numeric constant is transcribed from
+Clean-room implementation: every numeric constant is transcribed from
 ISO/IEC 11172-3:1993 and ISO/IEC 13818-3:1997, the staged clean-room
-docs, and observer-trace measurements of black-box decoder binaries —
-and from no other source. The decoder produces PCM end-to-end for
-MPEG-1, MPEG-2 LSF, and all three MPEG-2.5 rates (8 / 11.025 /
-12 kHz), mono and stereo; a corpus-wide differential sweep tracks the
-staged reference PCM for all 16 fixtures in the float-rounding regime
-(normalized RMS error ≤ 1.6e-5). The encoder produces valid CBR and
-VBR MP3 streams whose decode is verified against external black-box
-validator binaries across a 39-case matrix (every rate, mono/stereo,
-long / short / mixed / auto / auto+mixed block types — mixed now at
-every rate including MPEG-2.5 8 / 11.025 / 12 kHz (r440) — tone and
-wideband noise, `tests/validator_decode_sweep.rs`).
+docs, and input / output measurements of black-box binaries — and from
+no other source.
 
-Both directions are benchmarked and optimized (r409, output-invariant
-— encoded bytes and decoded PCM bit-for-bit unchanged, every optimized
-path pinned by an equivalence test): whole-stream encode is 3–13×
-faster than the r398 ranking baseline (≈ 150× real-time for a mono
-44.1 kHz tone, ≈ 30× for wide-spectrum noise) and whole-stream decode
-≈ 2× (≈ 1650× real-time mono). See `BENCHMARKS.md` for the per-stage
-before/after tables.
+## What is verified against outside tools
+
+`tests/blackbox_matrix.rs` generates its streams in a temp directory
+and skips when the tools (`lame`, `mpg123`, `ffmpeg`) are not
+installed.
+
+| Direction | Cells | Result |
+|---|---|---|
+| Streams of a black-box encoder -> this decoder | 970 | 969 equal to both black-box decoders, 1 where those two differ from each other (this decoder equals one) |
+| This encoder -> two black-box decoders | 960 configurations, 952 offered | 933 accepted without complaint, gapless-exact and sample-equal on both; 19 where the two decoders differ from each other (this crate equals one); 0 unreferenced |
+| Registry encoder + `.mp3` muxer -> two black-box decoders | 18 | 18 accepted without complaint, sample-equal |
+
+**Foreign streams.** Every sampling frequency (48 / 44.1 / 32, 24 /
+22.05 / 16, 12 / 11.025 / 8 kHz) x the full bitrate ladder x joint
+stereo / stereo / forced MS / dual channel / mono; free format below,
+between and above the ladder (to 640 kbit/s); two VBR routines at
+quality 0..9 and ABR; CRC protection, reservoir off, strict buffer
+constraints, emphasis / copyright / original bits, clipping input,
+with and without the information frame, ID3v1 / ID3v2 / padded ID3v2;
+1-sample to 2305-sample inputs and 40 s streams; truncated tails,
+truncated heads, junk prefixes and two streams concatenated (same and
+different sampling frequency). Judged against the black-box decoders'
+**float** output: every sample of this decoder's 16-bit output within
+2 LSB and the RMS difference at most 0.41 LSB (measured: maximum 0.5 to
+0.56 LSB, RMS 0.25 to 0.29 LSB — the rounding of the 16-bit output
+itself), exact sample count, and the gapless figures of every tagged
+stream equal to the encoder's input length. The one split cell is
+8 kbit/s forced MS at 24 kHz, where one black-box decoder renders
+granules with `big_values == 0` differently from the other and from
+this decoder.
+
+**Own streams.** Every sampling frequency x full ladder x mono /
+stereo / dual channel / MS / adaptive joint stereo, and at six rates
+every option: CRC, forced short and mixed blocks, both block-switching
+schedulers, scfsi reuse, threshold-in-quiet and outer-loop
+constructors, the four quality presets, VBR, and intensity stereo
+alone / with MS / adaptive, with long, short and switched blocks. Each
+stream must draw nothing on a black-box decoder's stderr, decode
+gapless to exactly the pushed sample count, equal this crate's own
+decode within 2 LSB, and sit at zero lag against the input. The 19
+split cells are all intensity stereo at the lower sampling
+frequencies, where the two black-box decoders disagree with each other
+(this crate equals one of them on every cell; at 48 / 44.1 kHz all
+intensity cells are equal on both). The 8 configurations not offered
+are the Model-2 block scheduler at the lower sampling frequencies (no
+Annex D tables there). One black-box decoder states that
+it does not implement mixed blocks at 8 kHz; those cells are judged on
+the other.
+
+**Never verified against an outside stream:** intensity-stereo and
+mixed-block streams from a *foreign* encoder (the black-box encoders
+here write neither; mixed blocks are covered by one staged fixture),
+`scalefac_scale` / `preflag` beyond what the black-box encoder happens
+to emit, and VBRI headers (no layout is staged — not implemented).
+
+Defects this matrix found and this round fixed: an information frame
+in a CRC-protected stream decoded as audio; free format above
+320 kbit/s refused; frames with missing reservoir data dropped instead
+of rendered silent; the gapless extension never found in real files
+(read two bytes early); the encoder dropping the last frame of input,
+overflowing the 12-bit `part2_3_length` at 8 kHz mono 64 kbit/s, and
+spending a fifth of its bits on dense spectra; intensity stereo
+leaving the band above the last scalefactor left-only, and using a
+constant illegal position at the lower sampling frequencies.
+
+## Speed
+
+One thread, 60 s of 44.1 kHz stereo (pink noise + swept tone), CPU
+time, median of three runs on a shared Apple-silicon host
+(`examples/mp3_to_pcm.rs`, `examples/wav_to_mp3.rs`):
+
+| | 128 kbit/s | 320 kbit/s |
+|---|---|---|
+| Decode | 0.13 s — 460x realtime | 0.16 s — 375x realtime |
+| Encode, joint stereo, before this round | 5.21 s — 11.5x | 4.77 s — 12.6x |
+| Encode, joint stereo, now | 1.38 s — 43x | 1.26 s — 48x |
+
+The encoder gain is output-invariant (same bytes as before on these
+clips at the commit that made it): the gain search starts at the first
+gain a lower bound on the Huffman bit count allows, each trial
+quantizes with one multiply per line from a cached 3/4 power, codebook
+costing is branch-free, and `push_samples` no longer moves its whole
+buffer once per frame. Plain stereo encodes at 53x, a quality preset
+(outer loop) at 20x. The decoder spends 36 % of its time in the exact
+64x32 `f64` synthesis matrixing; a fast transform there would change
+the last bit of some samples and was not done. `BENCHMARKS.md` holds
+the per-stage Criterion tables of earlier rounds.
+
+## Encoder quality
+
+Segmental critical-band SNR (`examples/band_snr.rs`: 1024-sample
+frames, 25 critical bands, per-cell SNR clamped to -10..50 dB and
+averaged — not a listening test) / plain SNR, in dB, 10 s clips at
+44.1 kHz stereo, each decoded by a black-box decoder:
+
+| Material | kbit/s | Black-box encoder | This encoder (joint) | Before this round |
+|---|---|---|---|---|
+| Two sawtooth tones + sine | 64 | 7.8 / 16.0 | 7.6 / 15.8 | 3.7 / 11.4 |
+| | 128 | 11.5 / 19.0 | 12.3 / 19.9 | 3.7 / 11.4 |
+| | 192 | 15.1 / 22.2 | 16.7 / 24.3 | 3.7 / 11.4 |
+| Decaying noise bursts | 64 | 12.9 / 3.3 | 11.6 / 1.2 | 10.0 / 1.2 |
+| | 128 | 16.2 / 5.7 | 12.9 / 3.4 | 11.6 / 3.4 |
+| | 192 | 20.4 / 8.1 | 17.2 / 9.8 | 13.7 / 7.8 |
+| Synthesised speech | 64 | 13.9 / 18.2 | 9.9 / 19.1 | 5.0 / 12.5 |
+| | 128 | 21.6 / 25.6 | 18.9 / 28.9 | 7.1 / 13.2 |
+| | 192 | 27.9 / 30.3 | 27.0 / 37.2 | 13.9 / 15.9 |
+
+The "before" column is the rate-loop defect (the figure did not move
+with the bitrate). What remains: on transients the default encoder
+uses long blocks only — arming `enable_auto_block_type` raises the
+noise-burst row at 128 kbit/s to 13.7 / 4.5 and is neutral on the
+other two — and it does not move bits between frames by demand, which
+is most of the remaining gap on bursts; on speech it maximises
+waveform SNR (higher than the black-box encoder's) where a perceptual
+allocation trades SNR for evenness across bands. The four quality
+presets produce identical output on these clips at these bitrates.
 
 ## Decoder
 
@@ -47,7 +146,15 @@ The full Layer III decode pipeline is implemented:
   types (long / start / short / stop, including mixed blocks), and the
   polyphase synthesis filterbank.
 - **Bit reservoir** (§2.4.2.7): `main_data_begin` back-references
-  across frames.
+  across frames. A frame whose back-reference points at data that was
+  never received (cut head, seek, damaged splice) is rendered as
+  silence and keeps its place on the timeline.
+- **Intensity stereo** (§2.4.3.4.9.3, ISO/IEC 13818-3 §2.4.3.2): per
+  window for short blocks; at the lower sampling frequencies the
+  illegal position is the largest value of the band's `slen` bits. The
+  lines above the last scalefactor band take the last transmitted
+  position (see the module doc of `stereo` for what the standard
+  leaves open there and what was measured).
 - **CRC-16** frame protection (§2.4.3.1).
 
 Output is planar `S16P` PCM (one little-endian `i16` plane per channel)
@@ -158,13 +265,35 @@ cross-frame bit-reservoir scheduling. Additional capabilities:
 The encoder is reachable through the `oxideav_core::Encoder` trait and
 several direct `make_encoder*` factory variants.
 
+**Delay and gapless.** A sample entering the encoder leaves a decoder
+1057 samples later (`END_TO_END_DELAY`). `finish` flushes that delay,
+so the whole input is decodable, and `Mp3Encoder::enable_info_frame`
+leads the stream with an Info / Xing frame — audio frame count, stream
+byte count, 100-entry seek table and the gapless extension (delay 528,
+exact end padding, both checksums) — from which readers recover exactly
+the pushed samples (verified on two black-box decoders in every cell
+of the matrix). The registry path (`make_encoder` packets through the
+muxer) writes the Info / Xing frame without the gapless extension:
+the delay and padding have no carrier between an `Encoder` and a
+`Muxer` in the published `oxideav-core`.
+
+**Buffering.** `Mp3Encoder` assembles frames as PCM arrives but writes
+the stream at `finish` (the bit reservoir is scheduled over the whole
+stream), and the registry encoder therefore returns its packets at
+`flush`. Memory grows with the stream length.
+
 ## Demuxer
 
 The `demuxer` module provides a streaming MP3 container reader: ID3v2
 skip, frame iteration, and parsing of the `Xing` / `Info` VBR header
-and the trailing gapless-playback extension (encoder delay / padding),
-so `trimmed_duration_samples()` reports the gapless sample count.
-Registered as a container alongside the codec.
+and the gapless-playback extension behind it (encoder delay / padding),
+so `trimmed_duration_samples()` reports the gapless sample count —
+equal to the encoder's input length on every tagged stream of the
+black-box matrix. The information frame is recognised in CRC-protected
+streams too (its magic stays at the offset tabulated from the frame
+start). Registered as a container alongside the codec. The decoder
+does not trim: it returns every frame, and the demuxer reports the
+figures.
 
 **Mid-stream header changes.** A stream may switch sampling frequency,
 MPEG version (MPEG-1 / MPEG-2 LSF / MPEG-2.5), channel mode, bitrate or
@@ -287,11 +416,18 @@ surface which path was taken.
 
 ## Not yet supported
 
-- Annex D psychoacoustic shaping remains **opt-in** under the perceptual
-  presets above; the bare-constructor default quantization is still
-  rate/distortion-driven. A perceptual preset applied by default at
-  construction time (rather than as an explicit `with_quality_preset`
-  call) is a possible future ergonomic refinement.
+- **VBRI seek headers**: no layout is staged in the clean-room docs.
+- **Gapless figures on the registry path** (see "Delay and gapless").
+- **Streaming encode**: packets appear at `flush`.
+- **Demand-driven bit reservoir** and a perceptual model by default:
+  Annex D psychoacoustic shaping is opt-in under the presets; the
+  bare-constructor quantization is rate / distortion driven.
+- **Intensity stereo at the lower sampling frequencies** decodes
+  identically on only one of the two black-box decoders in 19 of the
+  matrix cells (those decoders differ from each other there).
+- Layers I and II are framed by the demuxer but not decoded here
+  (`oxideav-mp2` does), and the ISO/IEC 13818-3 multichannel extension
+  is not decoded.
 
 ## Robustness
 
