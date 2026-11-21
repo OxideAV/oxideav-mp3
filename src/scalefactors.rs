@@ -688,6 +688,56 @@ pub(crate) fn read_lsf_channel(
     sf
 }
 
+/// The value that marks an **illegal intensity position** in each
+/// scalefactor slot of the right channel of an LSF intensity-stereo
+/// granule, laid out like the scalefactors themselves.
+///
+/// ISO/IEC 13818-3 §2.4.3.2: "the maximum value for intensity position
+/// will indicate an illegal intensity position" — the largest value
+/// the band's `slen` bits can hold, so it differs per partition. A
+/// partition with `slen == 0` transmits nothing: its positions are
+/// zero (§2.4.3.4, "resulting in an intensity position of zero") and
+/// no value is illegal there, recorded as [`NO_ILLEGAL_POSITION`].
+pub(crate) fn lsf_illegal_intensity_positions(gc: &GranuleChannel) -> ScaleFactors {
+    let params = lsf_scale_params(
+        gc.scalefac_compress,
+        gc.block_type,
+        gc.mixed_block_flag,
+        true,
+    );
+    let mut marks = ScaleFactors {
+        long: [NO_ILLEGAL_POSITION; LONG_SFB],
+        short: [[NO_ILLEGAL_POSITION; SHORT_WINDOWS]; SHORT_SFB],
+        ..ScaleFactors::default()
+    };
+    let short = gc.window_switching_flag && gc.block_type == BlockType::Short;
+    let fill = |sink: &mut dyn ScaleFactorSink| {
+        for p in 0..4 {
+            let mark = match params.slen[p] {
+                0 => NO_ILLEGAL_POSITION,
+                slen => (1u8 << slen) - 1,
+            };
+            for _ in 0..params.nr_of_sfb[p] {
+                sink.put(mark);
+            }
+        }
+    };
+    if short {
+        if gc.mixed_block_flag {
+            fill(&mut LsfMixedShortWriter::new(&mut marks));
+        } else {
+            fill(&mut LsfShortWriter::new(&mut marks));
+        }
+    } else {
+        fill(&mut LsfLongWriter::new(&mut marks));
+    }
+    marks
+}
+
+/// "No position is illegal in this band" (see
+/// [`lsf_illegal_intensity_positions`]); no scalefactor reaches it.
+pub(crate) const NO_ILLEGAL_POSITION: u8 = u8::MAX;
+
 /// A sink that places successive scalefactor values into the right slot
 /// of a [`ScaleFactors`] as the LSF four-partition reader walks them.
 trait ScaleFactorSink {

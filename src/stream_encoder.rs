@@ -414,6 +414,11 @@ pub struct Mp3Encoder {
     /// pre-counting samples) can supply them in the spec and the
     /// writer will use them verbatim.
     xing_template: Option<crate::xing_info::XingTagSpec>,
+    /// Write the gapless information frame at [`Mp3Encoder::finish`]
+    /// ([`Mp3Encoder::enable_info_frame`]).
+    info_frame: bool,
+    /// PCM samples per channel accepted by `push_samples` so far.
+    samples_in: u64,
 
     /// When `Some`, [`Mp3Encoder::finish`] picks a per-frame
     /// `bitrate_index` from the §2.4.2.3 ladder rather than emitting
@@ -920,6 +925,22 @@ struct PendingFrame {
     main_data: Vec<u8>,
 }
 
+/// Samples between an input sample entering the encoder and the same
+/// sample leaving a decoder: one granule of MDCT overlap (576), minus
+/// the 48 samples by which the analysis window leads its hop, plus
+/// the 529 samples a decoder's hybrid synthesis lags (the analysis /
+/// synthesis polyphase pair and the IMDCT overlap). Measured on the
+/// encoder's own output with two black-box decoders: 1057 at every
+/// sampling frequency.
+pub const END_TO_END_DELAY: usize = 1057;
+
+/// The decoder's share of [`END_TO_END_DELAY`]; gapless readers add
+/// it to the delay a stream declares (`lame-xing-info-tag.md` §5).
+const DECODER_DELAY: usize = 529;
+
+/// Largest value of the 12-bit `part2_3_length` field (§2.4.1.7).
+const MAX_PART2_3_BITS: usize = 4095;
+
 impl Mp3Encoder {
     /// Build a new encoder for the given sample rate + bitrate.
     ///
@@ -994,6 +1015,8 @@ impl Mp3Encoder {
             outer_loop_threshold: None,
             per_band_xmin: None,
             xing_template: None,
+            info_frame: false,
+            samples_in: 0,
             vbr: None,
             crc_enabled: false,
             ms_stereo: false,
@@ -1940,11 +1963,11 @@ impl Mp3Encoder {
     /// would otherwise extend the decoder-derived zero-part downward).
     ///
     /// The spectrum above the last long band boundary (Table B.8
-    /// `scalefac_l` covers 21 bands; the top lines up to 576 belong to
-    /// no band) carries no scalefactor and therefore no position; those
-    /// lines are coupled into the left channel the same way and decode
-    /// as left-only — the §2.4.3.4.9.3 layout simply has no is_pos slot
-    /// for them.
+    /// `scalefac_l` covers 21 bands; the top lines up to 576 form a
+    /// 22nd band) carries no scalefactor and therefore no position of
+    /// its own; those lines are coupled into the left channel the same
+    /// way and decode with the position of band 20 (see
+    /// [`crate::stereo`], "The band above the last scalefactor").
     ///
     /// On an **LSF** (MPEG-2 / MPEG-2.5) rate the same coupling geometry
     /// applies, but the right channel is written in the ISO/IEC 13818-3
@@ -2296,6 +2319,34 @@ impl Mp3Encoder {
             max_index: max_idx,
         });
         Ok(())
+    }
+
+    /// Lead the stream with a gapless information frame.
+    ///
+    /// [`Mp3Encoder::finish`] then writes, in front of the audio, one
+    /// silent Layer III frame carrying the Xing / Info fields (`Info`
+    /// for a constant-bitrate stream, `Xing` for VBR): audio frame
+    /// count, audio byte count, a 100-entry seek table, and the
+    /// gapless extension with the encoder delay and the end padding
+    /// (`lame-xing-info-tag.md` §4 / §5), so a reader recovers exactly
+    /// the samples that were pushed:
+    ///
+    /// ```text
+    /// frames x samples_per_frame - delay - padding == samples pushed
+    /// ```
+    ///
+    /// The frame is as long as an audio frame of the stream when the
+    /// fields fit, otherwise the smallest bitrate of the ladder whose
+    /// frame holds them. It takes precedence over a template given to
+    /// [`Mp3Encoder::enable_xing_info`].
+    pub fn enable_info_frame(&mut self) {
+        self.info_frame = true;
+    }
+
+    /// `true` once [`Mp3Encoder::enable_info_frame`] was called.
+    #[must_use]
+    pub fn info_frame_enabled(&self) -> bool {
+        self.info_frame
     }
 
     /// Enable Xing / Info VBR information-frame emission.
@@ -2833,6 +2884,7 @@ impl Mp3Encoder {
             let ch = i % nch;
             self.pending_pcm[ch].push(f32::from(s) * SCALE);
         }
+        self.samples_in += (samples.len() / nch) as u64;
 
         // Auto block-type needs one granule of PCM lookahead beyond
         // the frame it's currently encoding so the §C.1.5.2
@@ -2900,6 +2952,22 @@ impl Mp3Encoder {
         // tail-flush must reconstruct it for either.
         let auto_on = self.auto_block_type.is_some() || self.model2_block_type.is_some();
         let frame_samples = self.samples_per_frame();
+        // Flush the codec delay. Input sample `n` comes out of a
+        // decoder at position `n + END_TO_END_DELAY`, so the stream
+        // must run at least that many samples past the last input
+        // sample or the end of the signal is never decodable (it sits
+        // in the overlap half of an MDCT block that is not sent). Zero
+        // samples are appended up to the first frame boundary at or
+        // after `samples_in + END_TO_END_DELAY`.
+        if self.samples_in > 0 {
+            let needed = self.samples_in + END_TO_END_DELAY as u64;
+            let total = needed.div_ceil(frame_samples as u64) * frame_samples as u64;
+            let emitted = self.frames.len() as u64 * frame_samples as u64;
+            for buf in self.pending_pcm.iter_mut() {
+                let have = emitted + buf.len() as u64;
+                buf.resize(buf.len() + total.saturating_sub(have) as usize, 0.0);
+            }
+        }
         loop {
             let any_pending = self.pending_pcm.iter().any(|b| !b.is_empty());
             if !any_pending {
@@ -2960,10 +3028,18 @@ impl Mp3Encoder {
         let denom = self.granules_per_frame().saturating_mul(self.nch).max(1);
         // Hold back a small margin (16 bits) per granule-channel for
         // the assembler's last partial-byte pad and any rounding.
+        //
+        // `part2_3_length` is a 12-bit field (§2.4.1.7): one
+        // granule-channel can never carry more than 4095 bits, however
+        // large the slot is. Without the cap a large slot (8 kHz mono
+        // at 64 kbit/s is 4608 bits for its single granule-channel;
+        // free-format-sized frames likewise) let the quantizer spend
+        // past 4095 and the written length wrapped modulo 4096.
         slot_bytes
             .saturating_mul(8)
             .saturating_div(denom)
             .saturating_sub(16)
+            .min(MAX_PART2_3_BITS)
     }
 
     /// Internal: turn `per_ch_frame_pcm[ch][0..1152]` (deinterleaved,
@@ -4084,7 +4160,12 @@ impl Mp3Encoder {
                     let start_line = long_starts[start_sfb];
                     let mapped = (0..12)
                         .find(|&sfb| short_starts[sfb] >= start_line)
-                        .unwrap_or(12);
+                        // A start above every short band boundary still
+                        // couples the last band: a short granule of an
+                        // intensity frame never keeps a right channel
+                        // that reaches the top (see the top-band note
+                        // in `crate::stereo`).
+                        .unwrap_or(11);
                     let short_start = mapped.max(MIXED_FIRST_SHORT_SFB);
                     short_intensity_start_per_gr[gr] = short_start;
                     // A mixed granule couples whenever either region has
@@ -4119,6 +4200,21 @@ impl Mp3Encoder {
                             }
                         }
                     }
+                    // The lines above the last short band boundary
+                    // (`3·short_starts[12]..576`) have no scalefactor.
+                    // They are coupled as well: a non-zero right
+                    // channel there would end its zero part above
+                    // every coupled band, and a decoder that derives
+                    // the per-window bound over the whole window would
+                    // then decode none of them as intensity. They
+                    // decode with the position of band 11 of their
+                    // window.
+                    if short_start < 12 {
+                        for i in 3 * short_starts[12]..NUM_LINES {
+                            left[i] += right[i];
+                            right[i] = 0.0;
+                        }
+                    }
                     continue;
                 }
                 if short_intensity_gr[gr] {
@@ -4134,7 +4230,12 @@ impl Mp3Encoder {
                     let start_line = long_starts[start_sfb];
                     let short_start = (0..12)
                         .find(|&sfb| short_starts[sfb] >= start_line)
-                        .unwrap_or(12);
+                        // A start above every short band boundary still
+                        // couples the last band: a short granule of an
+                        // intensity frame never keeps a right channel
+                        // that reaches the top (see the top-band note
+                        // in `crate::stereo`).
+                        .unwrap_or(11);
                     // A short granule always couples (it shares the short
                     // geometry); the per-window zero-part below the bound
                     // is what makes the decoder's per-window bound
@@ -4177,6 +4278,21 @@ impl Mp3Encoder {
                                     right[i] = 0.0;
                                 }
                             }
+                        }
+                    }
+                    // The lines above the last short band boundary
+                    // (`3·short_starts[12]..576`) have no scalefactor.
+                    // They are coupled as well: a non-zero right
+                    // channel there would end its zero part above
+                    // every coupled band, and a decoder that derives
+                    // the per-window bound over the whole window would
+                    // then decode none of them as intensity. They
+                    // decode with the position of band 11 of their
+                    // window.
+                    if short_start < 12 {
+                        for i in 3 * short_starts[12]..NUM_LINES {
+                            left[i] += right[i];
+                            right[i] = 0.0;
                         }
                     }
                     continue;
@@ -5226,7 +5342,12 @@ impl Mp3Encoder {
                     let start_line = long_starts[start_sfb];
                     let mapped = (0..12)
                         .find(|&sfb| short_starts[sfb] >= start_line)
-                        .unwrap_or(12);
+                        // A start above every short band boundary still
+                        // couples the last band: a short granule of an
+                        // intensity frame never keeps a right channel
+                        // that reaches the top (see the top-band note
+                        // in `crate::stereo`).
+                        .unwrap_or(11);
                     let short_start = mapped.max(MIXED_FIRST_SHORT_SFB);
                     for win in 0..3 {
                         let mut last_nz_sfb: Option<usize> = None;
@@ -5268,7 +5389,12 @@ impl Mp3Encoder {
                     let start_line = long_starts[start_sfb];
                     let short_start = (0..12)
                         .find(|&sfb| short_starts[sfb] >= start_line)
-                        .unwrap_or(12);
+                        // A start above every short band boundary still
+                        // couples the last band: a short granule of an
+                        // intensity frame never keeps a right channel
+                        // that reaches the top (see the top-band note
+                        // in `crate::stereo`).
+                        .unwrap_or(11);
                     for win in 0..3 {
                         // Per-window last non-zero quantized line, in
                         // native bitstream layout (band `sfb` window `win`
@@ -5565,8 +5691,60 @@ impl Mp3Encoder {
         // refer to the audio region that follows, per the symmetric
         // [`crate::demuxer::parse_xing_info`] reader on the demuxer's
         // first-frame skip path).
+        let mut audio: Vec<u8> = Vec::with_capacity(audio_total_bytes as usize);
+        // Step 3a: assemble each audio frame as header (4 bytes) +
+        // optional CRC (2 bytes per §2.4.3.1) + side_info (`si_bytes`
+        // bytes) + slot (variable bytes).
+        for (i, sch) in scheduled.iter().enumerate() {
+            let hbytes = write_header(&headers[i]);
+            audio.extend_from_slice(&hbytes);
+            let sib = write_side_info(&side_infos[i]);
+            debug_assert_eq!(sib.len(), si_bytes);
+            if self.crc_enabled {
+                // §2.4.3.1: 16-bit CRC of header bits 16..31 plus the
+                // side-info bits, written big-endian (MSB first) in
+                // the two-byte slot between header and side_info. The
+                // protected side-info window follows the version: 135
+                // (mono) / 256 (other modes) bits for MPEG-1, 72 / 136
+                // bits for the shorter LSF side info (ISO/IEC 13818-3
+                // §2.4.1.4 defers to the 11172-3 definition over the
+                // LSF layout).
+                let crc = if lsf {
+                    crate::crc::crc16_layer3_lsf(&hbytes, &sib, self.nch as u8)
+                } else {
+                    crate::crc::crc16_layer3(&hbytes, &sib, self.nch as u8)
+                };
+                audio.extend_from_slice(&crc.to_be_bytes());
+            }
+            audio.extend_from_slice(&sib);
+            audio.extend_from_slice(&sch.slot);
+        }
+
+        // Step 3b: optional information frame, in front of the audio.
         let mut written = 0usize;
-        if let Some(template) = xing_template {
+        if self.info_frame {
+            let spf = u64::from(self.header_template.samples_per_frame());
+            let decoded = u64::from(audio_frame_count) * spf;
+            let delay = (END_TO_END_DELAY - DECODER_DELAY) as u64;
+            let padding = decoded.saturating_sub(delay + self.samples_in);
+            let min_kbps = headers
+                .iter()
+                .filter_map(|h| h.bitrate_kbps)
+                .min()
+                .unwrap_or(0);
+            let carrier = gapless_info_frame(
+                &self.header_template,
+                self.vbr.is_some(),
+                audio_frame_count,
+                &cum_audio_offsets,
+                min_kbps,
+                delay as u16,
+                padding.min(4095) as u16,
+                &audio,
+            )?;
+            sink.write_all(&carrier)?;
+            written += carrier.len();
+        } else if let Some(template) = xing_template {
             use crate::xing_info::{XingTagSpec, build_info_frame, flag_bit};
             // Fill in unresolved frames / bytes / toc fields per the
             // flag bits. Pre-set fields take precedence.
@@ -5597,37 +5775,8 @@ impl Mp3Encoder {
             written += carrier.len();
         }
 
-        // Step 3b: emit each audio frame as header (4 bytes) +
-        // optional CRC (2 bytes per §2.4.3.1) + side_info (`si_bytes`
-        // bytes) + slot (variable bytes).
-        for (i, sch) in scheduled.iter().enumerate() {
-            let hbytes = write_header(&headers[i]);
-            sink.write_all(&hbytes)?;
-            written += 4;
-            let sib = write_side_info(&side_infos[i]);
-            debug_assert_eq!(sib.len(), si_bytes);
-            if self.crc_enabled {
-                // §2.4.3.1: 16-bit CRC of header bits 16..31 plus the
-                // side-info bits, written big-endian (MSB first) in
-                // the two-byte slot between header and side_info. The
-                // protected side-info window follows the version: 135
-                // (mono) / 256 (other modes) bits for MPEG-1, 72 / 136
-                // bits for the shorter LSF side info (ISO/IEC 13818-3
-                // §2.4.1.4 defers to the 11172-3 definition over the
-                // LSF layout).
-                let crc = if lsf {
-                    crate::crc::crc16_layer3_lsf(&hbytes, &sib, self.nch as u8)
-                } else {
-                    crate::crc::crc16_layer3(&hbytes, &sib, self.nch as u8)
-                };
-                sink.write_all(&crc.to_be_bytes())?;
-                written += 2;
-            }
-            sink.write_all(&sib)?;
-            written += sib.len();
-            sink.write_all(&sch.slot)?;
-            written += sch.slot.len();
-        }
+        sink.write_all(&audio)?;
+        written += audio.len();
         Ok(written)
     }
 }
@@ -6250,6 +6399,94 @@ fn compute_xing_toc(cum_offsets: &[u64], total_bytes: u64) -> [u8; 100] {
         *slot = scaled.min(255) as u8;
     }
     toc
+}
+
+/// Build the gapless information frame of [`Mp3Encoder::enable_info_frame`]:
+/// a silent frame with the Xing / Info fields and the extension that
+/// declares the encoder delay and the end padding.
+#[allow(clippy::too_many_arguments)]
+fn gapless_info_frame(
+    template: &Mp3FrameHeader,
+    vbr: bool,
+    frames: u32,
+    cum_audio_offsets: &[u64],
+    min_kbps: u32,
+    delay: u16,
+    padding: u16,
+    audio: &[u8],
+) -> Result<Vec<u8>, StreamEncodeError> {
+    use crate::lame_tag::{ExtensionFields, LAME_TAG_FIELDS_LEN, crc16_reflected, write_extension};
+    use crate::xing_info::{XingTagSpec, build_info_frame, flag_bit};
+    let si_bytes = side_info_byte_len(template.version, template.channel_count() as usize);
+    let ext_at = 4 + si_bytes + crate::lame_tag::LAME_MAGIC_OFFSET_ALL_FLAGS;
+    let needed = ext_at + LAME_TAG_FIELDS_LEN;
+    // The stream's own frame size when the fields fit, else the
+    // smallest ladder bitrate whose frame holds them.
+    let mut carrier_hdr = *template;
+    carrier_hdr.padding = false;
+    carrier_hdr.crc_protected = false;
+    if carrier_hdr.frame_len().is_none_or(|l| l < needed) {
+        const LADDER_MPEG1: [u32; 14] = [
+            32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+        ];
+        const LADDER_LSF: [u32; 14] = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+        let ladder = if template.version.is_lsf() {
+            LADDER_LSF
+        } else {
+            LADDER_MPEG1
+        };
+        let fit = ladder.iter().find_map(|&kbps| {
+            let mut h = make_silent_header(kbps, template.sample_rate_hz, template.mode).ok()?;
+            h.mode_extension = template.mode_extension;
+            h.frame_len().is_some_and(|l| l >= needed).then_some(h)
+        });
+        carrier_hdr = fit.ok_or_else(|| {
+            StreamEncodeError::Huffman("no frame size holds the information frame".into())
+        })?;
+    }
+    // The byte count and the seek table describe the stream from the
+    // first byte of this frame (`lame-xing-info-tag.md` §2: "file /
+    // stream size", "offsets into the file"); the frame count is the
+    // audio frames after it.
+    let carrier_len = carrier_hdr.frame_len().unwrap_or(needed) as u64;
+    let total = carrier_len + audio.len() as u64;
+    let shifted: Vec<u64> = cum_audio_offsets.iter().map(|o| o + carrier_len).collect();
+    let spec = XingTagSpec {
+        id: if vbr {
+            crate::demuxer::XingTagId::Xing
+        } else {
+            crate::demuxer::XingTagId::Info
+        },
+        flags: flag_bit::ALL_FOUR,
+        frames: Some(frames),
+        bytes: Some(u32::try_from(total).unwrap_or(u32::MAX)),
+        toc: Some(compute_xing_toc(&shifted, total)),
+        quality: Some(0),
+    };
+    let mut frame = build_info_frame(&carrier_hdr, &spec)
+        .map_err(|e| StreamEncodeError::Huffman(e.to_string()))?;
+    let stereo_mode = match template.mode {
+        ChannelMode::SingleChannel => 0,
+        ChannelMode::Stereo => 1,
+        ChannelMode::DualChannel => 2,
+        ChannelMode::JointStereo => 3,
+    };
+    let music_length = (frame.len() + audio.len()) as u64;
+    write_extension(
+        &mut frame,
+        ext_at,
+        &ExtensionFields {
+            cbr: !vbr,
+            bitrate_kbps: min_kbps,
+            encoder_delay: delay,
+            zero_padding: padding,
+            stereo_mode,
+            source_rate_hz: template.sample_rate_hz,
+            music_length,
+            music_crc: crc16_reflected(0, audio),
+        },
+    );
+    Ok(frame)
 }
 
 /// Defensive: clamp every `is[i]` magnitude to `bound`, preserving sign.

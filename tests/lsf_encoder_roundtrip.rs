@@ -204,9 +204,10 @@ fn lsf_mono_22050_sine_roundtrip() {
         assert_eq!(si.byte_len(), 9);
         frames += 1;
     }
-    // 1 s @ 22.05 kHz = 22050 / 576 ≈ 38.3 frames (+1 tail round-up).
+    // 1 s @ 22.05 kHz plus the 1057-sample codec delay, rounded up
+    // to whole 576-sample frames.
     assert!(
-        (38..=40).contains(&frames),
+        frames == (SR as usize + 1057).div_ceil(576),
         "frame count out of range: {frames}"
     );
 }

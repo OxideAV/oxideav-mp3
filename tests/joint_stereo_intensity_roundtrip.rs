@@ -281,10 +281,9 @@ fn intensity_header_and_wire_bits() {
         assert_eq!(si.byte_len(), 32, "expected MPEG-1 stereo SI = 32 B");
         frame_count += 1;
     }
-    assert!(
-        (18..=20).contains(&frame_count),
-        "frame count out of range: {frame_count}"
-    );
+    // Half a second of input plus the 1057-sample codec delay,
+    // rounded up to whole frames.
+    assert_eq!(frame_count, (SR as usize / 2 + 1057).div_ceil(1152));
 }
 
 /// Wire-level §2.4.3.4.9.3 layout of a steady-state frame: the right

@@ -496,3 +496,130 @@ fn short_block_intensity_per_window() {
     assert!(approx(left[w2_b1], 0.0));
     assert!(approx(right[w2_b1], 12.0));
 }
+
+// ---------------------------------------------------------------------
+// The band above the last scalefactor, and LSF illegal positions.
+// ---------------------------------------------------------------------
+
+/// Long blocks: lines from `starts[21]` to 576 have no scalefactor and
+/// are decoded with the position of band 20 (two black-box decoders
+/// agree on MPEG-1 long-block streams; they used to stay left-only).
+#[test]
+fn long_top_band_takes_the_position_of_band_20() {
+    let starts = long_band_starts(44_100, MpegVersion::Mpeg1);
+    let mut left = [0.0f32; NUM_LINES];
+    let mut right = [0.0f32; NUM_LINES];
+    // Right channel non-zero in band 3 only: bands 4.. are intensity.
+    right[starts[3]] = 0.25;
+    for v in left.iter_mut() {
+        *v = 1.0;
+    }
+    let mut sf = ScaleFactors::default();
+    for (sfb, p) in sf.long.iter_mut().enumerate() {
+        *p = if sfb == 20 { 2 } else { 3 };
+    }
+    let gc = long_gc();
+    let ext = ModeExtension {
+        intensity_stereo: true,
+        ms_stereo: false,
+        raw: 1,
+    };
+    process_stereo(&mut left, &mut right, &sf, &gc, ext, 44_100, MpegVersion::Mpeg1);
+    let k = |pos: f32| {
+        let r = (pos * std::f32::consts::PI / 12.0).tan();
+        (r / (1.0 + r), 1.0 / (1.0 + r))
+    };
+    let (kl3, kr3) = k(3.0);
+    let (kl2, kr2) = k(2.0);
+    // Band 19: its own position 3.
+    assert!((left[starts[19]] - kl3).abs() < 1e-6);
+    assert!((right[starts[19]] - kr3).abs() < 1e-6);
+    // Band 20 and every line of the top band: position 2.
+    for i in [starts[20], starts[21], starts[21] + 7, NUM_LINES - 1] {
+        assert!((left[i] - kl2).abs() < 1e-6, "line {i}: L {}", left[i]);
+        assert!((right[i] - kr2).abs() < 1e-6, "line {i}: R {}", right[i]);
+    }
+    // A right channel that reaches into the top band leaves no
+    // intensity region at all.
+    let mut left = [1.0f32; NUM_LINES];
+    let mut right = [0.0f32; NUM_LINES];
+    right[NUM_LINES - 1] = 0.5;
+    process_stereo(&mut left, &mut right, &sf, &gc, ext, 44_100, MpegVersion::Mpeg1);
+    assert_eq!(left[starts[20]], 1.0);
+    assert_eq!(right[starts[20]], 0.0);
+}
+
+/// Short blocks: the lines above short band 11 of each window take
+/// that window's band-11 position.
+#[test]
+fn short_top_band_takes_the_position_of_band_11_of_its_window() {
+    let starts = short_band_starts(44_100, MpegVersion::Mpeg1);
+    let mut left = [1.0f32; NUM_LINES];
+    let mut right = [0.0f32; NUM_LINES];
+    let mut sf = ScaleFactors::default();
+    for row in sf.short.iter_mut() {
+        *row = [1, 1, 1];
+    }
+    sf.short[11] = [0, 3, 6];
+    let gc = short_gc();
+    let ext = ModeExtension {
+        intensity_stereo: true,
+        ms_stereo: false,
+        raw: 1,
+    };
+    process_stereo(&mut left, &mut right, &sf, &gc, ext, 44_100, MpegVersion::Mpeg1);
+    let top = 3 * starts[12];
+    // Window 0: position 0 -> L = 0, R = 1. Window 1: position 3 ->
+    // L = R = 1/2. Window 2: position 6 -> L = 1, R = 0.
+    for line in [top, top + 3, NUM_LINES - 3] {
+        assert!(left[line].abs() < 1e-6 && (right[line] - 1.0).abs() < 1e-6);
+        assert!((left[line + 1] - 0.5).abs() < 1e-6 && (right[line + 1] - 0.5).abs() < 1e-6);
+        assert!((left[line + 2] - 1.0).abs() < 1e-3 && right[line + 2].abs() < 1e-3);
+    }
+}
+
+/// ISO/IEC 13818-3 §2.4.3.2: at the lower sampling frequencies the
+/// illegal position is the largest value of the band's `slen` bits,
+/// not a constant 7; a band with `slen == 0` has position zero and no
+/// illegal value.
+#[test]
+fn lsf_illegal_position_is_the_largest_value_of_the_bands_slen() {
+    // int_scalefac_compress = 1*36 + 2*6 + 3 = 51 -> slen = [1, 2, 3],
+    // seven long bands each; scalefac_compress = 51 << 1.
+    let gc = GranuleChannel {
+        scalefac_compress: 51 << 1,
+        ..long_gc()
+    };
+    let marks = crate::scalefactors::lsf_illegal_intensity_positions(&gc);
+    assert_eq!(&marks.long[..7], &[1; 7]);
+    assert_eq!(&marks.long[7..14], &[3; 7]);
+    assert_eq!(&marks.long[14..21], &[7; 7]);
+
+    let starts = long_band_starts(22_050, MpegVersion::Mpeg2);
+    let mut left = [1.0f32; NUM_LINES];
+    let mut right = [0.0f32; NUM_LINES];
+    let mut sf = ScaleFactors::default();
+    // Band 2 (slen 1): position 1 is the illegal one there.
+    // Band 8 (slen 2): position 3 is illegal; band 9: position 1 legal.
+    // Band 15 (slen 3): position 3 is legal (7 would be illegal).
+    sf.long[2] = 1;
+    sf.long[8] = 3;
+    sf.long[9] = 1;
+    sf.long[15] = 3;
+    let ext = ModeExtension {
+        intensity_stereo: true,
+        ms_stereo: false,
+        raw: 1,
+    };
+    process_stereo(&mut left, &mut right, &sf, &gc, ext, 22_050, MpegVersion::Mpeg2);
+    let i0 = std::f32::consts::FRAC_1_SQRT_2.sqrt();
+    // Illegal, MS off: channels stay independent (L = 1, R = 0).
+    assert_eq!((left[starts[2]], right[starts[2]]), (1.0, 0.0));
+    assert_eq!((left[starts[8]], right[starts[8]]), (1.0, 0.0));
+    // Position 1: kl = i0, kr = 1.
+    assert!((left[starts[9]] - i0).abs() < 1e-6 && (right[starts[9]] - 1.0).abs() < 1e-6);
+    // Position 3: kl = i0^2, kr = 1.
+    assert!((left[starts[15]] - i0 * i0).abs() < 1e-6 && (right[starts[15]] - 1.0).abs() < 1e-6);
+    // Position 0 (band 0): both 1.
+    assert_eq!((left[0], right[0]), (1.0, 1.0));
+}

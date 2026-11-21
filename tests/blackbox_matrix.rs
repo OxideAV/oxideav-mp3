@@ -594,6 +594,9 @@ enum Verdict {
     /// The two black-box decoders disagree with each other; this
     /// crate agrees with one of them.
     Split(String),
+    /// No two decoders agree: the black-box decoders differ from each
+    /// other and from this crate, so the cell has no reference.
+    Contested(String),
     /// The black-box encoder does not make this cell.
     NotMade,
     Fail(String),
@@ -684,6 +687,23 @@ fn run_case(dir: &Path, idx: usize, c: &Case, with_ffmpeg: bool) -> Verdict {
             Err(_) => return Err("PANIC in this crate's decode".into()),
         };
         let ch = ch.max(c.channels);
+        // The gapless figures of an untouched stream that carries the
+        // information frame give back the input length exactly. (The
+        // black-box encoder leaves the frame out where an audio frame
+        // of the stream is too small to hold it.)
+        if c.kind == Kind::Intact {
+            let d = Mp3Demuxer::open(Box::new(Cursor::new(bytes.clone())))
+                .map_err(|e| format!("open: {e}"))?;
+            if d.xing().is_some() && d.trimmed_duration_samples() != Some(c.samples as i64) {
+                return Err(format!(
+                    "gapless length {:?} for {} input samples (delay {:?}, padding {:?})",
+                    d.trimmed_duration_samples(),
+                    c.samples,
+                    d.encoder_delay_samples(),
+                    d.zero_padding_samples()
+                ));
+            }
+        }
         let m = decode_mpg123(&mp3, ch)?;
         let vm = compare(&a, &m, ch, c, c.kind == Kind::Intact).map_err(|e| format!("mpg123: {e}"));
         if !with_ffmpeg || c.no_ffmpeg {
@@ -763,6 +783,7 @@ fn foreign_streams_decode_like_the_black_box_decoders() {
                 split += 1;
                 eprintln!("split {}{n}", cases[*i].label);
             }
+            Verdict::Contested(n) => fails.push(format!("{} [{}.mp3]: {n}", cases[*i].label, i)),
             Verdict::NotMade => {
                 not_made += 1;
                 if verbose {
@@ -792,6 +813,459 @@ fn foreign_streams_decode_like_the_black_box_decoders() {
             "{} of {} cells disagree; streams kept in {}",
             fails.len(),
             pass + split + fails.len(),
+            dir.display()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Direction ours -> foreign.
+// ---------------------------------------------------------------------
+
+use oxideav_mp3::{ChannelMode, Mp3Encoder, QualityPreset};
+
+/// One encoder cell: a label and how to build the encoder.
+struct EncCell {
+    label: String,
+    rate: u32,
+    channels: usize,
+    build: Box<dyn Fn() -> Option<Mp3Encoder> + Send + Sync>,
+}
+
+fn enc_cells() -> Vec<EncCell> {
+    let mut v: Vec<EncCell> = Vec::new();
+    let mut add = |label: String,
+                   rate: u32,
+                   channels: usize,
+                   build: Box<dyn Fn() -> Option<Mp3Encoder> + Send + Sync>| {
+        v.push(EncCell {
+            label,
+            rate,
+            channels,
+            build,
+        });
+    };
+    // A. Every sampling frequency x the full ladder x every channel
+    //    mode, default configuration.
+    for rate in RATES {
+        let full: &[u32] = if rate >= 32_000 {
+            &[
+                32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+            ]
+        } else {
+            &[8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]
+        };
+        for &br in full {
+            add(
+                format!("enc-{rate}-{br}k-mono"),
+                rate,
+                1,
+                Box::new(move || Mp3Encoder::new(br, rate, ChannelMode::SingleChannel).ok()),
+            );
+            add(
+                format!("enc-{rate}-{br}k-stereo"),
+                rate,
+                2,
+                Box::new(move || Mp3Encoder::new(br, rate, ChannelMode::Stereo).ok()),
+            );
+            add(
+                format!("enc-{rate}-{br}k-dual"),
+                rate,
+                2,
+                Box::new(move || Mp3Encoder::new(br, rate, ChannelMode::DualChannel).ok()),
+            );
+            add(
+                format!("enc-{rate}-{br}k-ms"),
+                rate,
+                2,
+                Box::new(move || Mp3Encoder::new_joint_stereo_ms(br, rate).ok()),
+            );
+            add(
+                format!("enc-{rate}-{br}k-joint-auto"),
+                rate,
+                2,
+                Box::new(move || Mp3Encoder::new_joint_stereo_auto(br, rate).ok()),
+            );
+        }
+    }
+    // B. Every encoder option, at one rate per MPEG version (and all
+    //    three MPEG-2.5 rates, whose band tables differ), mono and
+    //    stereo.
+    type Opt = (&'static str, fn(&mut Mp3Encoder) -> bool);
+    let opts: [Opt; 7] = [
+        ("crc", |e| {
+            e.with_protection_bit(true);
+            true
+        }),
+        ("short", |e| e.force_short_blocks_for_testing(true).is_ok()),
+        ("mixed", |e| e.force_mixed_blocks_for_testing(true).is_ok()),
+        ("auto", |e| e.enable_auto_block_type(4.0).is_ok()),
+        ("auto-mixed", |e| {
+            e.enable_auto_block_type_with_mixed(4.0, 0.5).is_ok()
+        }),
+        ("scfsi", |e| {
+            e.enable_scfsi_reuse();
+            true
+        }),
+        ("crc+auto", |e| {
+            e.with_protection_bit(true);
+            e.enable_auto_block_type(4.0).is_ok()
+        }),
+    ];
+    for (rate, br) in [
+        (44_100u32, 128u32),
+        (48_000, 192),
+        (22_050, 64),
+        (12_000, 32),
+        (11_025, 32),
+        (8_000, 24),
+    ] {
+        for (name, apply) in opts {
+            for (mname, mode, ch) in [
+                ("mono", ChannelMode::SingleChannel, 1usize),
+                ("stereo", ChannelMode::Stereo, 2),
+            ] {
+                add(
+                    format!("enc-{rate}-{br}k-{mname}-{name}"),
+                    rate,
+                    ch,
+                    Box::new(move || {
+                        let mut e = Mp3Encoder::new(br, rate, mode).ok()?;
+                        apply(&mut e).then_some(e)
+                    }),
+                );
+            }
+            // Joint stereo with the same option.
+            add(
+                format!("enc-{rate}-{br}k-joint-auto-{name}"),
+                rate,
+                2,
+                Box::new(move || {
+                    let mut e = Mp3Encoder::new_joint_stereo_auto(br, rate).ok()?;
+                    apply(&mut e).then_some(e)
+                }),
+            );
+        }
+        // Psychoacoustic constructors.
+        for (mname, mode, ch) in [
+            ("mono", ChannelMode::SingleChannel, 1usize),
+            ("stereo", ChannelMode::Stereo, 2),
+        ] {
+            add(
+                format!("enc-{rate}-{br}k-{mname}-tiq"),
+                rate,
+                ch,
+                Box::new(move || Mp3Encoder::new_with_threshold_in_quiet(br, rate, mode).ok()),
+            );
+            add(
+                format!("enc-{rate}-{br}k-{mname}-outer"),
+                rate,
+                ch,
+                Box::new(move || Mp3Encoder::new_with_outer_loop(br, rate, mode, 1e-6).ok()),
+            );
+            for (pname, preset) in [
+                ("fast", QualityPreset::Fast),
+                ("standard", QualityPreset::Standard),
+                ("high", QualityPreset::High),
+                ("transparent", QualityPreset::Transparent),
+            ] {
+                add(
+                    format!("enc-{rate}-{br}k-{mname}-new-preset-{pname}"),
+                    rate,
+                    ch,
+                    Box::new(move || {
+                        Mp3Encoder::new_with_quality_preset(br, rate, mode, preset).ok()
+                    }),
+                );
+            }
+            add(
+                format!("enc-{rate}-{br}k-{mname}-model2-blocks"),
+                rate,
+                ch,
+                Box::new(move || {
+                    let mut e =
+                        Mp3Encoder::new_with_quality_preset(br, rate, mode, QualityPreset::High)
+                            .ok()?;
+                    e.enable_auto_block_type_model2().is_ok().then_some(e)
+                }),
+            );
+            // VBR over the whole ladder below the constructor rate.
+            add(
+                format!("enc-{rate}-{br}k-{mname}-vbr"),
+                rate,
+                ch,
+                Box::new(move || {
+                    let mut e = Mp3Encoder::new(br, rate, mode).ok()?;
+                    let min = if rate >= 32_000 { 32 } else { 8 };
+                    e.enable_vbr(min, br).is_ok().then_some(e)
+                }),
+            );
+        }
+        // Intensity stereo, alone and with MS, fixed and adaptive.
+        for start in [4usize, 12, 18] {
+            add(
+                format!("enc-{rate}-{br}k-is{start}"),
+                rate,
+                2,
+                Box::new(move || Mp3Encoder::new_joint_stereo_is(br, rate, start).ok()),
+            );
+            add(
+                format!("enc-{rate}-{br}k-ms-is{start}"),
+                rate,
+                2,
+                Box::new(move || Mp3Encoder::new_joint_stereo_ms_is(br, rate, start).ok()),
+            );
+            add(
+                format!("enc-{rate}-{br}k-auto-is{start}"),
+                rate,
+                2,
+                Box::new(move || Mp3Encoder::new_joint_stereo_auto_is(br, rate, start).ok()),
+            );
+            add(
+                format!("enc-{rate}-{br}k-auto-is-adaptive{start}"),
+                rate,
+                2,
+                Box::new(move || {
+                    Mp3Encoder::new_joint_stereo_auto_is_adaptive(br, rate, start).ok()
+                }),
+            );
+            for (name, apply) in [opts[1], opts[3]] {
+                add(
+                    format!("enc-{rate}-{br}k-ms-is{start}-{name}"),
+                    rate,
+                    2,
+                    Box::new(move || {
+                        let mut e = Mp3Encoder::new_joint_stereo_ms_is(br, rate, start).ok()?;
+                        apply(&mut e).then_some(e)
+                    }),
+                );
+            }
+        }
+    }
+    v
+}
+
+/// A black-box decoder's gapless float decode and whatever it printed
+/// on stderr at warning level.
+fn gapless_decode(tool: &str, mp3: &Path, channels: usize) -> (Vec<f32>, String) {
+    let out = if tool == "mpg123" {
+        Command::new("mpg123")
+            .args(["-q", "-e", "f32", "-s"])
+            .arg(if channels == 1 { "--mono" } else { "--stereo" })
+            .arg(mp3)
+            .output()
+    } else {
+        Command::new("ffmpeg")
+            .args(["-v", "warning", "-nostdin", "-i"])
+            .arg(mp3)
+            .args(["-f", "f32le", "-"])
+            .output()
+    }
+    .expect("run decoder");
+    (
+        f32_lsb(&out.stdout),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+}
+
+fn run_enc_cell(dir: &Path, idx: usize, c: &EncCell, with_ffmpeg: bool) -> Verdict {
+    let Some(mut enc) = (c.build)() else {
+        return Verdict::NotMade;
+    };
+    // An odd length, so the last frame is partly padding.
+    let n = c.rate as usize + 1234 + idx % 577;
+    let pcm = material(c.rate, c.channels, n, idx as u32);
+    enc.enable_info_frame();
+    let mut bytes = Vec::new();
+    if let Err(e) = enc.push_samples(&pcm).and_then(|()| enc.finish(&mut bytes)) {
+        return Verdict::Fail(format!("encode: {e}"));
+    }
+    let mp3 = dir.join(format!("enc{idx}.mp3"));
+    std::fs::write(&mp3, &bytes).expect("write mp3");
+    let res = (|| -> Result<String, String> {
+        // Our own reading of the stream.
+        let d = Mp3Demuxer::open(Box::new(Cursor::new(bytes.clone())))
+            .map_err(|e| format!("own demuxer: {e}"))?;
+        if d.trimmed_duration_samples() != Some(n as i64) {
+            return Err(format!(
+                "own demuxer: gapless length {:?}, pushed {n}",
+                d.trimmed_duration_samples()
+            ));
+        }
+        let delay = d.encoder_delay_samples().unwrap_or(0) as usize + 529;
+        let (a, ch) = ours(&bytes)?;
+        if ch != c.channels {
+            return Err(format!("own decoder: {ch} channels"));
+        }
+        if a.len() / ch < delay + n {
+            return Err(format!(
+                "stream ends before the last input sample ({})",
+                a.len() / ch
+            ));
+        }
+        let ours_trimmed = &a[delay * ch..(delay + n) * ch];
+        let mut tools = vec!["mpg123"];
+        if with_ffmpeg {
+            tools.push("ffmpeg");
+        }
+        let mut decodes: Vec<(&str, Vec<f32>)> = Vec::new();
+        let mut verdicts: Vec<Result<String, String>> = Vec::new();
+        for tool in tools {
+            let (b, stderr) = gapless_decode(tool, &mp3, ch);
+            // One black-box decoder states that it does not implement
+            // mixed blocks at 8 kHz; such a cell is judged on the other.
+            if stderr.contains("is not implemented") {
+                continue;
+            }
+            if !stderr.is_empty() {
+                return Err(format!("{tool} complains: {stderr}"));
+            }
+            if b.len() / ch != n {
+                return Err(format!(
+                    "{tool}: gapless length {} for {n} pushed",
+                    b.len() / ch
+                ));
+            }
+            let Some((max, rms, limit)) = diff(ours_trimmed, &b, ch, 0, 0, n) else {
+                return Err(format!("{tool}: nothing to compare"));
+            };
+            verdicts.push(if max > MAX_LSB || rms > limit {
+                Err(format!("{tool}: max {max:.2} LSB rms {rms:.3}"))
+            } else {
+                Ok(format!(" {tool}:{max:.2}/{rms:.2}"))
+            });
+            decodes.push((tool, b));
+        }
+        let agree = verdicts.iter().filter(|v| v.is_ok()).count();
+        let mut note: String = verdicts.iter().flatten().cloned().collect();
+        if agree < verdicts.len() {
+            let errs: Vec<String> = verdicts.iter().filter_map(|v| v.clone().err()).collect();
+            // A cell passes as a split when the black-box decoders
+            // disagree with each other and this crate agrees with one.
+            let between = (decodes.len() == 2)
+                .then(|| diff(&decodes[0].1, &decodes[1].1, ch, 0, 0, n))
+                .flatten()
+                .is_some_and(|(max, _, _)| max > MAX_LSB);
+            if !between {
+                return Err(errs.join("; "));
+            }
+            note = if agree == 0 {
+                format!("CONTESTED {}", errs.join("; "))
+            } else {
+                format!("SPLIT{note}; {}", errs.join("; "))
+            };
+        }
+        // The decode is the input, in place: the error against the
+        // pushed PCM is smallest at zero lag.
+        let input: Vec<f32> = pcm.iter().map(|&s| f32::from(s)).collect();
+        let err_at = |lag: isize| diff(ours_trimmed, &input, ch, lag, 8, n - 8).map(|d| d.1);
+        let e0 = err_at(0).unwrap_or(f64::MAX);
+        for lag in [-2isize, -1, 1, 2] {
+            if err_at(lag).is_some_and(|e| e < e0) {
+                return Err(format!("decode is offset from the input by {lag}"));
+            }
+        }
+        Ok(note)
+    })();
+    match res {
+        Ok(n) => {
+            let _ = std::fs::remove_file(&mp3);
+            if n.starts_with("SPLIT") {
+                Verdict::Split(n)
+            } else if n.starts_with("CONTESTED") {
+                Verdict::Contested(n)
+            } else {
+                Verdict::Pass(n)
+            }
+        }
+        Err(e) => Verdict::Fail(e),
+    }
+}
+
+#[test]
+fn own_streams_decode_on_the_black_box_decoders() {
+    if !have("mpg123") {
+        eprintln!("skipping: `mpg123` is required for the black-box matrix");
+        return;
+    }
+    let with_ffmpeg = have("ffmpeg");
+    let verbose = std::env::var_os("OXIDEAV_MP3_MATRIX_VERBOSE").is_some();
+    let only = std::env::var("OXIDEAV_MP3_MATRIX_ONLY").ok();
+    let dir: PathBuf =
+        std::env::temp_dir().join(format!("oxideav-mp3-matrix-enc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cells: Vec<EncCell> = enc_cells()
+        .into_iter()
+        .filter(|c| only.as_ref().is_none_or(|o| c.label.contains(o.as_str())))
+        .collect();
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, Verdict)>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= cells.len() {
+                        break;
+                    }
+                    let v = run_enc_cell(&dir, i, &cells[i], with_ffmpeg);
+                    results.lock().unwrap().push((i, v));
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap();
+    results.sort_by_key(|r| r.0);
+    let (mut pass, mut split, mut contested, mut not_made) = (0usize, 0usize, 0usize, 0usize);
+    let mut fails = Vec::new();
+    for (i, v) in &results {
+        match v {
+            Verdict::Pass(n) => {
+                pass += 1;
+                if verbose {
+                    eprintln!("ok   {}{n}", cells[*i].label);
+                }
+            }
+            Verdict::Split(n) => {
+                split += 1;
+                if verbose {
+                    eprintln!("split {} {n}", cells[*i].label);
+                }
+            }
+            Verdict::Contested(n) => {
+                contested += 1;
+                eprintln!("contested {} {n}", cells[*i].label);
+            }
+            Verdict::NotMade => {
+                not_made += 1;
+                if verbose {
+                    eprintln!("n/a  {}", cells[*i].label);
+                }
+            }
+            Verdict::Fail(e) => fails.push(format!("{} [enc{}.mp3]: {e}", cells[*i].label, i)),
+        }
+    }
+    eprintln!(
+        "black-box matrix (ours -> foreign): {} cells, {} configurations the encoder does not offer, {} encoded: {} accepted without complaint, gapless-exact and sample-equal on every black-box decoder, {} where the black-box decoders differ from each other and this crate equals one, {} where no two decoders agree, {} fail (ffmpeg: {})",
+        cells.len(),
+        not_made,
+        pass + split + contested + fails.len(),
+        pass,
+        split,
+        contested,
+        fails.len(),
+        with_ffmpeg
+    );
+    if fails.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+    } else {
+        for f in &fails {
+            eprintln!("FAIL {f}");
+        }
+        panic!(
+            "{} of {} cells fail; streams kept in {}",
+            fails.len(),
+            pass + split + contested + fails.len(),
             dir.display()
         );
     }

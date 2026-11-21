@@ -88,6 +88,26 @@
 //! derives the bound directly from the reordered right-channel `xr`
 //! (the position of its last non-zero line).
 //!
+//! # The band above the last scalefactor
+//!
+//! 21 long bands (12 short bands per window) carry a scalefactor, but
+//! the band tables end below line 576 (192 per window): the lines
+//! from the last boundary to the top form one more band with no
+//! scalefactor, hence no transmitted position. §2.4.3.4.9.3 does not
+//! say how they are decoded when they lie in the zero part of the
+//! right channel. This module gives that band the position of the
+//! last band that has one (long band 20; short band 11 of the same
+//! window), including its "not intensity coded" marking. On MPEG-1
+//! long-block streams that is what two independent black-box decoders
+//! do (sample-equal to this decoder across the encoder's intensity
+//! modes in `tests/blackbox_matrix.rs`); leaving those lines
+//! left-only, as this module did before, differs from both by
+//! thousands of LSB on wide-band material. For short blocks and at
+//! the lower sampling frequencies the two black-box decoders differ
+//! from each other on intensity streams; this decoder is then
+//! sample-equal to one of them on nearly every cell (the matrix
+//! reports those cells as splits).
+//!
 //! Band boundaries are read from the same Table B.8 columns as the
 //! requantize / reorder stages via [`crate::requantize`].
 
@@ -105,6 +125,27 @@ const IS_POS_ILLEGAL: u8 = 7;
 
 /// Number of short-block scalefactor bands per window (`scalefac_s[..12]`).
 const SHORT_SFB: usize = 12;
+
+/// Long scalefactor bands that carry a scalefactor (`scalefac_l[..21]`).
+const LONG_SFB_TRANSMITTED: usize = 21;
+
+/// Long bands including the top one (lines `starts[21]..576`), which
+/// has no scalefactor.
+const LONG_BANDS_WITH_TOP: usize = 22;
+
+/// Short bands per window including the top one (lines
+/// `starts[12]..192`), which has no scalefactor.
+const SHORT_BANDS_WITH_TOP: usize = 13;
+
+/// End line (within one window) of short band `sfb`, the top band
+/// running to 192.
+fn short_band_end(starts: &[usize; 13], sfb: usize) -> usize {
+    if sfb + 1 < starts.len() {
+        starts[sfb + 1]
+    } else {
+        NUM_LINES / 3
+    }
+}
 
 /// In a mixed block the short region begins at short scalefactor
 /// band 3; lines below `3·short_starts[3]` are long-coded. Matches
@@ -163,10 +204,50 @@ pub fn process_stereo(
     // intensity-coded, using the per-window short-block layout when the
     // right channel is a short block.
     let is_short = right_gc.window_switching_flag && right_gc.block_type == BlockType::Short;
+    // The value marking "not intensity coded", per scalefactor slot:
+    // 7 in MPEG-1 (§2.4.3.4.9.3), the largest value of the band's
+    // `slen` bits at the lower sampling frequencies.
+    let illegal = match version {
+        MpegVersion::Mpeg1 => ScaleFactors {
+            long: [IS_POS_ILLEGAL; 21],
+            short: [[IS_POS_ILLEGAL; 3]; SHORT_SFB],
+            ..ScaleFactors::default()
+        },
+        MpegVersion::Mpeg2 | MpegVersion::Mpeg25 => {
+            crate::scalefactors::lsf_illegal_intensity_positions(right_gc)
+        }
+    };
+    let pos = Positions {
+        sf: right_sf,
+        illegal: &illegal,
+    };
     if is_short {
-        process_short(left, right, right_sf, right_gc, ms, sample_rate_hz, version);
+        process_short(left, right, pos, right_gc, ms, sample_rate_hz, version);
     } else {
-        process_long(left, right, right_sf, ms, sample_rate_hz, version);
+        process_long(left, right, pos, ms, sample_rate_hz, version);
+    }
+}
+
+/// The right channel's scalefactors read as intensity positions, with
+/// the per-slot value that marks a band as not intensity coded.
+#[derive(Clone, Copy)]
+struct Positions<'a> {
+    sf: &'a ScaleFactors,
+    illegal: &'a ScaleFactors,
+}
+
+impl Positions<'_> {
+    /// `(is_pos, illegal value)` of long band `sfb`; the top band (no
+    /// scalefactor) takes the last transmitted band's.
+    fn long(&self, sfb: usize) -> (u8, u8) {
+        let b = sfb.min(LONG_SFB_TRANSMITTED - 1);
+        (self.sf.long[b], self.illegal.long[b])
+    }
+
+    /// `(is_pos, illegal value)` of short band `sfb`, window `win`.
+    fn short(&self, sfb: usize, win: usize) -> (u8, u8) {
+        let b = sfb.min(SHORT_SFB - 1);
+        (self.sf.short[b][win], self.illegal.short[b][win])
     }
 }
 
@@ -190,7 +271,7 @@ fn apply_ms_range(left: &mut [f32; NUM_LINES], right: &mut [f32; NUM_LINES], lo:
 fn process_long(
     left: &mut [f32; NUM_LINES],
     right: &mut [f32; NUM_LINES],
-    right_sf: &ScaleFactors,
+    pos: Positions<'_>,
     ms: bool,
     sample_rate_hz: u32,
     version: MpegVersion,
@@ -198,23 +279,29 @@ fn process_long(
     let starts = long_band_starts(sample_rate_hz, version);
     let bound_sfb = long_intensity_bound(right, starts);
 
-    for sfb in 0..21 {
+    // 21 bands carry a scalefactor; the lines from `starts[21]` to 576
+    // form a 22nd band that has none and takes the position of band
+    // 20 (module doc, "The band above the last scalefactor").
+    for sfb in 0..LONG_BANDS_WITH_TOP {
         let lo = starts[sfb];
-        let hi = starts[sfb + 1];
+        let hi = if sfb + 1 < starts.len() {
+            starts[sfb + 1]
+        } else {
+            NUM_LINES
+        };
         if sfb < bound_sfb {
             if ms {
                 apply_ms_range(left, right, lo, hi);
             }
             // else: below-bound band passes through (already L/R).
         } else {
-            let is_pos = right_sf.long[sfb];
             apply_intensity_band(
                 left,
                 right,
                 lo,
                 hi,
-                is_pos,
-                right_sf.intensity_scale,
+                pos.long(sfb),
+                pos.sf.intensity_scale,
                 ms,
                 version,
             );
@@ -234,7 +321,7 @@ fn process_long(
 fn process_short(
     left: &mut [f32; NUM_LINES],
     right: &mut [f32; NUM_LINES],
-    right_sf: &ScaleFactors,
+    pos: Positions<'_>,
     right_gc: &GranuleChannel,
     ms: bool,
     sample_rate_hz: u32,
@@ -266,14 +353,13 @@ fn process_short(
                     apply_ms_range(left, right, lo, hi);
                 }
             } else {
-                let is_pos = right_sf.long[sfb];
                 apply_intensity_band(
                     left,
                     right,
                     lo,
                     hi,
-                    is_pos,
-                    right_sf.intensity_scale,
+                    pos.long(sfb),
+                    pos.sf.intensity_scale,
                     ms,
                     version,
                 );
@@ -293,9 +379,12 @@ fn process_short(
         short_intensity_bound(right, short_starts, 2, first_short_sfb),
     ];
 
-    for sfb in first_short_sfb..SHORT_SFB {
+    // 12 bands per window carry a scalefactor; the lines from
+    // `short_starts[12]` to 192 form a 13th band that has none and
+    // takes the position of band 11 of the same window.
+    for sfb in first_short_sfb..SHORT_BANDS_WITH_TOP {
         let s = short_starts[sfb];
-        let w = short_starts[sfb + 1] - short_starts[sfb];
+        let w = short_band_end(short_starts, sfb) - s;
         let base = 3 * s;
         for (win, &bound_sfb) in bound.iter().enumerate() {
             if sfb < bound_sfb {
@@ -311,9 +400,8 @@ fn process_short(
                     }
                 }
             } else {
-                let is_pos = right_sf.short[sfb][win];
                 let (kl, kr, intensity_ok) =
-                    intensity_factors(is_pos, right_sf.intensity_scale, version);
+                    intensity_factors(pos.short(sfb, win), pos.sf.intensity_scale, version);
                 for k in 0..w {
                     let i = base + 3 * k + win;
                     if i >= NUM_LINES {
@@ -362,13 +450,14 @@ fn long_intensity_bound_range(
         None => 0, // entire range zero -> intensity from the first band.
         Some(line) => {
             // Band holding `line`, plus one (that band is the last
-            // non-intensity band).
+            // non-intensity band). A line in the top band (at or above
+            // `starts[21]`) leaves no intensity region at all.
             for sfb in 0..21 {
                 if line < starts[sfb + 1] {
                     return sfb + 1;
                 }
             }
-            21
+            LONG_BANDS_WITH_TOP
         }
     }
 }
@@ -384,9 +473,9 @@ fn short_intensity_bound(
     first_sfb: usize,
 ) -> usize {
     let mut last_sfb: Option<usize> = None;
-    for sfb in first_sfb..SHORT_SFB {
+    for sfb in first_sfb..SHORT_BANDS_WITH_TOP {
         let s = starts[sfb];
-        let w = starts[sfb + 1] - starts[sfb];
+        let w = short_band_end(starts, sfb) - s;
         let base = 3 * s;
         for k in 0..w {
             let i = base + 3 * k + window;
@@ -409,12 +498,12 @@ fn apply_intensity_band(
     right: &mut [f32; NUM_LINES],
     lo: usize,
     hi: usize,
-    is_pos: u8,
+    position: (u8, u8),
     intensity_scale: bool,
     ms: bool,
     version: MpegVersion,
 ) {
-    let (kl, kr, intensity_ok) = intensity_factors(is_pos, intensity_scale, version);
+    let (kl, kr, intensity_ok) = intensity_factors(position, intensity_scale, version);
     for i in lo..hi {
         if intensity_ok {
             let l = left[i];
@@ -441,8 +530,12 @@ fn apply_intensity_band(
 ///   pre-step-4 `L`).
 /// * **LSF** (ISO/IEC 13818-3 §2.4.3.2): power-law factor selected by
 ///   `intensity_scale`.
-fn intensity_factors(is_pos: u8, intensity_scale: bool, version: MpegVersion) -> (f32, f32, bool) {
-    if is_pos == IS_POS_ILLEGAL {
+fn intensity_factors(
+    (is_pos, illegal): (u8, u8),
+    intensity_scale: bool,
+    version: MpegVersion,
+) -> (f32, f32, bool) {
+    if is_pos == illegal {
         return (0.0, 0.0, false);
     }
     match version {

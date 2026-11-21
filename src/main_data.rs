@@ -228,6 +228,10 @@ pub fn assemble_main_data(
             )?;
 
             let part2_3 = w.bit_pos() - before;
+            debug_assert!(
+                part2_3 <= 4095,
+                "part2_3_length {part2_3} does not fit its 12-bit field"
+            );
             part2_3_lengths[gr][ch] = part2_3 as u16;
             side_info.granules[gr][ch].part2_3_length = part2_3 as u16;
         }

@@ -254,10 +254,13 @@ fn aligned_psnr(pcm_in: &[i16], pcm_out: &[i16]) -> f64 {
         panic!("recon too short: {}", pcm_out.len());
     }
     let head_recon = warmup + total_delay;
+    // The steady part: the abrupt end of the input is a transient,
+    // which is not what these comparisons are about, so the last two
+    // frames of the input are left out.
     let cmp_len = pcm_out
         .len()
         .saturating_sub(head_recon)
-        .min(pcm_in.len() - warmup);
+        .min(pcm_in.len() - warmup - 2 * 1152);
     let recon_cmp = &pcm_out[head_recon..head_recon + cmp_len];
     let pcm_cmp = &pcm_in[warmup..warmup + cmp_len];
     psnr(pcm_cmp, recon_cmp)

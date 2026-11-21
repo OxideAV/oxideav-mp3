@@ -23,8 +23,14 @@
 //!
 //! # Layout (offsets relative to the Xing / Info magic byte)
 //!
-//! The staged doc gives **absolute** offsets `$24, $9A, $A5, …` for the
-//! MPEG-1 stereo carrier-frame case (magic at `$24`). Other MPEG
+//! The staged doc gives **absolute** offsets `$24, …, $A5, …` for the
+//! MPEG-1 stereo carrier-frame case (magic at `$24`). Its row for the
+//! encoder version string reads "`$9A–$A4`, 9 bytes", which cannot
+//! both hold; the rest of the doc decides it: zone A with all four
+//! fields ends at `$24 + 4 + 4 + 4 + 4 + 100 + 4 = $9C`, and a 9-byte
+//! string ending just before the `$A5` revision byte starts at `$9C`.
+//! Streams from the tag's originating black-box encoder carry the
+//! string at `$9C`, right after the quality field, with no overlap. Other MPEG
 //! version / channel-mode combinations shift everything by the
 //! difference in the magic offset, so this module works in
 //! **magic-relative** offsets exclusively:
@@ -37,7 +43,7 @@
 //! | +12  | 4   | bytes  (when `BYTES_FLAG`) |
 //! | +16  | 100 | toc[100] (when `TOC_FLAG`) |
 //! | +116 | 4   | quality (when `VBR_SCALE_FLAG`) |
-//! | +118 | 9   | encoder version string (`"LAME…"` UNMOVABLE) |
+//! | +120 | 9   | encoder version string (`"LAME…"` UNMOVABLE) |
 //! | +129 | 1   | info-tag revision (4 MSB) + VBR method (4 LSB) |
 //! | +130 | 1   | lowpass (×100 Hz) |
 //! | +131 | 4   | Replay-Gain peak amplitude (IEEE-754 f32 BE) |
@@ -83,23 +89,25 @@
 //! off the front (in addition to any decoder-intrinsic prime offset)
 //! and `padding` samples off the back.
 //!
-//! # CRC validation
+//! # CRCs
 //!
-//! The staged doc names `CRCInitValue = 0x0000` for the tag CRC but
-//! does not specify the polynomial. Without a polynomial in the
-//! cleanroom corpus this module **records** the on-wire CRC field
-//! without verifying it; the caller can compare against an expected
-//! value if it has one. Filling in the polynomial-specific
-//! verification is a follow-up task once the staged doc is extended
-//! (or another cleanroom source confirms the polynomial).
+//! The staged doc names a CRC-16 with `CRCInitValue = 0x0000` for the
+//! tag CRC (over every frame byte before the CRC field itself) and
+//! for the music CRC (over the audio frames after the information
+//! frame) without giving the polynomial. Byte / checksum pairs read
+//! from streams of the tag's originating black-box encoder fit the
+//! reflected CRC-16 with polynomial `x^16 + x^15 + x^2 + 1`
+//! (`0xA001` in reflected form) — [`crc16_reflected`]. The parser
+//! records both fields verbatim and does not reject a mismatch; the
+//! writer fills them in.
 //!
 //! # See also
 //!
 //! - [`crate::demuxer::parse_xing_info`] — the four-field Xing / Info
 //!   header parser this module's offsets are tied to.
 //! - [`crate::xing_info`] — the encoder-side emitter for the four
-//!   traditional Xing fields. (LAME-tag emission is a separate
-//!   round's scope.)
+//!   traditional Xing fields; [`write_extension`] adds this module's
+//!   fields behind them.
 
 /// LAME extension fields parsed from an MP3's leading Xing / Info
 /// information frame.
@@ -171,10 +179,10 @@ pub const LAME_TAG_FULL_LEN: usize = 156;
 
 /// Magic-relative offset of the `"LAME"` magic when **all four** Xing
 /// flag bits (FRAMES + BYTES + TOC + VBR_SCALE) are set. Same
-/// `$9A − $24 = +0x76` derivation. With fewer flags the offset is
-/// smaller by the omitted-field widths; callers pass the post-Xing
-/// cursor to [`parse_lame_tag`] explicitly.
-pub const LAME_MAGIC_OFFSET_ALL_FLAGS: usize = 118;
+/// `$9C − $24` derivation (see the module doc). With fewer flags the
+/// offset is smaller by the omitted-field widths; callers pass the
+/// post-Xing cursor to [`parse_lame_tag`] explicitly.
+pub const LAME_MAGIC_OFFSET_ALL_FLAGS: usize = 120;
 
 /// Magic-relative offset (from the LAME magic, not from the Xing
 /// magic) of the three-byte encoder-delay + zero-padding run.
@@ -185,14 +193,11 @@ pub const DELAY_PADDING_OFFSET_FROM_LAME_MAGIC: usize = OFF_DELAY_PADDING;
 #[non_exhaustive]
 pub enum LameParseError {
     /// The byte range described by `lame_magic_offset` and the
-    /// trailing 38 bytes of LAME-extension fields does not fit inside
+    /// trailing 36 bytes of LAME-extension fields does not fit inside
     /// the frame payload supplied by the caller.
     Truncated,
-    /// The four bytes at `lame_magic_offset` are not the `"LAME"`
-    /// ASCII magic. Other encoder strings (`"Lavc"`, `"Lavf"`,
-    /// `"Xing"` legacy emitters) do not populate the LAME-extension
-    /// layout the same way, so this module refuses to read past the
-    /// magic for them.
+    /// The four bytes at `lame_magic_offset` are not a printable
+    /// ASCII encoder string: the frame carries no extension.
     NotLameTag,
 }
 
@@ -200,7 +205,9 @@ impl core::fmt::Display for LameParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             LameParseError::Truncated => f.write_str("frame payload too short for LAME extension"),
-            LameParseError::NotLameTag => f.write_str("encoder string is not the LAME magic"),
+            LameParseError::NotLameTag => {
+                f.write_str("no encoder string where the tag extension starts")
+            }
         }
     }
 }
@@ -217,30 +224,14 @@ impl std::error::Error for LameParseError {}
 /// (b) which Xing/Info flag bits were set in the preceding traditional
 /// header — both of which the demuxer already computes.
 ///
-/// # Offset interpretation
-///
-/// The staged doc gives the encoder-version run as `$9A–$A4` "9 bytes"
-/// — an internal inconsistency, since `$9A..=$A4` is 11 bytes
-/// inclusive. The rest of the doc's offset chain
-/// (`$A5` revision/method, `$A6` lowpass, …, `$B1` delay+padding) is
-/// internally consistent and gives `$B1 − $9A = 23` bytes from the
-/// LAME magic to the delay+padding run. We resolve the doc ambiguity
-/// by trusting the **absolute-offset chain** (which the doc derives
-/// from worked hex dumps) over the **"9 bytes"** annotation: the field
-/// region from LAME magic through the tag CRC at `$BF` is
-/// `$BF − $9A + 1 = 38` bytes, with the encoder-version run occupying
-/// the 9 ASCII characters at offsets 0..9 from the magic and the next
-/// two bytes (`$A3–$A4`, magic-relative 9..11) being either trailing
-/// NUL padding of the version string or a per-LAME-version reserved
-/// region; either way no LAME-defined field occupies them.
-///
 /// # Errors
 ///
 /// * [`LameParseError::Truncated`] when the frame payload does not
 ///   reach as far as the last LAME-extension byte (`lame_magic_offset
-///   + 38`).
+///   + 36`).
 /// * [`LameParseError::NotLameTag`] when the four bytes at
-///   `lame_magic_offset` are not `"LAME"`.
+///   `lame_magic_offset` are not printable ASCII (no encoder string:
+///   the extension is absent).
 pub fn parse_lame_tag(
     frame_payload: &[u8],
     lame_magic_offset: usize,
@@ -252,15 +243,19 @@ pub fn parse_lame_tag(
         return Err(LameParseError::Truncated);
     }
     let bytes = &frame_payload[lame_magic_offset..end];
-    if &bytes[..4] != b"LAME" {
+    // The string names the writing encoder ("LAME…" for the tag's
+    // originator; other writers put their own short name there and
+    // fill the same field layout). An area without a printable
+    // encoder string carries no extension.
+    if !bytes[..4].iter().all(u8::is_ascii_graphic) {
         return Err(LameParseError::NotLameTag);
     }
 
     let mut encoder_version = [0u8; 9];
     encoder_version.copy_from_slice(&bytes[..9]);
 
-    // Field cursor inside the slice, magic-relative offsets per the
-    // doc's absolute-offset chain ($9A is byte 0; $A5 is byte 11; etc).
+    // Field cursor inside the slice, relative to the encoder string
+    // ($9C is byte 0; $A5 is byte 9; etc).
     let rev_vbr = bytes[OFF_REV_METHOD];
     let lowpass_byte = bytes[OFF_LOWPASS];
     let mut peak = [0u8; 4];
@@ -309,32 +304,119 @@ pub fn parse_lame_tag(
     })
 }
 
-// Magic-relative field offsets (LAME magic at +0). Derived from the
-// staged doc's absolute chain: $A5 - $9A = 11 for revision/method,
-// $A6 - $9A = 12 for lowpass, $A7 - $9A = 13 for peak (4 bytes), and
-// so on through $BE-$BF for the tag CRC at +36.
-const OFF_REV_METHOD: usize = 11;
-const OFF_LOWPASS: usize = 12;
-const OFF_PEAK: usize = 13;
-const OFF_RADIO_RG: usize = 17;
-const OFF_AUDIOPHILE_RG: usize = 19;
-const OFF_FLAGS_ATH: usize = 21;
-const OFF_BITRATE: usize = 22;
-const OFF_DELAY_PADDING: usize = 23;
-const OFF_MISC: usize = 26;
-const OFF_MP3_GAIN: usize = 27;
-const OFF_PRESET_SURROUND: usize = 28;
-const OFF_MUSIC_LEN: usize = 30;
-const OFF_MUSIC_CRC: usize = 34;
-const OFF_TAG_CRC: usize = 36;
+// Field offsets from the encoder string (at +0). Derived from the
+// staged doc's absolute chain: $A5 - $9C = 9 for revision/method,
+// $A6 - $9C = 10 for lowpass, $A7 - $9C = 11 for peak (4 bytes), and
+// so on through $BE-$BF for the tag CRC at +34.
+const OFF_REV_METHOD: usize = 9;
+const OFF_LOWPASS: usize = 10;
+const OFF_PEAK: usize = 11;
+const OFF_RADIO_RG: usize = 15;
+const OFF_AUDIOPHILE_RG: usize = 17;
+const OFF_FLAGS_ATH: usize = 19;
+const OFF_BITRATE: usize = 20;
+const OFF_DELAY_PADDING: usize = 21;
+const OFF_MISC: usize = 24;
+const OFF_MP3_GAIN: usize = 25;
+const OFF_PRESET_SURROUND: usize = 26;
+const OFF_MUSIC_LEN: usize = 28;
+const OFF_MUSIC_CRC: usize = 32;
+const OFF_TAG_CRC: usize = 34;
 
 /// Number of bytes the LAME-extension fields occupy starting at and
 /// including the 9-byte `"LAME"`-magic encoder-version string and
-/// running through the end of the tag-CRC field (`$9A..=$BF`,
+/// running through the end of the tag-CRC field (`$9C..=$BF`,
 /// inclusive, of the staged doc's worked example).
 ///
-/// `$BF − $9A + 1 = 38`.
-pub const LAME_TAG_FIELDS_LEN: usize = 38;
+/// `$BF − $9C + 1 = 36`.
+pub const LAME_TAG_FIELDS_LEN: usize = 36;
+
+/// Reflected CRC-16, polynomial `x^16 + x^15 + x^2 + 1` (`0xA001`
+/// reflected), no final XOR: the checksum of the tag-CRC and
+/// music-CRC fields (module doc, "CRCs"). `crc` is the running value
+/// (`0` to start), so a stream can be summed in pieces.
+#[must_use]
+pub fn crc16_reflected(mut crc: u16, data: &[u8]) -> u16 {
+    for &byte in data {
+        crc ^= u16::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// What [`write_extension`] records about the stream.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExtensionFields {
+    /// Constant bitrate (`true`) or not.
+    pub cbr: bool,
+    /// Bitrate (CBR) / lowest bitrate used (otherwise), kbit/s.
+    pub bitrate_kbps: u32,
+    /// Samples the decoded stream leads with before the first input
+    /// sample, not counting the decoder's own delay (12 bits).
+    pub encoder_delay: u16,
+    /// Samples after the last input sample (12 bits).
+    pub zero_padding: u16,
+    /// Stereo mode code of the misc byte: 0 mono, 1 stereo, 2 dual
+    /// channel, 3 joint.
+    pub stereo_mode: u8,
+    /// Sampling frequency of the encoder input.
+    pub source_rate_hz: u32,
+    /// Bytes from the start of the information frame to the end of
+    /// the last audio frame.
+    pub music_length: u64,
+    /// [`crc16_reflected`] of the audio frames after the information
+    /// frame.
+    pub music_crc: u16,
+}
+
+/// The 9-byte encoder string this crate writes. Its first four bytes
+/// are the fixed magic of the extension (`lame-xing-info-tag.md` §4,
+/// "UNMOVABLE"): readers key the whole extension on it. The rest
+/// identifies the writer.
+pub(crate) const ENCODER_STRING: &[u8; 9] = b"LAMEoxav1";
+
+/// Write the 36-byte extension into `frame` at byte offset `at` (the
+/// first byte after the last Xing / Info field), then the tag CRC over
+/// every frame byte before the CRC field. `frame` must already hold
+/// the header, side information and Xing / Info fields.
+///
+/// Fields this crate has no value for (lowpass, replay gain, ATH
+/// type, preset) are zero, which the staged doc defines as "unknown" /
+/// "none".
+pub(crate) fn write_extension(frame: &mut [u8], at: usize, f: &ExtensionFields) {
+    let ext = &mut frame[at..at + LAME_TAG_FIELDS_LEN];
+    ext.fill(0);
+    ext[..9].copy_from_slice(ENCODER_STRING);
+    // Tag revision 0; method 1 = constant bitrate, 0 = unknown.
+    ext[OFF_REV_METHOD] = u8::from(f.cbr);
+    ext[OFF_BITRATE] = f.bitrate_kbps.min(255) as u8;
+    let delay = f.encoder_delay.min(4095);
+    let padding = f.zero_padding.min(4095);
+    ext[OFF_DELAY_PADDING] = (delay >> 4) as u8;
+    ext[OFF_DELAY_PADDING + 1] = (((delay & 0x0F) << 4) | (padding >> 8)) as u8;
+    ext[OFF_DELAY_PADDING + 2] = (padding & 0xFF) as u8;
+    // Misc: source sampling frequency class in the two MSBs, stereo
+    // mode in bits 2..4, noise shaping (bits 0..1) unspecified.
+    let rate_class: u8 = match f.source_rate_hz {
+        0..=32_000 => 0,
+        32_001..=44_100 => 1,
+        44_101..=48_000 => 2,
+        _ => 3,
+    };
+    ext[OFF_MISC] = (rate_class << 6) | ((f.stereo_mode & 0x07) << 2);
+    let music_length = u32::try_from(f.music_length).unwrap_or(0);
+    ext[OFF_MUSIC_LEN..OFF_MUSIC_LEN + 4].copy_from_slice(&music_length.to_be_bytes());
+    ext[OFF_MUSIC_CRC..OFF_MUSIC_CRC + 2].copy_from_slice(&f.music_crc.to_be_bytes());
+    let crc_at = at + OFF_TAG_CRC;
+    let tag_crc = crc16_reflected(0, &frame[..crc_at]);
+    frame[crc_at..crc_at + 2].copy_from_slice(&tag_crc.to_be_bytes());
+}
 
 impl LameTag {
     /// Compute the trimmed PCM-sample count given the total number of
@@ -380,7 +462,7 @@ mod tests {
     /// Build a 156-byte synthetic Xing+LAME first-frame payload area
     /// (without the 4-byte MPEG header and without the side-info
     /// padding) — i.e. the bytes starting at the Xing magic. The LAME
-    /// magic sits at offset 118 inside this slice when all four Xing
+    /// magic sits at offset 120 inside this slice when all four Xing
     /// flags are set, matching the staged doc's MPEG-1-stereo
     /// magic-`$24` worked example after subtracting the magic offset.
     fn synthetic_lame_payload(delay: u16, padding: u16, version: &[u8; 9]) -> Vec<u8> {
@@ -399,15 +481,11 @@ mod tests {
         }
         // +116..+120: vbr quality = 1.
         buf[116..120].copy_from_slice(&1u32.to_be_bytes());
-        // +118..+127: 9-byte encoder version ("LAME...")
-        // Per the staged-doc note: the 9-byte encoder version sits at
-        // magic-relative offset 118 and overlaps the last two bytes
-        // of the VBR-scale field (+116..+120). Overwrite those two
-        // bytes with the start of the version — this is exactly what
-        // real LAME-tagged carrier frames look like on the wire.
+        // +120..+129: 9-byte encoder version ("LAME..."), right
+        // after the quality field.
         buf[LAME_MAGIC_OFFSET_ALL_FLAGS..LAME_MAGIC_OFFSET_ALL_FLAGS + 9].copy_from_slice(version);
         // The remaining LAME fields, magic-relative offsets per the
-        // OFF_* constants above (rev/method at +11, …, tag CRC at +36).
+        // OFF_* constants above (rev/method at +9, …, tag CRC at +34).
         let f = LAME_MAGIC_OFFSET_ALL_FLAGS;
         buf[f + OFF_REV_METHOD] = 0x10; // revision 1, VBR method 0
         buf[f + OFF_LOWPASS] = 196; // lowpass = 196 * 100 = 19_600 Hz
@@ -487,11 +565,72 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_non_lame_magic() {
+    fn parse_rejects_a_missing_encoder_string() {
+        // Zero bytes where the encoder string would start: no extension.
+        let buf = vec![0u8; LAME_TAG_FIELDS_LEN];
+        assert_eq!(
+            parse_lame_tag(&buf, 0).unwrap_err(),
+            LameParseError::NotLameTag
+        );
         let mut buf = vec![0u8; LAME_TAG_FIELDS_LEN];
-        buf[..4].copy_from_slice(b"Lavc");
-        let err = parse_lame_tag(&buf, 0).unwrap_err();
-        assert_eq!(err, LameParseError::NotLameTag);
+        buf[..4].copy_from_slice(b"LA\0E");
+        assert_eq!(
+            parse_lame_tag(&buf, 0).unwrap_err(),
+            LameParseError::NotLameTag
+        );
+    }
+
+    #[test]
+    fn another_writers_encoder_string_carries_the_same_fields() {
+        let mut buf = vec![0u8; LAME_TAG_FIELDS_LEN];
+        buf[..9].copy_from_slice(b"Lavc58.13");
+        buf[OFF_DELAY_PADDING] = 0x24;
+        buf[OFF_DELAY_PADDING + 1] = 0x05;
+        buf[OFF_DELAY_PADDING + 2] = 0x7C;
+        let tag = parse_lame_tag(&buf, 0).unwrap();
+        assert_eq!(&tag.encoder_version, b"Lavc58.13");
+        assert_eq!((tag.encoder_delay, tag.zero_padding), (576, 1404));
+    }
+
+    #[test]
+    fn written_extension_reads_back_and_its_checksums_hold() {
+        // A 417-byte MPEG-1 stereo carrier with all four Xing fields.
+        let mut frame = vec![0u8; 417];
+        frame[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+        frame[36..40].copy_from_slice(b"Info");
+        frame[43] = 0x0F;
+        let audio: Vec<u8> = (0..2000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let ext = ExtensionFields {
+            cbr: true,
+            bitrate_kbps: 128,
+            encoder_delay: 528,
+            zero_padding: 1300,
+            stereo_mode: 1,
+            source_rate_hz: 44_100,
+            music_length: (frame.len() + audio.len()) as u64,
+            music_crc: crc16_reflected(0, &audio),
+        };
+        let at = 36 + 120;
+        write_extension(&mut frame, at, &ext);
+        let tag = parse_lame_tag(&frame, at).unwrap();
+        assert_eq!(&tag.encoder_version[..4], b"LAME");
+        assert_eq!((tag.encoder_delay, tag.zero_padding), (528, 1300));
+        assert_eq!(tag.vbr_method, 1);
+        assert_eq!(tag.bitrate_byte, 128);
+        assert_eq!(tag.music_length, 2417);
+        assert_eq!(tag.music_crc, crc16_reflected(0, &audio));
+        // Tag CRC: every byte before the field ($00..$BD here).
+        assert_eq!(at + OFF_TAG_CRC, 0xBE);
+        assert_eq!(tag.tag_crc, crc16_reflected(0, &frame[..0xBE]));
+    }
+
+    #[test]
+    fn crc16_reflected_known_values() {
+        assert_eq!(crc16_reflected(0, b""), 0);
+        // CRC-16 with reflected polynomial 0xA001, zero init, of the
+        // ASCII digits — the catalogued check value of that
+        // parameter set.
+        assert_eq!(crc16_reflected(0, b"123456789"), 0xBB3D);
     }
 
     #[test]

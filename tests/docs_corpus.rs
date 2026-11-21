@@ -249,13 +249,14 @@ fn vbr_q5_stereo_44100_uses_xing_for_duration() {
     if expected.flags & 0x8 != 0 {
         assert_eq!(xt.quality, Some(expected.quality));
     }
-    // Duration: VBR uses frames * samples_per_frame / sample_rate.
-    // The fixture has frames=32 at 44.1 kHz => 32*1152/44100 ≈ 0.836s
-    let micros = d.duration_micros().unwrap();
-    assert!(
-        (micros - 835_900).abs() < 5_000,
-        "VBR duration micros={micros}, expected ~835900"
-    );
+    // Gross duration: frames * samples_per_frame. The fixture has
+    // frames=32 at 44.1 kHz => 32*1152 samples ≈ 0.836 s.
+    assert_eq!(d.streams()[0].duration, Some(32 * 1152));
+    // Its information frame also carries the gapless extension, so
+    // the playable duration is that of the encoder's input: the
+    // staged `expected.wav` holds 35280 samples = 0.8 s exactly.
+    assert_eq!(d.trimmed_duration_samples(), Some(35_280));
+    assert_eq!(d.duration_micros(), Some(800_000));
 }
 
 #[test]

@@ -416,7 +416,11 @@ fn ms_auto_short_intensity_picker_declines_on_high_side_energy() {
     let pcm = two_tone_stereo_pcm(SR as usize / 2, false);
     let out = encode_auto_short_is(&pcm, 0.0);
 
-    for frame in FrameWalker::new(&out) {
+    // Only the frames that carry input: the stream ends with the
+    // zero samples that flush the codec delay, and a silent frame has
+    // exactly zero side energy.
+    let signal_frames = pcm.len() / 2 / 1152;
+    for frame in FrameWalker::new(&out).take(signal_frames) {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         assert!(
             !hdr.mode_extension.ms_stereo,

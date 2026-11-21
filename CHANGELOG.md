@@ -25,8 +25,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   timeline, so later samples stay aligned with the container
   timestamps.
 
+- **The encoder no longer loses the end of the input.** A sample
+  entering the encoder leaves a decoder 1057 samples later, and the
+  stream stopped at the first frame boundary after the last input
+  sample, so up to a frame of audio at the end was never decodable.
+  `finish` now flushes the delay (`END_TO_END_DELAY`).
+- **`part2_3_length` overflow.** Where one granule-channel has more
+  than 4095 bits to spend (8 kHz mono at 64 kbit/s) the quantizer
+  spent past the 12-bit field and the written length wrapped; other
+  decoders rendered those streams as silence or noise. The budget is
+  capped at 4095.
+- **Gapless figures were never read from real files.** The extension
+  with the encoder delay / padding starts right after the Xing
+  quality field (`$9C` in the MPEG-1 stereo layout, 120 bytes after
+  the magic), not two bytes earlier, and follows whichever Xing
+  fields are present. `encoder_delay_samples`, `zero_padding_samples`
+  and `trimmed_duration_samples` now give the encoder's input length
+  on every tagged cell of the matrix (they silently returned "no
+  tag" on streams of the tag's originating encoder before). Encoder
+  strings of other writers are accepted.
+- **Intensity stereo, the band above the last scalefactor.** The
+  lines above long band 20 (short band 11) carry no position; they
+  were left left-only, which two black-box decoders contradict on
+  MPEG-1 long blocks (thousands of LSB on wide-band material). They
+  now take the last transmitted position, and a right channel that
+  reaches into that band ends the intensity region. The encoder
+  couples those lines in short and mixed granules too and always
+  couples at least the last short band of an intensity frame.
+- **Intensity stereo at the lower sampling frequencies: illegal
+  position.** The "not intensity coded" marker is the largest value
+  of the band's `slen` bits (ISO/IEC 13818-3 §2.4.3.2), not a
+  constant 7; bands with `slen == 0` have position zero.
+
 ### Added
 
+- **Gapless information frame from the encoder**:
+  `Mp3Encoder::enable_info_frame` leads the stream with an Info /
+  Xing frame carrying frame count, byte count, seek table and the
+  gapless extension (delay 528, exact padding, both checksums), so
+  readers recover exactly the pushed samples.
+- `tests/blackbox_matrix.rs`, direction ours -> foreign: 960
+  encoder configurations (every sampling frequency x full ladder x
+  mono / stereo / dual / MS / adaptive joint; CRC, forced short /
+  mixed, block switching, scfsi, presets, VBR, intensity variants),
+  each decoded by two black-box decoders: no complaint on stderr,
+  gapless length exact, every sample within 2 LSB of this crate's own
+  decode, and the decode in place against the input.
+- `examples/wav_to_mp3.rs` — file encode with a speed readout.
 - `tests/blackbox_matrix.rs` — live black-box matrix, foreign streams
   into this decoder: 970 cells from a black-box encoder (every
   sampling frequency x full bitrate ladder x joint / stereo / forced
