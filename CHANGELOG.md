@@ -112,6 +112,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   same way. The free-format length measurement is bounded
   by the §2.4.2.3 free-format bitrate ceilings and re-runs at a switch.
 
+### Performance
+
+- **Encode 3.8x faster, output byte-identical.** 60 s of 44.1 kHz
+  stereo, one thread, CPU time: 128 kbit/s joint 5.21 s -> 1.38 s
+  (11.5x -> 43x realtime), 320 kbit/s 4.77 s -> 1.41 s (12.6x -> 43x).
+  The gain search starts at the first gain a lower bound on the
+  Huffman bit count allows (binary search on sorted step-normalised
+  magnitudes) instead of scanning up from a magnitude-only bound;
+  each trial quantizes with one multiply per line from a cached 3/4
+  power (falling back to the quantizer proper near a rounding
+  boundary); the 3/4 power itself is two square roots with the same
+  fallback; codebook costing is a branch-free 32-lane add and its
+  totals are reused instead of re-walking the regions; and
+  `push_samples` no longer moves the whole pending buffer once per
+  frame (quadratic in the size of one push).
+- `examples/band_snr.rs` — segmental critical-band SNR of a decode
+  against its original (the objective figure the README quality
+  table uses).
+
 ### Changed
 
 - **API hygiene: public error enums, growable enums and parsed /

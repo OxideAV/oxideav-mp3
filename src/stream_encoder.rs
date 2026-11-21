@@ -2903,27 +2903,35 @@ impl Mp3Encoder {
         // holds at least one full granule-frame worth of samples
         // PLUS the auto-block-type lookahead (zero when auto is off).
         let frame_samples = self.samples_per_frame();
+        // Frames are cut at a moving offset and the consumed samples
+        // are dropped once at the end: removing each frame from the
+        // front of the buffer as it is cut moves everything behind it,
+        // which is quadratic in the size of one push.
+        let mut consumed = 0usize;
+        let mut result = Ok(());
         while self
             .pending_pcm
             .iter()
-            .all(|buf| buf.len() >= frame_samples + lookahead_pad)
+            .all(|buf| buf.len() - consumed >= frame_samples + lookahead_pad)
         {
             let mut per_ch_frame_pcm: Vec<Vec<f32>> = Vec::with_capacity(nch);
             let mut per_ch_lookahead: Vec<Vec<f32>> = Vec::with_capacity(nch);
-            for buf in self.pending_pcm.iter_mut() {
-                let mut take = vec![0.0f32; frame_samples];
-                take.copy_from_slice(&buf[..frame_samples]);
-                let mut peek = vec![0.0f32; lookahead_pad];
-                if lookahead_pad > 0 {
-                    peek.copy_from_slice(&buf[frame_samples..frame_samples + lookahead_pad]);
-                }
-                buf.drain(..frame_samples);
-                per_ch_frame_pcm.push(take);
-                per_ch_lookahead.push(peek);
+            for buf in self.pending_pcm.iter() {
+                let frame = &buf[consumed..consumed + frame_samples];
+                let peek = &buf[consumed + frame_samples..consumed + frame_samples + lookahead_pad];
+                per_ch_frame_pcm.push(frame.to_vec());
+                per_ch_lookahead.push(peek.to_vec());
             }
-            self.assemble_frame_with_lookahead(&per_ch_frame_pcm, &per_ch_lookahead)?;
+            consumed += frame_samples;
+            result = self.assemble_frame_with_lookahead(&per_ch_frame_pcm, &per_ch_lookahead);
+            if result.is_err() {
+                break;
+            }
         }
-        Ok(())
+        for buf in self.pending_pcm.iter_mut() {
+            buf.drain(..consumed);
+        }
+        result
     }
 
     /// Flush any remaining buffered PCM (zero-padded to a frame

@@ -427,3 +427,42 @@ fn quantize_hoisted_band_factor_matches_per_line() {
         }
     }
 }
+
+/// `pow_three_quarters` rounds to the same integer as `powf(0.75)`,
+/// over a dense sweep and right at the rounding boundaries (the
+/// quantizer's output is unchanged by the faster root).
+#[test]
+fn fast_three_quarter_power_rounds_like_powf() {
+    let check = |q: f32| {
+        if q > 0.0 && q.is_finite() {
+            assert_eq!(
+                pow_three_quarters(q).round(),
+                q.powf(0.75).round(),
+                "q = {q:e}"
+            );
+        }
+    };
+    // Dense pseudo-random sweep over twelve decades.
+    let mut s = 0x1357_9BDFu32;
+    for _ in 0..400_000 {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let mantissa = 1.0 + (s >> 9) as f32 / (1u32 << 23) as f32;
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let exponent = (s >> 24) as i32 % 40 - 14;
+        check(mantissa * 2f32.powi(exponent));
+    }
+    // Every half-integer boundary up to the largest codable value,
+    // and its float neighbours on both sides.
+    for k in 0..8300u32 {
+        let boundary = (f64::from(k) + 0.5).powf(4.0 / 3.0) as f32;
+        let mut below = boundary;
+        let mut above = boundary;
+        check(boundary);
+        for _ in 0..6 {
+            below = f32::from_bits(below.to_bits() - 1);
+            above = f32::from_bits(above.to_bits() + 1);
+            check(below);
+            check(above);
+        }
+    }
+}

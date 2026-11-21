@@ -697,18 +697,32 @@ pub const SELECTABLE_BIG_TABLES: [u8; 30] = [
 /// Integer addition is order-independent, so the per-table totals are
 /// identical to summing [`big_pair_bits`] per table.
 struct BigTableCostLut {
-    /// Codeword length per clamped `(xi, yi)` cell per selectable table;
-    /// `u8::MAX` marks a not-codable cell.
-    len: [[u8; SELECTABLE_BIG_TABLES.len()]; 256],
+    /// Codeword length per clamped `(xi, yi)` cell per selectable table,
+    /// in rows padded to [`COST_LANES`] so the per-pair accumulation is
+    /// a fixed-width, branch-free add. [`NOT_CODABLE`] marks a
+    /// not-codable cell: it is larger than any real region total, so a
+    /// sum at or above it says the region holds such a cell.
+    len: [[u16; COST_LANES]; 256],
     /// `linbits` ESC width per selectable table.
     linbits: [u8; SELECTABLE_BIG_TABLES.len()],
     /// [`big_table_reach`] per selectable table.
     reach: [u32; SELECTABLE_BIG_TABLES.len()],
 }
 
+/// Lanes of one [`BigTableCostLut::len`] row: the 30 selectable tables
+/// plus two always-zero pad lanes.
+const COST_LANES: usize = 32;
+
+/// Cost of a cell a codebook cannot code. A region has at most 288
+/// pairs of at most 19 bits (5472), so any sum reaching this value
+/// contains a not-codable cell, and 288 such cells still fit a `u32`.
+const NOT_CODABLE: u16 = 0x4000;
+
 static BIG_TABLE_COST_LUT: std::sync::LazyLock<BigTableCostLut> = std::sync::LazyLock::new(|| {
+    let mut row = [0u16; COST_LANES];
+    row[..SELECTABLE_BIG_TABLES.len()].fill(NOT_CODABLE);
     let mut lut = BigTableCostLut {
-        len: [[u8::MAX; SELECTABLE_BIG_TABLES.len()]; 256],
+        len: [row; 256],
         linbits: [0; SELECTABLE_BIG_TABLES.len()],
         reach: [0; SELECTABLE_BIG_TABLES.len()],
     };
@@ -723,18 +737,63 @@ static BIG_TABLE_COST_LUT: std::sync::LazyLock<BigTableCostLut> = std::sync::Laz
         for xi in 0..16usize {
             for yi in 0..16usize {
                 if xi >= xl || yi >= xl {
-                    continue; // stays u8::MAX (not codable)
+                    continue; // stays NOT_CODABLE
                 }
                 let ent = table.entries[xi * xl + yi];
                 if ent.len == 0 && (xi != 0 || yi != 0) {
-                    continue; // unused corner, stays u8::MAX
+                    continue; // unused corner, stays NOT_CODABLE
                 }
-                lut.len[xi * 16 + yi][t] = ent.len;
+                lut.len[xi * 16 + yi][t] = u16::from(ent.len);
             }
         }
     }
     lut
 });
+
+/// The fewest codeword bits (ESC `linbits` field of that value
+/// included, sign bits and the partner's ESC field excluded) any
+/// selectable big-values codebook spends on a pair one of whose values
+/// has magnitude `v >= 1`, over every partner value: a floor on what a
+/// pair holding `v` costs. `None` when no codebook reaches `v`.
+pub(crate) fn min_pair_code_bits(v: u32) -> Option<u32> {
+    let lut = &*BIG_TABLE_COST_LUT;
+    let cell = v.min(15) as usize;
+    let mut best: Option<u32> = None;
+    for t in 0..SELECTABLE_BIG_TABLES.len() {
+        if lut.reach[t] < v {
+            continue;
+        }
+        let esc = if v >= 15 {
+            u32::from(lut.linbits[t])
+        } else {
+            0
+        };
+        for partner in 0..16usize {
+            // The value may sit in either position of the pair.
+            for len in [
+                lut.len[cell * 16 + partner][t],
+                lut.len[partner * 16 + cell][t],
+            ] {
+                if len < NOT_CODABLE {
+                    let bits = u32::from(len) + esc;
+                    best = Some(best.map_or(bits, |b| b.min(bits)));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Magnitudes at which [`min_pair_code_bits`] can change: 1..=15 and
+/// one past the reach of each ESC codebook.
+pub(crate) fn pair_code_bit_breakpoints() -> Vec<u32> {
+    let lut = &*BIG_TABLE_COST_LUT;
+    let mut v: Vec<u32> = (1..=15).collect();
+    v.extend(lut.reach.iter().filter(|&&r| r >= 15).map(|r| r + 1));
+    v.sort_unstable();
+    v.dedup();
+    v
+}
 
 /// §C.1.5.4.4.7 — choose the big-values codebook that codes the line
 /// range `is[start..end]` in the **fewest** bits, per §C.1.5.4.4.8.
@@ -792,8 +851,7 @@ pub fn choose_best_table_for_region(
     // `single_pass_chooser_matches_per_table_reference`).
     let lut = &*BIG_TABLE_COST_LUT;
     const N: usize = SELECTABLE_BIG_TABLES.len();
-    let mut len_sum = [0u32; N];
-    let mut not_codable = [false; N];
+    let mut len_sum = [0u32; COST_LANES];
     let mut signs = 0u32;
     let mut escs = 0u32;
     let mut k = start;
@@ -804,13 +862,8 @@ pub fn choose_best_table_for_region(
         signs += u32::from(x != 0) + u32::from(y != 0);
         escs += u32::from(ax >= 15) + u32::from(ay >= 15);
         let cell = (ax.min(15) as usize) * 16 + (ay.min(15) as usize);
-        let row = &lut.len[cell];
-        for t in 0..N {
-            if row[t] == u8::MAX {
-                not_codable[t] = true;
-            } else {
-                len_sum[t] += u32::from(row[t]);
-            }
+        for (acc, &len) in len_sum.iter_mut().zip(&lut.len[cell]) {
+            *acc += u32::from(len);
         }
         k += 2;
     }
@@ -820,7 +873,7 @@ pub fn choose_best_table_for_region(
         // Reach filter: drop codebooks that would truncate the largest
         // magnitude in the range. Table 0 has reach 0 and is selectable
         // only for an all-zero range; this falls out naturally.
-        if not_codable[t] || lut.reach[t] < max_mag {
+        if len_sum[t] >= u32::from(NOT_CODABLE) || lut.reach[t] < max_mag {
             continue;
         }
         let bits =

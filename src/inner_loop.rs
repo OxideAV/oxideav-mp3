@@ -331,23 +331,45 @@ pub fn exact_bit_count_band_aligned(
         subdivide_bands(sample_rate_hz, version, split.big_pairs).region_ends
     };
 
-    let (t0, _) = choose_best_table_for_region(is, 0, region_ends.0)?;
-    let (t1, _) = choose_best_table_for_region(is, region_ends.0, region_ends.1)?;
-    let (t2, _) = choose_best_table_for_region(is, region_ends.1, bv2)?;
+    let (t0, b0) = choose_best_table_for_region(is, 0, region_ends.0)?;
+    let (t1, b1) = choose_best_table_for_region(is, region_ends.0, region_ends.1)?;
+    let (t2, b2) = choose_best_table_for_region(is, region_ends.1, bv2)?;
     let table_select = [t0, t1, t2];
 
     let c1_start = bv2;
     let c1_end = c1_start + split.count1_quads * 4;
-    let (count1table_b, _) = choose_best_count1_table(is, c1_start, c1_end);
+    let (count1table_b, c1_bits) = choose_best_count1_table(is, c1_start, c1_end);
 
-    let bits = count_huffman_bits(
-        is,
-        split.big_pairs,
-        region_ends,
-        table_select,
-        split.count1_quads,
-        count1table_b,
-    )?;
+    // The choosers already summed the codeword, ESC and sign bits of
+    // the table they picked for each region — the same integers
+    // `count_huffman_bits` adds up for those tables — so the total is
+    // their sum whenever the three regions tile `0..bv2` in order (the
+    // SUBDIVIDE primitives clamp them so; anything else is re-counted).
+    let tiled = region_ends.0 <= region_ends.1 && region_ends.1 <= bv2 && c1_end <= NUM_LINES;
+    let bits = if tiled {
+        let sum = b0 + b1 + b2 + c1_bits;
+        debug_assert_eq!(
+            Some(sum),
+            count_huffman_bits(
+                is,
+                split.big_pairs,
+                region_ends,
+                table_select,
+                split.count1_quads,
+                count1table_b,
+            )
+        );
+        sum
+    } else {
+        count_huffman_bits(
+            is,
+            split.big_pairs,
+            region_ends,
+            table_select,
+            split.count1_quads,
+            count1table_b,
+        )?
+    };
 
     Some(ExactBitCount {
         split,
@@ -706,12 +728,22 @@ where
 /// guaranteed `false` — the scan visits the exact same first-satisfying
 /// gain as the straightforward form (pinned by
 /// `search_bit_budget_matches_straightforward_scan`).
+///
+/// # Bit budget (optional)
+///
+/// When the predicate is "the exact Huffman bit count is `<= budget`",
+/// the caller passes that `budget`. The scan then starts at the first
+/// gain whose [`BitFloor`] — a lower bound on the Huffman bits of the
+/// quantization at that gain, monotone in the gain — is within the
+/// budget: every gain below it is proven over budget, so the predicate
+/// is false there and the first satisfying gain is the same one.
 fn search_linear<F>(
     xr: &[f32; NUM_LINES],
     gc_template: &GranuleChannel,
     sf: &ScaleFactors,
     sample_rate_hz: u32,
     version: MpegVersion,
+    budget: Option<u64>,
     predicate: F,
 ) -> InnerLoopResult
 where
@@ -719,13 +751,22 @@ where
 {
     let quant = |gain: u8| quantize_at(xr, gc_template, sf, sample_rate_hz, version, gain);
     let probes = build_gain_probes(xr, gc_template, sf, sample_rate_hz, version);
-    for g in u16::from(GAIN_MIN)..=u16::from(GAIN_MAX) {
+    let steps = reference_steps(gc_template, sf, sample_rate_hz, version);
+    let first = match budget {
+        Some(b) => BitFloor::new(xr, &steps).first_gain_within(b),
+        None => u16::from(GAIN_MIN),
+    };
+    let scaled = ScaledQuantizer::new(xr, &steps);
+    let mut is = [0i32; NUM_LINES];
+    for g in first..=u16::from(GAIN_MAX) {
         if probes_prove_uncodable(&probes, gc_template, g as u8) {
             // Proven uncodable at this gain: the predicate is false by
             // its codability contract, so skip the full evaluation.
             continue;
         }
-        let is = quant(g as u8);
+        if !scaled.quantize(g as u8, &mut is) {
+            is = quant(g as u8);
+        }
         if predicate(&is) {
             let m = max_abs(&is);
             return InnerLoopResult {
@@ -746,6 +787,199 @@ where
         satisfied: false,
     }
 }
+
+/// A lower bound on the exact Huffman bit count of the quantization of
+/// one granule-channel, as a function of `global_gain`, that needs no
+/// quantization to evaluate.
+///
+/// Every line is reduced once to its magnitude in units of the
+/// quantizer step at the reference gain, `n_i = |xr_i| / step_i`
+/// (`step_i` read back from the requantizer, so it carries the
+/// scalefactor, `preflag`, `scalefac_scale` and `subblock_gain` of the
+/// line), and the `n_i` are sorted. At gain `g` the steps scale by
+/// `2^((g - 210) / 4)`, and a line quantizes to a magnitude of at
+/// least `m` exactly when `n_i >= (m - 1/2)^(4/3)` of the scaled step —
+/// so the number of lines at or above any magnitude is one binary
+/// search. The bound charges each non-zero line its sign bit and half
+/// of the cheapest codeword of any pair that can hold its magnitude
+/// ([`crate::huffman::min_pair_code_bits`]; a pair costs at least the
+/// larger of its two values' floors, hence at least half their sum;
+/// values of magnitude 1 are charged at most 2 so the bound also holds
+/// in the count1 partition, where four of them share a 4-bit code).
+///
+/// The thresholds are taken 0.1 % high, far beyond the float rounding
+/// between this arithmetic and the quantizer's, so a line is only
+/// counted when the quantizer certainly gives it that magnitude: the
+/// bound never exceeds the true count. It only decreases as the gain
+/// rises.
+struct BitFloor {
+    /// `n_i`, ascending.
+    sorted: Vec<f32>,
+}
+
+/// `(magnitude, half-bits added when a line reaches it)`, ascending.
+static BIT_FLOOR_STEPS: std::sync::LazyLock<Vec<(u32, u32)>> = std::sync::LazyLock::new(|| {
+    let mut steps = Vec::new();
+    // Half-bits charged to a line of the previous magnitude class.
+    let mut charged = 0u32;
+    // The floor must not decrease with the magnitude: take the running
+    // minimum from the top down.
+    let points = crate::huffman::pair_code_bit_breakpoints();
+    let mut floors: Vec<u32> = points
+        .iter()
+        .map(|&v| crate::huffman::min_pair_code_bits(v).unwrap_or(0))
+        .collect();
+    for i in (0..floors.len().saturating_sub(1)).rev() {
+        floors[i] = floors[i].min(floors[i + 1]);
+    }
+    for (&v, &floor) in points.iter().zip(&floors) {
+        // One sign bit (two half-bits) plus half the codeword floor.
+        let code = if v == 1 { floor.min(2) } else { floor };
+        let half_bits = 2 + code;
+        if half_bits > charged {
+            steps.push((v, half_bits - charged));
+            charged = half_bits;
+        }
+    }
+    steps
+});
+
+/// Quantizer step of every line at [`BIT_FLOOR_REFERENCE_GAIN`]: what
+/// a quantized value of 1 requantizes to there (it carries the line's
+/// scalefactor, `preflag`, `scalefac_scale` and `subblock_gain`).
+fn reference_steps(
+    gc_template: &GranuleChannel,
+    sf: &ScaleFactors,
+    sample_rate_hz: u32,
+    version: MpegVersion,
+) -> [f32; NUM_LINES] {
+    let mut gc = *gc_template;
+    gc.global_gain = BIT_FLOOR_REFERENCE_GAIN;
+    crate::requantize::requantize(&[1; NUM_LINES], &gc, sf, sample_rate_hz, version)
+}
+
+/// The quantization of one granule-channel at any `global_gain`, from
+/// one multiply per line.
+///
+/// `|is_i| = round((|xr_i| / step_i(g))^(3/4))` and the step scales
+/// with the gain as `2^((g - 210) / 4)`, so with `p_i = (|xr_i| /
+/// step_i(210))^(3/4)` computed once (in `f64`), every gain is
+/// `round(p_i * 2^(-3 (g - 210) / 16))`. The quantizer proper
+/// ([`crate::quantize::quantize`]) works in `f32` and its value can
+/// differ from this one by a relative 1e-6 at most; the two round to
+/// different integers only if the value lies that close to a
+/// half-integer. [`ScaledQuantizer::quantize`] refuses the whole
+/// granule in that case (and for non-finite or out-of-range values),
+/// and the caller runs the quantizer proper — so what the search sees
+/// is always exactly the quantizer's output (pinned by
+/// `scaled_quantizer_matches_the_quantizer`).
+struct ScaledQuantizer {
+    /// `p_i`; negative when the line cannot use the fast path.
+    powers: [f64; NUM_LINES],
+    /// Sign of `xr_i`.
+    negative: [bool; NUM_LINES],
+    /// A line needs the quantizer proper at every gain.
+    unusable: bool,
+}
+
+impl ScaledQuantizer {
+    fn new(xr: &[f32; NUM_LINES], steps: &[f32; NUM_LINES]) -> Self {
+        let mut powers = [0f64; NUM_LINES];
+        let mut negative = [false; NUM_LINES];
+        let mut unusable = false;
+        for i in 0..NUM_LINES {
+            let x = xr[i];
+            negative[i] = x < 0.0;
+            if x == 0.0 {
+                continue;
+            }
+            let n = f64::from(x.abs()) / f64::from(steps[i]);
+            if !n.is_finite() || steps[i] <= 0.0 {
+                unusable = true;
+                continue;
+            }
+            powers[i] = n.powf(0.75);
+        }
+        ScaledQuantizer {
+            powers,
+            negative,
+            unusable,
+        }
+    }
+
+    /// Write the quantization at `gain` into `is`; `false` (with `is`
+    /// unspecified) when a line is too close to a rounding boundary to
+    /// be decided here.
+    fn quantize(&self, gain: u8, is: &mut [i32; NUM_LINES]) -> bool {
+        if self.unusable {
+            return false;
+        }
+        let scale = 2f64
+            .powf(-3.0 * f64::from(i32::from(gain) - i32::from(BIT_FLOOR_REFERENCE_GAIN)) / 16.0);
+        let mut undecided = false;
+        for ((out, &p), &neg) in is.iter_mut().zip(&self.powers).zip(&self.negative) {
+            let v = p * scale;
+            let floor = v.floor();
+            let to_boundary = ((v - floor) - 0.5).abs();
+            undecided |= to_boundary <= v * 4.0e-6 + 1.0e-6 || v >= 1.0e6;
+            // Round half away from zero, as the quantizer does.
+            let mag = if v - floor >= 0.5 { floor + 1.0 } else { floor } as i32;
+            *out = if neg { -mag } else { mag };
+        }
+        !undecided
+    }
+}
+
+impl BitFloor {
+    fn new(xr: &[f32; NUM_LINES], steps: &[f32; NUM_LINES]) -> Self {
+        let mut sorted: Vec<f32> = xr
+            .iter()
+            .zip(steps)
+            .map(|(&x, &step)| {
+                let n = x.abs() / step;
+                if n.is_finite() { n } else { 0.0 }
+            })
+            .collect();
+        sorted.sort_unstable_by(f32::total_cmp);
+        BitFloor { sorted }
+    }
+
+    /// Lower bound on the Huffman bits at `gain`.
+    fn bits(&self, gain: u16) -> u64 {
+        let scale =
+            2f64.powf(f64::from(i32::from(gain) - i32::from(BIT_FLOOR_REFERENCE_GAIN)) / 4.0);
+        let mut half_bits = 0u64;
+        for &(magnitude, add) in BIT_FLOOR_STEPS.iter() {
+            let threshold = ((f64::from(magnitude) - 0.5).powf(4.0 / 3.0) * scale * 1.001) as f32;
+            let below = self.sorted.partition_point(|&n| n < threshold);
+            let count = (self.sorted.len() - below) as u64;
+            if count == 0 {
+                break;
+            }
+            half_bits += count * u64::from(add);
+        }
+        half_bits / 2
+    }
+
+    /// The first gain whose bound is within `budget` (binary search:
+    /// the bound is monotone in the gain).
+    fn first_gain_within(&self, budget: u64) -> u16 {
+        let (mut lo, mut hi) = (u16::from(GAIN_MIN), u16::from(GAIN_MAX));
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.bits(mid) > budget {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+/// `global_gain` at which [`BitFloor`] reads the step sizes (the gain
+/// whose `2^((gain - 210) / 4)` factor is 1).
+const BIT_FLOOR_REFERENCE_GAIN: u8 = 210;
 
 /// §C.1.5.4.4.2 magnitude-clamp inner loop: find the smallest
 /// `global_gain` whose quantized `is[]` keeps `max|is| ≤`
@@ -808,11 +1042,19 @@ pub fn search_bit_budget(
     version: MpegVersion,
     budget: u64,
 ) -> InnerLoopResult {
-    search_linear(xr, gc_template, sf, sample_rate_hz, version, |is| {
-        // A range no codebook can code (corrupt input) is treated as
-        // over-budget so the search raises the gain.
-        exact_bit_count(is, gc_template).is_some_and(|c| c.bits as u64 <= budget)
-    })
+    search_linear(
+        xr,
+        gc_template,
+        sf,
+        sample_rate_hz,
+        version,
+        Some(budget),
+        |is| {
+            // A range no codebook can code (corrupt input) is treated as
+            // over-budget so the search raises the gain.
+            exact_bit_count(is, gc_template).is_some_and(|c| c.bits as u64 <= budget)
+        },
+    )
 }
 
 /// §C.1.5.4.4 bit-budget inner loop, gated on the **band-aligned**
@@ -853,12 +1095,20 @@ pub fn search_bit_budget_band_aligned(
     version: MpegVersion,
     budget: u64,
 ) -> InnerLoopResult {
-    search_linear(xr, gc_template, sf, sample_rate_hz, version, |is| {
-        // A range no codebook can code (corrupt input) is treated as
-        // over-budget so the search raises the gain.
-        exact_bit_count_band_aligned(is, gc_template, sample_rate_hz, version)
-            .is_some_and(|c| c.bits as u64 <= budget)
-    })
+    search_linear(
+        xr,
+        gc_template,
+        sf,
+        sample_rate_hz,
+        version,
+        Some(budget),
+        |is| {
+            // A range no codebook can code (corrupt input) is treated as
+            // over-budget so the search raises the gain.
+            exact_bit_count_band_aligned(is, gc_template, sample_rate_hz, version)
+                .is_some_and(|c| c.bits as u64 <= budget)
+        },
+    )
 }
 
 #[cfg(test)]

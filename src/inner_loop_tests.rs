@@ -1126,3 +1126,101 @@ fn probe_skip_only_fires_on_truly_uncodable_gains() {
 fn max_selectable_reach_is_8206() {
     assert_eq!(max_selectable_reach(), 8206);
 }
+
+// ---------------------------------------------------------------------
+// Search accelerators: outputs identical to the plain scan.
+// ---------------------------------------------------------------------
+
+/// Deterministic spectrum with a wide dynamic range.
+fn accel_spectrum(seed: u32, level: f32) -> [f32; NUM_LINES] {
+    let mut s = seed.wrapping_mul(0x9E37_79B9) | 1;
+    let mut xr = [0.0f32; NUM_LINES];
+    for (i, v) in xr.iter_mut().enumerate() {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let u = (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+        let tilt = 1.0 / (1.0 + i as f32 / 40.0);
+        *v = if s & 0x700 == 0 { 0.0 } else { u * level * tilt };
+    }
+    xr
+}
+
+/// Whenever [`ScaledQuantizer::quantize`] accepts a granule, it wrote
+/// exactly what the quantizer writes.
+#[test]
+fn scaled_quantizer_matches_the_quantizer() {
+    let mut accepted = 0u32;
+    for seed in 0..40u32 {
+        let xr = accel_spectrum(seed, [1.0e-4f32, 0.01, 0.3, 4.0][seed as usize % 4]);
+        let mut sf = ScaleFactors::default();
+        for (b, v) in sf.long.iter_mut().enumerate() {
+            *v = ((b as u32 * 7 + seed) % 4) as u8;
+        }
+        let gc = long_gc(seed % 2 == 1);
+        let steps = reference_steps(&gc, &sf, SR, V);
+        let scaled = ScaledQuantizer::new(&xr, &steps);
+        for gain in (60..=255u16).step_by(3) {
+            let mut fast = [0i32; NUM_LINES];
+            if scaled.quantize(gain as u8, &mut fast) {
+                let exact = quantize_at(&xr, &gc, &sf, SR, V, gain as u8);
+                assert_eq!(fast[..], exact[..], "seed {seed} gain {gain}");
+                accepted += 1;
+            }
+        }
+    }
+    assert!(accepted > 1000, "the fast path was hardly ever taken: {accepted}");
+}
+
+/// [`BitFloor`] never exceeds the exact Huffman bit count, and never
+/// rises with the gain.
+#[test]
+fn bit_floor_is_a_lower_bound_and_monotone() {
+    for seed in 0..24u32 {
+        let xr = accel_spectrum(seed + 100, [0.002f32, 0.05, 1.0][seed as usize % 3]);
+        let sf = ScaleFactors::default();
+        let gc = long_gc(false);
+        let steps = reference_steps(&gc, &sf, SR, V);
+        let floor = BitFloor::new(&xr, &steps);
+        let mut previous = u64::MAX;
+        for gain in 0..=255u16 {
+            let bound = floor.bits(gain);
+            assert!(bound <= previous, "seed {seed}: floor rises at gain {gain}");
+            previous = bound;
+            let is = quantize_at(&xr, &gc, &sf, SR, V, gain as u8);
+            if let Some(c) = exact_bit_count_band_aligned(&is, &gc, SR, V) {
+                assert!(
+                    bound <= c.bits as u64,
+                    "seed {seed} gain {gain}: floor {bound} above the exact count {}",
+                    c.bits
+                );
+            }
+        }
+    }
+}
+
+/// The accelerated search returns the gain and the quantization of the
+/// plain upward scan, for budgets from starved to generous.
+#[test]
+fn accelerated_search_matches_the_plain_scan() {
+    for seed in 0..12u32 {
+        let xr = accel_spectrum(seed + 500, [0.004f32, 0.2, 2.0][seed as usize % 3]);
+        let sf = ScaleFactors::default();
+        let gc = long_gc(false);
+        for budget in [0u64, 37, 300, 1200, 2500, 4095] {
+            let fast = search_bit_budget_band_aligned(&xr, &gc, &sf, SR, V, budget);
+            let mut plain = None;
+            for gain in 0..=255u16 {
+                let is = quantize_at(&xr, &gc, &sf, SR, V, gain as u8);
+                if exact_bit_count_band_aligned(&is, &gc, SR, V)
+                    .is_some_and(|c| c.bits as u64 <= budget)
+                {
+                    plain = Some((gain as u8, is));
+                    break;
+                }
+            }
+            let (gain, is) = plain.expect("some gain fits");
+            assert!(fast.satisfied);
+            assert_eq!(fast.global_gain, gain, "seed {seed} budget {budget}");
+            assert_eq!(fast.is[..], is[..], "seed {seed} budget {budget}");
+        }
+    }
+}

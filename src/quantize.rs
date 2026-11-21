@@ -94,7 +94,7 @@ fn quantize_magnitude(abs_xr_over_factor: f32) -> i32 {
     if abs_xr_over_factor == 0.0 {
         return 0;
     }
-    let mag = abs_xr_over_factor.powf(0.75);
+    let mag = pow_three_quarters(abs_xr_over_factor);
     // round-half-away-from-zero is the f32 default of `.round()`. The
     // §C.1.5.4 (informational) iteration adds a +0.0946 bias before the
     // round to push values away from zero — that's a noise-shaping
@@ -104,6 +104,29 @@ fn quantize_magnitude(abs_xr_over_factor: f32) -> i32 {
         rounded as i32
     } else {
         0
+    }
+}
+
+/// `q^(3/4)` for `q > 0`, rounding to the same integer as
+/// `q.powf(0.75)` does.
+///
+/// `sqrt(q) * sqrt(sqrt(q))` is two correctly rounded square roots and
+/// one multiply — a few times cheaper than `powf` and within 3 ulp of
+/// the true value, as `powf` is within 1. The caller only rounds the
+/// result to the nearest integer, so the two can differ only when the
+/// value sits within those few ulp of a half-integer; there (and for
+/// values too large or too small for the bound to hold) `powf` itself
+/// decides. The quantized output is therefore unchanged.
+#[inline]
+fn pow_three_quarters(q: f32) -> f32 {
+    let r = q.sqrt();
+    let fast = r * r.sqrt();
+    // Distance from the nearest rounding boundary (k + 0.5).
+    let to_boundary = ((fast - fast.floor()) - 0.5).abs();
+    if fast < 1.0e6 && to_boundary > fast * 1.0e-6 {
+        fast
+    } else {
+        q.powf(0.75)
     }
 }
 
