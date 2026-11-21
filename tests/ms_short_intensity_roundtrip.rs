@@ -228,8 +228,8 @@ fn ms_short_intensity_header_and_short_side_info() {
         assert!(hdr.mode_extension.intensity_stereo && hdr.mode_extension.ms_stereo);
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("si");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 assert!(
                     gc.window_switching_flag
                         && gc.block_type == BlockType::Short
@@ -262,14 +262,19 @@ fn ms_short_intensity_right_channel_positions_in_range() {
             continue; // filterbank warm-up
         }
         let fsf = decode_scalefactors(&hdr, &si, &run).expect("scalefactors");
-        for gr in 0..si.granule_count as usize {
-            let sf = &fsf.granules[gr][1];
-            for sfb in 0..12 {
-                for win in 0..3 {
+        for (gr, gr_row) in fsf
+            .granules
+            .iter()
+            .enumerate()
+            .take(si.granule_count as usize)
+        {
+            let sf = gr_row[1];
+            for (sfb, sfb_wins) in sf.short.iter().enumerate().take(12) {
+                for (win, win_sf) in sfb_wins.iter().enumerate().take(3) {
                     assert!(
-                        sf.short[sfb][win] <= 7,
+                        *win_sf <= 7,
                         "frame {idx} gr {gr}: sfb {sfb} win {win} pos {} out of range",
-                        sf.short[sfb][win]
+                        *win_sf
                     );
                 }
             }

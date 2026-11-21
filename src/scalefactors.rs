@@ -600,19 +600,19 @@ pub(crate) fn read_mpeg1_granule_channel(
             for band in sf.long.iter_mut().take(8) {
                 *band = r.read(u32::from(slen1)) as u8;
             }
-            for sfb in 3..12 {
+            for (sfb, row) in sf.short.iter_mut().enumerate().take(12).skip(3) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for win in 0..SHORT_WINDOWS {
-                    sf.short[sfb][win] = r.read(u32::from(slen)) as u8;
+                for v in row.iter_mut().take(SHORT_WINDOWS) {
+                    *v = r.read(u32::from(slen)) as u8;
                 }
             }
         } else {
             // Pure short: sfb 0..6 at slen1, sfb 6..12 at slen2, each
             // over three windows.
-            for sfb in 0..SHORT_SFB {
+            for (sfb, row) in sf.short.iter_mut().enumerate().take(SHORT_SFB) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for win in 0..SHORT_WINDOWS {
-                    sf.short[sfb][win] = r.read(u32::from(slen)) as u8;
+                for v in row.iter_mut().take(SHORT_WINDOWS) {
+                    *v = r.read(u32::from(slen)) as u8;
                 }
             }
         }
@@ -817,17 +817,17 @@ pub(crate) fn write_mpeg1_granule_channel(
             for &band in sf.long.iter().take(8) {
                 w.write(u32::from(band), u32::from(slen1));
             }
-            for sfb in 3..12 {
+            for (sfb, row) in sf.short.iter().enumerate().take(12).skip(3) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for win in 0..SHORT_WINDOWS {
-                    w.write(u32::from(sf.short[sfb][win]), u32::from(slen));
+                for &v in row.iter().take(SHORT_WINDOWS) {
+                    w.write(u32::from(v), u32::from(slen));
                 }
             }
         } else {
-            for sfb in 0..SHORT_SFB {
+            for (sfb, row) in sf.short.iter().enumerate().take(SHORT_SFB) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for win in 0..SHORT_WINDOWS {
-                    w.write(u32::from(sf.short[sfb][win]), u32::from(slen));
+                for &v in row.iter().take(SHORT_WINDOWS) {
+                    w.write(u32::from(v), u32::from(slen));
                 }
             }
         }
@@ -838,9 +838,9 @@ pub(crate) fn write_mpeg1_granule_channel(
             if reuse {
                 continue;
             }
-            for sfb in lo..hi {
+            for (sfb, &v) in sf.long.iter().enumerate().take(hi).skip(lo) {
                 let slen = mpeg1_long_band_slen(sfb, slen1, slen2);
-                w.write(u32::from(sf.long[sfb]), u32::from(slen));
+                w.write(u32::from(v), u32::from(slen));
             }
         }
     }
@@ -874,15 +874,15 @@ pub(crate) fn write_lsf_channel(
             for &v in sf.long.iter().take(6) {
                 values.push(v);
             }
-            for sfb in 3..SHORT_SFB {
-                for win in 0..SHORT_WINDOWS {
-                    values.push(sf.short[sfb][win]);
+            for row in sf.short.iter().take(SHORT_SFB).skip(3) {
+                for &v in row.iter().take(SHORT_WINDOWS) {
+                    values.push(v);
                 }
             }
         } else {
-            for sfb in 0..SHORT_SFB {
-                for win in 0..SHORT_WINDOWS {
-                    values.push(sf.short[sfb][win]);
+            for row in sf.short.iter().take(SHORT_SFB) {
+                for &v in row.iter().take(SHORT_WINDOWS) {
+                    values.push(v);
                 }
             }
         }
@@ -1263,13 +1263,9 @@ mod tests {
         let fsf = decode_scalefactors(&hdr, &si, &md).unwrap();
         assert_eq!(fsf.granule_count, 2);
         assert_eq!(fsf.channels, 1);
-        for gr in 0..2 {
-            for sfb in 0..21 {
-                assert_eq!(
-                    fsf.granules[gr][0].long[sfb],
-                    (sfb % 2) as u8,
-                    "gr{gr} sfb{sfb}"
-                );
+        for (gr, g) in fsf.granules.iter().enumerate().take(2) {
+            for (sfb, &v) in g[0].long.iter().enumerate().take(21) {
+                assert_eq!(v, (sfb % 2) as u8, "gr{gr} sfb{sfb}");
             }
         }
     }
@@ -1299,15 +1295,15 @@ mod tests {
         let fsf = decode_scalefactors(&hdr, &si, &md).unwrap();
 
         // gr0 all ones.
-        for sfb in 0..21 {
-            assert_eq!(fsf.granules[0][0].long[sfb], 1, "gr0 sfb{sfb}");
+        for (sfb, &v) in fsf.granules[0][0].long.iter().enumerate().take(21) {
+            assert_eq!(v, 1, "gr0 sfb{sfb}");
         }
         // gr1: reused groups (0..6 and 11..16) keep gr0's value (1);
         // transmitted groups (6..11 and 16..21) are 0.
-        for sfb in 0..21 {
+        for (sfb, &v) in fsf.granules[1][0].long.iter().enumerate().take(21) {
             let reused = (0..6).contains(&sfb) || (11..16).contains(&sfb);
             let expect = if reused { 1 } else { 0 };
-            assert_eq!(fsf.granules[1][0].long[sfb], expect, "gr1 sfb{sfb}");
+            assert_eq!(v, expect, "gr1 sfb{sfb}");
         }
     }
 
@@ -1329,12 +1325,12 @@ mod tests {
         }
         let md = w.finish();
         let fsf = decode_scalefactors(&hdr, &si, &md).unwrap();
-        for gr in 0..2 {
-            for sfb in 0..11 {
-                assert_eq!(fsf.granules[gr][0].long[sfb], 1, "gr{gr} sfb{sfb} slen1");
+        for (gr, g) in fsf.granules.iter().enumerate().take(2) {
+            for (sfb, &v) in g[0].long.iter().enumerate().take(11) {
+                assert_eq!(v, 1, "gr{gr} sfb{sfb} slen1");
             }
-            for sfb in 11..21 {
-                assert_eq!(fsf.granules[gr][0].long[sfb], 5, "gr{gr} sfb{sfb} slen2");
+            for (sfb, &v) in g[0].long.iter().enumerate().take(21).skip(11) {
+                assert_eq!(v, 5, "gr{gr} sfb{sfb} slen2");
             }
         }
     }
@@ -1401,15 +1397,15 @@ mod tests {
         }
         let md = w2.finish();
         let fsf = decode_scalefactors(&hdr, &si, &md).unwrap();
-        for gr in 0..2 {
-            let g = &fsf.granules[gr][0];
+        for (gr, row) in fsf.granules.iter().enumerate().take(2) {
+            let g = &row[0];
             // long array all zero for pure short.
             assert_eq!(g.long, [0u8; LONG_SFB]);
-            for sfb in 0..6 {
-                assert_eq!(g.short[sfb], [0, 1, 0], "gr{gr} sfb{sfb} slen1");
+            for (sfb, v) in g.short.iter().enumerate().take(6) {
+                assert_eq!(*v, [0, 1, 0], "gr{gr} sfb{sfb} slen1");
             }
-            for sfb in 6..12 {
-                assert_eq!(g.short[sfb], [2, 3, 4], "gr{gr} sfb{sfb} slen2");
+            for (sfb, v) in g.short.iter().enumerate().take(12).skip(6) {
+                assert_eq!(*v, [2, 3, 4], "gr{gr} sfb{sfb} slen2");
             }
             assert!(!g.preflag, "short blocks never set preflag");
         }
@@ -1469,23 +1465,23 @@ mod tests {
         }
         let md = w2.finish();
         let fsf = decode_scalefactors(&hdr, &si, &md).unwrap();
-        for gr in 0..2 {
-            let g = &fsf.granules[gr][0];
+        for (gr, row) in fsf.granules.iter().enumerate().take(2) {
+            let g = &row[0];
             // First 8 long bands are 1; bands 8..21 stay 0.
-            for sfb in 0..8 {
-                assert_eq!(g.long[sfb], 1, "gr{gr} long sfb{sfb}");
+            for (sfb, &v) in g.long.iter().enumerate().take(8) {
+                assert_eq!(v, 1, "gr{gr} long sfb{sfb}");
             }
-            for sfb in 8..21 {
-                assert_eq!(g.long[sfb], 0, "gr{gr} long sfb{sfb} untouched");
+            for (sfb, &v) in g.long.iter().enumerate().take(21).skip(8) {
+                assert_eq!(v, 0, "gr{gr} long sfb{sfb} untouched");
             }
             // short bands 0..3 untouched (mixed uses long there).
-            for sfb in 0..3 {
-                assert_eq!(g.short[sfb], [0, 0, 0], "gr{gr} short sfb{sfb}");
+            for (sfb, v) in g.short.iter().enumerate().take(3) {
+                assert_eq!(*v, [0, 0, 0], "gr{gr} short sfb{sfb}");
             }
-            for sfb in 3..12 {
-                for win in 0..3 {
+            for (sfb, row) in g.short.iter().enumerate().take(12).skip(3) {
+                for (win, &v) in row.iter().enumerate().take(3) {
                     let expect = ((sfb as u32 + win as u32) & 1) as u8;
-                    assert_eq!(g.short[sfb][win], expect, "gr{gr} short sfb{sfb} win{win}");
+                    assert_eq!(v, expect, "gr{gr} short sfb{sfb} win{win}");
                 }
             }
         }
@@ -1648,17 +1644,17 @@ mod tests {
         let fsf = decode_scalefactors(&hdr, &si, &md).unwrap();
         assert_eq!(fsf.granule_count, 1);
         let g = &fsf.granules[0][0];
-        for sfb in 0..6 {
-            assert_eq!(g.long[sfb], 1, "p1 sfb{sfb}");
+        for (sfb, &v) in g.long.iter().enumerate().take(6) {
+            assert_eq!(v, 1, "p1 sfb{sfb}");
         }
-        for sfb in 6..11 {
-            assert_eq!(g.long[sfb], 0, "p2 sfb{sfb}");
+        for (sfb, &v) in g.long.iter().enumerate().take(11).skip(6) {
+            assert_eq!(v, 0, "p2 sfb{sfb}");
         }
-        for sfb in 11..16 {
-            assert_eq!(g.long[sfb], 5, "p3 sfb{sfb}");
+        for (sfb, &v) in g.long.iter().enumerate().take(16).skip(11) {
+            assert_eq!(v, 5, "p3 sfb{sfb}");
         }
-        for sfb in 16..21 {
-            assert_eq!(g.long[sfb], 3, "p4 sfb{sfb}");
+        for (sfb, &v) in g.long.iter().enumerate().take(21).skip(16) {
+            assert_eq!(v, 3, "p4 sfb{sfb}");
         }
         assert!(!g.preflag);
     }
@@ -1681,11 +1677,11 @@ mod tests {
         let fsf = decode_scalefactors(&hdr, &si, &md).unwrap();
         let g = &fsf.granules[0][0];
         assert!(g.preflag);
-        for sfb in 0..11 {
-            assert_eq!(g.long[sfb], 7, "p1 sfb{sfb}");
+        for (sfb, &v) in g.long.iter().enumerate().take(11) {
+            assert_eq!(v, 7, "p1 sfb{sfb}");
         }
-        for sfb in 11..21 {
-            assert_eq!(g.long[sfb], 2, "p2 sfb{sfb}");
+        for (sfb, &v) in g.long.iter().enumerate().take(21).skip(11) {
+            assert_eq!(v, 2, "p2 sfb{sfb}");
         }
     }
 

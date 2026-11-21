@@ -985,9 +985,8 @@ mod tests {
         for frame in crate::frame::FrameWalker::new(&wire) {
             let hdr = parse_header(&frame.data[..4]).unwrap();
             let si = parse_side_info(&hdr, &frame.data[4..]).unwrap();
-            for gr in 0..si.granule_count as usize {
-                for ch in 0..si.channels as usize {
-                    let gc = &si.granules[gr][ch];
+            for row in si.granules.iter().take(si.granule_count as usize) {
+                for gc in row.iter().take(si.channels as usize) {
                     if gc.window_switching_flag
                         && gc.block_type == crate::side_info::BlockType::Short
                     {

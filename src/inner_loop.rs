@@ -549,8 +549,8 @@ fn build_gain_probes(
         let win_start = starts[sfb];
         let win_end = if sfb < 12 { starts[sfb + 1] } else { 192 };
         let win_width = win_end - win_start;
-        for win in 0..3usize {
-            let sf_value = if sfb < 12 { sf.short[sfb][win] } else { 0 };
+        let sf_row = if sfb < 12 { sf.short[sfb] } else { [0; 3] };
+        for (win, &sf_value) in sf_row.iter().enumerate() {
             let sf_term = (-(mult * f32::from(sf_value))).exp2();
             let base = 3 * win_start + win * win_width;
             let mut best = 0.0f32;

@@ -70,17 +70,17 @@ fn read_mpeg1_part2(
             for band in sf.long.iter_mut().take(8) {
                 *band = r.read(u32::from(slen1)) as u8;
             }
-            for sfb in 3..12 {
+            for (sfb, sfb_wins) in sf.short.iter_mut().enumerate().take(12).skip(3) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for w in 0..3 {
-                    sf.short[sfb][w] = r.read(u32::from(slen)) as u8;
+                for win_sf in sfb_wins.iter_mut().take(3) {
+                    *win_sf = r.read(u32::from(slen)) as u8;
                 }
             }
         } else {
-            for sfb in 0..12 {
+            for (sfb, sfb_wins) in sf.short.iter_mut().enumerate().take(12) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for w in 0..3 {
-                    sf.short[sfb][w] = r.read(u32::from(slen)) as u8;
+                for win_sf in sfb_wins.iter_mut().take(3) {
+                    *win_sf = r.read(u32::from(slen)) as u8;
                 }
             }
         }
@@ -185,8 +185,8 @@ fn count_scfsi_bits(bytes: &[u8]) -> (usize, usize) {
         let hdr = parse_header(&frame.data[..4]).expect("header parse");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
         let mut frame_set = 0usize;
-        for ch in 0..si.channels as usize {
-            frame_set += si.scfsi[ch].iter().filter(|&&b| b).count();
+        for ch_scfsi in si.scfsi.iter().take(si.channels as usize) {
+            frame_set += ch_scfsi.iter().filter(|&&b| b).count();
         }
         if frame_set > 0 {
             frames_with_reuse += 1;
@@ -373,8 +373,8 @@ fn sum_gr1_part2_3(bytes: &[u8]) -> u64 {
         let hdr = parse_header(&frame.data[..4]).expect("header parse");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
         if si.granule_count as usize == 2 {
-            for ch in 0..si.channels as usize {
-                s += u64::from(si.granules[1][ch].part2_3_length);
+            for gc_cell in si.granules[1].iter().take(si.channels as usize) {
+                s += u64::from(gc_cell.part2_3_length);
             }
         }
     }

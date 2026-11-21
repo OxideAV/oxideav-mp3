@@ -250,12 +250,16 @@ fn carrier_decode_to_silence_does_not_leak_into_audio() {
     let si_bytes = side_info_len(hdr.version, hdr.channel_count());
     let si = oxideav_mp3::parse_side_info(&hdr, &first.data[4..4 + si_bytes]).unwrap();
     for gr in 0..si.granule_count as usize {
-        for ch in 0..si.channels as usize {
+        for (ch, gc_cell) in si.granules[gr]
+            .iter()
+            .enumerate()
+            .take(si.channels as usize)
+        {
             assert_eq!(
-                si.granules[gr][ch].part2_3_length, 0,
+                gc_cell.part2_3_length, 0,
                 "carrier frame side-info granule {gr}/{ch} has non-zero part2_3_length"
             );
-            assert_eq!(si.granules[gr][ch].big_values, 0);
+            assert_eq!(gc_cell.big_values, 0);
         }
     }
 }

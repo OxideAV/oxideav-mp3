@@ -161,8 +161,8 @@ fn walk_block_types(bytes: &[u8]) -> (usize, bool) {
         assert!(hdr.version.is_lsf());
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
         assert_eq!(si.granule_count, 1, "LSF frame carries one granule");
-        for ch in 0..si.channels as usize {
-            let gc = &si.granules[0][ch];
+        for gc_cell in si.granules[0].iter().take(si.channels as usize) {
+            let gc = gc_cell;
             if gc.window_switching_flag && gc.block_type == BlockType::Short {
                 assert!(
                     !gc.preflag,
@@ -323,8 +323,8 @@ fn assert_auto_mixed_demotes(sr: u32, bitrate_kbps: u32, click_period: usize) {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         let si_start = 4 + if hdr.crc_protected { 2 } else { 0 };
         let si = parse_side_info(&hdr, &frame.data[si_start..]).expect("side info");
-        for gr in 0..si.granule_count as usize {
-            let gc = &si.granules[gr][0];
+        for gr_row in si.granules.iter().take(si.granule_count as usize) {
+            let gc = gr_row[0];
             if gc.window_switching_flag && gc.block_type == BlockType::Short {
                 saw_short = true;
             }

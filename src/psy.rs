@@ -10897,13 +10897,13 @@ mod tests {
         // (Annex D Table D.1), so the three windows of each short SFB
         // must carry the same per-cell xmin.
         let x = XminThresholds::threshold_in_quiet(44_100, MpegVersion::Mpeg1, 128);
-        for sfb in 0..SHORT_SFB {
-            let w0 = x.short[sfb][0];
-            for win in 1..SHORT_WINDOWS {
+        for (sfb, row) in x.short.iter().enumerate().take(SHORT_SFB) {
+            let w0 = row[0];
+            for (win, &v) in row.iter().enumerate().take(SHORT_WINDOWS).skip(1) {
                 assert!(
-                    (x.short[sfb][win] - w0).abs() < 1.0e-12,
+                    (v - w0).abs() < 1.0e-12,
                     "sfb {sfb}: window {win} ({}) differs from window 0 ({w0})",
-                    x.short[sfb][win],
+                    v,
                 );
             }
         }

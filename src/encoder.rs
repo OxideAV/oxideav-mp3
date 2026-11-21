@@ -280,8 +280,8 @@ pub fn write_side_info(si: &SideInfo) -> Vec<u8> {
             w.write(u32::from(si.private_bits), 2);
         }
         // One granule, nch channels.
-        for ch in 0..nch {
-            write_granule_channel(&mut w, &si.granules[0][ch], true);
+        for gc in si.granules[0].iter().take(nch) {
+            write_granule_channel(&mut w, gc, true);
         }
     } else {
         // main_data_begin (9 bits in MPEG-1).
@@ -293,15 +293,15 @@ pub fn write_side_info(si: &SideInfo) -> Vec<u8> {
             w.write(u32::from(si.private_bits), 3);
         }
         // scfsi[ch][band]: 4 one-bit flags per channel.
-        for ch in 0..nch {
-            for band in 0..4 {
-                w.write_bool(si.scfsi[ch][band]);
+        for flags in si.scfsi.iter().take(nch) {
+            for &flag in flags.iter().take(4) {
+                w.write_bool(flag);
             }
         }
         // Two granules, nch channels each.
-        for gr in 0..GRANULES {
-            for ch in 0..nch {
-                write_granule_channel(&mut w, &si.granules[gr][ch], false);
+        for row in si.granules.iter().take(GRANULES) {
+            for gc in row.iter().take(nch) {
+                write_granule_channel(&mut w, gc, false);
             }
         }
     }
@@ -780,10 +780,10 @@ mod tests {
             // Side info round-trip (no CRC, so side info starts at byte 4).
             let si = parse_side_info(&hdr, &frame[4..]).unwrap();
             assert_eq!(si.main_data_begin, 0);
-            for gr in 0..si.granule_count as usize {
-                for ch in 0..si.channels as usize {
-                    assert_eq!(si.granules[gr][ch].part2_3_length, 0);
-                    assert_eq!(si.granules[gr][ch].big_values, 0);
+            for row in si.granules.iter().take(si.granule_count as usize) {
+                for gc in row.iter().take(si.channels as usize) {
+                    assert_eq!(gc.part2_3_length, 0);
+                    assert_eq!(gc.big_values, 0);
                 }
             }
         }

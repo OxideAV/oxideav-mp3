@@ -135,8 +135,8 @@ fn long_block_baseline_carries_only_long_granules() {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 if gc.window_switching_flag || gc.block_type != BlockType::Long {
                     long_only = false;
                 }
@@ -161,9 +161,9 @@ fn force_short_blocks_writes_short_block_side_info() {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
                 any = true;
-                let gc = &si.granules[gr][ch];
+                let gc = gc_cell;
                 if !gc.window_switching_flag
                     || gc.block_type != BlockType::Short
                     || gc.mixed_block_flag
@@ -273,9 +273,9 @@ fn force_short_blocks_on_independent_stereo_writes_short_side_info_both_channels
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
         assert_eq!(si.channels, 2, "stereo si carries 2 channels");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
                 total_gcs += 1;
-                let gc = &si.granules[gr][ch];
+                let gc = gc_cell;
                 if !gc.window_switching_flag
                     || gc.block_type != BlockType::Short
                     || gc.mixed_block_flag
@@ -347,9 +347,9 @@ fn force_short_blocks_on_ms_stereo_writes_short_agreed_side_info() {
         );
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
         assert_eq!(si.channels, 2);
-        for gr in 0..si.granule_count as usize {
-            let gc_l = &si.granules[gr][0];
-            let gc_r = &si.granules[gr][1];
+        for gr_row in si.granules.iter().take(si.granule_count as usize) {
+            let gc_l = gr_row[0];
+            let gc_r = gr_row[1];
             total_gcs += 2;
             for gc in [gc_l, gc_r] {
                 if !gc.window_switching_flag

@@ -229,9 +229,7 @@ mod tests {
         g.scalefac_compress = 13;
         g.big_values = 0; // no Huffman big values
         g.table_select = [0, 0, 0];
-        for b in 0..LONG_SFB {
-            sf.granules[0][0].long[b] = (b % 8) as u8;
-        }
+for (b, v) in sf.granules[0][0].long.iter_mut().enumerate().take(LONG_SFB) { *v = (b % 8) as u8; }
         gcd[0][0].big_pairs = 0;
         gcd[0][0].count1_quads = 0;
 
@@ -666,11 +664,7 @@ mod tests {
         g.region0_count = 8;
         g.region1_count = 63;
 
-        for sfb in 0..SHORT_SFB {
-            for win in 0..SHORT_WINDOWS {
-                sf.granules[0][0].short[sfb][win] = ((sfb + win) % 2) as u8;
-            }
-        }
+for (sfb, row) in sf.granules[0][0].short.iter_mut().enumerate().take(SHORT_SFB) { for (win, v) in row.iter_mut().enumerate().take(SHORT_WINDOWS) { *v = ((sfb + win) % 2) as u8; } }
 
         let d = &mut gcd[0][0];
         d.is[0] = 1;

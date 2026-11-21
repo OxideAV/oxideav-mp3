@@ -7947,8 +7947,8 @@ mod tests {
         for f in FrameWalker::new(&out) {
             let hdr = parse_header(&f.data[..4]).expect("valid header");
             let si = parse_side_info(&hdr, &f.data[4..]).expect("side info parses");
-            for gr in 0..GRANULES {
-                let gc = &si.granules[gr][0];
+            for row in si.granules.iter().take(GRANULES) {
+                let gc = &row[0];
                 assert!(!gc.window_switching_flag, "steady tone must stay long");
                 assert_eq!(gc.block_type, BlockType::Long);
             }
@@ -7991,8 +7991,8 @@ mod tests {
         for f in FrameWalker::new(&out) {
             let hdr = parse_header(&f.data[..4]).expect("valid header");
             let si = parse_side_info(&hdr, &f.data[4..]).expect("side info parses");
-            for gr in 0..GRANULES {
-                seq.push(si.granules[gr][0].block_type);
+            for row in si.granules.iter().take(GRANULES) {
+                seq.push(row[0].block_type);
             }
         }
         assert!(!seq.is_empty());
@@ -8088,11 +8088,11 @@ mod tests {
         for (fidx, frame) in frames.iter().enumerate().take(n) {
             let hdr = parse_header(&frame.data[..4]).unwrap();
             let si = parse_side_info(&hdr, &frame.data[4..]).unwrap();
-            for gr in 0..GRANULES {
+            for (gr, row) in si.granules.iter().enumerate().take(GRANULES) {
                 let g = fidx * GRANULES + gr;
                 let expect = sm.step(flat[g], flat[g + 1]);
                 assert_eq!(
-                    si.granules[gr][0].block_type, expect,
+                    row[0].block_type, expect,
                     "frame {fidx} gr {gr}: emitted block type must equal the \
                      scheduler walk over captured pe > 1800 attacks"
                 );
@@ -8242,9 +8242,9 @@ mod tests {
                 "the intensity-stereo bit must be set"
             );
             let si = parse_side_info(&hdr, &f.data[4..]).expect("side info parses");
-            for gr in 0..GRANULES {
-                let l = &si.granules[gr][0];
-                let r = &si.granules[gr][1];
+            for (gr, row) in si.granules.iter().enumerate().take(GRANULES) {
+                let l = &row[0];
+                let r = &row[1];
                 assert_eq!(
                     l.window_switching_flag, r.window_switching_flag,
                     "frame {nframes} gr {gr}: both channels must share window geometry"

@@ -351,11 +351,11 @@ fn intensity_right_channel_scalefactors_carry_positions() {
             // (b) Intensity region: legal positions only (7 = illegal
             // marker must not appear at/above the bound), with the
             // 6 kHz probe band carrying the derived position.
-            for sfb in START_SFB..21 {
+            for (sfb, sfb_sf) in sf.long.iter().enumerate().take(21).skip(START_SFB) {
                 assert!(
-                    sf.long[sfb] <= 6,
+                    *sfb_sf <= 6,
                     "frame {idx} gr {gr}: sfb {sfb} carries illegal is_pos {}",
-                    sf.long[sfb]
+                    *sfb_sf
                 );
             }
             assert_eq!(
@@ -380,9 +380,15 @@ fn intensity_right_channel_scalefactors_carry_positions() {
             // content reaches the band just below the bound; the
             // high-tone-only scenario below guarantees a non-empty
             // marker run.
-            for sfb in zero_tail_from..START_SFB {
+            for (sfb, sfb_sf) in sf
+                .long
+                .iter()
+                .enumerate()
+                .take(START_SFB)
+                .skip(zero_tail_from)
+            {
                 assert_eq!(
-                    sf.long[sfb], 7,
+                    *sfb_sf, 7,
                     "frame {idx} gr {gr}: zero band {sfb} below the bound must carry the marker 7"
                 );
             }
@@ -462,17 +468,17 @@ fn intensity_marker_seven_fills_silent_below_bound_bands() {
                 "frame {idx} gr {gr}: hard-left probe leaked right-channel spectral data"
             );
             let sf = &fsf.granules[gr][1];
-            for sfb in 0..START_SFB {
+            for (sfb, sfb_sf) in sf.long.iter().enumerate().take(START_SFB) {
                 assert_eq!(
-                    sf.long[sfb], 7,
+                    *sfb_sf, 7,
                     "frame {idx} gr {gr}: silent band {sfb} below the bound must carry the marker 7"
                 );
             }
             // Every intensity band derives the E_R → 0 limit position
             // 6 (all-left), including the tone band.
-            for sfb in START_SFB..21 {
+            for (sfb, sfb_sf) in sf.long.iter().enumerate().take(21).skip(START_SFB) {
                 assert_eq!(
-                    sf.long[sfb], 6,
+                    *sfb_sf, 6,
                     "frame {idx} gr {gr}: hard-left intensity band {sfb} position"
                 );
             }

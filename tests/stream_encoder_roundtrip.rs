@@ -403,8 +403,8 @@ fn cbr_long_block_part2_3_within_per_granule_budget() {
         let hdr = parse_header(&frame.data[..4]).unwrap();
         let si = parse_side_info(&hdr, &frame.data[4..]).unwrap();
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 // Reservoir lets a granule borrow earlier slack, so the
                 // hard per-granule cap is the reservoir-extended budget;
                 // a single granule never exceeds the *full-frame* slot

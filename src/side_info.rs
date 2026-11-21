@@ -943,9 +943,8 @@ mod tests {
         assert_eq!(si.scfsi[1], [false, true, false, true]);
 
         let mut tag = 0u32;
-        for gr in 0..2 {
-            for ch in 0..2 {
-                let g = &si.granules[gr][ch];
+        for (gr, row) in si.granules.iter().enumerate().take(2) {
+            for (ch, g) in row.iter().enumerate().take(2) {
                 assert_eq!(g.part2_3_length, (100 + tag) as u16, "p23 gr{gr} ch{ch}");
                 assert_eq!(g.big_values, (10 + tag) as u16);
                 assert_eq!(g.global_gain, (50 + tag) as u8);

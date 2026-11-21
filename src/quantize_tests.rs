@@ -223,11 +223,7 @@ fn short_block_roundtrip() {
 fn short_block_per_window_scalefactor_roundtrip() {
     let gc = short_gc(210, [0, 0, 0], true);
     let mut sf = ScaleFactors::default();
-    for sfb in 0..12 {
-        for w in 0..3 {
-            sf.short[sfb][w] = ((sfb + w) as u8) % 5;
-        }
-    }
+for (sfb, row) in sf.short.iter_mut().enumerate().take(12) { for (w, v) in row.iter_mut().enumerate().take(3) { *v = ((sfb + w) as u8) % 5; } }
     let end = short_active_end(44100);
     let mut is = [0i32; NUM_LINES];
     is.iter_mut().take(end).for_each(|v| *v = 3);

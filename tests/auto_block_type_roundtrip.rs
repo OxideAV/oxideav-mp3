@@ -235,8 +235,8 @@ fn auto_block_type_combines_with_outer_loop_and_roundtrips() {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 // §2.4.2.7 invariant: short blocks never set preflag.
                 if gc.window_switching_flag && gc.block_type == BlockType::Short {
                     assert!(
@@ -302,9 +302,9 @@ fn auto_block_type_on_pure_sine_stays_long() {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
                 any_gc = true;
-                let gc = &si.granules[gr][ch];
+                let gc = gc_cell;
                 if gc.window_switching_flag || gc.block_type != BlockType::Long {
                     long_only = false;
                 }
@@ -509,14 +509,14 @@ fn auto_block_type_on_independent_stereo_runs_per_channel_scheduler() {
         let hdr = parse_header(&frame.data[..4]).expect("header parse");
         assert_eq!(hdr.channel_count(), 2);
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
-        for gr in 0..si.granule_count as usize {
+        for gr_row in si.granules.iter().take(si.granule_count as usize) {
             // Channel 0 (left): driven by click train, expect Start / Short.
-            let left = &si.granules[gr][0];
+            let left = gr_row[0];
             if left.window_switching_flag && left.block_type != BlockType::Long {
                 left_non_long += 1;
             }
             // Channel 1 (right): driven by sustained sine, expect Long.
-            let right = &si.granules[gr][1];
+            let right = gr_row[1];
             right_total += 1;
             if !right.window_switching_flag && right.block_type == BlockType::Long {
                 right_long += 1;
@@ -604,10 +604,10 @@ fn auto_block_type_on_ms_stereo_agrees_per_granule_and_responds_to_either_channe
         let hdr = parse_header(&frame.data[..4]).expect("header parse");
         assert_eq!(hdr.channel_count(), 2);
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
-        for gr in 0..si.granule_count as usize {
+        for gr_row in si.granules.iter().take(si.granule_count as usize) {
             total_granules += 1;
-            let l = &si.granules[gr][0];
-            let r = &si.granules[gr][1];
+            let l = gr_row[0];
+            let r = gr_row[1];
             if l.block_type != r.block_type
                 || l.window_switching_flag != r.window_switching_flag
                 || l.mixed_block_flag != r.mixed_block_flag
@@ -672,8 +672,8 @@ fn auto_block_type_outer_loop_dispatches_start_end_through_long_primitive() {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 match gc.block_type {
                     BlockType::Start => {
                         assert!(

@@ -221,8 +221,8 @@ fn mixed_auto_engages_mixed_block_on_low_band_dc_with_hf_clicks() {
         let hdr = parse_header(&frame.data[..4]).expect("header plain");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info plain");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 if gc.window_switching_flag
                     && gc.block_type == BlockType::Short
                     && gc.mixed_block_flag
@@ -262,8 +262,8 @@ fn mixed_auto_engages_mixed_block_on_low_band_dc_with_hf_clicks() {
         let hdr = parse_header(&frame.data[..4]).expect("header mixed");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info mixed");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 if gc.window_switching_flag && gc.block_type == BlockType::Short {
                     short_count += 1;
                     if gc.mixed_block_flag {
@@ -351,8 +351,8 @@ fn mixed_auto_on_pure_sine_stays_long() {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 if gc.window_switching_flag || gc.block_type != BlockType::Long {
                     any_short_or_mixed = true;
                 }
@@ -399,8 +399,8 @@ fn mixed_auto_combines_with_outer_loop_and_roundtrips() {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 if gc.window_switching_flag && gc.block_type == BlockType::Short {
                     if gc.mixed_block_flag {
                         saw_mixed = true;
@@ -477,8 +477,8 @@ fn mixed_burst_flags_flanking_transition_granules() {
     for frame in FrameWalker::new(&bytes) {
         let hdr = parse_header(&frame.data[..4]).expect("header");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side info");
-        for gr in 0..si.granule_count as usize {
-            let gc = &si.granules[gr][0];
+        for gr_row in si.granules.iter().take(si.granule_count as usize) {
+            let gc = gr_row[0];
             seq.push((gc.block_type, gc.window_switching_flag, gc.mixed_block_flag));
         }
     }

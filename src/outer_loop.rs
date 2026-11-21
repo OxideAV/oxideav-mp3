@@ -2849,9 +2849,8 @@ mod tests {
         // And the amplification must land in the targeted band range.
         let mut low_amp = 0u32;
         let mut high_amp = 0u32;
-        for sfb in 0..SHORT_SFB {
-            for win in 0..SHORT_WINDOWS {
-                let v = skewed.scalefactors.short[sfb][win];
+        for (sfb, row) in skewed.scalefactors.short.iter().enumerate().take(SHORT_SFB) {
+            for &v in row.iter().take(SHORT_WINDOWS) {
                 if v > 0 {
                     if sfb < 3 {
                         low_amp += 1;
@@ -3036,16 +3035,29 @@ mod tests {
         assert!(!res.stats.converged);
         assert!(res.stats.bands_amplified > 0);
         assert!(res.stats.iterations >= 2);
-        for sfb in 0..=MIXED_LAST_LONG_SFB {
+        for (sfb, &v) in res
+            .scalefactors
+            .long
+            .iter()
+            .enumerate()
+            .take(MIXED_LAST_LONG_SFB + 1)
+        {
             assert!(
-                res.scalefactors.long[sfb] <= MIXED_SCALEFAC_L_MAX,
+                v <= MIXED_SCALEFAC_L_MAX,
                 "long sfb={sfb} sf={} exceeds mixed long cap {MIXED_SCALEFAC_L_MAX}",
-                res.scalefactors.long[sfb],
+                v,
             );
         }
-        for sfb in MIXED_FIRST_SHORT_SFB..SHORT_SFB {
+        for (sfb, row) in res
+            .scalefactors
+            .short
+            .iter()
+            .enumerate()
+            .take(SHORT_SFB)
+            .skip(MIXED_FIRST_SHORT_SFB)
+        {
             let cap = scalefac_short_upper_limit(sfb);
-            for (win, &v) in res.scalefactors.short[sfb].iter().enumerate() {
+            for (win, &v) in row.iter().enumerate() {
                 assert!(
                     v <= cap,
                     "short sfb={sfb} win={win} sf={v} exceeds §C.1.5.4.3.6 cap {cap}",
@@ -3107,8 +3119,15 @@ mod tests {
         // The short region carried zero energy ⇒ zero distortion ⇒ no
         // amplification fired on any short cell. Any non-zero short
         // scalefactor would be a bug.
-        for sfb in MIXED_FIRST_SHORT_SFB..SHORT_SFB {
-            for (win, &v) in res.scalefactors.short[sfb].iter().enumerate() {
+        for (sfb, row) in res
+            .scalefactors
+            .short
+            .iter()
+            .enumerate()
+            .take(SHORT_SFB)
+            .skip(MIXED_FIRST_SHORT_SFB)
+        {
+            for (win, &v) in row.iter().enumerate() {
                 assert_eq!(
                     v, 0,
                     "short sfb={sfb} win={win} amplified spuriously to {v} (no energy planted)",
@@ -3171,11 +3190,17 @@ mod tests {
         assert!(res.stats.bands_amplified >= 1);
         // No long-region scalefactor should be non-zero (no energy in
         // lines 0..36).
-        for sfb in 0..=MIXED_LAST_LONG_SFB {
+        for (sfb, &v) in res
+            .scalefactors
+            .long
+            .iter()
+            .enumerate()
+            .take(MIXED_LAST_LONG_SFB + 1)
+        {
             assert_eq!(
-                res.scalefactors.long[sfb], 0,
+                v, 0,
                 "long sfb={sfb} amplified spuriously to {} (no energy planted)",
-                res.scalefactors.long[sfb],
+                v,
             );
         }
     }
@@ -3290,16 +3315,29 @@ mod tests {
             res.scalefactors.long,
         );
         // All cells must stay within their respective caps.
-        for sfb in 0..=MIXED_LAST_LONG_SFB {
+        for (sfb, &v) in res
+            .scalefactors
+            .long
+            .iter()
+            .enumerate()
+            .take(MIXED_LAST_LONG_SFB + 1)
+        {
             assert!(
-                res.scalefactors.long[sfb] <= MIXED_SCALEFAC_L_MAX,
+                v <= MIXED_SCALEFAC_L_MAX,
                 "long sfb={sfb} sf={} exceeds mixed long cap",
-                res.scalefactors.long[sfb],
+                v,
             );
         }
-        for sfb in MIXED_FIRST_SHORT_SFB..SHORT_SFB {
+        for (sfb, row) in res
+            .scalefactors
+            .short
+            .iter()
+            .enumerate()
+            .take(SHORT_SFB)
+            .skip(MIXED_FIRST_SHORT_SFB)
+        {
             let cap = scalefac_short_upper_limit(sfb);
-            for (win, &v) in res.scalefactors.short[sfb].iter().enumerate() {
+            for (win, &v) in row.iter().enumerate() {
                 assert!(
                     v <= cap,
                     "short sfb={sfb} win={win} sf={v} exceeds cap {cap}",
@@ -3617,8 +3655,13 @@ mod tests {
         // Amplification must land in the targeted long band range.
         let mut low_long_amp = 0u32;
         let mut high_long_amp = 0u32;
-        for sfb in 0..=MIXED_LAST_LONG_SFB {
-            let v = skewed.scalefactors.long[sfb];
+        for (sfb, &v) in skewed
+            .scalefactors
+            .long
+            .iter()
+            .enumerate()
+            .take(MIXED_LAST_LONG_SFB + 1)
+        {
             if v > 0 {
                 if sfb < 4 {
                     low_long_amp += 1;

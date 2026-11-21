@@ -111,17 +111,17 @@ fn read_mpeg1_part2(
             for band in sf.long.iter_mut().take(8) {
                 *band = r.read(u32::from(slen1)) as u8;
             }
-            for sfb in 3..12 {
+            for (sfb, sfb_wins) in sf.short.iter_mut().enumerate().take(12).skip(3) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for w in 0..3 {
-                    sf.short[sfb][w] = r.read(u32::from(slen)) as u8;
+                for win_sf in sfb_wins.iter_mut().take(3) {
+                    *win_sf = r.read(u32::from(slen)) as u8;
                 }
             }
         } else {
-            for sfb in 0..12 {
+            for (sfb, sfb_wins) in sf.short.iter_mut().enumerate().take(12) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for w in 0..3 {
-                    sf.short[sfb][w] = r.read(u32::from(slen)) as u8;
+                for win_sf in sfb_wins.iter_mut().take(3) {
+                    *win_sf = r.read(u32::from(slen)) as u8;
                 }
             }
         }
@@ -478,9 +478,9 @@ fn outer_loop_preflag_fires_on_hf_heavy_content() {
         let hdr = parse_header(&frame.data[..4]).expect("header parse");
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("side_info parse");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
                 total_gc += 1;
-                if si.granules[gr][ch].preflag {
+                if gc_cell.preflag {
                     preflag_count += 1;
                 }
             }

@@ -54,10 +54,10 @@ fn single_frame_self_roundtrip() {
     assert_eq!(si.main_data_begin, 0);
     assert_eq!(si.granule_count, 2);
     assert_eq!(si.channels, 2);
-    for gr in 0..2 {
-        for ch in 0..2 {
-            assert_eq!(si.granules[gr][ch].part2_3_length, 0);
-            assert_eq!(si.granules[gr][ch].big_values, 0);
+    for gr_row in si.granules.iter().take(2) {
+        for gc_cell in gr_row.iter().take(2) {
+            assert_eq!(gc_cell.part2_3_length, 0);
+            assert_eq!(gc_cell.big_values, 0);
         }
     }
 

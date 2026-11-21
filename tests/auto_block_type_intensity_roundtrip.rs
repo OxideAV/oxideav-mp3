@@ -325,10 +325,10 @@ fn auto_ms_intensity_stream_mixes_block_types() {
             hdr.mode_extension.raw
         );
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("si");
-        for gr in 0..si.granule_count as usize {
+        for gr_row in si.granules.iter().take(si.granule_count as usize) {
             // §2.4.3.4.9 channel agreement: both channels share geometry.
-            let g0 = &si.granules[gr][0];
-            let g1 = &si.granules[gr][1];
+            let g0 = gr_row[0];
+            let g1 = gr_row[1];
             assert_eq!(g0.block_type, g1.block_type, "channels share block_type");
             assert_eq!(
                 g0.window_switching_flag, g1.window_switching_flag,
@@ -384,21 +384,21 @@ fn auto_ms_intensity_short_positions_in_range() {
             if gc.window_switching_flag && gc.block_type == BlockType::Short && !gc.mixed_block_flag
             {
                 checked_short = true;
-                for sfb in 0..12 {
-                    for win in 0..3 {
+                for sfb_wins in sf.short.iter().take(12) {
+                    for win_sf in sfb_wins.iter().take(3) {
                         assert!(
-                            sf.short[sfb][win] <= 7,
+                            *win_sf <= 7,
                             "frame {idx} gr {gr}: short pos {} out of range",
-                            sf.short[sfb][win]
+                            *win_sf
                         );
                     }
                 }
             } else {
-                for sfb in 0..21 {
+                for sfb_sf in sf.long.iter().take(21) {
                     assert!(
-                        sf.long[sfb] <= 7,
+                        *sfb_sf <= 7,
                         "frame {idx} gr {gr}: long pos {} out of range",
-                        sf.long[sfb]
+                        *sfb_sf
                     );
                 }
             }
@@ -471,9 +471,9 @@ fn auto_is_only_stream_mixes_block_types_and_agrees() {
             hdr.mode_extension.raw
         );
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("si");
-        for gr in 0..si.granule_count as usize {
-            let g0 = &si.granules[gr][0];
-            let g1 = &si.granules[gr][1];
+        for gr_row in si.granules.iter().take(si.granule_count as usize) {
+            let g0 = gr_row[0];
+            let g1 = gr_row[1];
             assert_eq!(g0.block_type, g1.block_type, "channels share block_type");
             assert_eq!(
                 g0.window_switching_flag, g1.window_switching_flag,
@@ -529,21 +529,21 @@ fn auto_is_only_short_positions_in_range() {
             if gc.window_switching_flag && gc.block_type == BlockType::Short && !gc.mixed_block_flag
             {
                 checked_short = true;
-                for sfb in 0..12 {
-                    for win in 0..3 {
+                for sfb_wins in sf.short.iter().take(12) {
+                    for win_sf in sfb_wins.iter().take(3) {
                         assert!(
-                            sf.short[sfb][win] <= 7,
+                            *win_sf <= 7,
                             "frame {idx} gr {gr}: short pos {} out of range",
-                            sf.short[sfb][win]
+                            *win_sf
                         );
                     }
                 }
             } else {
-                for sfb in 0..21 {
+                for sfb_sf in sf.long.iter().take(21) {
                     assert!(
-                        sf.long[sfb] <= 7,
+                        *sfb_sf <= 7,
                         "frame {idx} gr {gr}: long pos {} out of range",
-                        sf.long[sfb]
+                        *sfb_sf
                     );
                 }
             }

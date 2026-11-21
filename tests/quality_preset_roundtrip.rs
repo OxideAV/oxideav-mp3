@@ -110,17 +110,17 @@ fn read_mpeg1_part2(
             for band in sf.long.iter_mut().take(8) {
                 *band = r.read(u32::from(slen1)) as u8;
             }
-            for sfb in 3..12 {
+            for (sfb, sfb_wins) in sf.short.iter_mut().enumerate().take(12).skip(3) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for w in 0..3 {
-                    sf.short[sfb][w] = r.read(u32::from(slen)) as u8;
+                for win_sf in sfb_wins.iter_mut().take(3) {
+                    *win_sf = r.read(u32::from(slen)) as u8;
                 }
             }
         } else {
-            for sfb in 0..12 {
+            for (sfb, sfb_wins) in sf.short.iter_mut().enumerate().take(12) {
                 let slen = if sfb < 6 { slen1 } else { slen2 };
-                for w in 0..3 {
-                    sf.short[sfb][w] = r.read(u32::from(slen)) as u8;
+                for win_sf in sfb_wins.iter_mut().take(3) {
+                    *win_sf = r.read(u32::from(slen)) as u8;
                 }
             }
         }

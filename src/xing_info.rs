@@ -546,10 +546,10 @@ mod tests {
         // Sanity: side-info reconstructs to all-zero granules.
         let si_bytes = side_info_len(hdr.version, hdr.channel_count());
         let si = crate::side_info::parse_side_info(&hdr, &frame[4..4 + si_bytes]).unwrap();
-        for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                assert_eq!(si.granules[gr][ch].part2_3_length, 0);
-                assert_eq!(si.granules[gr][ch].big_values, 0);
+        for row in si.granules.iter().take(si.granule_count as usize) {
+            for gc in row.iter().take(si.channels as usize) {
+                assert_eq!(gc.part2_3_length, 0);
+                assert_eq!(gc.big_values, 0);
             }
         }
     }

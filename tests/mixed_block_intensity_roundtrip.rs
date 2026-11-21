@@ -224,8 +224,8 @@ fn mixed_intensity_header_and_mixed_side_info() {
         assert!(hdr.mode_extension.intensity_stereo && !hdr.mode_extension.ms_stereo);
         let si = parse_side_info(&hdr, &frame.data[4..]).expect("si");
         for gr in 0..si.granule_count as usize {
-            for ch in 0..si.channels as usize {
-                let gc = &si.granules[gr][ch];
+            for gc_cell in si.granules[gr].iter().take(si.channels as usize) {
+                let gc = gc_cell;
                 assert!(
                     gc.window_switching_flag
                         && gc.block_type == BlockType::Short
@@ -259,23 +259,28 @@ fn mixed_intensity_right_channel_carries_long_and_short_positions() {
         }
         let fsf = decode_scalefactors(&hdr, &si, &run).expect("scalefactors");
 
-        for gr in 0..si.granule_count as usize {
-            let sf = &fsf.granules[gr][1];
+        for (gr, gr_row) in fsf
+            .granules
+            .iter()
+            .enumerate()
+            .take(si.granule_count as usize)
+        {
+            let sf = gr_row[1];
             // Long region (bands 0..8): legal positions or marker 7.
-            for sfb in 0..8 {
+            for (sfb, sfb_sf) in sf.long.iter().enumerate().take(8) {
                 assert!(
-                    sf.long[sfb] <= 7,
+                    *sfb_sf <= 7,
                     "frame {idx} gr {gr}: long sfb {sfb} pos {} out of range",
-                    sf.long[sfb]
+                    *sfb_sf
                 );
             }
             // Short region (bands 3..12, per window): legal or marker 7.
-            for sfb in 3..12 {
-                for win in 0..3 {
+            for (sfb, sfb_wins) in sf.short.iter().enumerate().take(12).skip(3) {
+                for (win, win_sf) in sfb_wins.iter().enumerate().take(3) {
                     assert!(
-                        sf.short[sfb][win] <= 7,
+                        *win_sf <= 7,
                         "frame {idx} gr {gr}: short sfb {sfb} win {win} pos {} out of range",
-                        sf.short[sfb][win]
+                        *win_sf
                     );
                 }
             }
