@@ -5,8 +5,8 @@
 //! ```
 //!
 //! `preset` is one of `fast`, `standard`, `high`, `transparent` (the
-//! psychoacoustic quality presets); without it the encoder's default
-//! rate/distortion loop is used. The output leads with the gapless
+//! psychoacoustic quality presets, coded as plain stereo); without it
+//! the encoder's default rate/distortion loop is used. The output leads with the gapless
 //! information frame. Prints the encode speed (x realtime, one thread)
 //! on stderr.
 
@@ -76,13 +76,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|p| ((i32::from(p[0]) + i32::from(p[1])) / 2) as i16)
             .collect();
     }
-    let mut enc = match (channels, mode) {
-        (1, _) | (_, "mono") => Mp3Encoder::new(kbps, rate, ChannelMode::SingleChannel)?,
-        (_, "stereo") => Mp3Encoder::new(kbps, rate, ChannelMode::Stereo)?,
-        _ => Mp3Encoder::new_joint_stereo_auto(kbps, rate)?,
+    let mono = channels == 1 || mode == "mono";
+    let mut enc = match (preset, mono, mode) {
+        // The presets configure the outer (noise-allocation) loop,
+        // which the plain-stereo and mono constructors carry.
+        (Some(p), true, _) => {
+            Mp3Encoder::new_with_quality_preset(kbps, rate, ChannelMode::SingleChannel, p)?
+        }
+        (Some(p), false, _) => {
+            Mp3Encoder::new_with_quality_preset(kbps, rate, ChannelMode::Stereo, p)?
+        }
+        (None, true, _) => Mp3Encoder::new(kbps, rate, ChannelMode::SingleChannel)?,
+        (None, false, "stereo") => Mp3Encoder::new(kbps, rate, ChannelMode::Stereo)?,
+        (None, false, _) => Mp3Encoder::new_joint_stereo_auto(kbps, rate)?,
     };
-    if let Some(p) = preset {
-        enc.with_quality_preset(p)?;
+    // Block switching: `OXIDEAV_MP3_BLOCKS=auto` arms the attack
+    // detector (short blocks on transients), `=model2` the
+    // psychoacoustic-entropy scheduler.
+    match std::env::var("OXIDEAV_MP3_BLOCKS").as_deref() {
+        Ok("auto") => enc.enable_auto_block_type(4.0)?,
+        Ok("model2") => enc.enable_auto_block_type_model2()?,
+        _ => {}
     }
     enc.enable_info_frame();
     let out_channels = if mode == "mono" { 1 } else { channels };

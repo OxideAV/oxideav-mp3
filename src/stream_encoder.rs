@@ -6079,53 +6079,22 @@ fn best_table_or(is: &[i32; NUM_LINES], start: usize, end: usize) -> u8 {
 }
 
 /// Bit cost of coding `is[start..end)` as one big-values region under
-/// codebook `table_idx`. Reuses the in-tree
-/// [`crate::huffman::count_huffman_bits`] by shoehorning the range
-/// into "region 2" of a three-region split, with region 0 and
-/// region 1 collapsed to `(start, start)`. Returns `None` if any
-/// pair is not codable by the chosen table (corner test) **or** if
-/// the table's `linbits` cannot represent the magnitudes (corner
-/// test only catches the small tables; the ESC tables' linbits-reach
-/// limit is filtered upstream by the per-table `reach` lookup, so any
-/// `None` returned here is the corner case).
+/// codebook `table_idx` (codewords, ESC fields and sign bits), or
+/// `None` if a pair of the range is not codable by that table.
+///
+/// Only the range itself is costed. (This used to be computed as the
+/// cost of `[0, end)` minus the cost of `[0, start)` under the same
+/// table, which is `None` whenever the *preceding* regions hold a
+/// value the table cannot code — the usual case, since a later region
+/// has the smaller values and the smaller table. The rate loop read
+/// that as "over budget" and raised the gain until the whole spectrum
+/// fitted the smallest table in use, discarding most of the frame's
+/// bits.)
 fn bits_for_range(is: &[i32; NUM_LINES], start: usize, end: usize, table_idx: u8) -> Option<usize> {
     if start >= end {
         return Some(0);
     }
-    // Place the range under region 2 (table_select[2] = idx). Set
-    // big_pairs = end / 2 so the range [start, end) actually carries
-    // pairs. Region 0 / 1 cover [0, start) but with tables 0/1
-    // we'd need them codable too — easier to set region_ends = (0, 0)
-    // and ALSO start = 0 effectively, BUT the caller has start > 0.
-    //
-    // Simpler: when start > 0, count the FULL [0, end) range under
-    // `table_idx` and subtract the [0, start) cost under the same
-    // table. Both share `table_idx`, so the additive split is exact.
-    let full = single_table_bits_from_zero(is, end, table_idx)?;
-    if start == 0 {
-        return Some(full);
-    }
-    let head = single_table_bits_from_zero(is, start, table_idx)?;
-    Some(full - head)
-}
-
-/// Bit cost of coding `is[0..end)` as ONE big-values region under
-/// `table_idx`. Calls [`crate::huffman::count_huffman_bits`] with
-/// `big_pairs = end / 2`, three regions collapsed to a single one at
-/// position 0..end via `region_ends = (end, end)` and
-/// `table_select = [table_idx, 0, 0]`. Returns `None` only when a
-/// pair in `[0, end)` is not codable by `table_idx`.
-fn single_table_bits_from_zero(is: &[i32; NUM_LINES], end: usize, table_idx: u8) -> Option<usize> {
-    if end == 0 {
-        return Some(0);
-    }
-    let end = end.min(NUM_LINES);
-    let end = end - (end % 2); // round down to even
-    if end == 0 {
-        return Some(0);
-    }
-    let big_pairs = end / 2;
-    crate::huffman::count_huffman_bits(is, big_pairs, (end, end), [table_idx, 0, 0], 0, false)
+    crate::huffman::region_bits_with_table(is, start, end.min(NUM_LINES), table_idx)
 }
 
 /// A default long-block granule-channel record: window_switching off,

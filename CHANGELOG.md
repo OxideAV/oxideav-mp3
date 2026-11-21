@@ -25,6 +25,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   timeline, so later samples stay aligned with the container
   timestamps.
 
+- **The rate loop spends the frame.** The bit cost of a big-values
+  region was computed as `cost(0..end) - cost(0..start)` under that
+  region's table, which has no value whenever an earlier region holds
+  a magnitude the table cannot code; the loop read that as "over
+  budget" and raised the gain until the whole spectrum fitted the
+  smallest table in use. On dense spectra the encoder wrote a fifth
+  of its bits, and its output did not improve with the bitrate. Same
+  clips, 128 kbit/s joint stereo, segmental critical-band SNR
+  (`examples/band_snr.rs`): harmonic-rich tones 3.7 -> 12.3 dB (a
+  black-box encoder: 11.5), speech 7.1 -> 18.9 dB (21.6), noise
+  bursts 11.6 -> 12.9 dB (16.2).
 - **The encoder no longer loses the end of the input.** A sample
   entering the encoder leaves a decoder 1057 samples later, and the
   stream stopped at the first frame boundary after the last input

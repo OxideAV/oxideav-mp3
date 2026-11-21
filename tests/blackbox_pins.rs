@@ -324,3 +324,50 @@ fn the_stream_covers_the_last_input_sample_and_declares_its_length() {
         }
     }
 }
+
+/// The rate loop spends the frame. The cost of a big-values region
+/// was computed as `cost(0..end) - cost(0..start)` under that region's
+/// table, which fails whenever an earlier region holds a value the
+/// table cannot code; the loop took the failure for "over budget" and
+/// raised the gain until the whole spectrum fitted the smallest table
+/// in use. On a harmonic-rich signal at 128 kbit/s stereo it then
+/// wrote ~150 of the ~750 bits each granule-channel may use (band-SNR
+/// 3.7 dB against a black-box encoder's 11.5 dB at the same rate).
+#[test]
+fn the_rate_loop_spends_its_budget_on_a_dense_spectrum() {
+    // Two sawtooth-like tones (harmonics up to Nyquist), stereo.
+    let n = 44_100usize;
+    let mut pcm = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f64 / 44_100.0;
+        let saw = |f: f64| {
+            let mut v = 0.0;
+            let mut k = 1.0;
+            while f * k < 20_000.0 {
+                v += (std::f64::consts::TAU * f * k * t).sin() / k;
+                k += 1.0;
+            }
+            v
+        };
+        pcm.push((saw(220.0) * 4_000.0) as i16);
+        pcm.push((saw(277.18) * 4_000.0) as i16);
+    }
+    let enc = Mp3Encoder::new(128, 44_100, ChannelMode::Stereo).expect("encoder");
+    let out = encode(enc, &pcm);
+    let (mut bits, mut cells) = (0usize, 0usize);
+    let frames: Vec<_> = FrameWalker::new(&out).collect();
+    // Steady part only (skip the onset and the delay flush).
+    for f in &frames[4..frames.len() - 4] {
+        let si = parse_side_info(&f.header, &f.data[4..]).expect("side info");
+        for gc in si.granules.iter().flatten() {
+            bits += usize::from(gc.part2_3_length);
+            cells += 1;
+        }
+    }
+    let mean = bits / cells;
+    // (417 - 4 - 32) * 8 / 4 = 762 bits per granule-channel.
+    assert!(
+        mean > 600,
+        "mean part2_3_length {mean} bits of ~762 available: the frame is not being spent"
+    );
+}

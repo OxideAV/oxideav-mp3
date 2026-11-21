@@ -651,7 +651,7 @@ fn big_pair_bits(table: &BigTable, x: i32, y: i32) -> Option<usize> {
 /// §C.1.5.4.4.8. Returns `None` if any pair is not codable by the chosen
 /// table (magnitude out of range / unused corner) or if `table_idx` is an
 /// unused/out-of-range codebook.
-fn region_bits_with_table(
+pub(crate) fn region_bits_with_table(
     is: &[i32; NUM_LINES],
     start: usize,
     end: usize,
