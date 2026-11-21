@@ -2368,8 +2368,8 @@ impl Mp3Encoder {
     ///   [`crate::xing_info::flag_bit::BYTES`]) is set **and** the
     ///   template's field is `None`, [`Mp3Encoder::finish`] computes
     ///   the field at flush time (frame count = number of audio frames
-    ///   following the carrier; byte count = total bytes of audio
-    ///   following the carrier).
+    ///   following the carrier; byte count = the whole stream, carrier
+    ///   frame included).
     /// * If the field is already `Some(_)` in the template, the
     ///   provided value is written verbatim.
     /// * If the flag bit is clear, the field is omitted regardless of
@@ -5678,7 +5678,6 @@ impl Mp3Encoder {
             audio_total_bytes += 4 + crc_bytes as u64 + si_bytes as u64 + sch.slot.len() as u64;
             cum_audio_offsets.push(audio_total_bytes);
         }
-        let audio_total_bytes_u32: u32 = audio_total_bytes.try_into().unwrap_or(u32::MAX);
 
         // Step 3a: optional Xing / Info carrier frame.
         //
@@ -5759,16 +5758,24 @@ impl Mp3Encoder {
             if spec.flags & flag_bit::FRAMES != 0 && spec.frames.is_none() {
                 spec.frames = Some(audio_frame_count);
             }
-            if spec.flags & flag_bit::BYTES != 0 && spec.bytes.is_none() {
-                spec.bytes = Some(audio_total_bytes_u32);
-            }
-            if spec.flags & flag_bit::TOC != 0 && spec.toc.is_none() {
-                spec.toc = Some(compute_xing_toc(&cum_audio_offsets, audio_total_bytes));
-            }
             // Carrier header: same as the audio header template but
             // unpadded (so its size equals the base CBR frame length).
             let mut carrier_hdr = self.header_template;
             carrier_hdr.padding = false;
+            // The byte count and the seek table describe the stream
+            // from the first byte of the carrier frame
+            // (`lame-xing-info-tag.md` §2: "file / stream size",
+            // "offsets into the file"); the frame count is the audio
+            // frames after it.
+            let carrier_len = carrier_hdr.frame_len().unwrap_or(0) as u64;
+            let total = carrier_len + audio_total_bytes;
+            if spec.flags & flag_bit::BYTES != 0 && spec.bytes.is_none() {
+                spec.bytes = Some(u32::try_from(total).unwrap_or(u32::MAX));
+            }
+            if spec.flags & flag_bit::TOC != 0 && spec.toc.is_none() {
+                let shifted: Vec<u64> = cum_audio_offsets.iter().map(|o| o + carrier_len).collect();
+                spec.toc = Some(compute_xing_toc(&shifted, total));
+            }
             let carrier = build_info_frame(&carrier_hdr, &spec)
                 .map_err(|e| StreamEncodeError::Huffman(e.to_string()))?;
             sink.write_all(&carrier)?;
@@ -6398,6 +6405,9 @@ fn compute_xing_toc(cum_offsets: &[u64], total_bytes: u64) -> [u8; 100] {
         let scaled = (256u64 * offset) / total_bytes;
         *slot = scaled.min(255) as u8;
     }
+    // Position 0 % is the start of the stream (the information frame
+    // itself when the offsets are counted from it).
+    toc[0] = 0;
     toc
 }
 

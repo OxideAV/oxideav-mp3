@@ -302,14 +302,16 @@ fn vbr_xing_toc_bytes_field_matches_audio_region() {
     let si_bytes = side_info_len(hdr.version, hdr.channel_count());
     let tag = parse_xing_info(carrier.data, si_bytes).expect("xing");
 
-    let mut audio_bytes: u64 = 0;
+    // Frames: the audio frames after the carrier. Bytes: the whole
+    // stream, carrier included.
+    let mut stream_bytes: u64 = carrier.data.len() as u64;
     let mut audio_frames: u32 = 0;
     for f in walker {
-        audio_bytes += f.data.len() as u64;
+        stream_bytes += f.data.len() as u64;
         audio_frames += 1;
     }
     assert_eq!(tag.frames.unwrap(), audio_frames);
-    assert_eq!(tag.bytes.unwrap() as u64, audio_bytes);
+    assert_eq!(tag.bytes.unwrap() as u64, stream_bytes);
 }
 
 #[test]

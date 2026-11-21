@@ -1270,3 +1270,118 @@ fn own_streams_decode_on_the_black_box_decoders() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// Registry path: `make_encoder` packets through the `.mp3` muxer.
+// ---------------------------------------------------------------------
+
+/// A seekable in-memory sink the test can read back.
+#[derive(Clone, Default)]
+struct SharedSink(std::sync::Arc<Mutex<Cursor<Vec<u8>>>>);
+
+impl std::io::Write for SharedSink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for SharedSink {
+    fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.lock().unwrap().seek(p)
+    }
+}
+
+/// Encode through the framework traits and mux to `.mp3` bytes.
+fn registry_encode(rate: u32, channels: usize, kbps: u64, pcm: &[i16]) -> Vec<u8> {
+    use oxideav_core::{AudioFrame, Muxer, StreamInfo, TimeBase};
+    let mut params = CodecParameters::audio(CodecId::new("mp3"));
+    params.sample_rate = Some(rate);
+    params.channels = Some(channels as u16);
+    params.bit_rate = Some(kbps * 1000);
+    let mut enc = oxideav_mp3::make_encoder(&params).expect("make_encoder");
+    let sink = SharedSink::default();
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, i64::from(rate)),
+        duration: None,
+        start_time: Some(0),
+        params: enc.output_params().clone(),
+    };
+    let mut mux: Box<dyn Muxer> =
+        oxideav_mp3::muxer::open_muxer(Box::new(sink.clone()), &[stream]).expect("open_muxer");
+    mux.write_header().expect("header");
+    let drain = |enc: &mut dyn oxideav_core::Encoder, mux: &mut dyn Muxer| {
+        while let Ok(p) = enc.receive_packet() {
+            mux.write_packet(&p).expect("write_packet");
+        }
+    };
+    for chunk in pcm.chunks(4096 * channels) {
+        let frame = Frame::Audio(AudioFrame {
+            samples: (chunk.len() / channels) as u32,
+            pts: None,
+            data: vec![chunk.iter().flat_map(|s| s.to_le_bytes()).collect()],
+        });
+        enc.send_frame(&frame).expect("send_frame");
+        drain(enc.as_mut(), mux.as_mut());
+    }
+    enc.flush().expect("flush");
+    drain(enc.as_mut(), mux.as_mut());
+    mux.write_trailer().expect("trailer");
+    sink.0.lock().unwrap().get_ref().clone()
+}
+
+#[test]
+fn registry_path_streams_decode_on_the_black_box_decoders() {
+    if !have("mpg123") {
+        eprintln!("skipping: `mpg123` is required for the black-box matrix");
+        return;
+    }
+    let with_ffmpeg = have("ffmpeg");
+    let dir: PathBuf =
+        std::env::temp_dir().join(format!("oxideav-mp3-matrix-reg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let mut cells = 0usize;
+    for rate in RATES {
+        for channels in [1usize, 2] {
+            let kbps = if rate >= 32_000 { 128 } else { 64 };
+            let n = rate as usize + 777;
+            let pcm = material(rate, channels, n, rate + channels as u32);
+            let bytes = registry_encode(rate, channels, kbps, &pcm);
+            let label = format!("registry-{rate}-{channels}ch");
+            let mp3 = dir.join(format!("{label}.mp3"));
+            std::fs::write(&mp3, &bytes).expect("write");
+            let (a, ch) = ours(&bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(ch, channels, "{label}");
+            // Every input sample is in the stream.
+            assert!(a.len() / ch >= n + 1057, "{label}: stream too short");
+            let m = decode_mpg123(&mp3, ch).expect("mpg123");
+            assert_eq!(m.len(), a.len(), "{label}: mpg123 length");
+            let (max, rms, limit) = diff(&a, &m, ch, 0, 0, m.len() / ch).expect("overlap");
+            assert!(
+                max <= MAX_LSB && rms <= limit,
+                "{label}: mpg123 max {max:.2} rms {rms:.3}"
+            );
+            let (_, stderr) = gapless_decode("mpg123", &mp3, ch);
+            assert!(stderr.is_empty(), "{label}: mpg123 complains: {stderr}");
+            if with_ffmpeg {
+                let (f, stderr) = gapless_decode("ffmpeg", &mp3, ch);
+                assert!(stderr.is_empty(), "{label}: ffmpeg complains: {stderr}");
+                let lag = best_lag(&a, &f, ch, 2 * 1152 + 600, usize::MAX);
+                let (max, rms, limit) = diff(&a, &f, ch, lag, 0, f.len() / ch).expect("overlap");
+                assert!(
+                    max <= MAX_LSB && rms <= limit,
+                    "{label}: ffmpeg max {max:.2} rms {rms:.3} lag {lag}"
+                );
+            }
+            let _ = std::fs::remove_file(&mp3);
+            cells += 1;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!(
+        "black-box matrix (registry encoder + muxer): {cells} cells accepted without complaint and sample-equal"
+    );
+}

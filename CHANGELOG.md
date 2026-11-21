@@ -57,6 +57,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   of the band's `slen` bits (ISO/IEC 13818-3 §2.4.3.2), not a
   constant 7; bands with `slen == 0` have position zero.
 
+- **Xing / Info byte count and seek table count from the start of
+  the information frame** (the stream size, as the tag's staged
+  description and its originating encoder have it), in the muxer and
+  in `Mp3Encoder::enable_xing_info`; they described the audio after
+  it. A black-box reader reported "invalid concatenated file" on the
+  shorter figure.
+
 ### Added
 
 - **Gapless information frame from the encoder**:
@@ -71,6 +78,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   each decoded by two black-box decoders: no complaint on stderr,
   gapless length exact, every sample within 2 LSB of this crate's own
   decode, and the decode in place against the input.
+- `tests/blackbox_matrix.rs`, registry path: `make_encoder` packets
+  through the `.mp3` muxer at every sampling frequency, mono and
+  stereo, accepted without complaint and sample-equal on both
+  black-box decoders.
 - `examples/wav_to_mp3.rs` — file encode with a speed readout.
 - `tests/blackbox_matrix.rs` — live black-box matrix, foreign streams
   into this decoder: 970 cells from a black-box encoder (every

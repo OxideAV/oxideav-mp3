@@ -7,7 +7,7 @@
 //! For Layer III streams the muxer additionally leads the file with a
 //! Xing / Info information frame ([`crate::xing_info`]): a silent frame
 //! at the stream's own header geometry whose main-data slot carries the
-//! total frame count, the audio byte count and a 100-entry seek table.
+//! audio frame count, the stream byte count and a 100-entry seek table.
 //! The frame is reserved when the first packet arrives (its header
 //! fixes version / rate / mode / bit rate) and back-patched in
 //! [`Muxer::write_trailer`] once the totals are known. The tag id is
@@ -133,9 +133,16 @@ impl Mp3Muxer {
         let Some(slot) = self.info else {
             return Ok(());
         };
+        // The frame count is the audio frames; the byte count and the
+        // seek table describe the stream from the first byte of the
+        // info frame (`lame-xing-info-tag.md` §2: "file / stream
+        // size", "offsets into the file").
+        let info_len = slot.header.frame_len().unwrap_or(0) as u64;
+        let total = info_len + self.audio_bytes;
         let frames = u32::try_from(self.frame_offsets.len()).unwrap_or(u32::MAX);
-        let bytes = u32::try_from(self.audio_bytes).unwrap_or(u32::MAX);
-        let toc = seek_table(&self.frame_offsets, self.audio_bytes);
+        let bytes = u32::try_from(total).unwrap_or(u32::MAX);
+        let shifted: Vec<u64> = self.frame_offsets.iter().map(|o| o + info_len).collect();
+        let toc = seek_table(&shifted, total);
         let id = if self.vbr {
             XingTagId::Xing
         } else {
@@ -180,6 +187,8 @@ fn seek_table(frame_offsets: &[u64], total_bytes: u64) -> [u8; 100] {
         let off = frame_offsets[frame.min(n - 1)];
         *slot = ((off * 256) / total_bytes).min(255) as u8;
     }
+    // Position 0 % is the start of the stream (the info frame).
+    toc[0] = 0;
     toc
 }
 
@@ -315,10 +324,17 @@ mod tests {
         assert_eq!(tag.id, XingTagId::Info);
         assert_eq!(tag.frames, Some(frames.len() as u32));
         let audio: Vec<u8> = frames.concat();
-        assert_eq!(tag.bytes, Some(audio.len() as u32));
+        assert_eq!(tag.bytes, Some(out.len() as u32));
         assert_eq!(&out[info_len..], &audio[..]);
         let toc = tag.toc.expect("toc");
+        // Position 0 % is the stream start; later entries are offsets
+        // from it, so none points inside the info frame.
         assert_eq!(toc[0], 0);
+        assert!(
+            toc[1..]
+                .iter()
+                .all(|&t| usize::from(t) >= info_len * 256 / out.len())
+        );
         assert!(toc.windows(2).all(|w| w[0] <= w[1]));
     }
 

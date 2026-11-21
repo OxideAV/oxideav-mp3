@@ -107,12 +107,12 @@ fn carrier_frame_parse_xing_info_recovers_writer_intent() {
 }
 
 #[test]
-fn xing_audio_total_bytes_matches_actual_audio_region_length() {
+fn xing_total_bytes_matches_actual_stream_length() {
     // The `bytes` field the encoder fills in must equal the on-wire
-    // byte length of every audio frame that follows the carrier —
-    // not just a count of N base-length frames (some frames may carry
-    // the CBR padding byte). Verify the encoder's accounting agrees
-    // with byte-counting via FrameWalker.
+    // byte length of the stream — the carrier frame and every audio
+    // frame that follows it, not just a count of N base-length frames
+    // (some frames may carry the CBR padding byte). Verify the
+    // encoder's accounting agrees with byte-counting via FrameWalker.
     let n = SAMPLES_PER_FRAME * 20; // ~520 ms — pad cycle long enough to land padded frames.
     let pcm = sine_pcm(n, 440.0, SR as f32, 0.5);
     let mut enc = fresh_encoder_with_xing(
@@ -126,12 +126,13 @@ fn xing_audio_total_bytes_matches_actual_audio_region_length() {
     let mut walker = FrameWalker::new(&bytes);
     let carrier = walker.next().expect("carrier frame");
     assert_eq!(carrier.data.len(), BASE_FRAME_LEN_128_44);
-    let mut audio_bytes: u64 = 0;
+    let mut audio_bytes: u64 = carrier.data.len() as u64;
     let mut audio_frames: u32 = 0;
     for f in walker {
         audio_bytes += f.data.len() as u64;
         audio_frames += 1;
     }
+    assert_eq!(audio_bytes, bytes.len() as u64);
 
     let hdr = parse_header(&carrier.data[..4]).unwrap();
     let si_bytes = side_info_len(hdr.version, hdr.channel_count());
@@ -146,7 +147,7 @@ fn xing_audio_total_bytes_matches_actual_audio_region_length() {
     assert_eq!(
         tag.bytes.unwrap() as u64,
         audio_bytes,
-        "bytes field {} != audio-region byte count {}",
+        "bytes field {} != stream byte count {}",
         tag.bytes.unwrap(),
         audio_bytes
     );
